@@ -1,0 +1,57 @@
+name: quant-intelligence-platform
+
+services:
+  timescaledb-pgvector:
+    image: timescale/timescaledb-ha:pg18.6-ts2.29.2-all
+    container_name: argon-timescaledb-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: quant_intelligence
+      POSTGRES_USER: argon_quant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-argon_institutional_2026}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TIMESCALEDB_TELEMETRY: "off"
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data/pgdata
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=2GB"
+      - "-c"
+      - "effective_cache_size=6GB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "maintenance_work_mem=512MB"
+      - "-c"
+      - "max_connections=250"
+      - "-c"
+      - "synchronous_commit=off"
+      - "-c"
+      - "wal_buffers=16MB"
+      - "-c"
+      - "max_worker_processes=16"
+      - "-c"
+      - "timescaledb.max_background_workers=8"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U argon_quant -d quant_intelligence"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  duckdb-lakehouse:
+    image: alpine:3.21
+    container_name: argon-duckdb-lakehouse-vol
+    volumes:
+      - duckdb_parquet_lakehouse:/lakehouse
+    command: ["sh", "-c", "mkdir -p /lakehouse/raw_bars /lakehouse/options_flow /lakehouse/short_float /lakehouse/internals /lakehouse/onnx_models && tail -f /dev/null"]
+
+volumes:
+  timescale_data:
+    driver: local
+  duckdb_parquet_lakehouse:
+    driver: local
+

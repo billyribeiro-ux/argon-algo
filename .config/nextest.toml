@@ -1,0 +1,21 @@
+[profile.default]
+retries = 0
+test-threads = "num-cpus"
+fail-fast = false
+status-level = "pass"
+final-status-level = "flaky"
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[profile.ci]
+retries = 1
+fail-fast = true
+status-level = "fail"
+final-status-level = "fail"
+slow-timeout = { period = "15s", terminate-after = 1 }
+
+[profile.default.junit]
+path = "target/nextest/default/junit.xml"
+report-name = "quant-intelligence-platform-nextest"
+store-success-output = false
+store-failure-output = true
+

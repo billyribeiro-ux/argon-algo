@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/raw-fingerprint-core",
+    "crates/market-data-bus",
+    "crates/live-execution-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+authors = ["Principal Quantitative Architecture Team <quant-arch@argon-algo.io>"]
+license = "Proprietary"
+repository = "https://github.com/billyribeiro-ux/argon-algo.git"
+
+[workspace.dependencies]
+tokio = { version = "1.52.3", features = ["full"] }
+axum = { version = "0.8.9", features = ["macros", "json"] }
+tokio-tungstenite = "0.24.0"
+tower = { version = "0.5.3" }
+tower-http = { version = "0.6.11", features = ["cors", "trace", "compression-full"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.23.3", features = ["v4", "serde"] }
+dashmap = "6.2.1"
+futures = "0.3.32"
+rayon = "1.12.0"
+rust_decimal = { version = "1.42.0", features = ["serde"] }
+parking_lot = "0.12.5"
+crossbeam = "0.8.4"
+csv = "1.4.0"
+zip = { version = "3.0.0", default-features = false, features = ["deflate"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+fastrand = "2.4.1"
+bytes = "1.11.1"
+http = "1.4.2"
+
+raw-fingerprint-core = { path = "crates/raw-fingerprint-core" }
+market-data-bus = { path = "crates/market-data-bus" }
+
+[profile.dev.package.raw-fingerprint-core]
+opt-level = 3
+
+[profile.test]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = false
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

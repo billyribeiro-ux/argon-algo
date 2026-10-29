@@ -1,0 +1,30 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Python / uv / maturin
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# Node / SvelteKit / Vite
+node_modules/
+web-terminal/.svelte-kit/
+web-terminal/build/
+web-terminal/dist/
+.DS_Store
+
+# Environment & Secrets
+.env
+.env.local
+*.pem
+

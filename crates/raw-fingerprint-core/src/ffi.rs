@@ -8,9 +8,13 @@ use std::slice;
 
 use crate::price::SubPennyPrice;
 use crate::streams::{
-    RawBarRecord, RawMarketInternalsSnapshot, RawOptionsSnapshot, RawShortFloatSnapshot,
+    BrainHorizonId, PrimaryFingerprintDriver, RawBarRecord, RawMarketInternalsSnapshot,
+    RawOptionsSnapshot, RawShortFloatSnapshot, TraceHealthBadge, TradeDirection,
 };
-use crate::tensor::{FINGERPRINT_FEATURE_DIM, RawFingerprintEngine, TRACE_EMBEDDING_DIM};
+use crate::tensor::{
+    FINGERPRINT_FEATURE_DIM, OpenPositionEvaluationContext, RawFingerprintEngine,
+    TRACE_EMBEDDING_DIM,
+};
 
 /// C-compatible raw bar struct for zero-copy array passing from Python / NumPy / Polars.
 #[repr(C)]
@@ -199,6 +203,277 @@ pub unsafe extern "C" fn argon_build_fingerprint_tensor_cabi(
             out_w[1] = res.stream_weights.options_gamma_vanna_weight;
             out_w[2] = res.stream_weights.short_float_squeeze_weight;
             out_w[3] = res.stream_weights.market_internals_macro_weight;
+            0
+        }
+        Err(_) => -2,
+    }
+}
+
+/// C-compatible output struct for `argon_evaluate_autonomous_signal_cabi`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CAbiAutonomousSignalOutput {
+    pub direction_sign: i32,
+    pub entry_scaled: i64,
+    pub structural_stop_scaled: i64,
+    pub target_1_scaled: i64,
+    pub target_2_scaled: i64,
+    pub predicted_hold_ms: i64,
+    pub ai_confidence_pct: f64,
+    pub expected_r_multiple: f64,
+    pub primary_driver_code: i32,
+    pub stream_weights: [f32; 4],
+}
+
+/// C-compatible output struct for `argon_evaluate_live_trace_health_cabi` (Speed-1 Intraday Loop).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CAbiLiveTraceHealthOutput {
+    pub badge_code: i32,
+    pub updated_stop_scaled: i64,
+    pub opposing_absorption_score: f64,
+    pub current_r_multiple: f64,
+    pub should_exit_immediately: i32,
+}
+
+/// Evaluates a complete autonomous signal blueprint over C-ABI with zero training-serving skew.
+///
+/// # Safety
+/// All pointer arguments must be valid and non-null, and `bars_ptr` must contain `seq_len >= 2` elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn argon_evaluate_autonomous_signal_cabi(
+    brain_code: i32,
+    bars_ptr: *const CAbiRawBar,
+    seq_len: usize,
+    options_ptr: *const CAbiOptionsSnapshot,
+    short_float_ptr: *const CAbiShortFloatSnapshot,
+    internals_ptr: *const CAbiMarketInternalsSnapshot,
+    out_signal_ptr: *mut CAbiAutonomousSignalOutput,
+) -> i32 {
+    if bars_ptr.is_null()
+        || options_ptr.is_null()
+        || short_float_ptr.is_null()
+        || internals_ptr.is_null()
+        || out_signal_ptr.is_null()
+        || seq_len < 2
+    {
+        return -1;
+    }
+
+    let brain_id = match brain_code {
+        1 => BrainHorizonId::Brain01PennyAnomaly,
+        2 => BrainHorizonId::Brain02IntradayDayTrade,
+        3 => BrainHorizonId::Brain03ShortTermSwing,
+        4 => BrainHorizonId::Brain04CoreSwing,
+        _ => BrainHorizonId::Brain05LongTermWealth,
+    };
+
+    let c_bars = unsafe { slice::from_raw_parts(bars_ptr, seq_len) };
+    let c_opts = unsafe { &*options_ptr };
+    let c_sf = unsafe { &*short_float_ptr };
+    let c_int = unsafe { &*internals_ptr };
+
+    let mut bars = Vec::with_capacity(seq_len);
+    for b in c_bars {
+        bars.push(RawBarRecord {
+            timestamp_ns: b.timestamp_ns,
+            open: SubPennyPrice::from_scaled_units(b.open_scaled.max(1))
+                .unwrap_or(SubPennyPrice::MIN_VALID),
+            high: SubPennyPrice::from_scaled_units(b.high_scaled.max(1))
+                .unwrap_or(SubPennyPrice::MIN_VALID),
+            low: SubPennyPrice::from_scaled_units(b.low_scaled.max(1))
+                .unwrap_or(SubPennyPrice::MIN_VALID),
+            close: SubPennyPrice::from_scaled_units(b.close_scaled.max(1))
+                .unwrap_or(SubPennyPrice::MIN_VALID),
+            volume: b.volume,
+            vwap: SubPennyPrice::from_scaled_units(b.vwap_scaled.max(1))
+                .unwrap_or(SubPennyPrice::MIN_VALID),
+            dollar_turnover: b.dollar_turnover,
+            trade_count: b.trade_count,
+            bid_ask_spread: SubPennyPrice::from_scaled_units_allow_zero(b.spread_scaled.max(0))
+                .unwrap_or(SubPennyPrice::ZERO),
+            time_delta_ms: b.time_delta_ms,
+        });
+    }
+
+    let options = RawOptionsSnapshot {
+        timestamp_ns: c_opts.timestamp_ns,
+        call_volume: c_opts.call_volume,
+        put_volume: c_opts.put_volume,
+        total_open_interest: c_opts.total_open_interest,
+        ask_fill_aggression_ratio: c_opts.ask_fill_aggression_ratio,
+        bid_fill_aggression_ratio: c_opts.bid_fill_aggression_ratio,
+        net_dealer_gamma_gex: c_opts.net_dealer_gamma_gex,
+        net_dealer_vanna: c_opts.net_dealer_vanna,
+        zero_dte_volume_share: c_opts.zero_dte_volume_share,
+        front_iv: c_opts.front_iv,
+        back_iv: c_opts.back_iv,
+        dominant_gamma_wall_strike: SubPennyPrice::from_scaled_units(
+            c_opts.dominant_gamma_wall_scaled.max(1),
+        )
+        .unwrap_or(SubPennyPrice::MIN_VALID),
+    };
+
+    let short_float = RawShortFloatSnapshot {
+        timestamp_ns: c_sf.timestamp_ns,
+        public_float_shares: c_sf.public_float_shares,
+        shares_outstanding: c_sf.shares_outstanding,
+        short_interest_shares: c_sf.short_interest_shares,
+        days_to_cover: c_sf.days_to_cover,
+        intraday_short_volume_ratio: c_sf.intraday_short_volume_ratio,
+        cost_to_borrow_annual_pct: c_sf.cost_to_borrow_annual_pct,
+        cumulative_session_volume: c_sf.cumulative_session_volume,
+    };
+
+    let internals = RawMarketInternalsSnapshot {
+        timestamp_ns: c_int.timestamp_ns,
+        nyse_tick: c_int.nyse_tick,
+        nasdaq_tick: c_int.nasdaq_tick,
+        add_breadth: c_int.add_breadth,
+        vold_up_down_ratio: c_int.vold_up_down_ratio,
+        vix_spot: c_int.vix_spot,
+        vix_front_month: c_int.vix_front_month,
+        sector_relative_flow: c_int.sector_relative_flow,
+    };
+
+    let engine = RawFingerprintEngine::new();
+    match engine.evaluate_autonomous_signal(
+        "CABI",
+        brain_id,
+        &bars,
+        &options,
+        &short_float,
+        &internals,
+    ) {
+        Ok(sig) => {
+            let driver_code = match sig.primary_driver {
+                PrimaryFingerprintDriver::VolumeAbsorption => 0,
+                PrimaryFingerprintDriver::GammaSqueeze => 1,
+                PrimaryFingerprintDriver::ShortSqueeze => 2,
+                PrimaryFingerprintDriver::InternalsAlignment => 3,
+            };
+            unsafe {
+                *out_signal_ptr = CAbiAutonomousSignalOutput {
+                    direction_sign: match sig.direction {
+                        TradeDirection::Long => 1,
+                        TradeDirection::Short => -1,
+                    },
+                    entry_scaled: sig.entry_price.scaled_units(),
+                    structural_stop_scaled: sig.structural_stop_price.scaled_units(),
+                    target_1_scaled: sig.target_1_price.scaled_units(),
+                    target_2_scaled: sig.target_2_price.scaled_units(),
+                    predicted_hold_ms: sig.predicted_hold_duration_ms,
+                    ai_confidence_pct: sig.ai_confidence_pct,
+                    expected_r_multiple: sig.expected_r_multiple,
+                    primary_driver_code: driver_code,
+                    stream_weights: [
+                        sig.stream_weights.chart_tape_physics_weight,
+                        sig.stream_weights.options_gamma_vanna_weight,
+                        sig.stream_weights.short_float_squeeze_weight,
+                        sig.stream_weights.market_internals_macro_weight,
+                    ],
+                };
+            }
+            0
+        }
+        Err(_) => -2,
+    }
+}
+
+/// Evaluates Speed-1 Intraday bar-by-bar dynamic exit and trace health over C-ABI.
+///
+/// # Safety
+/// All pointer arguments must be valid and non-null, and `bars_ptr` must contain `seq_len >= 1` elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn argon_evaluate_live_trace_health_cabi(
+    direction_sign: i32,
+    entry_scaled: i64,
+    structural_stop_scaled: i64,
+    target_1_scaled: i64,
+    target_2_scaled: i64,
+    peak_favorable_scaled: i64,
+    bars_ptr: *const CAbiRawBar,
+    seq_len: usize,
+    internals_ptr: *const CAbiMarketInternalsSnapshot,
+    out_health_ptr: *mut CAbiLiveTraceHealthOutput,
+) -> i32 {
+    if bars_ptr.is_null() || internals_ptr.is_null() || out_health_ptr.is_null() || seq_len == 0 {
+        return -1;
+    }
+
+    let c_bars = unsafe { slice::from_raw_parts(bars_ptr, seq_len) };
+    let c_int = unsafe { &*internals_ptr };
+
+    let mut bars = Vec::with_capacity(seq_len);
+    for b in c_bars {
+        bars.push(RawBarRecord {
+            timestamp_ns: b.timestamp_ns,
+            open: SubPennyPrice::from_scaled_units(b.open_scaled.max(1))
+                .unwrap_or(SubPennyPrice::MIN_VALID),
+            high: SubPennyPrice::from_scaled_units(b.high_scaled.max(1))
+                .unwrap_or(SubPennyPrice::MIN_VALID),
+            low: SubPennyPrice::from_scaled_units(b.low_scaled.max(1))
+                .unwrap_or(SubPennyPrice::MIN_VALID),
+            close: SubPennyPrice::from_scaled_units(b.close_scaled.max(1))
+                .unwrap_or(SubPennyPrice::MIN_VALID),
+            volume: b.volume,
+            vwap: SubPennyPrice::from_scaled_units(b.vwap_scaled.max(1))
+                .unwrap_or(SubPennyPrice::MIN_VALID),
+            dollar_turnover: b.dollar_turnover,
+            trade_count: b.trade_count,
+            bid_ask_spread: SubPennyPrice::from_scaled_units_allow_zero(b.spread_scaled.max(0))
+                .unwrap_or(SubPennyPrice::ZERO),
+            time_delta_ms: b.time_delta_ms,
+        });
+    }
+
+    let internals = RawMarketInternalsSnapshot {
+        timestamp_ns: c_int.timestamp_ns,
+        nyse_tick: c_int.nyse_tick,
+        nasdaq_tick: c_int.nasdaq_tick,
+        add_breadth: c_int.add_breadth,
+        vold_up_down_ratio: c_int.vold_up_down_ratio,
+        vix_spot: c_int.vix_spot,
+        vix_front_month: c_int.vix_front_month,
+        sector_relative_flow: c_int.sector_relative_flow,
+    };
+
+    let ctx = OpenPositionEvaluationContext {
+        direction: if direction_sign >= 0 {
+            TradeDirection::Long
+        } else {
+            TradeDirection::Short
+        },
+        entry_price: SubPennyPrice::from_scaled_units(entry_scaled.max(1))
+            .unwrap_or(SubPennyPrice::MIN_VALID),
+        structural_stop_price: SubPennyPrice::from_scaled_units(structural_stop_scaled.max(1))
+            .unwrap_or(SubPennyPrice::MIN_VALID),
+        target_1_price: SubPennyPrice::from_scaled_units(target_1_scaled.max(1))
+            .unwrap_or(SubPennyPrice::MIN_VALID),
+        target_2_price: SubPennyPrice::from_scaled_units(target_2_scaled.max(1))
+            .unwrap_or(SubPennyPrice::MIN_VALID),
+        peak_favorable_price: SubPennyPrice::from_scaled_units(peak_favorable_scaled.max(1))
+            .unwrap_or(SubPennyPrice::MIN_VALID),
+    };
+
+    let engine = RawFingerprintEngine::new();
+    match engine.evaluate_live_trace_health(&ctx, &bars, &internals) {
+        Ok(eval) => {
+            let badge_code = match eval.badge {
+                TraceHealthBadge::Accelerating => 0,
+                TraceHealthBadge::TrailingTarget1 => 1,
+                TraceHealthBadge::ExhaustionWarning => 2,
+                TraceHealthBadge::DynamicExitTriggered => 3,
+            };
+            unsafe {
+                *out_health_ptr = CAbiLiveTraceHealthOutput {
+                    badge_code,
+                    updated_stop_scaled: eval.updated_structural_stop.scaled_units(),
+                    opposing_absorption_score: eval.opposing_absorption_score,
+                    current_r_multiple: eval.current_r_multiple,
+                    should_exit_immediately: i32::from(eval.should_exit_immediately),
+                };
+            }
             0
         }
         Err(_) => -2,

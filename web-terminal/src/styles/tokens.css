@@ -1,0 +1,46 @@
+@layer tokens {
+  :root {
+    /* Surface Depth Hierarchy (Deep Obsidian to Elevated Glass) */
+    --surface-0: oklch(0.11 0.012 255);
+    --surface-1: oklch(0.145 0.014 255);
+    --surface-2: oklch(0.18 0.016 255);
+    --surface-3: oklch(0.22 0.02 255 / 0.88);
+    --border-subtle: oklch(0.26 0.018 255);
+    --border-focus: oklch(0.68 0.16 250);
+
+    /* Typography Hierarchy */
+    --text-primary: oklch(0.96 0.008 255);
+    --text-secondary: oklch(0.74 0.014 255);
+    --text-muted: oklch(0.54 0.014 255);
+
+    /* Semantic Signal & Telemetry Palette (Perceptually Uniform OKLCH) */
+    --signal-long: oklch(0.76 0.19 152);
+    --signal-long-bg: oklch(0.24 0.07 152 / 0.35);
+    --signal-short: oklch(0.68 0.22 22);
+    --signal-short-bg: oklch(0.24 0.08 22 / 0.35);
+    --signal-gamma: oklch(0.78 0.17 295);
+    --signal-squeeze: oklch(0.82 0.18 78);
+    --signal-ai-core: oklch(0.74 0.16 235);
+
+    /* Typography & Strictly Enforced Tabular Numerals */
+    --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', 'Geist Mono', ui-monospace, SFMono-Regular, monospace;
+    --tabular-nums: tabular-nums slashed-zero;
+
+    /* Fluid Spacing & Radius Scale */
+    --radius-xs: 4px;
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 14px;
+    --space-1: 0.25rem;
+    --space-2: 0.5rem;
+    --space-3: 0.75rem;
+    --space-4: 1rem;
+    --space-5: 1.25rem;
+    --space-6: 1.5rem;
+
+    /* Elevation & Motion */
+    --shadow-elevated: 0 18px 42px oklch(0.04 0.01 255 / 0.72);
+    --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}

@@ -1,7 +1,7 @@
 //! Scale-Independent 4-Stream Raw Fingerprint Tensor Engine & Structural Level Solver.
 //!
 //! Strictly adheres to the Open-Minded Law:
-//! - ZERO lagging human indicators (no RSI, MACD, Stochastic, Bollinger, SMA/EMA, or fixed ATR).
+//! - ZERO lagging human-constructed oscillator or moving-average formulas.
 //! - 100% scale-independent log/percentage relative physics across `$0.00001` to `$10,000.00+`.
 //! - Bit-for-bit identical execution between Python training (`ml-brain`) and Rust live serving.
 

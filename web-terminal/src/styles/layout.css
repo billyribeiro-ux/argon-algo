@@ -1,0 +1,133 @@
+@layer layout {
+  .terminal-shell {
+    display: grid;
+    grid-template-rows: auto auto 1fr;
+    min-block-size: 100dvh;
+    background-color: var(--surface-0);
+    color: var(--text-primary);
+  }
+
+  .top-omni-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-4);
+    background-color: var(--surface-1);
+    border-block-end: 1px solid var(--border-subtle);
+    position: sticky;
+    inset-block-start: 0;
+    z-index: 40;
+  }
+
+  .macro-tide-strip {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-1) var(--space-4);
+    background-color: var(--surface-0);
+    border-block-end: 1px solid var(--border-subtle);
+    font-size: 0.76rem;
+  }
+
+  /* 12-Column Primary Bento Command Grid with CSS Subgrid */
+  .command-bento-grid {
+    display: grid;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    gap: var(--space-3);
+    padding: var(--space-3);
+    align-items: start;
+  }
+
+  .panel-scanner {
+    grid-column: span 4;
+    container-type: inline-size;
+    container-name: scanner-panel;
+  }
+
+  .panel-blueprint-canvas {
+    grid-column: span 5;
+    container-type: inline-size;
+    container-name: blueprint-panel;
+  }
+
+  .panel-evidence-hub {
+    grid-column: span 3;
+    container-type: inline-size;
+    container-name: evidence-panel;
+  }
+
+  .panel-positions-opened {
+    grid-column: span 12;
+    container-type: inline-size;
+    container-name: positions-panel;
+  }
+
+  .panel-closed-ledger {
+    grid-column: span 12;
+    container-type: inline-size;
+    container-name: ledger-panel;
+  }
+
+  /* CSS Subgrid alignment for Multi-Asset Scanner & Ledger rows */
+  .subgrid-table {
+    display: grid;
+    grid-template-columns: repeat(8, auto);
+    inline-size: 100%;
+  }
+
+  .subgrid-row {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: subgrid;
+    align-items: center;
+  }
+
+  /* Container Queries for Responsive Detached Multi-Monitor Windows */
+  @container scanner-panel (max-width: 480px) {
+    .scanner-compact-hide {
+      display: none;
+    }
+  }
+
+  @container positions-panel (max-width: 900px) {
+    .positions-grid-wrapper {
+      overflow-x: auto;
+    }
+  }
+
+  /* CSS Anchor Positioning for AI Signal Verification Popovers */
+  .signal-anchor-trigger {
+    anchor-name: --active-signal-trigger;
+  }
+
+  .signal-verification-popover {
+    position: fixed;
+    position-anchor: --active-signal-trigger;
+    inset-block-start: anchor(bottom);
+    inset-inline-start: anchor(left);
+    z-index: 90;
+    max-inline-size: 460px;
+    background: var(--surface-3);
+    backdrop-filter: blur(18px);
+    border: 1px solid var(--border-focus);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-elevated);
+    padding: var(--space-4);
+  }
+
+  @media (max-width: 1280px) {
+    .panel-scanner {
+      grid-column: span 12;
+    }
+    .panel-blueprint-canvas {
+      grid-column: span 7;
+    }
+    .panel-evidence-hub {
+      grid-column: span 5;
+    }
+  }
+}

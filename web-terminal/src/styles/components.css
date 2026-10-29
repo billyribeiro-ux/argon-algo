@@ -1,0 +1,174 @@
+@layer components {
+  .glass-panel {
+    background-color: var(--surface-1);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    box-shadow: 0 8px 24px oklch(0.05 0.01 255 / 0.45);
+  }
+
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    background-color: var(--surface-2);
+    border-block-end: 1px solid var(--border-subtle);
+  }
+
+  .panel-title {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-primary);
+  }
+
+  .brain-selector-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    background-color: var(--surface-0);
+    padding: 3px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .brain-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border-radius: var(--radius-xs);
+    font-size: 0.74rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    transition: background-color 140ms var(--ease-out-expo), color 140ms var(--ease-out-expo);
+  }
+
+  .brain-pill:hover {
+    color: var(--text-primary);
+    background-color: var(--surface-2);
+  }
+
+  .brain-pill[data-active="true"] {
+    background-color: oklch(0.26 0.06 235);
+    color: var(--text-primary);
+    border: 1px solid var(--signal-ai-core);
+  }
+
+  .action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 11px;
+    border-radius: var(--radius-xs);
+    font-size: 0.74rem;
+    font-weight: 600;
+    background-color: var(--surface-2);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    transition: all 140ms var(--ease-out-expo);
+  }
+
+  .action-btn:hover {
+    border-color: var(--border-focus);
+    background-color: oklch(0.23 0.03 250);
+  }
+
+  .action-btn-primary {
+    background-color: oklch(0.28 0.08 152);
+    border-color: var(--signal-long);
+    color: var(--text-primary);
+  }
+
+  .action-btn-export {
+    background-color: oklch(0.25 0.06 235);
+    border-color: var(--signal-ai-core);
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 7px;
+    border-radius: var(--radius-xs);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    font-variant-numeric: var(--tabular-nums);
+  }
+
+  .badge-long {
+    background-color: var(--signal-long-bg);
+    color: var(--signal-long);
+    border: 1px solid oklch(0.76 0.19 152 / 0.45);
+  }
+
+  .badge-short {
+    background-color: var(--signal-short-bg);
+    color: var(--signal-short);
+    border: 1px solid oklch(0.68 0.22 22 / 0.45);
+  }
+
+  .badge-gamma {
+    background-color: oklch(0.25 0.08 295 / 0.4);
+    color: var(--signal-gamma);
+    border: 1px solid oklch(0.78 0.17 295 / 0.45);
+  }
+
+  .badge-squeeze {
+    background-color: oklch(0.26 0.08 78 / 0.4);
+    color: var(--signal-squeeze);
+    border: 1px solid oklch(0.82 0.18 78 / 0.45);
+  }
+
+  .badge-ai-core {
+    background-color: oklch(0.24 0.06 235 / 0.4);
+    color: var(--signal-ai-core);
+    border: 1px solid oklch(0.74 0.16 235 / 0.45);
+  }
+
+  .filter-pill-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .filter-pill {
+    padding: 4px 9px;
+    border-radius: var(--radius-xs);
+    font-size: 0.72rem;
+    font-weight: 600;
+    background-color: var(--surface-0);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+
+  .filter-pill[data-selected="true"] {
+    background-color: oklch(0.25 0.06 235);
+    color: var(--text-primary);
+    border-color: var(--signal-ai-core);
+  }
+
+  .input-control {
+    padding: 5px 9px;
+    border-radius: var(--radius-xs);
+    background-color: var(--surface-0);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    font-size: 0.75rem;
+    font-variant-numeric: var(--tabular-nums);
+  }
+
+  .input-control:focus {
+    outline: none;
+    border-color: var(--border-focus);
+  }
+}

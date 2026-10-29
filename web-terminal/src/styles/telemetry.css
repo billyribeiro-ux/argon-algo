@@ -1,0 +1,111 @@
+@layer telemetry {
+  /* Strict Tabular Numeral Enforcement on All Numeric, Price, Option, and P&L Cells */
+  .tabular-num,
+  .price-cell,
+  .pnl-cell,
+  .greek-cell,
+  .kpi-metric-value,
+  td[data-numeric="true"],
+  th[data-numeric="true"] {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums slashed-zero;
+    font-feature-settings: "tnum" 1, "zero" 1;
+  }
+
+  .pnl-positive {
+    color: var(--signal-long);
+  }
+
+  .pnl-negative {
+    color: var(--signal-short);
+  }
+
+  .data-table-container {
+    overflow-x: auto;
+    max-block-size: 460px;
+    overflow-y: auto;
+  }
+
+  .telemetry-table {
+    inline-size: 100%;
+    font-size: 0.74rem;
+  }
+
+  .telemetry-table thead th {
+    position: sticky;
+    inset-block-start: 0;
+    z-index: 10;
+    background-color: var(--surface-2);
+    color: var(--text-secondary);
+    font-weight: 600;
+    text-align: left;
+    padding: 7px 10px;
+    border-block-end: 1px solid var(--border-subtle);
+    white-space: nowrap;
+  }
+
+  .telemetry-table tbody tr {
+    border-block-end: 1px solid oklch(0.2 0.014 255);
+    transition: background-color 100ms ease;
+  }
+
+  .telemetry-table tbody tr:hover {
+    background-color: oklch(0.19 0.02 250 / 0.65);
+  }
+
+  .telemetry-table tbody tr[data-selected="true"] {
+    background-color: oklch(0.23 0.045 235 / 0.55);
+  }
+
+  .telemetry-table td {
+    padding: 6px 10px;
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+
+  .scorecard-kpi-ribbon {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+    gap: var(--space-2);
+    padding: var(--space-3);
+    background-color: var(--surface-0);
+    border-block-end: 1px solid var(--border-subtle);
+  }
+
+  .kpi-card {
+    background-color: var(--surface-1);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: var(--space-2) var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .kpi-label {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+  }
+
+  .kpi-metric-value {
+    font-size: 1.05rem;
+    font-weight: 700;
+  }
+
+  .stream-meter-track {
+    inline-size: 100%;
+    block-size: 7px;
+    background-color: var(--surface-0);
+    border-radius: 999px;
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .stream-meter-fill {
+    block-size: 100%;
+    border-radius: 999px;
+    transition: inline-size 220ms var(--ease-out-expo);
+  }
+}

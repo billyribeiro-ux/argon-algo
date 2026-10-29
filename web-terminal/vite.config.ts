@@ -3,27 +3,9 @@ import { defineConfig } from 'vite';
 
 export default defineConfig({
   plugins: [sveltekit()],
-  css: {
-    transformer: 'lightningcss',
-    lightningcss: {
-      drafts: {
-        customMedia: true
-      }
-    }
-  },
-  optimizeDeps: {
-    rolldownOptions: {
-      target: 'es2025'
-    }
-  },
+  clearScreen: false,
   server: {
     port: 5173,
-    strictPort: false,
-    forwardConsole: true
-  },
-  build: {
-    target: 'es2025',
-    cssMinify: 'lightningcss'
+    strictPort: false
   }
 });
-

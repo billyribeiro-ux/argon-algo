@@ -15,9 +15,7 @@
     "skipLibCheck": true,
     "sourceMap": true,
     "rootDir": "./src",
-    "types": [
-      "node"
-    ]
+    "noUncheckedSideEffectImports": false
   },
   "include": [
     "src/**/*.ts",

@@ -124,4 +124,56 @@ mod tests {
         assert!(sheet3_xml.contains("state=\"frozen\""));
         assert!(sheet3_xml.contains("<autoFilter"));
     }
+
+    #[tokio::test]
+    async fn test_phase5_full_system_stress_test_all_brains_and_export_artifacts() {
+        let models_dir = Path::new("../../models");
+        let state = AppState::new(if models_dir.exists() {
+            Some(models_dir)
+        } else {
+            None
+        });
+
+        // Execute 15 back-to-back multi-brain simulation cycles (90 closed trades + 30 open positions)
+        for _ in 0..15 {
+            let _ = state
+                .run_historical_replay_simulation()
+                .await
+                .expect("stress simulation cycle succeeds");
+        }
+
+        let master_snap = state
+            .ledger
+            .query_filtered_snapshot(&HyperFilterQuery::default());
+        assert_eq!(master_snap.closed_trades.len(), 90);
+        assert_eq!(master_snap.positions_opened.len(), 30);
+        assert_eq!(master_snap.scoreboard.by_brain_breakdowns.len(), 5);
+        assert!(
+            master_snap.scoreboard.filter_eval_latency_micros < 5_000,
+            "Stress test Hyper-Filter latency was {}µs (limit 5000µs)",
+            master_snap.scoreboard.filter_eval_latency_micros
+        );
+
+        // Write verified .CSV and 4-Sheet .XLSX exports to target/exports/
+        let export_dir = Path::new("../../target/exports");
+        std::fs::create_dir_all(export_dir).expect("create target/exports dir");
+
+        let csv_bytes =
+            export_to_csv_bytes(&master_snap, ExportScope::FullMasterDatabase).expect("CSV bytes");
+        let xlsx_bytes = export_to_xlsx_bytes(&master_snap).expect("XLSX bytes");
+
+        let csv_path = export_dir.join("quant_closed_trade_ledger_verified.csv");
+        let xlsx_path = export_dir.join("quant_intelligence_ledger_verified.xlsx");
+        std::fs::write(&csv_path, &csv_bytes).expect("write verified CSV");
+        std::fs::write(&xlsx_path, &xlsx_bytes).expect("write verified XLSX");
+
+        assert!(csv_path.exists());
+        assert!(xlsx_path.exists());
+        println!(
+            "[PHASE-5 STRESS TEST] Verified 90 closed trades + 30 open positions across all 5 Brains | Filter latency: {}µs | CSV: {} bytes | XLSX: {} bytes",
+            master_snap.scoreboard.filter_eval_latency_micros,
+            csv_bytes.len(),
+            xlsx_bytes.len()
+        );
+    }
 }

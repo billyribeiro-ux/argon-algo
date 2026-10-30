@@ -1,7 +1,7 @@
 {
   "positions_opened": [
     {
-      "position_id": "9529af8f-417c-4220-8954-9548d9d2d3b5",
+      "position_id": "e3c1bdea-ca25-423f-9b40-76b69d42521f",
       "opened_at_iso": "2026-10-29T23:44:40.000Z",
       "opened_timestamp_ns": 1793317480000000000,
       "live_hold_duration_ms": 0,
@@ -704,7 +704,7 @@
       ]
     },
     {
-      "position_id": "cb44a51e-1ded-496c-80fd-5bd54b910933",
+      "position_id": "d695b1db-144d-4bbb-9677-c65ae7b7c5fd",
       "opened_at_iso": "2026-10-29T23:59:57.000Z",
       "opened_timestamp_ns": 1793318397000000000,
       "live_hold_duration_ms": 0,
@@ -1407,7 +1407,7 @@
       ]
     },
     {
-      "position_id": "59ccf46c-75c6-4389-b078-f6d64663fd18",
+      "position_id": "cb8ac7f1-88b0-4fc8-9fb2-416f3a884fcd",
       "opened_at_iso": "2026-10-29T23:59:02.000Z",
       "opened_timestamp_ns": 1793318342000000000,
       "live_hold_duration_ms": 0,
@@ -2112,8 +2112,8 @@
   ],
   "closed_ledger": [
     {
-      "trade_id": "a8e093f7-ca21-490a-9486-88049c97c064",
-      "position_id": "1134886f-d9f5-4da2-be35-2e1444214566",
+      "trade_id": "6f9da211-b253-4be4-931d-7054a9a88d80",
+      "position_id": "310a76a8-9de5-4126-83a8-baa1f42f4fdb",
       "outcome_badge": "CLOSED - TARGET HIT",
       "brain_id": "BRAIN-01",
       "brain_name": "Penny & Sub-Penny Anomaly Algo",
@@ -2722,8 +2722,8 @@
       ]
     },
     {
-      "trade_id": "2e9a8480-1294-46a8-9379-514988789b84",
-      "position_id": "520a7ffa-b033-427e-8db4-58fce542725c",
+      "trade_id": "89b353db-1854-413c-a2d7-decf4c24e011",
+      "position_id": "a735ff09-d2ce-4f0a-8e71-e9c092ad82b8",
       "outcome_badge": "CLOSED - TARGET HIT",
       "brain_id": "BRAIN-02",
       "brain_name": "Intraday Day-Trading Algo",
@@ -3423,8 +3423,8 @@
       ]
     },
     {
-      "trade_id": "acdd441f-da8b-477d-9239-15d2ab73736f",
-      "position_id": "cfca0e0b-6175-4a2f-afb8-f96e15404e7e",
+      "trade_id": "d1a52011-1539-4a65-850e-95fcd8d9dd7f",
+      "position_id": "254c1bc6-2b74-4175-ab2e-68d4e23628c2",
       "outcome_badge": "CLOSED - TARGET HIT",
       "brain_id": "BRAIN-02",
       "brain_name": "Intraday Day-Trading Algo",
@@ -4059,8 +4059,8 @@
       ]
     },
     {
-      "trade_id": "a066948d-3a7c-4a55-a082-371d275fffc4",
-      "position_id": "7d46dd84-6b2e-4b27-8013-a8924f03167d",
+      "trade_id": "9881c4a9-67de-4d86-a9c7-496fb02ac72c",
+      "position_id": "4d553693-e850-47ef-877c-aa4e7131a650",
       "outcome_badge": "CLOSED - TARGET HIT",
       "brain_id": "BRAIN-03",
       "brain_name": "Short-Term Swing Algo",
@@ -4613,8 +4613,8 @@
       ]
     },
     {
-      "trade_id": "aa895baa-b9a2-4e3c-83b7-6ca1c9f82a32",
-      "position_id": "c09a15f4-6252-4fb0-b7cb-edfea8b16490",
+      "trade_id": "cfec8280-b010-4021-a124-59a6e9d6cc06",
+      "position_id": "31603a02-05de-4976-8c2f-84a26802f08e",
       "outcome_badge": "CLOSED - STOPPED OUT",
       "brain_id": "BRAIN-03",
       "brain_name": "Short-Term Swing Algo",
@@ -5275,8 +5275,8 @@
       ]
     },
     {
-      "trade_id": "c490de2d-2257-43c4-ae88-2f291650506f",
-      "position_id": "a3d89fe3-1fca-48e9-9d7d-91a8fddd5cac",
+      "trade_id": "984a6949-93f3-42a2-945b-74727e91b1ad",
+      "position_id": "3a49155e-a00b-424d-880e-695bcce91209",
       "outcome_badge": "CLOSED - TARGET HIT",
       "brain_id": "BRAIN-04",
       "brain_name": "Core Swing Trading Algo",
@@ -5989,8 +5989,8 @@
       ]
     },
     {
-      "trade_id": "d3b8050e-d9aa-4cbf-b03b-4ca75219c349",
-      "position_id": "49b61f01-76a5-4b9c-923d-e743aa1aca56",
+      "trade_id": "0c55c99c-f617-423b-9055-da45124f19a3",
+      "position_id": "962d1568-9e70-4cbc-bba2-892849e43756",
       "outcome_badge": "CLOSED - TARGET HIT",
       "brain_id": "BRAIN-05",
       "brain_name": "Long-Term Portfolio & Wealth Algo",
@@ -6705,5 +6705,5 @@
   ],
   "running_net_profit_usd": 985.5620670840002,
   "autopsy_runs_count": 1,
-  "last_autopsy_iso": "2026-10-30T00:45:39.992Z"
+  "last_autopsy_iso": "2026-10-30T01:31:58.739Z"
 }

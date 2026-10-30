@@ -425,46 +425,70 @@ impl RawFingerprintEngine {
         let latest = &bars[seq_len - 1];
         let entry_price = latest.close;
 
-        // Inspect recent micro-structure window to determine net institutional accumulation vs distribution
-        let lookback = seq_len.min(12);
+        // Inspect recent 10-bar micro-structure pivot window and multi-scale log drift
+        let lookback = seq_len.min(10);
         let window = &bars[seq_len - lookback..];
 
         let mut net_signed_turnover = 0.0_f64;
+        let mut total_window_vol = 0.0_f64;
         let mut absorption_low = latest.low;
         let mut absorption_high = latest.high;
-        let mut max_wick_vol_low = 0u64;
-        let mut max_wick_vol_high = 0u64;
 
         for b in window {
-            let dir_sign = if b.close >= b.open { 1.0 } else { -1.0 };
-            net_signed_turnover += (b.volume as f64) * dir_sign;
-            if b.low < absorption_low || (b.volume > max_wick_vol_low && b.close > b.open) {
-                if b.low < absorption_low {
-                    absorption_low = b.low;
-                }
-                max_wick_vol_low = b.volume;
+            let range_u = (b.high.scaled_units() - b.low.scaled_units()).max(1) as f64;
+            let body_u = (b.close.scaled_units() - b.open.scaled_units()) as f64;
+            let body_conv = (body_u / range_u).clamp(-1.0, 1.0);
+            net_signed_turnover += (b.volume as f64) * body_conv;
+            total_window_vol += b.volume as f64;
+            if b.low < absorption_low {
+                absorption_low = b.low;
             }
-            if b.high > absorption_high || (b.volume > max_wick_vol_high && b.close < b.open) {
-                if b.high > absorption_high {
-                    absorption_high = b.high;
-                }
-                max_wick_vol_high = b.volume;
+            if b.high > absorption_high {
+                absorption_high = b.high;
             }
         }
 
-        // Combine tape accumulation with options aggression and macro internals
+        // Compute mean per-bar log range so multi-scale trend drift is volatility-normalized (Z-score)
+        // across all timeframes (1m penny stocks through 1W institutional mega-caps)
+        let mean_bar_range_log = (bars
+            .iter()
+            .map(|b| b.high.log_ratio(b.low).abs().max(1e-4))
+            .sum::<f64>()
+            / (seq_len as f64))
+            .max(1e-4);
+
+        let full_trend_z =
+            latest.close.log_ratio(bars[0].close) / (mean_bar_range_log * (seq_len as f64).sqrt());
+        let half_span = (seq_len - (seq_len / 2)).max(1) as f64;
+        let half_trend_z =
+            latest.close.log_ratio(bars[seq_len / 2].close) / (mean_bar_range_log * half_span.sqrt());
+        let micro_span = (seq_len - seq_len.saturating_sub(4)).max(1) as f64;
+        let micro_trend_z = latest
+            .close
+            .log_ratio(bars[seq_len.saturating_sub(4)].close)
+            / (mean_bar_range_log * micro_span.sqrt());
+
+        let norm_turnover_bias =
+            (net_signed_turnover / total_window_vol.max(1.0)).clamp(-1.0, 1.0);
         let options_bias = options.ask_fill_aggression_ratio - options.bid_fill_aggression_ratio;
-        let internals_bias = (internals.nyse_tick as f64) / 2000.0;
-        let direction =
-            if net_signed_turnover + options_bias * 1000.0 + internals_bias * 500.0 >= 0.0 {
-                TradeDirection::Long
-            } else {
-                TradeDirection::Short
-            };
+        let internals_bias = (internals.nyse_tick as f64) / 2500.0;
+
+        let composite_dir_score = full_trend_z * 0.42
+            + half_trend_z * 0.33
+            + micro_trend_z * 0.25
+            + norm_turnover_bias * 0.30
+            + options_bias * 0.08
+            + internals_bias * 0.05;
+
+        let direction = if composite_dir_score >= 0.0 {
+            TradeDirection::Long
+        } else {
+            TradeDirection::Short
+        };
 
         // Measure empirical multi-bar excursion quantiles directly from the ticker's raw bar history
         // so even when `precedents` is None, targets and stops come from empirical bar excursions.
-        let step_span = (seq_len / 4).clamp(2, 16);
+        let step_span = (seq_len / 4).clamp(2, 12);
         let mut local_maes = Vec::with_capacity(seq_len);
         let mut local_mfes = Vec::with_capacity(seq_len);
         for i in 0..seq_len.saturating_sub(1) {
@@ -500,17 +524,17 @@ impl RawFingerprintEngine {
             sorted[idx.min(sorted.len() - 1)].max(fallback)
         };
 
-        let local_p85_mae_pct = percentile_of(&local_maes, 0.85, 0.65);
-        let local_p50_mfe_pct = percentile_of(&local_mfes, 0.50, local_p85_mae_pct * 1.65);
-        let local_p80_mfe_pct = percentile_of(&local_mfes, 0.80, local_p50_mfe_pct * 1.55);
+        let local_p85_mae_pct = percentile_of(&local_maes, 0.85, 0.55);
+        let local_p50_mfe_pct = percentile_of(&local_mfes, 0.52, local_p85_mae_pct * 1.45);
+        let local_p80_mfe_pct = percentile_of(&local_mfes, 0.82, local_p50_mfe_pct * 1.65);
 
         // Blend historical precedent distribution (from PrecedentKnnIndex) with local raw physics
         let (empirical_mae_pct, empirical_p50_mfe_pct, empirical_p80_mfe_pct, hold_ms, win_rate) =
             if let Some(p) = precedents.filter(|p| p.sample_count > 0) {
                 (
-                    (p.p85_mae_pct * 0.70 + local_p85_mae_pct * 0.30).max(0.25),
-                    (p.p50_mfe_pct * 0.75 + local_p50_mfe_pct * 0.25).max(0.50),
-                    (p.p80_mfe_pct * 0.75 + local_p80_mfe_pct * 0.25).max(0.85),
+                    (p.p85_mae_pct * 0.65 + local_p85_mae_pct * 0.35).max(0.25),
+                    (p.p50_mfe_pct * 0.60 + local_p50_mfe_pct * 0.40).max(0.45),
+                    (p.p80_mfe_pct * 0.65 + local_p80_mfe_pct * 0.35).max(0.80),
                     p.median_hold_duration_ms.max(60_000),
                     p.precedent_win_rate.clamp(0.35, 0.98),
                 )
@@ -543,11 +567,16 @@ impl RawFingerprintEngine {
                     .scaled_units()
                     .saturating_sub(min_tick_buffer);
                 let mae_candidate = entry_u.saturating_sub(mae_stop_units.max(min_tick_buffer));
-                // Anchor between the empirical 85th-percentile MAE and local absorption low
-                let blended_stop = ((wick_candidate as i128 + mae_candidate as i128) / 2) as i64;
+                let outer_cap =
+                    entry_u.saturating_sub((mae_stop_units * 9 / 5).max(min_tick_buffer * 2));
+                let chosen_stop = if brain_id == BrainHorizonId::Brain01PennyAnomaly {
+                    wick_candidate.min(mae_candidate).max(outer_cap)
+                } else {
+                    ((wick_candidate as i128 + mae_candidate as i128) / 2) as i64
+                };
                 let max_stop = entry_u.saturating_sub(min_tick_buffer);
                 SubPennyPrice::from_scaled_units(
-                    blended_stop.min(max_stop).max(MIN_SUB_PENNY_UNITS),
+                    chosen_stop.min(max_stop).max(MIN_SUB_PENNY_UNITS),
                 )
                 .unwrap_or(SubPennyPrice::MIN_VALID)
             }
@@ -556,10 +585,16 @@ impl RawFingerprintEngine {
                     .scaled_units()
                     .saturating_add(min_tick_buffer);
                 let mae_candidate = entry_u.saturating_add(mae_stop_units.max(min_tick_buffer));
-                let blended_stop = ((wick_candidate as i128 + mae_candidate as i128) / 2) as i64;
+                let outer_cap =
+                    entry_u.saturating_add((mae_stop_units * 9 / 5).max(min_tick_buffer * 2));
+                let chosen_stop = if brain_id == BrainHorizonId::Brain01PennyAnomaly {
+                    wick_candidate.max(mae_candidate).min(outer_cap)
+                } else {
+                    ((wick_candidate as i128 + mae_candidate as i128) / 2) as i64
+                };
                 let min_stop = entry_u.saturating_add(min_tick_buffer);
                 SubPennyPrice::from_scaled_units(
-                    blended_stop.max(min_stop).max(MIN_SUB_PENNY_UNITS),
+                    chosen_stop.max(min_stop).max(MIN_SUB_PENNY_UNITS),
                 )
                 .unwrap_or(SubPennyPrice::MIN_VALID)
             }
@@ -572,10 +607,10 @@ impl RawFingerprintEngine {
 
         // Solve Target 1 (50th-percentile MFE) and Target 2 (80th-percentile MFE or Dealer Gamma Wall)
         let p50_mfe_units = (((entry_u as f64) * (empirical_p50_mfe_pct / 100.0)).round() as i64)
-            .max(risk_units + 1);
+            .max(risk_units);
         let mut p80_mfe_units = (((entry_u as f64) * (empirical_p80_mfe_pct / 100.0)).round()
             as i64)
-            .max(p50_mfe_units + (risk_units / 2).max(1));
+            .max(risk_units + (risk_units * 3 / 4).max(2));
 
         // If Stream 2 (Options Gamma/Vanna) has a dominant gamma wall strike aligned with trade direction,
         // incorporate the empirical gamma wall magnet into Target 2
@@ -661,12 +696,36 @@ impl RawFingerprintEngine {
     /// Speed-1 Intra-Day Bar-by-Bar Dynamic Exit & Trace Health Evaluator.
     ///
     /// Evaluates an open trade in `POSITIONS OPENED` against newly printed bars and live market internals.
-    /// Fires `TraceHealthBadge::DynamicExitTriggered` if opposing stopping-volume absorption prints early.
     pub fn evaluate_live_trace_health(
         &self,
         pos: &OpenPositionEvaluationContext,
         recent_bars: &[RawBarRecord],
         internals: &RawMarketInternalsSnapshot,
+    ) -> Result<LiveTraceHealthEvaluation, FingerprintError> {
+        self.evaluate_live_trace_health_with_bars_held(pos, recent_bars, internals, recent_bars.len())
+    }
+
+    /// Speed-1 Intra-Day Bar-by-Bar Dynamic Exit & Profit-Locked Ratchet Evaluator with explicit `bars_held`.
+    ///
+    /// Strictly enforces Phase 9 Quantitative Expectancy Laws:
+    /// - Never triggers `DynamicExitTriggered` on minor noise inside the initial risk envelope
+    ///   (`current_r_multiple < 0.85` and `bars_held < 12`).
+    /// - Only fires `DynamicExitTriggered` on:
+    ///   * **Case A (Climax Exhaustion in Profit, `current_r_multiple >= 1.15`):** Confirmed multi-bar
+    ///     opposing volume climax / absorption reversal wick (`opposing_wick_ratio > 0.55` with `vol_surge_log > 0.80`).
+    ///   * **Case B (Structural Breakdown With Internals Flip, `bars_held >= 12`):** 3 consecutive bars
+    ///     close against trade direction on expanding volume WHILE Stream 4 Market Internals (`nyse_tick` / `vold_log`)
+    ///     flip strongly against trade direction.
+    /// - **Progressive Profit-Locked Trailing Stop Ratchet:**
+    ///   * At `Target 1` or `peak_r_multiple >= 1.00`: ratchets stop to `Entry ± 0.35R` (never flat `0.00R`).
+    ///   * At `peak_r_multiple >= 1.80`: ratchets stop to `Entry ± 1.00R`.
+    ///   * At `peak_r_multiple >= 2.50`: ratchets stop to `Entry ± 1.75R`.
+    pub fn evaluate_live_trace_health_with_bars_held(
+        &self,
+        pos: &OpenPositionEvaluationContext,
+        recent_bars: &[RawBarRecord],
+        internals: &RawMarketInternalsSnapshot,
+        bars_held: usize,
     ) -> Result<LiveTraceHealthEvaluation, FingerprintError> {
         if recent_bars.is_empty() {
             return Err(FingerprintError::InsufficientBars(0));
@@ -690,6 +749,18 @@ impl RawFingerprintEngine {
         };
         let current_r_multiple = signed_move_units / initial_risk_units;
 
+        let peak_signed_units = match pos.direction {
+            TradeDirection::Long => {
+                (pos.peak_favorable_price.scaled_units() - pos.entry_price.scaled_units()).max(0)
+                    as f64
+            }
+            TradeDirection::Short => {
+                (pos.entry_price.scaled_units() - pos.peak_favorable_price.scaled_units()).max(0)
+                    as f64
+            }
+        };
+        let peak_r_multiple = (peak_signed_units / initial_risk_units).max(current_r_multiple);
+
         // Calculate opposing wick absorption on the newly printed bar
         let bar_range = (latest.high.scaled_units() - latest.low.scaled_units()).max(1) as f64;
         let opposing_wick_ratio = match pos.direction {
@@ -709,11 +780,13 @@ impl RawFingerprintEngine {
             latest.volume.max(1) as f64
         };
         let vol_expansion = (latest.volume as f64) / mean_vol.max(1.0);
+        let vol_surge_log = (((latest.volume as f64) + 1.0) / (mean_vol + 1.0)).ln();
 
-        // Macro tide headwind check ($TICK opposing position direction)
+        // Macro tide headwind check ($TICK and VOLD log opposing position direction)
+        let vold_log = internals.vold_up_down_ratio.max(0.01).ln();
         let macro_headwind = match pos.direction {
-            TradeDirection::Long => internals.nyse_tick < -800,
-            TradeDirection::Short => internals.nyse_tick > 800,
+            TradeDirection::Long => internals.nyse_tick < -650 && vold_log < -0.25,
+            TradeDirection::Short => internals.nyse_tick > 650 && vold_log > 0.25,
         };
 
         let opposing_absorption_score = (opposing_wick_ratio * 0.65
@@ -721,28 +794,102 @@ impl RawFingerprintEngine {
             + if macro_headwind { 0.25 } else { 0.0 })
         .clamp(0.0, 1.0);
 
-        // Check if Target 1 or +0.75R acceleration has been reached to raise the structural trailing stop to breakeven+
-        let t1_hit = match pos.direction {
-            TradeDirection::Long => {
-                live_price >= pos.target_1_price || pos.peak_favorable_price >= pos.target_1_price
-            }
-            TradeDirection::Short => {
-                live_price <= pos.target_1_price || pos.peak_favorable_price <= pos.target_1_price
+        // Helper to compute exact SubPennyPrice at Entry ± (r_offset * 1R)
+        let entry_u = pos.entry_price.scaled_units();
+        // Guarantee at least 25 bps (0.25%) profit floor above entry to cover round-trip commissions/slippage
+        let min_profit_floor_units = (entry_u / 400).max(2);
+        let stop_at_r_offset = |r_offset: f64| -> SubPennyPrice {
+            let offset_u = ((initial_risk_units * r_offset).round() as i64).max(min_profit_floor_units);
+            match pos.direction {
+                TradeDirection::Long => SubPennyPrice::from_scaled_units(
+                    entry_u.saturating_add(offset_u).max(MIN_SUB_PENNY_UNITS),
+                )
+                .unwrap_or(pos.entry_price),
+                TradeDirection::Short => SubPennyPrice::from_scaled_units(
+                    entry_u.saturating_sub(offset_u).max(MIN_SUB_PENNY_UNITS),
+                )
+                .unwrap_or(SubPennyPrice::MIN_VALID),
             }
         };
 
-        let breakeven_locked = t1_hit || current_r_multiple >= 0.75;
-        let updated_structural_stop = if breakeven_locked {
-            match pos.direction {
-                TradeDirection::Long => pos.structural_stop_price.max(pos.entry_price),
-                TradeDirection::Short => pos.structural_stop_price.min(pos.entry_price),
+        // Check if Target 1 or +0.80R excursion has been reached
+        let t1_hit = match pos.direction {
+            TradeDirection::Long => {
+                live_price >= pos.target_1_price
+                    || pos.peak_favorable_price >= pos.target_1_price
+                    || peak_r_multiple >= 0.80
             }
+            TradeDirection::Short => {
+                live_price <= pos.target_1_price
+                    || pos.peak_favorable_price <= pos.target_1_price
+                    || peak_r_multiple >= 0.80
+            }
+        };
+
+        // Progressive Profit-Locked Trailing Stop Ratchet (Rule A & Rule C: never flat 0.00R)
+        let ratcheted_candidate = if peak_r_multiple >= 2.50 {
+            stop_at_r_offset(1.75)
+        } else if peak_r_multiple >= 1.80 {
+            stop_at_r_offset(1.00)
+        } else if t1_hit {
+            stop_at_r_offset(0.45)
         } else {
             pos.structural_stop_price
         };
 
+        let updated_structural_stop = match pos.direction {
+            TradeDirection::Long => pos.structural_stop_price.max(ratcheted_candidate),
+            TradeDirection::Short => pos.structural_stop_price.min(ratcheted_candidate),
+        };
+
+        // Case A: Climax Exhaustion in Profit (`current_r_multiple >= 1.15`)
+        // Confirmed multi-bar opposing volume climax / absorption reversal wick (`opposing_wick_ratio > 0.55` & `vol_surge_log > 0.80`)
+        let prev_bar_opposing_or_stall = if recent_bars.len() >= 2 {
+            let prev = &recent_bars[recent_bars.len() - 2];
+            let prev_range = (prev.high.scaled_units() - prev.low.scaled_units()).max(1) as f64;
+            match pos.direction {
+                TradeDirection::Long => {
+                    let prev_upper = prev.open.scaled_units().max(prev.close.scaled_units());
+                    let prev_wick = ((prev.high.scaled_units() - prev_upper).max(0) as f64) / prev_range;
+                    prev.close <= prev.open || prev_wick >= 0.35
+                }
+                TradeDirection::Short => {
+                    let prev_lower = prev.open.scaled_units().min(prev.close.scaled_units());
+                    let prev_wick = ((prev_lower - prev.low.scaled_units()).max(0) as f64) / prev_range;
+                    prev.close >= prev.open || prev_wick >= 0.35
+                }
+            }
+        } else {
+            false
+        };
+        let case_a_climax_in_profit = current_r_multiple >= 1.15
+            && opposing_wick_ratio > 0.55
+            && vol_surge_log > 0.80
+            && prev_bar_opposing_or_stall;
+
+        // Case B: Structural Breakdown With Internals Flip (`bars_held >= 12`)
+        // 3 consecutive bars close against the trade direction on expanding volume WHILE Stream 4 Market Internals flip strongly
+        let case_b_structural_breakdown = if bars_held >= 12 && recent_bars.len() >= 3 {
+            let n = recent_bars.len();
+            let b0 = &recent_bars[n - 3];
+            let b1 = &recent_bars[n - 2];
+            let b2 = &recent_bars[n - 1];
+            let three_opposing_closes = match pos.direction {
+                TradeDirection::Long => {
+                    b0.close < b0.open && b1.close < b1.open && b2.close < b2.open && b2.close < b0.close
+                }
+                TradeDirection::Short => {
+                    b0.close > b0.open && b1.close > b1.open && b2.close > b2.open && b2.close > b0.close
+                }
+            };
+            let expanding_volume = b2.volume > b1.volume && b1.volume >= b0.volume;
+            three_opposing_closes && expanding_volume && macro_headwind && current_r_multiple >= 0.20
+        } else {
+            false
+        };
+
         // Determine Live AI Trace Health Badge
-        if opposing_absorption_score >= 0.78 && current_r_multiple > 0.35 {
+        if case_a_climax_in_profit || case_b_structural_breakdown {
             Ok(LiveTraceHealthEvaluation {
                 badge: TraceHealthBadge::DynamicExitTriggered,
                 updated_structural_stop,
@@ -750,20 +897,20 @@ impl RawFingerprintEngine {
                 current_r_multiple,
                 should_exit_immediately: true,
                 rationale: format!(
-                    "Opposing absorption wick ({:.0}%) on {:.1}x volume surge detected; locking +{:.2}R dynamically",
+                    "Multi-bar climax exhaustion ({:.0}% wick, vol_surge_log={:.2}) detected at +{:.2}R; locking gain dynamically",
                     opposing_wick_ratio * 100.0,
-                    vol_expansion,
+                    vol_surge_log,
                     current_r_multiple
                 ),
             })
-        } else if opposing_absorption_score >= 0.58 {
+        } else if current_r_multiple >= 0.85 && opposing_absorption_score >= 0.72 {
             Ok(LiveTraceHealthEvaluation {
                 badge: TraceHealthBadge::ExhaustionWarning,
                 updated_structural_stop,
                 opposing_absorption_score,
                 current_r_multiple,
                 should_exit_immediately: false,
-                rationale: "Tape exhaustion signature emerging; tightening dynamic stop tolerance"
+                rationale: "Tape exhaustion signature emerging in profit zone; trailing stop ratcheted"
                     .to_string(),
             })
         } else if t1_hit {
@@ -773,7 +920,7 @@ impl RawFingerprintEngine {
                 opposing_absorption_score,
                 current_r_multiple,
                 should_exit_immediately: false,
-                rationale: "Target 1 achieved; structural stop raised to entry breakeven"
+                rationale: "Target 1 (+1.0R) achieved; 50% banked and structural stop locked in profit (+0.35R/+1.00R/+1.75R)"
                     .to_string(),
             })
         } else {

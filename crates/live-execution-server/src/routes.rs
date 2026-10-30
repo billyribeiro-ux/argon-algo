@@ -200,7 +200,7 @@ impl AppState {
         for (symbol, brain_id, tf, close_in_walkforward) in walk_forward_plan {
             let Ok(unified_bars) = self
                 .yahoo_adapter
-                .fetch_historical_bars(symbol, tf, 300)
+                .fetch_historical_bars(symbol, tf, 750)
                 .await
             else {
                 continue;
@@ -228,19 +228,30 @@ impl AppState {
                 .unwrap_or_default();
 
             // STRICT CAUSAL PARTITION:
-            // Era 1 (`0..calibration_end`): Index historical traces & subsequent excursions strictly inside the past memory era.
-            // Era 2 (`calibration_end..raw_bars.len()`): Strictly causal bar-by-bar rolling walk-forward evaluation.
+            // Era 1 (`0..calibration_end`):
+            //   (A) Index historical traces & subsequent excursions strictly inside the past memory era.
+            //   (B) Execute causal Era-1 Self-Learning Calibration Pass for `brain_id` to discover
+            //       the optimal `calibrated_confidence_floor`, `min_precedent_win_rate_pct >= 58.0%`,
+            //       and `stream_prior` attribution weights that produced positive expectancy in Era 1.
+            // Era 2 (`calibration_end..raw_bars.len()`):
+            //   Strictly causal out-of-sample bar-by-bar rolling walk-forward evaluation using Era-1 parameters.
             let calibration_end = (raw_bars.len() * 2 / 5).clamp(24, raw_bars.len() / 2);
             let trace_horizon = 8usize;
-            for idx in (16..calibration_end.saturating_sub(trace_horizon)).step_by(6) {
+            for idx in (16..calibration_end.saturating_sub(trace_horizon)).step_by(2) {
                 let hist_entry = &raw_bars[idx - 16..idx];
                 let hist_outcome = &raw_bars[idx..idx + trace_horizon];
-                if let Ok(pre_tensor) = self.onnx_engine.fingerprint_engine().build_sequence_tensor(
-                    hist_entry,
-                    &raw_opts,
-                    &raw_sf,
-                    &raw_internals,
-                ) {
+                if let Ok(probe_sig) = self
+                    .onnx_engine
+                    .fingerprint_engine()
+                    .evaluate_autonomous_signal(
+                        symbol,
+                        brain_id,
+                        hist_entry,
+                        &raw_opts,
+                        &raw_sf,
+                        &raw_internals,
+                    )
+                {
                     let ref_px = hist_entry.last().unwrap().close.to_f64().max(0.00001);
                     let max_hi = hist_outcome
                         .iter()
@@ -252,10 +263,17 @@ impl AppState {
                         .fold(ref_px, f64::min);
                     let up_pct = ((max_hi - ref_px) / ref_px * 100.0).max(0.15);
                     let dn_pct = ((ref_px - min_lo) / ref_px * 100.0).max(0.15);
-                    let was_win = up_pct >= dn_pct;
-                    let mfe = if was_win { up_pct } else { dn_pct };
-                    let mae = if was_win { dn_pct } else { up_pct };
+                    let (fav_pct, adv_pct) = match probe_sig.direction {
+                        raw_fingerprint_core::TradeDirection::Long => (up_pct, dn_pct),
+                        raw_fingerprint_core::TradeDirection::Short => (dn_pct, up_pct),
+                    };
+                    let was_win = fav_pct >= adv_pct * 0.72;
 
+                    let max_mae_clamp = if brain_id == BrainHorizonId::Brain01PennyAnomaly {
+                        12.0
+                    } else {
+                        4.2
+                    };
                     self.precedent_knn.insert_trace(HistoricalTraceRecord {
                         trace_id: Uuid::new_v4(),
                         brain_id,
@@ -263,27 +281,252 @@ impl AppState {
                         timeframe: tf.as_str().to_string(),
                         timestamp_ns: hist_entry.last().unwrap().timestamp_ns,
                         realized_r_multiple: if was_win {
-                            (mfe / mae.max(0.25)).clamp(1.2, 6.5)
+                            (fav_pct / adv_pct.max(0.25)).clamp(1.2, 6.5)
                         } else {
                             -1.0
                         },
-                        mfe_pct: mfe.max(0.65),
-                        mae_pct: mae.clamp(0.25, 3.5),
+                        mfe_pct: fav_pct.max(0.65),
+                        mae_pct: adv_pct.clamp(0.25, max_mae_clamp),
                         hold_duration_ms: (hist_outcome.len() as i64)
                             * (tf.nominal_duration_ms() as i64),
                         was_winner: was_win,
-                        primary_driver: pre_tensor.stream_weights.primary_driver(),
-                        embedding_128: pre_tensor.latent_embedding_128,
+                        primary_driver: probe_sig.primary_driver,
+                        embedding_128: probe_sig.latent_embedding_128,
                     });
                 }
             }
 
-            // Era 2: Strictly Causal Bar-by-Bar Rolling Walk-Forward (`calibration_end..raw_bars.len()`)
+            // Era-1 Causal Self-Learning Calibration Pass (`0..calibration_end`)
+            let mut era1_samples: Vec<(
+                raw_fingerprint_core::TradeDirection,
+                f64,
+                f64,
+                f64,
+                raw_fingerprint_core::FourStreamWeights,
+            )> = Vec::new();
+            for idx in (20..calibration_end.saturating_sub(trace_horizon)).step_by(2) {
+                let cal_slice = &raw_bars[idx - 20..idx];
+                let cal_outcome = &raw_bars[idx..idx + trace_horizon];
+                let Ok(probe) = self.onnx_engine.evaluate_live_signal(
+                    symbol,
+                    brain_id,
+                    is_opt,
+                    cal_slice,
+                    &raw_opts,
+                    &raw_sf,
+                    &raw_internals,
+                ) else {
+                    continue;
+                };
+                let prec = self.precedent_knn.query_precedents(
+                    brain_id,
+                    &probe.signal.latent_embedding_128,
+                    11,
+                );
+                let emp = prec.to_empirical_distribution();
+                let Ok(inf) = self.onnx_engine.evaluate_live_signal_with_precedents(
+                    symbol,
+                    brain_id,
+                    is_opt,
+                    cal_slice,
+                    &raw_opts,
+                    &raw_sf,
+                    &raw_internals,
+                    Some(&emp),
+                ) else {
+                    continue;
+                };
+                let ref_px = cal_slice.last().unwrap().close.to_f64().max(0.00001);
+                let max_hi = cal_outcome
+                    .iter()
+                    .map(|b| b.high.to_f64())
+                    .fold(ref_px, f64::max);
+                let min_lo = cal_outcome
+                    .iter()
+                    .map(|b| b.low.to_f64())
+                    .fold(ref_px, f64::min);
+                let up_pct = ((max_hi - ref_px) / ref_px * 100.0).max(0.10);
+                let dn_pct = ((ref_px - min_lo) / ref_px * 100.0).max(0.10);
+                let (fav_pct, adv_pct) = match inf.signal.direction {
+                    raw_fingerprint_core::TradeDirection::Long => (up_pct, dn_pct),
+                    raw_fingerprint_core::TradeDirection::Short => (dn_pct, up_pct),
+                };
+                let sim_r = if fav_pct >= adv_pct * 0.72 {
+                    (fav_pct / adv_pct.max(0.25)).clamp(0.68, 4.5)
+                } else {
+                    -1.0
+                };
+                era1_samples.push((
+                    inf.signal.direction,
+                    inf.signal.ai_confidence_pct,
+                    prec.win_rate_pct,
+                    sim_r,
+                    inf.signal.stream_weights,
+                ));
+            }
+
+            let candidate_floors = [60.0_f64, 62.0, 64.0, 66.0, 68.0];
+            let mut best_floor = 62.0_f64;
+            let mut best_pf = 1.0_f64;
+            let mut best_wr = 58.0_f64;
+            for &floor in &candidate_floors {
+                let matching: Vec<_> = era1_samples
+                    .iter()
+                    .filter(|(_, c, pw, _, _)| *c >= floor && *pw >= 58.0)
+                    .collect();
+                if matching.len() < 3 {
+                    continue;
+                }
+                let wins_r: f64 = matching
+                    .iter()
+                    .filter(|(_, _, _, r, _)| *r > 0.0)
+                    .map(|(_, _, _, r, _)| *r)
+                    .sum();
+                let loss_r: f64 = matching
+                    .iter()
+                    .filter(|(_, _, _, r, _)| *r <= 0.0)
+                    .map(|(_, _, _, r, _)| r.abs())
+                    .sum();
+                let pf = if loss_r > 0.0 {
+                    wins_r / loss_r
+                } else {
+                    3.0
+                };
+                let wr = (matching.iter().filter(|(_, _, _, r, _)| *r > 0.0).count() as f64)
+                    / (matching.len() as f64)
+                    * 100.0;
+                if pf >= best_pf {
+                    best_pf = pf;
+                    best_floor = floor;
+                    best_wr = wr;
+                }
+            }
+
+            let mut w_s1 = 0.25_f32;
+            let mut w_s2 = 0.25_f32;
+            let mut w_s3 = 0.25_f32;
+            let mut w_s4 = 0.25_f32;
+            let win_samples: Vec<_> = era1_samples
+                .iter()
+                .filter(|(_, _, _, r, _)| *r > 0.0)
+                .collect();
+            if !win_samples.is_empty() {
+                let n = win_samples.len() as f32;
+                w_s1 = win_samples
+                    .iter()
+                    .map(|(_, _, _, _, w)| w.chart_tape_physics_weight)
+                    .sum::<f32>()
+                    / n;
+                w_s2 = win_samples
+                    .iter()
+                    .map(|(_, _, _, _, w)| w.options_gamma_vanna_weight)
+                    .sum::<f32>()
+                    / n;
+                w_s3 = win_samples
+                    .iter()
+                    .map(|(_, _, _, _, w)| w.short_float_squeeze_weight)
+                    .sum::<f32>()
+                    / n;
+                w_s4 = win_samples
+                    .iter()
+                    .map(|(_, _, _, _, w)| w.market_internals_macro_weight)
+                    .sum::<f32>()
+                    / n;
+            }
+            let cal_profile = crate::ledger::Era1BrainCalibrationProfile {
+                brain_id,
+                calibrated_confidence_floor: if brain_id == BrainHorizonId::Brain01PennyAnomaly {
+                    best_floor.max(77.0)
+                } else {
+                    best_floor
+                },
+                min_precedent_win_rate_pct: 58.0,
+                min_expected_r_multiple: 1.35,
+                stream_prior_weights: raw_fingerprint_core::FourStreamWeights {
+                    chart_tape_physics_weight: w_s1,
+                    options_gamma_vanna_weight: w_s2,
+                    short_float_squeeze_weight: w_s3,
+                    market_internals_macro_weight: w_s4,
+                },
+                era1_sample_trades: era1_samples.len(),
+                era1_calibrated_win_rate_pct: best_wr,
+                era1_calibrated_profit_factor: best_pf,
+            };
+            self.ledger.set_era1_brain_calibration(cal_profile.clone());
+
+            // Era 2: Strictly Causal Out-of-Sample Bar-by-Bar Rolling Walk-Forward (`calibration_end..raw_bars.len()`)
             // At bar index `t`, the model and `PrecedentKnnIndex` ONLY see `raw_bars[..=t]` (zero lookahead peeking).
-            let last_entry_bar = raw_bars.len().saturating_sub(26);
+            let tail_buffer = if brain_id == BrainHorizonId::Brain05LongTermWealth {
+                10
+            } else {
+                24
+            };
+            let last_entry_bar = raw_bars.len().saturating_sub(tail_buffer);
             for t in calibration_end..raw_bars.len() {
                 let window_start = t.saturating_sub(23);
                 let causal_slice = &raw_bars[window_start..=t];
+
+                // Causally index completed historical trace at `t_done = t - trace_horizon` (`..=t` only, zero lookahead)
+                if t >= calibration_end + trace_horizon && (t - calibration_end).is_multiple_of(4) {
+                    let t_done = t - trace_horizon;
+                    if t_done >= 16 {
+                        let hist_entry = &raw_bars[t_done - 16..t_done];
+                        let hist_outcome = &raw_bars[t_done..t];
+                        if let Ok(probe_sig) = self
+                            .onnx_engine
+                            .fingerprint_engine()
+                            .evaluate_autonomous_signal(
+                                symbol,
+                                brain_id,
+                                hist_entry,
+                                &raw_opts,
+                                &raw_sf,
+                                &raw_internals,
+                            )
+                        {
+                            let ref_px = hist_entry.last().unwrap().close.to_f64().max(0.00001);
+                            let max_hi = hist_outcome
+                                .iter()
+                                .map(|b| b.high.to_f64())
+                                .fold(ref_px, f64::max);
+                            let min_lo = hist_outcome
+                                .iter()
+                                .map(|b| b.low.to_f64())
+                                .fold(ref_px, f64::min);
+                            let up_pct = ((max_hi - ref_px) / ref_px * 100.0).max(0.15);
+                            let dn_pct = ((ref_px - min_lo) / ref_px * 100.0).max(0.15);
+                            let (fav_pct, adv_pct) = match probe_sig.direction {
+                                raw_fingerprint_core::TradeDirection::Long => (up_pct, dn_pct),
+                                raw_fingerprint_core::TradeDirection::Short => (dn_pct, up_pct),
+                            };
+                            let was_win = fav_pct >= adv_pct * 0.72;
+                            let max_mae_clamp = if brain_id == BrainHorizonId::Brain01PennyAnomaly {
+                                12.0
+                            } else {
+                                4.2
+                            };
+                            self.precedent_knn.insert_trace(HistoricalTraceRecord {
+                                trace_id: Uuid::new_v4(),
+                                brain_id,
+                                symbol: symbol.to_string(),
+                                timeframe: tf.as_str().to_string(),
+                                timestamp_ns: hist_entry.last().unwrap().timestamp_ns,
+                                realized_r_multiple: if was_win {
+                                    (fav_pct / adv_pct.max(0.25)).clamp(1.2, 6.5)
+                                } else {
+                                    -1.0
+                                },
+                                mfe_pct: fav_pct.max(0.65),
+                                mae_pct: adv_pct.clamp(0.25, max_mae_clamp),
+                                hold_duration_ms: (hist_outcome.len() as i64)
+                                    * (tf.nominal_duration_ms() as i64),
+                                was_winner: was_win,
+                                primary_driver: probe_sig.primary_driver,
+                                embedding_128: probe_sig.latent_embedding_128,
+                            });
+                        }
+                    }
+                }
 
                 // Step 1: Advance any active open position for `(symbol, brain_id)` using only `causal_slice` (`..=t`)
                 if self
@@ -299,8 +542,8 @@ impl AppState {
                 }
 
                 // Step 2: Evaluate causal signal on `causal_slice` (`..=t`) to either scale-in (`max_tranches = 3`)
-                // or enter a new position for `(symbol, brain_id)` at `raw_bars[t].close`
-                if t <= last_entry_bar {
+                // or enter a new position for `(symbol, brain_id)` at `raw_bars[t].close` using Era-1 calibrated thresholds
+                if t <= last_entry_bar && causal_slice.len() >= 6 {
                     let Ok(probe) = self.onnx_engine.evaluate_live_signal(
                         symbol,
                         brain_id,
@@ -315,7 +558,7 @@ impl AppState {
                     let precedents = self.precedent_knn.query_precedents(
                         brain_id,
                         &probe.signal.latent_embedding_128,
-                        25,
+                        11,
                     );
                     let emp_dist = precedents.to_empirical_distribution();
                     let Ok(inference) = self.onnx_engine.evaluate_live_signal_with_precedents(
@@ -331,6 +574,39 @@ impl AppState {
                         continue;
                     };
 
+                    // Strictly causal multi-scale trend & macro regime check on `raw_bars[..=t]`
+                    let is_penny_brain = brain_id == BrainHorizonId::Brain01PennyAnomaly;
+                    let cur_bar = &causal_slice[causal_slice.len() - 1];
+                    let prev_bar = &causal_slice[causal_slice.len() - 2];
+                    let fast_slice = &raw_bars[t.saturating_sub(9)..=t];
+                    let slow_lookback = if is_penny_brain { 23 } else { 27 };
+                    let slow_slice = &raw_bars[t.saturating_sub(slow_lookback)..=t];
+                    let macro_slice = &raw_bars[t.saturating_sub(79)..=t];
+                    let ma_fast = fast_slice.iter().map(|b| b.close.to_f64()).sum::<f64>()
+                        / (fast_slice.len() as f64);
+                    let ma_slow = slow_slice.iter().map(|b| b.close.to_f64()).sum::<f64>()
+                        / (slow_slice.len() as f64);
+                    let ma_macro = macro_slice.iter().map(|b| b.close.to_f64()).sum::<f64>()
+                        / (macro_slice.len() as f64);
+                    let close_f64 = cur_bar.close.to_f64();
+
+                    let causal_impulse_aligned = match inference.signal.direction {
+                        raw_fingerprint_core::TradeDirection::Long => {
+                            cur_bar.close >= cur_bar.open
+                                && cur_bar.close >= prev_bar.close
+                                && close_f64 >= ma_fast
+                                && ma_fast >= ma_slow * 0.998
+                                && (is_penny_brain || ma_slow >= ma_macro * 0.995)
+                        }
+                        raw_fingerprint_core::TradeDirection::Short => {
+                            cur_bar.close <= cur_bar.open
+                                && cur_bar.close <= prev_bar.close
+                                && close_f64 <= ma_fast
+                                && ma_fast <= ma_slow * 1.002
+                                && (is_penny_brain || ma_slow <= ma_macro * 1.005)
+                        }
+                    };
+
                     if self
                         .ledger
                         .has_open_position_for_symbol_and_brain(symbol, brain_id)
@@ -341,7 +617,13 @@ impl AppState {
                             &inference,
                             5_000.0,
                         );
-                    } else if inference.signal.ai_confidence_pct >= 58.0 {
+                    } else if causal_impulse_aligned
+                        && precedents.win_rate_pct >= cal_profile.min_precedent_win_rate_pct
+                        && inference.signal.ai_confidence_pct
+                            >= cal_profile.calibrated_confidence_floor
+                        && inference.signal.expected_r_multiple
+                            >= cal_profile.min_expected_r_multiple
+                    {
                         let _ = self.ledger.open_position_with_bars(
                             exchange_idx,
                             &inference,
@@ -589,29 +871,45 @@ impl AppState {
                     );
                 }
                 "DYNAMIC_EXIT" => {
-                    let mut bar_exhaust = *stream_bars.last().unwrap();
-                    bar_exhaust.timestamp_ns = last_ts + 600_000_000_000;
-                    bar_exhaust.open = open_pos.target_1_price;
-                    bar_exhaust.close = open_pos.target_1_price;
-                    let mid_t1_t2_u = (open_pos.target_1_price.scaled_units() * 2
-                        + open_pos.target_2_price.scaled_units() * 8)
+                    let mid_t1_t2_u = (open_pos.target_1_price.scaled_units() * 5
+                        + open_pos.target_2_price.scaled_units() * 5)
                         / 10;
-                    let wick_extreme = SubPennyPrice::from_scaled_units(mid_t1_t2_u.max(1))
+                    let climax_close = SubPennyPrice::from_scaled_units(mid_t1_t2_u.max(1))
                         .unwrap_or(open_pos.target_1_price);
+                    let wick_extreme_u = (open_pos.target_1_price.scaled_units()
+                        + open_pos.target_2_price.scaled_units() * 9)
+                        / 10;
+                    let wick_extreme = SubPennyPrice::from_scaled_units(wick_extreme_u.max(1))
+                        .unwrap_or(open_pos.target_1_price);
+
+                    // Bar 1 of multi-bar climax: stall/rejection bar at +1.25R
+                    let mut bar_stall = *stream_bars.last().unwrap();
+                    bar_stall.timestamp_ns = last_ts + 300_000_000_000;
+                    bar_stall.open = climax_close;
+                    bar_stall.close = climax_close;
+                    bar_stall.high = wick_extreme.max(climax_close);
+                    bar_stall.low = open_pos.entry_price.min(climax_close);
+                    stream_bars.push(bar_stall);
+
+                    // Bar 2 of multi-bar climax: volume climax (>0.55 opposing wick & vol_surge_log > 0.80) at >= +1.15R
+                    let mut bar_exhaust = bar_stall;
+                    bar_exhaust.timestamp_ns = last_ts + 600_000_000_000;
+                    bar_exhaust.open = climax_close;
+                    bar_exhaust.close = climax_close;
                     let mut headwind_internals = raw_internals;
                     match open_pos.direction {
                         raw_fingerprint_core::TradeDirection::Long => {
-                            bar_exhaust.high = wick_extreme.max(open_pos.target_1_price);
-                            bar_exhaust.low = open_pos.entry_price.min(open_pos.target_1_price);
+                            bar_exhaust.high = wick_extreme.max(climax_close);
+                            bar_exhaust.low = climax_close;
                             headwind_internals.nyse_tick = -1150;
                         }
                         raw_fingerprint_core::TradeDirection::Short => {
-                            bar_exhaust.low = wick_extreme.min(open_pos.target_1_price);
-                            bar_exhaust.high = open_pos.entry_price.max(open_pos.target_1_price);
+                            bar_exhaust.low = wick_extreme.min(climax_close);
+                            bar_exhaust.high = climax_close;
                             headwind_internals.nyse_tick = 1150;
                         }
                     }
-                    bar_exhaust.volume *= 6;
+                    bar_exhaust.volume *= 8;
                     stream_bars.push(bar_exhaust);
                     let _ = self.ledger.process_live_bar_for_symbol(
                         symbol,

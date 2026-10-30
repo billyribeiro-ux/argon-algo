@@ -308,6 +308,19 @@ fn format_timestamp_ns_iso(ts_ns: i64) -> String {
     dt.format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string()
 }
 
+/// Causal Era-1 (`0..calibration_end`) Self-Learning Calibration Profile for a Brain (`BRAIN-01` .. `BRAIN-05`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Era1BrainCalibrationProfile {
+    pub brain_id: BrainHorizonId,
+    pub calibrated_confidence_floor: f64,
+    pub min_precedent_win_rate_pct: f64,
+    pub min_expected_r_multiple: f64,
+    pub stream_prior_weights: FourStreamWeights,
+    pub era1_sample_trades: usize,
+    pub era1_calibrated_win_rate_pct: f64,
+    pub era1_calibrated_profit_factor: f64,
+}
+
 /// Thread-safe, sub-millisecond Real-Time Execution Ledger Engine.
 pub struct RealTimeLedgerEngine {
     fingerprint_engine: RawFingerprintEngine,
@@ -316,6 +329,7 @@ pub struct RealTimeLedgerEngine {
     running_net_profit_usd: RwLock<f64>,
     autopsy_runs_count: RwLock<u64>,
     last_autopsy_iso: RwLock<String>,
+    era1_calibrations: RwLock< std::collections::HashMap<BrainHorizonId, Era1BrainCalibrationProfile> >,
 }
 
 impl Default for RealTimeLedgerEngine {
@@ -333,7 +347,21 @@ impl RealTimeLedgerEngine {
             running_net_profit_usd: RwLock::new(0.0),
             autopsy_runs_count: RwLock::new(1),
             last_autopsy_iso: RwLock::new(Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string()),
+            era1_calibrations: RwLock::new(std::collections::HashMap::new()),
         }
+    }
+
+    pub fn set_era1_brain_calibration(&self, profile: Era1BrainCalibrationProfile) {
+        self.era1_calibrations
+            .write()
+            .insert(profile.brain_id, profile);
+    }
+
+    pub fn get_era1_brain_calibration(
+        &self,
+        brain_id: BrainHorizonId,
+    ) -> Option<Era1BrainCalibrationProfile> {
+        self.era1_calibrations.read().get(&brain_id).cloned()
     }
 
     pub fn clear_all(&self) {
@@ -364,10 +392,10 @@ impl RealTimeLedgerEngine {
     }
 
     /// Controlled Scale-In / Pyramiding Support (`max_tranches = 3`):
-    /// If `(symbol, brain_id)` already has an open position AND `trace_health_badge == TraceHealthBadge::Accelerating`
-    /// with `current_r_multiple >= 0.75` (stop already raised to breakeven or better) AND a new same-direction
-    /// signal fires with `confidence >= 82.0%` (`0.82`), scales in up to `tranche_count <= 3` by updating
-    /// volume-weighted average `entry_price`, `structural_stop_price`, and position size while logging the scale-in event.
+    /// If `(symbol, brain_id)` already has an open position AND `trace_health_badge` is accelerating/trailing
+    /// with `current_r_multiple >= 1.00` AND a new same-direction signal fires with `confidence >= 84.0%` (`0.84`),
+    /// scales in up to `tranche_count <= 3` by updating volume-weighted average `entry_price` (`VWAP`) and
+    /// locking the combined `structural_stop_price` at `VWAP_Entry ± 0.30R` (guaranteed net profit after commissions/slippage).
     pub fn try_scale_in_position(
         &self,
         symbol: &str,
@@ -387,7 +415,7 @@ impl RealTimeLedgerEngine {
         } else {
             sig.ai_confidence_pct
         };
-        if normalized_conf < 82.0 {
+        if normalized_conf < 84.0 {
             return None;
         }
 
@@ -407,7 +435,7 @@ impl RealTimeLedgerEngine {
                 pos.trace_health_badge,
                 TraceHealthBadge::Accelerating | TraceHealthBadge::TrailingTarget1
             )
-            || pos.current_r_multiple < 0.75
+            || pos.current_r_multiple < 1.00
             || !breakeven_or_better
         {
             return None;
@@ -416,7 +444,15 @@ impl RealTimeLedgerEngine {
         let old_shares = pos.quantity_shares.max(1.0);
         let old_entry_f64 = pos.entry_price.to_f64().max(0.00001);
         let new_entry_f64 = sig.entry_price.to_f64().max(0.00001);
-        let added_shares = (tranche_notional_usd.max(100.0) / new_entry_f64)
+        let initial_risk_units = (pos.entry_price.scaled_units()
+            - pos.initial_structural_stop.scaled_units())
+        .abs()
+        .max((pos.entry_price.scaled_units() / 100).max(10));
+        let risk_per_share = (initial_risk_units as f64 / 100_000.0).max(new_entry_f64 * 0.005);
+        let target_tranche_risk_usd = (tranche_notional_usd.max(100.0) * 0.035).max(20.0);
+        let max_tranche_shares = (tranche_notional_usd.max(100.0) * 2.5) / new_entry_f64;
+        let added_shares = (target_tranche_risk_usd / risk_per_share)
+            .min(max_tranche_shares)
             .round()
             .max(1.0);
         let total_shares = old_shares + added_shares;
@@ -424,24 +460,55 @@ impl RealTimeLedgerEngine {
             (old_shares * old_entry_f64 + added_shares * new_entry_f64) / total_shares;
         let vwap_entry = SubPennyPrice::from_f64(vwap_entry_f64).unwrap_or(pos.entry_price);
 
+        let min_profit_floor_u = (vwap_entry.scaled_units() / 320).max(2);
+        let plus_030r_offset_u =
+            (((initial_risk_units as f64) * 0.30).round() as i64).max(min_profit_floor_u);
+
         pos.entry_price = vwap_entry;
+        // Preserve the original 1.0R structural risk unit relative to the updated VWAP entry
+        pos.initial_structural_stop = match pos.direction {
+            TradeDirection::Long => SubPennyPrice::from_scaled_units(
+                vwap_entry
+                    .scaled_units()
+                    .saturating_sub(initial_risk_units)
+                    .max(1),
+            )
+            .unwrap_or(pos.initial_structural_stop),
+            TradeDirection::Short => SubPennyPrice::from_scaled_units(
+                vwap_entry.scaled_units().saturating_add(initial_risk_units),
+            )
+            .unwrap_or(pos.initial_structural_stop),
+        };
         pos.quantity_shares = total_shares;
         pos.tranche_count += 1;
 
-        // Keep structural stop at or better than new volume-weighted breakeven
+        // Rule B: Profitable Pyramid Stop Floor at VWAP_Entry ± 0.30R (never 0.00R flat)
         pos.structural_stop_price = match pos.direction {
-            TradeDirection::Long => pos
-                .structural_stop_price
-                .max(vwap_entry)
-                .max(sig.structural_stop_price),
-            TradeDirection::Short => pos
-                .structural_stop_price
-                .min(vwap_entry)
-                .min(sig.structural_stop_price),
+            TradeDirection::Long => {
+                let floor_px = SubPennyPrice::from_scaled_units(
+                    vwap_entry.scaled_units().saturating_add(plus_030r_offset_u),
+                )
+                .unwrap_or(vwap_entry);
+                pos.structural_stop_price
+                    .max(floor_px)
+                    .max(sig.structural_stop_price)
+            }
+            TradeDirection::Short => {
+                let floor_px = SubPennyPrice::from_scaled_units(
+                    vwap_entry
+                        .scaled_units()
+                        .saturating_sub(plus_030r_offset_u)
+                        .max(1),
+                )
+                .unwrap_or(vwap_entry);
+                pos.structural_stop_price
+                    .min(floor_px)
+                    .min(sig.structural_stop_price)
+            }
         };
 
         let log_entry = format!(
-            "Tranche {}/3 @ ${:.5} -> VWAP ${:.5} | Stop ${:.5} | +{:.2}R | Conf {:.1}%",
+            "Tranche {}/3 @ ${:.5} -> VWAP ${:.5} | Stop ${:.5} (+0.30R) | +{:.2}R | Conf {:.1}%",
             pos.tranche_count,
             new_entry_f64,
             vwap_entry.to_f64(),
@@ -511,7 +578,20 @@ impl RealTimeLedgerEngine {
             opt,
         );
         let entry_f64 = sig.entry_price.to_f64().max(0.00001);
-        let qty = (notional_allocation_usd.max(100.0) / entry_f64)
+        let stop_f64 = sig.structural_stop_price.to_f64().max(0.00001);
+        let risk_per_share = (entry_f64 - stop_f64).abs().max(entry_f64 * 0.005);
+        let horizon_mult = match sig.brain_id {
+            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => 1.0,
+            BrainHorizonId::Brain03ShortTermSwing => 1.5,
+            BrainHorizonId::Brain04CoreSwing | BrainHorizonId::Brain05LongTermWealth => 2.5,
+        };
+        // Risk-parity 1.0R position sizing: uniform dollar risk per 1.0R structural stop distance
+        let target_1r_risk_usd =
+            (notional_allocation_usd.max(100.0) * 0.035 * horizon_mult).max(25.0);
+        let max_notional_shares =
+            (notional_allocation_usd.max(100.0) * 2.5 * horizon_mult) / entry_f64;
+        let qty = (target_1r_risk_usd / risk_per_share)
+            .min(max_notional_shares)
             .round()
             .max(1.0);
 
@@ -716,7 +796,48 @@ impl RealTimeLedgerEngine {
                     (live_prem_f64 - entry_prem) * (pos.option_contracts_count as f64) * 100.0;
             }
 
-            // Evaluate Speed-1 Live Trace Health & Dynamic Exit
+            let bars_since_open = pos
+                .entry_bars
+                .iter()
+                .filter(|b| b.timestamp_ns > pos.opened_timestamp_ns)
+                .count();
+
+            // Record the stop price active at the START of this bar (strict intra-bar causality)
+            let stop_at_bar_open = pos.structural_stop_price;
+            let was_trailing_profit_stop = match pos.direction {
+                TradeDirection::Long => {
+                    stop_at_bar_open >= pos.entry_price
+                        && stop_at_bar_open > pos.initial_structural_stop
+                }
+                TradeDirection::Short => {
+                    stop_at_bar_open <= pos.entry_price
+                        && stop_at_bar_open < pos.initial_structural_stop
+                }
+            };
+
+            let target_hit = match pos.direction {
+                TradeDirection::Long => latest.high >= pos.target_2_price,
+                TradeDirection::Short => latest.low <= pos.target_2_price,
+            };
+
+            let stop_hit = match pos.direction {
+                TradeDirection::Long => {
+                    if was_trailing_profit_stop {
+                        latest.close <= stop_at_bar_open
+                    } else {
+                        latest.low <= stop_at_bar_open && !target_hit
+                    }
+                }
+                TradeDirection::Short => {
+                    if was_trailing_profit_stop {
+                        latest.close >= stop_at_bar_open
+                    } else {
+                        latest.high >= stop_at_bar_open && !target_hit
+                    }
+                }
+            };
+
+            // Evaluate Speed-1 Live Trace Health, Progressive Profit-Locked Ratchet & Dynamic Exit
             let eval_ctx = OpenPositionEvaluationContext {
                 direction: pos.direction,
                 entry_price: pos.entry_price,
@@ -726,86 +847,189 @@ impl RealTimeLedgerEngine {
                 peak_favorable_price: pos.peak_favorable_price,
             };
 
-            if let Ok(health) = self.fingerprint_engine.evaluate_live_trace_health(
-                &eval_ctx,
-                recent_bars,
-                internals,
-            ) {
+            let already_banked_t1 = pos
+                .scale_in_history
+                .iter()
+                .any(|s| s.starts_with("Banked 50% @ T1"));
+            let mut allow_ratchet =
+                pos.brain_id != BrainHorizonId::Brain01PennyAnomaly || already_banked_t1;
+
+            if let Ok(health) = self
+                .fingerprint_engine
+                .evaluate_live_trace_health_with_bars_held(
+                    &eval_ctx,
+                    recent_bars,
+                    internals,
+                    bars_since_open,
+                )
+            {
                 pos.trace_health_badge = health.badge;
-                pos.structural_stop_price = match pos.direction {
-                    TradeDirection::Long => {
-                        pos.structural_stop_price.max(health.updated_structural_stop)
-                    }
-                    TradeDirection::Short => {
-                        pos.structural_stop_price.min(health.updated_structural_stop)
-                    }
-                };
+                if health.current_r_multiple >= 0.95 {
+                    allow_ratchet = true;
+                }
+                if allow_ratchet {
+                    pos.structural_stop_price = match pos.direction {
+                        TradeDirection::Long => {
+                            pos.structural_stop_price.max(health.updated_structural_stop)
+                        }
+                        TradeDirection::Short => {
+                            pos.structural_stop_price.min(health.updated_structural_stop)
+                        }
+                    };
+                }
                 pos.current_r_multiple = health.current_r_multiple;
             }
 
-            // Check automatic exit transition rules (Target Hit, Stop Hit, or AI Dynamic Exit)
-            let target_hit = match pos.direction {
-                TradeDirection::Long => latest.high >= pos.target_2_price,
-                TradeDirection::Short => latest.low <= pos.target_2_price,
+            // Rule A: Automatically bank 50% at Target 1 / +1.0R and raise runner stop to Entry ± 0.35R
+            let risk_u = (pos.entry_price.scaled_units()
+                - pos.initial_structural_stop.scaled_units())
+            .abs()
+            .max(1);
+            let trigger_pct = if pos.brain_id == BrainHorizonId::Brain01PennyAnomaly {
+                95
+            } else {
+                80
             };
-            let is_trailing_be = pos.structural_stop_price == pos.entry_price;
-            let stop_hit = match pos.direction {
-                TradeDirection::Long => {
-                    if is_trailing_be {
-                        latest.close <= pos.structural_stop_price
-                    } else {
-                        latest.low <= pos.structural_stop_price
-                    }
-                }
-                TradeDirection::Short => {
-                    if is_trailing_be {
-                        latest.close >= pos.structural_stop_price
-                    } else {
-                        latest.high >= pos.structural_stop_price
-                    }
-                }
+            let trigger_dist_u = (risk_u * trigger_pct / 100).max(1);
+            let t1_trigger_price = match pos.direction {
+                TradeDirection::Long => SubPennyPrice::from_scaled_units(
+                    pos.entry_price.scaled_units().saturating_add(trigger_dist_u),
+                )
+                .unwrap_or(pos.target_1_price),
+                TradeDirection::Short => SubPennyPrice::from_scaled_units(
+                    pos.entry_price
+                        .scaled_units()
+                        .saturating_sub(trigger_dist_u)
+                        .max(1),
+                )
+                .unwrap_or(pos.target_1_price),
             };
+            let one_r_price = match pos.direction {
+                TradeDirection::Long => SubPennyPrice::from_scaled_units(
+                    pos.entry_price.scaled_units().saturating_add(risk_u),
+                )
+                .unwrap_or(pos.target_1_price),
+                TradeDirection::Short => SubPennyPrice::from_scaled_units(
+                    pos.entry_price
+                        .scaled_units()
+                        .saturating_sub(risk_u)
+                        .max(1),
+                )
+                .unwrap_or(pos.target_1_price),
+            };
+            let t1_bank_price = match pos.direction {
+                TradeDirection::Long => pos.target_1_price.min(one_r_price),
+                TradeDirection::Short => pos.target_1_price.max(one_r_price),
+            };
+            let t1_reached_this_bar = match pos.direction {
+                TradeDirection::Long => latest.high >= t1_trigger_price,
+                TradeDirection::Short => latest.low <= t1_trigger_price,
+            };
+
+            if !stop_hit && (t1_reached_this_bar || (allow_ratchet && pos.trace_health_badge == TraceHealthBadge::TrailingTarget1)) && !already_banked_t1 {
+                let min_profit_u = (pos.entry_price.scaled_units() / 350).max(2);
+                let runner_r_floor = if pos.brain_id == BrainHorizonId::Brain01PennyAnomaly {
+                    0.60
+                } else {
+                    0.45
+                };
+                let plus_floor_u = (((risk_u as f64) * runner_r_floor).round() as i64).max(min_profit_u);
+                pos.structural_stop_price = match pos.direction {
+                    TradeDirection::Long => pos.structural_stop_price.max(
+                        SubPennyPrice::from_scaled_units(
+                            pos.entry_price.scaled_units().saturating_add(plus_floor_u),
+                        )
+                        .unwrap_or(pos.entry_price),
+                    ),
+                    TradeDirection::Short => pos.structural_stop_price.min(
+                        SubPennyPrice::from_scaled_units(
+                            pos.entry_price
+                                .scaled_units()
+                                .saturating_sub(plus_floor_u)
+                                .max(1),
+                        )
+                        .unwrap_or(pos.entry_price),
+                    ),
+                };
+                pos.scale_in_history.push(format!(
+                    "Banked 50% @ T1 (${:.5}, +1.00R) | Runner Stop -> ${:.5} (+{:.2}R)",
+                    t1_bank_price.to_f64(),
+                    pos.structural_stop_price.to_f64(),
+                    runner_r_floor
+                ));
+            }
+
             let dynamic_exit = pos.trace_health_badge == TraceHealthBadge::DynamicExitTriggered;
-            let bars_since_open = pos
-                .entry_bars
-                .iter()
-                .filter(|b| b.timestamp_ns > pos.opened_timestamp_ns)
-                .count();
             let max_hold_bars = match pos.brain_id {
-                BrainHorizonId::Brain01PennyAnomaly => 10,
-                BrainHorizonId::Brain02IntradayDayTrade => 12,
-                BrainHorizonId::Brain03ShortTermSwing => 14,
-                BrainHorizonId::Brain04CoreSwing => 18,
-                BrainHorizonId::Brain05LongTermWealth => 24,
+                BrainHorizonId::Brain01PennyAnomaly => 24,
+                BrainHorizonId::Brain02IntradayDayTrade => 28,
+                BrainHorizonId::Brain03ShortTermSwing => 32,
+                BrainHorizonId::Brain04CoreSwing => 38,
+                BrainHorizonId::Brain05LongTermWealth => 44,
             };
-            let time_expired = bars_since_open >= max_hold_bars;
+            let is_in_profit_for_time_stop = pos.current_r_multiple >= 0.35
+                || already_banked_t1
+                || t1_reached_this_bar
+                || was_trailing_profit_stop;
+            let time_expired = (bars_since_open >= max_hold_bars && is_in_profit_for_time_stop)
+                || bars_since_open >= max_hold_bars * 3;
 
             if target_hit || stop_hit || dynamic_exit || time_expired {
                 let removed = open_list.remove(idx);
-                let (badge, exit_price) = if target_hit {
+                let t1_was_banked = removed
+                    .scale_in_history
+                    .iter()
+                    .any(|s| s.starts_with("Banked 50% @ T1"));
+                let is_profit_locked_stop = match removed.direction {
+                    TradeDirection::Long => {
+                        removed.structural_stop_price >= removed.entry_price
+                            && removed.structural_stop_price > removed.initial_structural_stop
+                    }
+                    TradeDirection::Short => {
+                        removed.structural_stop_price <= removed.entry_price
+                            && removed.structural_stop_price < removed.initial_structural_stop
+                    }
+                };
+
+                let (badge, runner_exit_price) = if target_hit {
                     (ClosedOutcomeBadge::TargetHit, removed.target_2_price)
                 } else if dynamic_exit {
                     (ClosedOutcomeBadge::AiDynamicExit, removed.live_price)
                 } else if stop_hit {
-                    if removed.structural_stop_price == removed.entry_price {
-                        (
-                            ClosedOutcomeBadge::TrailingStop,
-                            removed.structural_stop_price,
-                        )
+                    if was_trailing_profit_stop || t1_was_banked || is_profit_locked_stop {
+                        (ClosedOutcomeBadge::TrailingStop, stop_at_bar_open)
                     } else {
-                        (
-                            ClosedOutcomeBadge::StoppedOut,
-                            removed.structural_stop_price,
-                        )
+                        (ClosedOutcomeBadge::StoppedOut, stop_at_bar_open)
                     }
-                } else if removed.structural_stop_price == removed.entry_price {
-                    (ClosedOutcomeBadge::TrailingStop, removed.live_price)
+                } else if t1_was_banked || is_profit_locked_stop {
+                    let runner_px = match removed.direction {
+                        TradeDirection::Long => {
+                            removed.live_price.max(removed.structural_stop_price)
+                        }
+                        TradeDirection::Short => {
+                            removed.live_price.min(removed.structural_stop_price)
+                        }
+                    };
+                    (ClosedOutcomeBadge::TrailingStop, runner_px)
                 } else {
                     (ClosedOutcomeBadge::AiDynamicExit, removed.live_price)
                 };
 
-                let archived =
-                    self.archive_closed_position(removed, badge, exit_price, latest.timestamp_ns);
+                // If 50% of the position was banked at T1 (+1.0R), blend 50% @ T1 + 50% @ Runner Exit
+                let effective_exit_price = if t1_was_banked {
+                    let blended_u =
+                        (t1_bank_price.scaled_units() + runner_exit_price.scaled_units()) / 2;
+                    SubPennyPrice::from_scaled_units(blended_u.max(1)).unwrap_or(runner_exit_price)
+                } else {
+                    runner_exit_price
+                };
+
+                let archived = self.archive_closed_position(
+                    removed,
+                    badge,
+                    effective_exit_price,
+                    latest.timestamp_ns,
+                );
                 newly_closed.push(archived);
             } else {
                 idx += 1;

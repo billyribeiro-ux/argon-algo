@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod adapters;
 pub mod scanner;
 pub mod types;
+pub mod yahoo;
 
 pub use adapter::{DataBusError, MarketDataAdapter, MultiFeedRouter, ProviderTelemetry};
 pub use adapters::{
@@ -18,4 +19,8 @@ pub use scanner::{
 pub use types::{
     MarketStreamEvent, OptionRight, TickerSnapshot, Timeframe, UnifiedBar, UnifiedMarketInternals,
     UnifiedOptionChain, UnifiedOptionContract, UnifiedTick,
+};
+pub use yahoo::{
+    REAL_YAHOO_CORE_UNIVERSE, RealUniverseTickerMeta, RealYahooSymbolData, YahooFinanceLiveAdapter,
+    YahooSessionManager,
 };

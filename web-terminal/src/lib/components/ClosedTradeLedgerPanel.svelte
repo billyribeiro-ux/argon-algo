@@ -223,7 +223,12 @@
       </thead>
       <tbody>
         {#each rows as row (row.tradeId)}
-          <tr>
+          <tr
+            data-selected={terminalStore.selectedTicker === row.symbol}
+            onclick={() => terminalStore.selectClosedTradeForReplay(row)}
+            style="cursor: pointer;"
+            title="Click to inspect real Yahoo Finance chart & trade markers for {row.symbol}"
+          >
             <td class="tabular-num">{row.tradeId}</td>
             <td>
               <strong>{row.symbol}</strong>

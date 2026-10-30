@@ -2,16 +2,37 @@
  * Multi-Window Workspace Synchronization & Window Management Engine.
  *
  * Uses native `BroadcastChannel('quant-terminal-v1')` for <2ms zero-lag cross-monitor
- * synchronization, `window.getScreenDetails()` for automatic 2-to-4 monitor placement,
+ * synchronization, Color-Channel Link Groups (`RED`, `BLUE`, `GREEN`, `GOLD`, `UNLINKED`),
+ * `window.getScreenDetails()` for automatic 2-to-4 monitor placement,
  * and `documentPictureInPicture` for the always-on-top P&L / Signal Alert HUD.
  */
 
+export type LinkChannelColor = 'RED' | 'BLUE' | 'GREEN' | 'GOLD' | 'UNLINKED';
+
+export type WorkspaceLayoutMode = 'SINGLE' | 'SPLIT_50_50' | 'QUAD_2X2';
+
 export type SyncMessagePayload =
-  | { type: 'SELECT_TICKER'; symbol: string; sourceWindow: string }
-  | { type: 'SELECT_BRAIN'; brainId: string; sourceWindow: string }
-  | { type: 'SELECT_ASSET_CLASS'; assetClass: 'ALL' | 'STOCKS' | 'OPTIONS'; sourceWindow: string }
+  | {
+      type: 'SELECT_TICKER';
+      symbol: string;
+      linkChannel?: LinkChannelColor;
+      sourceWindow: string;
+    }
+  | {
+      type: 'SELECT_BRAIN';
+      brainId: string;
+      linkChannel?: LinkChannelColor;
+      sourceWindow: string;
+    }
+  | {
+      type: 'SELECT_ASSET_CLASS';
+      assetClass: 'ALL' | 'STOCKS' | 'OPTIONS';
+      linkChannel?: LinkChannelColor;
+      sourceWindow: string;
+    }
   | { type: 'TRIGGER_REPLAY_TICK'; timestampMs: number; sourceWindow: string }
-  | { type: 'APPLY_QUICK_FILTER'; pillId: string; sourceWindow: string };
+  | { type: 'APPLY_QUICK_FILTER'; pillId: string; sourceWindow: string }
+  | { type: 'SET_LINK_CHANNEL'; linkChannel: LinkChannelColor; sourceWindow: string };
 
 const CHANNEL_NAME = 'quant-terminal-v1';
 
@@ -46,11 +67,16 @@ export class MultiWindowSyncBus {
 
   public publish(
     event:
-      | { type: 'SELECT_TICKER'; symbol: string }
-      | { type: 'SELECT_BRAIN'; brainId: string }
-      | { type: 'SELECT_ASSET_CLASS'; assetClass: 'ALL' | 'STOCKS' | 'OPTIONS' }
+      | { type: 'SELECT_TICKER'; symbol: string; linkChannel?: LinkChannelColor }
+      | { type: 'SELECT_BRAIN'; brainId: string; linkChannel?: LinkChannelColor }
+      | {
+          type: 'SELECT_ASSET_CLASS';
+          assetClass: 'ALL' | 'STOCKS' | 'OPTIONS';
+          linkChannel?: LinkChannelColor;
+        }
       | { type: 'TRIGGER_REPLAY_TICK'; timestampMs: number }
       | { type: 'APPLY_QUICK_FILTER'; pillId: string }
+      | { type: 'SET_LINK_CHANNEL'; linkChannel: LinkChannelColor }
   ): void {
     if (!this.channel) {
       return;
@@ -75,7 +101,8 @@ export class MultiWindowSyncBus {
   public async detachPanelWindow(
     routePath: '/blueprint' | '/positions-and-ledger' | '/macro-and-adapters',
     windowTitle: string,
-    preferredScreenIndex = 1
+    preferredScreenIndex = 1,
+    linkChannel: LinkChannelColor = 'RED'
   ): Promise<Window | null> {
     if (typeof window === 'undefined') {
       return null;
@@ -102,7 +129,7 @@ export class MultiWindowSyncBus {
     }
 
     const features = `popup=yes,left=${left},top=${top},width=${width},height=${height}`;
-    return window.open(routePath, windowTitle, features);
+    return window.open(`${routePath}?channel=${linkChannel}`, windowTitle, features);
   }
 
   /**
@@ -126,4 +153,3 @@ export class MultiWindowSyncBus {
     return [w1, w2, w3].filter((w) => w !== null).length;
   }
 }
-

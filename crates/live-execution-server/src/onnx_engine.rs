@@ -10,9 +10,10 @@ use std::path::Path;
 use std::time::Instant;
 
 use raw_fingerprint_core::{
-    AutonomousSignalBlueprint, BrainHorizonId, FINGERPRINT_FEATURE_DIM, FourStreamWeights,
-    PrimaryFingerprintDriver, RawBarRecord, RawFingerprintEngine, RawMarketInternalsSnapshot,
-    RawOptionsSnapshot, RawShortFloatSnapshot, SubPennyPrice, TradeDirection,
+    AutonomousSignalBlueprint, BrainHorizonId, EmpiricalPrecedentDistribution,
+    FINGERPRINT_FEATURE_DIM, FourStreamWeights, PrimaryFingerprintDriver, RawBarRecord,
+    RawFingerprintEngine, RawMarketInternalsSnapshot, RawOptionsSnapshot, RawShortFloatSnapshot,
+    SubPennyPrice, TradeDirection,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -30,6 +31,8 @@ pub enum InferenceError {
 }
 
 /// Matched Options Contract & Structure Blueprint computed alongside stock shares.
+/// Supports all 6 institutional structures (`SHARES_ONLY`, `SINGLE_LEG_CALL`, `SINGLE_LEG_PUT`,
+/// `VERTICAL_DEBIT_SPREAD`, `CREDIT_SPREAD`, `DIAGONAL_SPREAD`, `DEEP_ITM_LEAPS`) and full Greeks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchedOptionExecutionPlan {
     pub option_structure: String,
@@ -41,6 +44,10 @@ pub struct MatchedOptionExecutionPlan {
     pub option_contracts_count: u32,
     pub contract_delta: f64,
     pub contract_gamma: f64,
+    pub contract_vanna: f64,
+    pub contract_theta: f64,
+    pub contract_vega: f64,
+    pub contract_iv: f64,
 }
 
 /// Complete `<1.5ms` ONNX live inference output package.
@@ -102,7 +109,7 @@ impl LoadedOnnxBrainModel {
 
         Ok(Self {
             brain_id,
-            model_version: "v1.0.0-onnx-production".to_string(),
+            model_version: "v1.1.0-onnx-production".to_string(),
             effective_weights,
         })
     }
@@ -130,7 +137,7 @@ impl LoadedOnnxBrainModel {
 
         Self {
             brain_id,
-            model_version: "v1.0.0-embedded-onnx".to_string(),
+            model_version: "v1.1.0-embedded-onnx".to_string(),
             effective_weights: weights,
         }
     }
@@ -206,6 +213,10 @@ impl OnnxMultiBrainEngine {
         }
     }
 
+    pub fn fingerprint_engine(&self) -> &RawFingerprintEngine {
+        &self.fingerprint_engine
+    }
+
     /// Executes 4-stream tensor normalization, ONNX state-space readout, TreeSHAP attribution,
     /// structural stop solving, and Options contract matching in `<1.5ms`.
     #[allow(clippy::too_many_arguments)]
@@ -219,19 +230,47 @@ impl OnnxMultiBrainEngine {
         short_float: &RawShortFloatSnapshot,
         internals: &RawMarketInternalsSnapshot,
     ) -> Result<LiveBrainInferenceOutput, InferenceError> {
+        self.evaluate_live_signal_with_precedents(
+            symbol,
+            brain_id,
+            is_optionable,
+            bars,
+            options,
+            short_float,
+            internals,
+            None,
+        )
+    }
+
+    /// Executes `<1.5ms` ONNX live inference anchored to the empirical `PrecedentKnnIndex` distribution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_live_signal_with_precedents(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+        is_optionable: bool,
+        bars: &[RawBarRecord],
+        options: &RawOptionsSnapshot,
+        short_float: &RawShortFloatSnapshot,
+        internals: &RawMarketInternalsSnapshot,
+        precedents: Option<&EmpiricalPrecedentDistribution>,
+    ) -> Result<LiveBrainInferenceOutput, InferenceError> {
         let start = Instant::now();
 
         let tensor =
             self.fingerprint_engine
                 .build_sequence_tensor(bars, options, short_float, internals)?;
-        let mut signal = self.fingerprint_engine.evaluate_autonomous_signal(
-            symbol,
-            brain_id,
-            bars,
-            options,
-            short_float,
-            internals,
-        )?;
+        let mut signal = self
+            .fingerprint_engine
+            .evaluate_autonomous_signal_with_precedents(
+                symbol,
+                brain_id,
+                bars,
+                options,
+                short_float,
+                internals,
+                precedents,
+            )?;
 
         let model = self
             .models
@@ -290,6 +329,7 @@ impl OnnxMultiBrainEngine {
             signal.target_2_price,
             is_optionable,
             options.front_iv,
+            options.net_dealer_vanna,
         );
 
         let latency_micros = start.elapsed().as_micros() as u64;
@@ -314,11 +354,12 @@ impl OnnxMultiBrainEngine {
         target_2_price: SubPennyPrice,
         is_optionable: bool,
         front_iv: f64,
+        net_dealer_vanna: f64,
     ) -> MatchedOptionExecutionPlan {
         let spot = entry_price.to_f64();
-        if !is_optionable || spot < 1.00 {
+        if !is_optionable || spot < 1.25 {
             return MatchedOptionExecutionPlan {
-                option_structure: "NONE".to_string(),
+                option_structure: "SHARES_ONLY".to_string(),
                 matched_option_contract: "SHARES_ONLY".to_string(),
                 option_entry_premium: SubPennyPrice::ZERO,
                 option_live_premium: SubPennyPrice::ZERO,
@@ -327,6 +368,10 @@ impl OnnxMultiBrainEngine {
                 option_contracts_count: 0,
                 contract_delta: 0.0,
                 contract_gamma: 0.0,
+                contract_vanna: 0.0,
+                contract_theta: 0.0,
+                contract_vega: 0.0,
+                contract_iv: 0.0,
             };
         }
 
@@ -334,7 +379,18 @@ impl OnnxMultiBrainEngine {
         let right_char = if is_long { 'C' } else { 'P' };
 
         let (structure, exp_date, delta_abs, dte_days) = match brain_id {
-            BrainHorizonId::Brain01PennyAnomaly => ("SINGLE_LEG_OPTION", "2026-11-20", 0.50, 21.0),
+            BrainHorizonId::Brain01PennyAnomaly => (
+                if front_iv > 0.85 {
+                    "CREDIT_SPREAD"
+                } else if is_long {
+                    "SINGLE_LEG_CALL"
+                } else {
+                    "SINGLE_LEG_PUT"
+                },
+                "2026-11-20",
+                0.50,
+                21.0,
+            ),
             BrainHorizonId::Brain02IntradayDayTrade => (
                 if is_long {
                     "SINGLE_LEG_CALL"
@@ -342,11 +398,13 @@ impl OnnxMultiBrainEngine {
                     "SINGLE_LEG_PUT"
                 },
                 "2026-11-06",
-                0.54,
+                0.55,
                 5.0,
             ),
             BrainHorizonId::Brain03ShortTermSwing => {
-                if front_iv > 0.60 {
+                if front_iv > 0.85 {
+                    ("CREDIT_SPREAD", "2026-11-13", 0.48, 14.0)
+                } else if front_iv > 0.52 {
                     ("VERTICAL_DEBIT_SPREAD", "2026-11-13", 0.56, 14.0)
                 } else {
                     (
@@ -365,22 +423,36 @@ impl OnnxMultiBrainEngine {
             BrainHorizonId::Brain05LongTermWealth => ("DEEP_ITM_LEAPS", "2027-11-19", 0.80, 365.0),
         };
 
-        let strike = if brain_id == BrainHorizonId::Brain05LongTermWealth {
-            (spot * (if is_long { 0.85 } else { 1.15 }))
-                .round()
-                .max(1.0)
+        let strike_step = if spot < 15.0 {
+            0.50
+        } else if spot < 100.0 {
+            1.00
+        } else if spot < 300.0 {
+            2.50
         } else {
-            spot.round().max(1.0)
+            5.00
         };
+        let raw_strike = if brain_id == BrainHorizonId::Brain05LongTermWealth {
+            spot * (if is_long { 0.85 } else { 1.15 })
+        } else {
+            spot
+        };
+        let strike = ((raw_strike / strike_step).round() * strike_step).max(0.50);
 
-        let iv = front_iv.clamp(0.20, 1.50);
-        let entry_prem_f64 = (spot * iv * (dte_days / 365.0_f64).sqrt() * 0.42).max(0.25);
-        let gamma = (0.06 / (spot * 0.04).max(0.5)).clamp(0.004, 0.15);
+        let iv = front_iv.clamp(0.18, 1.85);
+        let sqrt_t = (dte_days / 365.0_f64).sqrt();
+        let entry_prem_f64 = (spot * iv * sqrt_t * 0.42).max(0.25);
+        let gamma = (0.40 / (spot * iv * sqrt_t).max(0.5)).clamp(0.002, 0.18);
+        let vega = (spot * 0.3989 * sqrt_t * 0.01).clamp(0.01, 2.50);
+        let theta = (-entry_prem_f64 / (dte_days * 1.45).max(1.0)).clamp(-2.50, -0.01);
+        let vanna = ((net_dealer_vanna / 100.0).tanh() * 0.045
+            + (if is_long { 0.018 } else { -0.018 }))
+        .clamp(-0.25, 0.25);
 
         let ds_stop = (spot - stop_price.to_f64()).abs();
         let ds_target = (target_2_price.to_f64() - spot).abs();
 
-        let stop_prem_f64 = (entry_prem_f64 - delta_abs * ds_stop).max(entry_prem_f64 * 0.55);
+        let stop_prem_f64 = (entry_prem_f64 - delta_abs * ds_stop).max(entry_prem_f64 * 0.52);
         let target_prem_f64 =
             entry_prem_f64 + delta_abs * ds_target + 0.5 * gamma * ds_target * ds_target;
 
@@ -389,13 +461,34 @@ impl OnnxMultiBrainEngine {
         let stop_prem = SubPennyPrice::from_f64(stop_prem_f64).unwrap_or(SubPennyPrice::MIN_VALID);
         let target_prem = SubPennyPrice::from_f64(target_prem_f64).unwrap_or(entry_prem);
 
-        let contract_label = format!(
-            "{} {} ${:.2}{}",
-            symbol.to_uppercase(),
-            exp_date,
-            strike,
-            right_char
-        );
+        let contract_label = match structure {
+            "VERTICAL_DEBIT_SPREAD" | "CREDIT_SPREAD" => {
+                let wing = ((strike
+                    + if is_long {
+                        strike_step * 2.0
+                    } else {
+                        -strike_step * 2.0
+                    })
+                    / strike_step)
+                    .round()
+                    * strike_step;
+                format!(
+                    "{} {} ${:.2}/${:.2}{}",
+                    symbol.to_uppercase(),
+                    exp_date,
+                    strike,
+                    wing.max(0.50),
+                    right_char
+                )
+            }
+            _ => format!(
+                "{} {} ${:.2}{}",
+                symbol.to_uppercase(),
+                exp_date,
+                strike,
+                right_char
+            ),
+        };
 
         MatchedOptionExecutionPlan {
             option_structure: structure.to_string(),
@@ -407,6 +500,10 @@ impl OnnxMultiBrainEngine {
             option_contracts_count: 5,
             contract_delta: if is_long { delta_abs } else { -delta_abs },
             contract_gamma: gamma,
+            contract_vanna: vanna,
+            contract_theta: theta,
+            contract_vega: vega,
+            contract_iv: iv,
         }
     }
 }

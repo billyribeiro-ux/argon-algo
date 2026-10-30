@@ -50,6 +50,23 @@ pub struct NormalizedFingerprintTensor {
     pub bar_attention_heatmap: Vec<f32>,
 }
 
+/// Empirical outcome distribution from top-k cosine-similar historical traces in `PrecedentKnnIndex`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EmpiricalPrecedentDistribution {
+    /// 85th-percentile Maximum Adverse Excursion (MAE) as a percentage of entry price (e.g. `1.45` = `1.45%`).
+    pub p85_mae_pct: f64,
+    /// 50th-percentile (median) Maximum Favorable Excursion (MFE) of winning traces as `%` of entry price.
+    pub p50_mfe_pct: f64,
+    /// 80th-percentile Maximum Favorable Excursion (MFE) of winning traces as `%` of entry price.
+    pub p80_mfe_pct: f64,
+    /// Historical win rate (`0.0` to `1.0`) across the matched top-k precedent cohort.
+    pub precedent_win_rate: f64,
+    /// Median time-to-peak excursion in milliseconds across the matched cohort.
+    pub median_hold_duration_ms: i64,
+    /// Number of matched precedent traces in the cohort.
+    pub sample_count: usize,
+}
+
 /// Live position context passed into Speed-1 bar-by-bar dynamic exit evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct OpenPositionEvaluationContext {
@@ -366,8 +383,9 @@ impl RawFingerprintEngine {
 
     /// Autonomous Entry, Structural Stop-Loss & Dual Target Solver.
     ///
-    /// Discovers the exact structural invalidation price from raw volume-absorption wicks and
-    /// volume-profile pockets (never an arbitrary fixed percentage or lagging indicator).
+    /// Discovers the exact structural invalidation price and dual targets from empirical
+    /// precedent excursion distributions (`p85_mae_pct`, `p50_mfe_pct`, `p80_mfe_pct`)
+    /// plus local raw volume-absorption wicks and Dealer Gamma walls.
     pub fn evaluate_autonomous_signal(
         &self,
         symbol: &str,
@@ -376,6 +394,31 @@ impl RawFingerprintEngine {
         options: &RawOptionsSnapshot,
         short_float: &RawShortFloatSnapshot,
         internals: &RawMarketInternalsSnapshot,
+    ) -> Result<AutonomousSignalBlueprint, FingerprintError> {
+        self.evaluate_autonomous_signal_with_precedents(
+            symbol,
+            brain_id,
+            bars,
+            options,
+            short_float,
+            internals,
+            None,
+        )
+    }
+
+    /// Autonomous Entry, Structural Stop-Loss & Dual Target Solver anchored to the
+    /// empirical `PrecedentKnnIndex` historical distribution (`p85_mae_pct`, `p50_mfe_pct`,
+    /// `p80_mfe_pct`, `median_hold_duration_ms`) and local raw tape/gamma physics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_autonomous_signal_with_precedents(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+        bars: &[RawBarRecord],
+        options: &RawOptionsSnapshot,
+        short_float: &RawShortFloatSnapshot,
+        internals: &RawMarketInternalsSnapshot,
+        precedents: Option<&EmpiricalPrecedentDistribution>,
     ) -> Result<AutonomousSignalBlueprint, FingerprintError> {
         let tensor = self.build_sequence_tensor(bars, options, short_float, internals)?;
         let seq_len = bars.len();
@@ -419,55 +462,153 @@ impl RawFingerprintEngine {
                 TradeDirection::Short
             };
 
-        // Solve exact AI Structural Stop-Loss from the raw absorption wick / volume pocket boundary
-        let min_tick_buffer = (entry_price.scaled_units() / 200).max(1); // minimum 0.5% or 1 sub-penny tick
+        // Measure empirical multi-bar excursion quantiles directly from the ticker's raw bar history
+        // so even when `precedents` is None, targets and stops come from empirical bar excursions.
+        let step_span = (seq_len / 4).clamp(2, 16);
+        let mut local_maes = Vec::with_capacity(seq_len);
+        let mut local_mfes = Vec::with_capacity(seq_len);
+        for i in 0..seq_len.saturating_sub(1) {
+            let ref_px = bars[i].close.scaled_units().max(1) as f64;
+            let end_idx = (i + step_span).min(seq_len - 1);
+            let mut max_hi = bars[i].high.scaled_units();
+            let mut min_lo = bars[i].low.scaled_units();
+            for b in &bars[i + 1..=end_idx] {
+                max_hi = max_hi.max(b.high.scaled_units());
+                min_lo = min_lo.min(b.low.scaled_units());
+            }
+            let up_pct = ((max_hi as f64 - ref_px).max(0.0) / ref_px) * 100.0;
+            let dn_pct = ((ref_px - min_lo as f64).max(0.0) / ref_px) * 100.0;
+            match direction {
+                TradeDirection::Long => {
+                    local_mfes.push(up_pct);
+                    local_maes.push(dn_pct);
+                }
+                TradeDirection::Short => {
+                    local_mfes.push(dn_pct);
+                    local_maes.push(up_pct);
+                }
+            }
+        }
+        local_maes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        local_mfes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let percentile_of = |sorted: &[f64], q: f64, fallback: f64| -> f64 {
+            if sorted.is_empty() {
+                return fallback;
+            }
+            let idx = (((sorted.len() - 1) as f64) * q).round() as usize;
+            sorted[idx.min(sorted.len() - 1)].max(fallback)
+        };
+
+        let local_p85_mae_pct = percentile_of(&local_maes, 0.85, 0.65);
+        let local_p50_mfe_pct = percentile_of(&local_mfes, 0.50, local_p85_mae_pct * 1.65);
+        let local_p80_mfe_pct = percentile_of(&local_mfes, 0.80, local_p50_mfe_pct * 1.55);
+
+        // Blend historical precedent distribution (from PrecedentKnnIndex) with local raw physics
+        let (empirical_mae_pct, empirical_p50_mfe_pct, empirical_p80_mfe_pct, hold_ms, win_rate) =
+            if let Some(p) = precedents.filter(|p| p.sample_count > 0) {
+                (
+                    (p.p85_mae_pct * 0.70 + local_p85_mae_pct * 0.30).max(0.25),
+                    (p.p50_mfe_pct * 0.75 + local_p50_mfe_pct * 0.25).max(0.50),
+                    (p.p80_mfe_pct * 0.75 + local_p80_mfe_pct * 0.25).max(0.85),
+                    p.median_hold_duration_ms.max(60_000),
+                    p.precedent_win_rate.clamp(0.35, 0.98),
+                )
+            } else {
+                let avg_bar_ms = bars
+                    .last()
+                    .map(|b| b.time_delta_ms as i64)
+                    .unwrap_or(60_000)
+                    .max(1_000);
+                let empirical_hold =
+                    (avg_bar_ms * (step_span as i64)).max(brain_id.default_hold_duration_ms());
+                (
+                    local_p85_mae_pct,
+                    local_p50_mfe_pct,
+                    local_p80_mfe_pct,
+                    empirical_hold,
+                    0.68,
+                )
+            };
+
+        // Solve exact AI Structural Stop-Loss from the 85th-percentile MAE invalidation structure
+        // anchored to the local raw absorption wick boundary.
+        let entry_u = entry_price.scaled_units();
+        let min_tick_buffer = (entry_u / 250).max(1);
+        let mae_stop_units = ((entry_u as f64) * (empirical_mae_pct / 100.0)).round() as i64;
+
         let structural_stop_price = match direction {
             TradeDirection::Long => {
-                let candidate = absorption_low
+                let wick_candidate = absorption_low
                     .scaled_units()
                     .saturating_sub(min_tick_buffer);
-                let max_stop = entry_price.scaled_units().saturating_sub(min_tick_buffer);
-                SubPennyPrice::from_scaled_units(candidate.min(max_stop).max(MIN_SUB_PENNY_UNITS))
-                    .unwrap_or(SubPennyPrice::MIN_VALID)
+                let mae_candidate = entry_u.saturating_sub(mae_stop_units.max(min_tick_buffer));
+                // Anchor between the empirical 85th-percentile MAE and local absorption low
+                let blended_stop = ((wick_candidate as i128 + mae_candidate as i128) / 2) as i64;
+                let max_stop = entry_u.saturating_sub(min_tick_buffer);
+                SubPennyPrice::from_scaled_units(
+                    blended_stop.min(max_stop).max(MIN_SUB_PENNY_UNITS),
+                )
+                .unwrap_or(SubPennyPrice::MIN_VALID)
             }
             TradeDirection::Short => {
-                let candidate = absorption_high
+                let wick_candidate = absorption_high
                     .scaled_units()
                     .saturating_add(min_tick_buffer);
-                let min_stop = entry_price.scaled_units().saturating_add(min_tick_buffer);
-                SubPennyPrice::from_scaled_units(candidate.max(min_stop).max(MIN_SUB_PENNY_UNITS))
-                    .unwrap_or(SubPennyPrice::MIN_VALID)
+                let mae_candidate = entry_u.saturating_add(mae_stop_units.max(min_tick_buffer));
+                let blended_stop = ((wick_candidate as i128 + mae_candidate as i128) / 2) as i64;
+                let min_stop = entry_u.saturating_add(min_tick_buffer);
+                SubPennyPrice::from_scaled_units(
+                    blended_stop.max(min_stop).max(MIN_SUB_PENNY_UNITS),
+                )
+                .unwrap_or(SubPennyPrice::MIN_VALID)
             }
         };
 
         // Structural risk distance in 5-decimal scaled units
-        let risk_units = (entry_price.scaled_units() - structural_stop_price.scaled_units())
+        let risk_units = (entry_u - structural_stop_price.scaled_units())
             .abs()
             .max(1);
 
-        // Amplify expected payoff multiple when Gamma Squeeze or Short Squeeze physics are active
-        let squeeze_boost = (tensor.stream_weights.options_gamma_vanna_weight as f64) * 1.4
-            + (tensor.stream_weights.short_float_squeeze_weight as f64) * 1.8;
-        let t1_r = (2.0 + squeeze_boost * 0.5).clamp(1.8, 4.0);
-        let t2_r = (3.5 + squeeze_boost * 1.2).clamp(3.0, 8.5);
+        // Solve Target 1 (50th-percentile MFE) and Target 2 (80th-percentile MFE or Dealer Gamma Wall)
+        let p50_mfe_units = (((entry_u as f64) * (empirical_p50_mfe_pct / 100.0)).round() as i64)
+            .max(risk_units + 1);
+        let mut p80_mfe_units = (((entry_u as f64) * (empirical_p80_mfe_pct / 100.0)).round()
+            as i64)
+            .max(p50_mfe_units + (risk_units / 2).max(1));
+
+        // If Stream 2 (Options Gamma/Vanna) has a dominant gamma wall strike aligned with trade direction,
+        // incorporate the empirical gamma wall magnet into Target 2
+        let wall_u = options.dominant_gamma_wall_strike.scaled_units();
+        if wall_u > MIN_SUB_PENNY_UNITS {
+            match direction {
+                TradeDirection::Long if wall_u > entry_u + p50_mfe_units => {
+                    let wall_dist = wall_u - entry_u;
+                    p80_mfe_units = ((p80_mfe_units + wall_dist) / 2).max(p50_mfe_units + 1);
+                }
+                TradeDirection::Short if wall_u < entry_u - p50_mfe_units => {
+                    let wall_dist = entry_u - wall_u;
+                    p80_mfe_units = ((p80_mfe_units + wall_dist) / 2).max(p50_mfe_units + 1);
+                }
+                _ => {}
+            }
+        }
 
         let (target_1_price, target_2_price) = match direction {
             TradeDirection::Long => {
-                let t1_u =
-                    entry_price.scaled_units() + ((risk_units as f64 * t1_r).round() as i64).max(1);
-                let t2_u =
-                    entry_price.scaled_units() + ((risk_units as f64 * t2_r).round() as i64).max(2);
+                let t1_u = entry_u.saturating_add(p50_mfe_units.max(1));
+                let t2_u = entry_u.saturating_add(p80_mfe_units.max(2));
                 (
                     SubPennyPrice::from_scaled_units(t1_u).unwrap_or(entry_price),
                     SubPennyPrice::from_scaled_units(t2_u).unwrap_or(entry_price),
                 )
             }
             TradeDirection::Short => {
-                let t1_u = (entry_price.scaled_units()
-                    - ((risk_units as f64 * t1_r).round() as i64))
+                let t1_u = entry_u
+                    .saturating_sub(p50_mfe_units.max(1))
                     .max(MIN_SUB_PENNY_UNITS);
-                let t2_u = (entry_price.scaled_units()
-                    - ((risk_units as f64 * t2_r).round() as i64))
+                let t2_u = entry_u
+                    .saturating_sub(p80_mfe_units.max(2))
                     .max(MIN_SUB_PENNY_UNITS);
                 (
                     SubPennyPrice::from_scaled_units(t1_u).unwrap_or(SubPennyPrice::MIN_VALID),
@@ -476,9 +617,19 @@ impl RawFingerprintEngine {
             }
         };
 
-        // Compute Raw Evidence Confidence % (55.0% to 98.5%)
+        let expected_r_multiple = (p80_mfe_units as f64) / (risk_units as f64);
+
+        // Compute Raw Evidence Confidence % directly from bar impulse attention + empirical precedent win rate + stream alignment
         let latest_attn = *tensor.bar_attention_heatmap.last().unwrap_or(&0.5) as f64;
-        let ai_confidence_pct = (68.0 + latest_attn * 24.0 + squeeze_boost * 5.0).clamp(55.0, 98.8);
+        let stream_concentration = (tensor
+            .stream_weights
+            .chart_tape_physics_weight
+            .max(tensor.stream_weights.options_gamma_vanna_weight)
+            .max(tensor.stream_weights.short_float_squeeze_weight)
+            as f64)
+            .clamp(0.25, 1.0);
+        let ai_confidence_pct =
+            (win_rate * 58.0 + latest_attn * 24.0 + stream_concentration * 16.0).clamp(55.0, 98.8);
         let primary_driver = tensor.stream_weights.primary_driver();
 
         Ok(AutonomousSignalBlueprint {
@@ -490,9 +641,9 @@ impl RawFingerprintEngine {
             structural_stop_price,
             target_1_price,
             target_2_price,
-            predicted_hold_duration_ms: brain_id.default_hold_duration_ms(),
+            predicted_hold_duration_ms: hold_ms,
             ai_confidence_pct,
-            expected_r_multiple: t2_r,
+            expected_r_multiple,
             primary_driver,
             stream_weights: tensor.stream_weights,
             latent_embedding_128: tensor.latent_embedding_128,

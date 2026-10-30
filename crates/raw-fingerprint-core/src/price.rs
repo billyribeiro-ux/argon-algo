@@ -8,7 +8,7 @@ use std::ops::{Add, Sub};
 use std::str::FromStr;
 
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// Scale factor for 5-decimal sub-penny resolution: `100,000` ticks = `$1.00000`.
@@ -28,9 +28,33 @@ pub enum PriceError {
 }
 
 /// Exact 5-decimal fixed-point price representation (`1 unit = $0.00001`).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Serializes to JSON as exact 5-decimal dollar `f64` (`$210.14680 -> 210.1468`)
+/// and deserializes back into exact `100,000x` scaled integer units.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct SubPennyPrice(i64);
+
+impl Serialize for SubPennyPrice {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(self.to_f64())
+    }
+}
+
+impl<'de> Deserialize<'de> for SubPennyPrice {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let val = f64::deserialize(deserializer)?;
+        let scaled = (val * SUB_PENNY_SCALE_F64).round() as i64;
+        Ok(Self(scaled.max(0)))
+    }
+}
 
 impl SubPennyPrice {
     /// Minimum allowed positive market price: `$0.00001`.

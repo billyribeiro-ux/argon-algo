@@ -8,7 +8,9 @@
   import {
     terminalStore,
     formatSignedUsd,
-    type BrainId
+    type BrainId,
+    type LinkChannelColor,
+    type WorkspaceLayoutMode
   } from '$lib/state/terminal.svelte';
   import type { Snippet } from 'svelte';
 
@@ -23,15 +25,32 @@
     { id: 'BRAIN-05', label: 'BRAIN-05 WEALTH', horizon: '2m - 12m+' }
   ];
 
+  const LAYOUT_MODES: Array<{ id: WorkspaceLayoutMode; label: string }> = [
+    { id: 'SINGLE', label: 'Full Bento' },
+    { id: 'SPLIT_50_50', label: '50/50 Split' },
+    { id: 'QUAD_2X2', label: '2x2 Quad' }
+  ];
+
+  const LINK_CHANNELS: Array<{ id: LinkChannelColor; label: string; colorCss: string }> = [
+    { id: 'RED', label: 'RED', colorCss: 'oklch(0.68 0.22 22)' },
+    { id: 'BLUE', label: 'BLUE', colorCss: 'oklch(0.72 0.17 240)' },
+    { id: 'GREEN', label: 'GREEN', colorCss: 'oklch(0.76 0.19 152)' },
+    { id: 'GOLD', label: 'GOLD', colorCss: 'oklch(0.82 0.17 85)' },
+    { id: 'UNLINKED', label: 'UNLINKED', colorCss: 'oklch(0.55 0.02 255)' }
+  ];
+
   const internals = $derived(terminalStore.macroInternals);
   const openSummary = $derived(terminalStore.openPositionsSummary);
   const kpis = $derived(terminalStore.scorecardKpis);
+  const primaryProvider = $derived(
+    terminalStore.providers.find((p) => p.role === 'PRIMARY')?.providerId ?? 'yahoo_finance_live'
+  );
 </script>
 
-<div class="terminal-shell">
+<div class="terminal-shell" data-workspace-layout={terminalStore.workspaceLayout}>
   <!-- Top Omni-Command Bar -->
   <header class="top-omni-bar">
-    <div style="display: flex; align-items: center; gap: 12px;">
+    <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
       <a href="/" style="display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 0.88rem; letter-spacing: 0.04em;">
         <span class="badge badge-ai-core">ARGON-4</span>
         <span>QUANT INTELLIGENCE TERMINAL</span>
@@ -53,8 +72,8 @@
       </nav>
     </div>
 
-    <!-- Universe Price Tier & Multi-Monitor Workspace Detach Controls -->
-    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+    <!-- Universe Price Tier, Layout Switcher, Color-Channel Link & Multi-Monitor Detach Controls -->
+    <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
       <select class="input-control" bind:value={terminalStore.universeTierMode} aria-label="Universe Price Tier">
         <option value="ALL">UNIVERSE: ALL ($0.00001 - $10,000+)</option>
         <option value="SUB_PENNY_ONLY">SUB-PENNY ($0.00001 - $5.00)</option>
@@ -67,17 +86,66 @@
         <option value="STOCKS">EQUITY ONLY</option>
       </select>
 
+      <!-- Side-by-Side Workspace Layout Mode Selector -->
+      <div
+        style="display: flex; align-items: center; gap: 3px; padding: 2px 6px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
+        role="group"
+        aria-label="Workspace Layout Mode"
+      >
+        {#each LAYOUT_MODES as lm (lm.id)}
+          <button
+            type="button"
+            class="filter-pill"
+            data-selected={terminalStore.workspaceLayout === lm.id}
+            onclick={() => terminalStore.setWorkspaceLayout(lm.id)}
+            style="padding: 2px 6px; font-size: 0.66rem;"
+          >
+            {lm.label}
+          </button>
+        {/each}
+      </div>
+
+      <!-- Color-Channel Link Badge Selector -->
+      <div
+        style="display: flex; align-items: center; gap: 4px; padding: 2px 6px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
+        role="group"
+        aria-label="Window Color Link Channel"
+      >
+        <span style="font-size: 0.64rem; color: var(--text-secondary); font-weight: 700;">CH:</span>
+        {#each LINK_CHANNELS as ch (ch.id)}
+          <button
+            type="button"
+            onclick={() => terminalStore.setLinkChannel(ch.id, true)}
+            title="Link Window to {ch.label} Channel"
+            style="inline-size: 14px; block-size: 14px; border-radius: 50%; background: {ch.colorCss}; border: {terminalStore.activeLinkChannel === ch.id ? '2px solid white' : '1px solid transparent'}; cursor: pointer;"
+            aria-label="Channel {ch.label}"
+          ></button>
+        {/each}
+      </div>
+
       <button
         type="button"
         class="action-btn"
-        onclick={() => terminalStore.syncBus.detachPanelWindow('/blueprint', 'monitor_2_blueprint', 1)}
+        onclick={() =>
+          terminalStore.syncBus.detachPanelWindow(
+            '/blueprint',
+            'monitor_2_blueprint',
+            1,
+            terminalStore.activeLinkChannel
+          )}
       >
         Detach Blueprint
       </button>
       <button
         type="button"
         class="action-btn"
-        onclick={() => terminalStore.syncBus.detachPanelWindow('/positions-and-ledger', 'monitor_3_ledger', 2)}
+        onclick={() =>
+          terminalStore.syncBus.detachPanelWindow(
+            '/positions-and-ledger',
+            'monitor_3_ledger',
+            2,
+            terminalStore.activeLinkChannel
+          )}
       >
         Detach Ledger
       </button>
@@ -101,14 +169,23 @@
         </strong>
       </span>
       <span class="tabular-num">
-        $ADD: <strong class="pnl-positive">+{internals.nyseAdd}</strong>
+        $ADD:
+        <strong class={internals.nyseAdd >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+          {internals.nyseAdd >= 0 ? '+' : ''}{internals.nyseAdd}
+        </strong>
       </span>
       <span class="tabular-num">
         $VOLD: <strong class="pnl-positive">{internals.voldRatio.toFixed(2)}x</strong>
       </span>
       <span class="tabular-num">
+        VIX Spot: <strong>{internals.vixSpot.toFixed(2)}</strong>
+      </span>
+      <span class="tabular-num">
         SOXX / SMH:
-        <strong class="pnl-positive">+{internals.soxxPct.toFixed(2)}% / +{internals.smhPct.toFixed(2)}%</strong>
+        <strong class={internals.smhPct >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+          {internals.soxxPct >= 0 ? '+' : ''}{internals.soxxPct.toFixed(2)}% /
+          {internals.smhPct >= 0 ? '+' : ''}{internals.smhPct.toFixed(2)}%
+        </strong>
       </span>
       <span class="tabular-num">
         VIX Slope: <strong>{internals.vixTermSlope.toFixed(3)}</strong>
@@ -128,8 +205,8 @@
           {formatSignedUsd(kpis.netCombinedPnlUsd)}
         </strong>
       </span>
-      <a href="/macro-and-adapters" class="badge badge-long">
-        BUS: DATABENTO + OPRA + FINRA (0.8ms)
+      <a href="/macro-and-adapters" class="badge {terminalStore.backendConnected ? 'badge-long' : 'badge-squeeze'}">
+        BUS: {primaryProvider.toUpperCase()} ({terminalStore.backendConnected ? 'LIVE WS' : 'RECONNECTING'})
       </a>
     </div>
   </div>
@@ -139,4 +216,3 @@
     {@render children()}
   </main>
 </div>
-

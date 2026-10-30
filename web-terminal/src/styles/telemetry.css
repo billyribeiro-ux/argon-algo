@@ -47,6 +47,9 @@
   .telemetry-table tbody tr {
     border-block-end: 1px solid oklch(0.2 0.014 255);
     transition: background-color 100ms ease;
+    content-visibility: auto;
+    contain-intrinsic-size: 0 38px;
+    contain: layout style paint;
   }
 
   .telemetry-table tbody tr:hover {

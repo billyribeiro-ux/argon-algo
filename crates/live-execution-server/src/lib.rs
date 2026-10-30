@@ -11,15 +11,16 @@ pub mod routes;
 
 pub use exporter::{ExportError, ExportScope, export_to_csv_bytes, export_to_xlsx_bytes};
 pub use ledger::{
-    BrainBreakdownSummary, ClosedOutcomeBadge, ClosedTradeRow, FilteredLedgerSnapshot,
-    HyperFilterQuery, MasterExecutiveScoreboard, OpenPositionRow, RealTimeLedgerEngine,
+    AutopsyTradeGrade, BrainBreakdownSummary, BrainEvolutionStatus, ChampionChallengerComparison,
+    ClosedOutcomeBadge, ClosedTradeRow, FilteredLedgerSnapshot, HyperFilterQuery,
+    MasterExecutiveScoreboard, OpenPositionRow, RealTimeLedgerEngine,
 };
 pub use onnx_engine::{
     InferenceError, LiveBrainInferenceOutput, LoadedOnnxBrainModel, MatchedOptionExecutionPlan,
     OnnxMultiBrainEngine,
 };
 pub use precedent_knn::{HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMatchSummary};
-pub use routes::{AppState, build_axum_router};
+pub use routes::{AppState, LiveChartResponse, ScannerCandidatesResponse, build_axum_router};
 
 #[cfg(test)]
 mod tests {
@@ -175,5 +176,100 @@ mod tests {
             csv_bytes.len(),
             xlsx_bytes.len()
         );
+    }
+
+    #[tokio::test]
+    async fn test_real_yahoo_finance_live_chart_and_ledger_pipeline() {
+        use market_data_bus::{MarketDataAdapter, Timeframe};
+
+        let models_dir = Path::new("../../models");
+        let state = AppState::new(if models_dir.exists() {
+            Some(models_dir)
+        } else {
+            None
+        });
+
+        // 1. Verify YahooFinanceLiveAdapter is the default primary adapter
+        assert_eq!(state.data_bus.primary_provider_id(), "yahoo_finance_live");
+
+        // 2. Fetch real Yahoo Finance 5m bars for NVDA, TSLA, SPY, and SOFI
+        for sym in ["NVDA", "TSLA", "SPY", "SOFI"] {
+            let bars = state
+                .yahoo_adapter
+                .fetch_historical_bars(sym, Timeframe::M5, 32)
+                .await
+                .unwrap_or_else(|e| panic!("Failed fetching real Yahoo bars for {sym}: {e}"));
+            assert!(
+                bars.len() >= 16,
+                "Expected >= 16 real Yahoo bars for {sym}, got {}",
+                bars.len()
+            );
+            let latest = bars.last().unwrap();
+            assert!(latest.close.to_f64() > 0.50);
+            assert!(latest.volume > 0);
+            println!(
+                "[REAL YAHOO CHART] {} | Bars: {} | Latest Ts(ns): {} | Open: {} | High: {} | Low: {} | Close: {} | Vol: {}",
+                sym,
+                bars.len(),
+                latest.timestamp_ns,
+                latest.open,
+                latest.high,
+                latest.low,
+                latest.close,
+                latest.volume
+            );
+        }
+
+        // 3. Execute real Yahoo Finance walk-forward backfill across all 5 Brains
+        let snap = state
+            .run_real_yahoo_walk_forward_backfill()
+            .await
+            .expect("Real Yahoo walk-forward backfill succeeds");
+
+        assert!(
+            !snap.positions_opened.is_empty(),
+            "Expected live open positions from real Yahoo Finance data"
+        );
+        assert!(
+            !snap.closed_trades.is_empty(),
+            "Expected walk-forward closed trades from real Yahoo Finance data"
+        );
+
+        for pos in &snap.positions_opened {
+            println!(
+                "[REAL YAHOO OPEN POSITION] {} ({}) | Dir: {} | Entry: {} | Live: {} | Stop: {} | T1: {} | T2: {} | Option: {} ({}) | Conf: {:.1}%",
+                pos.symbol,
+                pos.brain_id.code(),
+                pos.direction.as_str(),
+                pos.entry_price,
+                pos.live_price,
+                pos.structural_stop_price,
+                pos.target_1_price,
+                pos.target_2_price,
+                pos.matched_option_contract,
+                pos.option_structure,
+                pos.ai_confidence_pct
+            );
+        }
+
+        for tr in &snap.closed_trades {
+            println!(
+                "[REAL YAHOO CLOSED TRADE] {} ({}) | Badge: {} | Entry: {} -> Exit: {} | Net P&L: ${:.2} ({:.2}R) | Bars: {}",
+                tr.symbol,
+                tr.brain_id.code(),
+                tr.outcome_badge.as_str(),
+                tr.entry_price,
+                tr.actual_exit_price,
+                tr.net_pnl_usd,
+                tr.realized_r_multiple,
+                tr.entry_bars.len()
+            );
+            assert!(!tr.entry_bars.is_empty());
+        }
+
+        // 4. Verify Speed-2 Nightly Autopsy & Speed-3 Champion-vs-Challenger Tournament
+        let evo = state.ledger.run_autopsy_and_tournament(true);
+        assert_eq!(evo.trade_grades.len(), snap.closed_trades.len());
+        assert_eq!(evo.tournament_results.len(), 5);
     }
 }

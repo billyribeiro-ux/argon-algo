@@ -10,6 +10,7 @@ description = "Agnostic Plug-and-Play Market Data Bus, Multi-Feed Hot-Swap Route
 [dependencies]
 raw-fingerprint-core.workspace = true
 tokio.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

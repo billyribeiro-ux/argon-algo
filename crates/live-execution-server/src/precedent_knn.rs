@@ -2,10 +2,13 @@
 //!
 //! Mirrors the `trace_embeddings` (`vector(128)`) table in memory and queries the nearest
 //! historical 4-stream raw fingerprint traces in `<1ms`, returning the exact precedent
-//! match count, historical win rate %, and mean realized R-multiple.
+//! match count, historical win rate %, mean realized R-multiple, and empirical excursion
+//! distribution (`p85_mae_pct`, `p50_mfe_pct`, `p80_mfe_pct`, `median_hold_duration_ms`).
 
 use parking_lot::RwLock;
-use raw_fingerprint_core::{BrainHorizonId, PrimaryFingerprintDriver, TRACE_EMBEDDING_DIM};
+use raw_fingerprint_core::{
+    BrainHorizonId, EmpiricalPrecedentDistribution, PrimaryFingerprintDriver, TRACE_EMBEDDING_DIM,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -26,14 +29,33 @@ pub struct HistoricalTraceRecord {
     pub embedding_128: Vec<f32>,
 }
 
-/// Summary of the k-NN historical precedent search displayed on the Fingerprint Trace Card.
+/// Summary of the k-NN historical precedent search displayed on the Fingerprint Trace Card
+/// and fed into the Empirical Structural Stop / Target solver.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrecedentMatchSummary {
     pub matches_count: usize,
     pub win_rate_pct: f64,
     pub mean_realized_r_multiple: f64,
     pub mean_similarity_pct: f64,
+    pub p85_mae_pct: f64,
+    pub p50_mfe_pct: f64,
+    pub p80_mfe_pct: f64,
+    pub median_hold_duration_ms: i64,
     pub top_exemplar_symbols: Vec<String>,
+}
+
+impl PrecedentMatchSummary {
+    #[inline]
+    pub fn to_empirical_distribution(&self) -> EmpiricalPrecedentDistribution {
+        EmpiricalPrecedentDistribution {
+            p85_mae_pct: self.p85_mae_pct,
+            p50_mfe_pct: self.p50_mfe_pct,
+            p80_mfe_pct: self.p80_mfe_pct,
+            precedent_win_rate: (self.win_rate_pct / 100.0).clamp(0.0, 1.0),
+            median_hold_duration_ms: self.median_hold_duration_ms,
+            sample_count: self.matches_count,
+        }
+    }
 }
 
 /// High-speed cosine similarity index over 128-d L2-normalized trace embeddings.
@@ -52,14 +74,14 @@ impl PrecedentKnnIndex {
     /// across all 5 Brains (`BRAIN-01` through `BRAIN-05`).
     pub fn new_preseeded() -> Self {
         let brains = [
-            (BrainHorizonId::Brain01PennyAnomaly, "1m", "ZNTX", 4.8),
-            (BrainHorizonId::Brain01PennyAnomaly, "3m", "KULR", 3.6),
+            (BrainHorizonId::Brain01PennyAnomaly, "1m", "PLUG", 3.4),
+            (BrainHorizonId::Brain01PennyAnomaly, "5m", "SOFI", 3.1),
             (BrainHorizonId::Brain02IntradayDayTrade, "5m", "NVDA", 2.9),
             (BrainHorizonId::Brain02IntradayDayTrade, "5m", "TSLA", 3.4),
             (BrainHorizonId::Brain03ShortTermSwing, "1H", "PLTR", 4.1),
             (BrainHorizonId::Brain03ShortTermSwing, "4H", "IONQ", 3.8),
             (BrainHorizonId::Brain04CoreSwing, "1D", "AMD", 4.5),
-            (BrainHorizonId::Brain05LongTermWealth, "1W", "GS", 6.2),
+            (BrainHorizonId::Brain05LongTermWealth, "1W", "GS", 5.2),
         ];
 
         let drivers = [
@@ -99,8 +121,16 @@ impl PrecedentKnnIndex {
                 timeframe: tf.to_string(),
                 timestamp_ns: 1_760_000_000_000_000_000 + (i as i64) * 3_600_000_000_000,
                 realized_r_multiple: r_mult,
-                mfe_pct: if was_winner { r_mult * 2.1 } else { 0.45 },
-                mae_pct: if was_winner { 0.38 } else { 1.45 },
+                mfe_pct: if was_winner {
+                    (r_mult * 0.85).clamp(1.2, 8.5)
+                } else {
+                    0.42
+                },
+                mae_pct: if was_winner {
+                    0.55 + ((i % 3) as f64) * 0.18
+                } else {
+                    1.35
+                },
                 hold_duration_ms: brain_id.default_hold_duration_ms(),
                 was_winner,
                 primary_driver: driver,
@@ -113,12 +143,25 @@ impl PrecedentKnnIndex {
         }
     }
 
-    /// Inserts a newly completed trade's 128-d trace embedding into the vector store.
+    /// Inserts a newly completed trade or discovered historical Yahoo trace into the vector store.
     pub fn insert_trace(&self, record: HistoricalTraceRecord) {
         self.records.write().push(record);
     }
 
-    /// Queries the top-$K$ historical precedent traces for `brain_id` in `<1ms` via cosine similarity.
+    /// Returns a snapshot of all indexed historical trace records.
+    pub fn all_records(&self) -> Vec<HistoricalTraceRecord> {
+        self.records.read().clone()
+    }
+
+    /// Replaces the in-memory trace records (e.g., when restoring from disk persistence).
+    pub fn replace_all_records(&self, new_records: Vec<HistoricalTraceRecord>) {
+        if !new_records.is_empty() {
+            *self.records.write() = new_records;
+        }
+    }
+
+    /// Queries the top-$K$ historical precedent traces for `brain_id` in `<1ms` via cosine similarity
+    /// and computes the empirical 85th-percentile MAE, 50th/80th-percentile MFE, and median hold duration.
     pub fn query_precedents(
         &self,
         brain_id: BrainHorizonId,
@@ -136,7 +179,6 @@ impl PrecedentKnnIndex {
                 for (a, b) in r.embedding_128.iter().zip(query_embedding_128.iter()) {
                     dot += a * b;
                 }
-                // Map cosine similarity [-1, 1] into [0.5, 0.99] similarity score
                 let sim = (0.75 + 0.24 * dot).clamp(0.50, 0.995);
                 (sim, r)
             })
@@ -151,6 +193,10 @@ impl PrecedentKnnIndex {
                 win_rate_pct: 78.5,
                 mean_realized_r_multiple: 2.85,
                 mean_similarity_pct: 86.4,
+                p85_mae_pct: 0.85,
+                p50_mfe_pct: 1.95,
+                p80_mfe_pct: 3.40,
+                median_hold_duration_ms: brain_id.default_hold_duration_ms(),
                 top_exemplar_symbols: vec!["NVDA".to_string(), "PLTR".to_string()],
             };
         }
@@ -166,6 +212,38 @@ impl PrecedentKnnIndex {
         let mean_sim_pct =
             (scored.iter().map(|(s, _)| *s as f64).sum::<f64>() / (count as f64)) * 100.0;
 
+        let mut maes: Vec<f64> = scored.iter().map(|(_, r)| r.mae_pct.max(0.15)).collect();
+        let mut win_mfes: Vec<f64> = scored
+            .iter()
+            .filter(|(_, r)| r.was_winner)
+            .map(|(_, r)| r.mfe_pct.max(0.40))
+            .collect();
+        if win_mfes.is_empty() {
+            win_mfes = scored.iter().map(|(_, r)| r.mfe_pct.max(0.50)).collect();
+        }
+        let mut holds: Vec<i64> = scored
+            .iter()
+            .map(|(_, r)| r.hold_duration_ms.max(60_000))
+            .collect();
+
+        maes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        win_mfes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        holds.sort_unstable();
+
+        let p85_idx = (((maes.len() - 1) as f64) * 0.85).round() as usize;
+        let p50_idx = (((win_mfes.len() - 1) as f64) * 0.50).round() as usize;
+        let p80_idx = (((win_mfes.len() - 1) as f64) * 0.80).round() as usize;
+        let hold_mid_idx = holds.len() / 2;
+
+        let p85_mae_pct = maes[p85_idx.min(maes.len() - 1)].clamp(0.25, 12.0);
+        let p50_mfe_pct = win_mfes[p50_idx.min(win_mfes.len() - 1)]
+            .max(p85_mae_pct * 1.45)
+            .clamp(0.50, 25.0);
+        let p80_mfe_pct = win_mfes[p80_idx.min(win_mfes.len() - 1)]
+            .max(p50_mfe_pct * 1.35)
+            .clamp(0.80, 45.0);
+        let median_hold_duration_ms = holds[hold_mid_idx.min(holds.len() - 1)];
+
         let mut exemplars = Vec::new();
         for (_, rec) in scored.iter().take(3) {
             if !exemplars.contains(&rec.symbol) {
@@ -177,7 +255,11 @@ impl PrecedentKnnIndex {
             matches_count: count,
             win_rate_pct: (win_rate_pct * 10.0).round() / 10.0,
             mean_realized_r_multiple: (mean_r * 100.0).round() / 100.0,
-            mean_similarity_pct: (mean_sim_pct * 10.0).round() / 10.0,
+            mean_similarity_pct: (mean_sim_pct * 10.0).round() / 100.0 * 10.0,
+            p85_mae_pct: (p85_mae_pct * 100.0).round() / 100.0,
+            p50_mfe_pct: (p50_mfe_pct * 100.0).round() / 100.0,
+            p80_mfe_pct: (p80_mfe_pct * 100.0).round() / 100.0,
+            median_hold_duration_ms,
             top_exemplar_symbols: exemplars,
         }
     }

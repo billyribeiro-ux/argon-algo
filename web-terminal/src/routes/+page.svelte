@@ -7,21 +7,44 @@
   import RawEvidencePanel from '$lib/components/RawEvidencePanel.svelte';
   import PositionsOpenedPanel from '$lib/components/PositionsOpenedPanel.svelte';
   import ClosedTradeLedgerPanel from '$lib/components/ClosedTradeLedgerPanel.svelte';
+  import BrainAutopsyLab from '$lib/components/BrainAutopsyLab.svelte';
 
   const candidates = $derived(terminalStore.filteredScannerCandidates);
+  let scanningYahoo = $state(false);
+
+  async function handleYahooScan(): Promise<void> {
+    scanningYahoo = true;
+    await terminalStore.triggerYahooUniverseScan();
+    scanningYahoo = false;
+  }
 </script>
 
-<div class="command-bento-grid">
+<div
+  class="command-bento-grid"
+  style={terminalStore.workspaceLayout === 'SPLIT_50_50'
+    ? 'grid-template-columns: repeat(2, minmax(0, 1fr));'
+    : terminalStore.workspaceLayout === 'QUAD_2X2'
+      ? 'grid-template-columns: repeat(2, minmax(0, 1fr));'
+      : ''}
+>
   <!-- Left Panel: Two-Stage 11,000+ Ticker Universe Scanner -->
   <section class="glass-panel panel-scanner" aria-label="11,000+ Ticker Universe Scanner">
-    <header class="panel-header">
+    <header class="panel-header" style="flex-wrap: wrap; gap: 6px;">
       <div class="panel-title">
-        <span>11,000+ Universe Scanner</span>
-        <span class="badge badge-ai-core">{candidates.length} TOP SIGNALS</span>
+        <span>Yahoo Finance Live Scanner</span>
+        <span class="badge badge-ai-core">{candidates.length} SIGNALS</span>
       </div>
-      <span style="font-size: 0.68rem; color: var(--text-secondary);" class="tabular-num">
-        Stage-1: 11,420 → Stage-2: 150
-      </span>
+      <div style="display: flex; align-items: center; gap: 6px;">
+        <button
+          type="button"
+          class="action-btn"
+          onclick={handleYahooScan}
+          disabled={scanningYahoo}
+          style="padding: 2px 7px; font-size: 0.67rem;"
+        >
+          {scanningYahoo ? 'Scanning Yahoo...' : 'Scan Yahoo Now'}
+        </button>
+      </div>
     </header>
 
     <div class="data-table-container">
@@ -86,5 +109,7 @@
 
   <!-- Full-Width Panel 2: CLOSED TRADE LEDGER, 6-Dimension Hyper-Filter & 1-Click CSV/XLSX Exporters -->
   <ClosedTradeLedgerPanel />
-</div>
 
+  <!-- Full-Width Panel 3: 3-Speed Continuous Self-Learning & Nightly Autopsy Lab -->
+  <BrainAutopsyLab />
+</div>

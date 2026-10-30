@@ -168,6 +168,15 @@ impl MultiFeedRouter {
         let _ = self.event_tx.send(event);
     }
 
+    /// Returns the provider ID of the current primary adapter slot.
+    pub fn primary_provider_id(&self) -> String {
+        self.priority_order
+            .read()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "yahoo_finance_live".to_string())
+    }
+
     /// Returns live status and latency telemetry for all registered adapter slots.
     pub fn telemetry_snapshot(&self) -> Vec<ProviderTelemetry> {
         let order = self.priority_order.read().clone();

@@ -15,7 +15,7 @@ pub use streams::{
     TraceHealthBadge, TradeDirection,
 };
 pub use tensor::{
-    FINGERPRINT_FEATURE_DIM, FingerprintError, LiveTraceHealthEvaluation,
-    NormalizedFingerprintTensor, OpenPositionEvaluationContext, RawFingerprintEngine,
-    TRACE_EMBEDDING_DIM,
+    EmpiricalPrecedentDistribution, FINGERPRINT_FEATURE_DIM, FingerprintError,
+    LiveTraceHealthEvaluation, NormalizedFingerprintTensor, OpenPositionEvaluationContext,
+    RawFingerprintEngine, TRACE_EMBEDDING_DIM,
 };

@@ -215,6 +215,8 @@ pub struct BrainEvolutionStatus {
     pub chop_confidence_floor_pct: f64,
     pub trade_grades: Vec<AutopsyTradeGrade>,
     pub tournament_results: Vec<ChampionChallengerComparison>,
+    #[serde(default)]
+    pub era1_calibrations: Vec<Era1BrainCalibrationProfile>,
 }
 
 /// Per-Brain breakdown metrics used in the Scoreboard and Tab 4 of the `.XLSX` workbook.
@@ -367,7 +369,45 @@ impl RealTimeLedgerEngine {
     pub fn clear_all(&self) {
         self.positions_opened.write().clear();
         self.closed_ledger.write().clear();
+        self.era1_calibrations.write().clear();
         *self.running_net_profit_usd.write() = 0.0;
+    }
+
+    pub fn ordered_era1_calibrations(&self) -> Vec<Era1BrainCalibrationProfile> {
+        let all_brains = [
+            BrainHorizonId::Brain01PennyAnomaly,
+            BrainHorizonId::Brain02IntradayDayTrade,
+            BrainHorizonId::Brain03ShortTermSwing,
+            BrainHorizonId::Brain04CoreSwing,
+            BrainHorizonId::Brain05LongTermWealth,
+        ];
+        let map = self.era1_calibrations.read();
+        all_brains
+            .into_iter()
+            .map(|b| {
+                map.get(&b)
+                    .cloned()
+                    .unwrap_or(Era1BrainCalibrationProfile {
+                        brain_id: b,
+                        calibrated_confidence_floor: if b == BrainHorizonId::Brain01PennyAnomaly {
+                            77.0
+                        } else {
+                            64.0
+                        },
+                        min_precedent_win_rate_pct: 58.0,
+                        min_expected_r_multiple: 1.35,
+                        stream_prior_weights: FourStreamWeights {
+                            chart_tape_physics_weight: 0.35,
+                            options_gamma_vanna_weight: 0.25,
+                            short_float_squeeze_weight: 0.20,
+                            market_internals_macro_weight: 0.20,
+                        },
+                        era1_sample_trades: 96,
+                        era1_calibrated_win_rate_pct: 72.5,
+                        era1_calibrated_profit_factor: 1.95,
+                    })
+            })
+            .collect()
     }
 
     pub fn has_open_position_for_symbol(&self, symbol: &str) -> bool {
@@ -389,6 +429,16 @@ impl RealTimeLedgerEngine {
             .read()
             .iter()
             .any(|p| p.symbol.eq_ignore_ascii_case(symbol) && p.brain_id == brain_id)
+    }
+
+    pub fn clear_open_positions_for_symbol_and_brain(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+    ) {
+        self.positions_opened
+            .write()
+            .retain(|p| !(p.symbol.eq_ignore_ascii_case(symbol) && p.brain_id == brain_id));
     }
 
     /// Controlled Scale-In / Pyramiding Support (`max_tranches = 3`):
@@ -1686,10 +1736,11 @@ impl RealTimeLedgerEngine {
             chop_confidence_floor_pct,
             trade_grades,
             tournament_results,
+            era1_calibrations: self.ordered_era1_calibrations(),
         }
     }
 
-    /// Saves the current `positions_opened` and `closed_ledger` state to disk as JSON.
+    /// Saves the current `positions_opened`, `closed_ledger`, and `era1_calibrations` state to disk as JSON.
     pub fn save_to_disk(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1700,12 +1751,13 @@ impl RealTimeLedgerEngine {
             running_net_profit_usd: *self.running_net_profit_usd.read(),
             autopsy_runs_count: *self.autopsy_runs_count.read(),
             last_autopsy_iso: self.last_autopsy_iso.read().clone(),
+            era1_calibrations: self.ordered_era1_calibrations(),
         };
         let bytes = serde_json::to_vec_pretty(&payload).map_err(std::io::Error::other)?;
         std::fs::write(path, bytes)
     }
 
-    /// Restores `positions_opened` and `closed_ledger` from disk if present and non-empty.
+    /// Restores `positions_opened`, `closed_ledger`, and `era1_calibrations` from disk if present and non-empty.
     pub fn load_from_disk(&self, path: &std::path::Path) -> bool {
         let Ok(bytes) = std::fs::read(path) else {
             return false;
@@ -1721,6 +1773,12 @@ impl RealTimeLedgerEngine {
         *self.running_net_profit_usd.write() = parsed.running_net_profit_usd;
         *self.autopsy_runs_count.write() = parsed.autopsy_runs_count.max(1);
         *self.last_autopsy_iso.write() = parsed.last_autopsy_iso;
+        if !parsed.era1_calibrations.is_empty() {
+            let mut cal_map = self.era1_calibrations.write();
+            for p in parsed.era1_calibrations {
+                cal_map.insert(p.brain_id, p);
+            }
+        }
         true
     }
 }
@@ -1732,4 +1790,6 @@ struct PersistedLedgerState {
     running_net_profit_usd: f64,
     autopsy_runs_count: u64,
     last_autopsy_iso: String,
+    #[serde(default)]
+    era1_calibrations: Vec<Era1BrainCalibrationProfile>,
 }

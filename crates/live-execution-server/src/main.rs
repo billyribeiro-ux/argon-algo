@@ -51,22 +51,23 @@ async fn main() -> anyhow::Result<()> {
     let bg_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(25));
+        interval.tick().await; // consume immediate 0ms tick so boot snapshot is untouched
         loop {
             interval.tick().await;
             let snap = bg_state
                 .ledger
                 .query_filtered_snapshot(&HyperFilterQuery::default());
-            let open_targets: Vec<(String, raw_fingerprint_core::BrainHorizonId)> = snap
+            let open_targets: Vec<(String, raw_fingerprint_core::BrainHorizonId, i64)> = snap
                 .positions_opened
                 .iter()
-                .map(|p| (p.symbol.clone(), p.brain_id))
+                .map(|p| (p.symbol.clone(), p.brain_id, p.opened_timestamp_ns))
                 .collect();
 
             if !open_targets.is_empty()
                 && let Ok(internals_u) = bg_state.yahoo_adapter.fetch_market_internals().await
             {
                 let raw_internals = internals_u.to_raw_internals_snapshot("SPY");
-                for (sym, brain_id) in &open_targets {
+                for (sym, brain_id, opened_ts_ns) in &open_targets {
                     let native_tf = match brain_id {
                         raw_fingerprint_core::BrainHorizonId::Brain01PennyAnomaly
                         | raw_fingerprint_core::BrainHorizonId::Brain02IntradayDayTrade => {
@@ -87,12 +88,17 @@ async fn main() -> anyhow::Result<()> {
                     {
                         let raw_bars: Vec<RawBarRecord> =
                             bars.iter().map(|b| b.to_raw_bar_record()).collect();
-                        let _ = bg_state.ledger.process_live_bar_for_symbol_and_brain(
-                            sym,
-                            *brain_id,
-                            &raw_bars,
-                            &raw_internals,
-                        );
+                        if raw_bars
+                            .last()
+                            .is_some_and(|b| b.timestamp_ns > *opened_ts_ns)
+                        {
+                            let _ = bg_state.ledger.process_live_bar_for_symbol_and_brain(
+                                sym,
+                                *brain_id,
+                                &raw_bars,
+                                &raw_internals,
+                            );
+                        }
                     }
                 }
             }

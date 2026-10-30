@@ -78,6 +78,74 @@
       </div>
     </div>
 
+    {#if evo.era1Calibrations && evo.era1Calibrations.length > 0}
+      <div style="padding: 12px 12px 0 12px;">
+        <div class="glass-panel" style="background: var(--surface-0);">
+          <header class="panel-header">
+            <div class="panel-title">
+              <span>Era-1 Causal Calibration &amp; 4-Stream Learned Priors (Zero Lookahead Out-of-Sample Gate)</span>
+            </div>
+          </header>
+          <div class="data-table-container">
+            <table class="telemetry-table">
+              <thead>
+                <tr>
+                  <th>Brain</th>
+                  <th data-numeric="true">Calibrated Conf Floor</th>
+                  <th data-numeric="true">Min Precedent WR</th>
+                  <th data-numeric="true">Min Expected R</th>
+                  <th data-numeric="true">Era-1 Samples</th>
+                  <th data-numeric="true">Era-1 Calibrated WR</th>
+                  <th data-numeric="true">Era-1 Calibrated PF</th>
+                  <th data-numeric="true">Chart/Tape %</th>
+                  <th data-numeric="true">Options/Gamma %</th>
+                  <th data-numeric="true">Short/Float %</th>
+                  <th data-numeric="true">Internals/Macro %</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each evo.era1Calibrations as cal (cal.brainId)}
+                  <tr>
+                    <td><span class="badge badge-ai-core">{cal.brainId}</span></td>
+                    <td data-numeric="true" class="tabular-num">
+                      <strong>{cal.calibratedConfidenceFloor.toFixed(1)}%</strong>
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      {cal.minPrecedentWinRatePct.toFixed(1)}%
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      +{cal.minExpectedRMultiple.toFixed(2)}R
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      {cal.era1SampleTrades}
+                    </td>
+                    <td data-numeric="true" class="tabular-num pnl-positive">
+                      {cal.era1CalibratedWinRatePct.toFixed(1)}%
+                    </td>
+                    <td data-numeric="true" class="tabular-num pnl-positive">
+                      <strong>{cal.era1CalibratedProfitFactor.toFixed(2)}</strong>
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      {(cal.chartTapePhysicsWeight * 100).toFixed(1)}%
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      {(cal.optionsGammaVannaWeight * 100).toFixed(1)}%
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      {(cal.shortFloatSqueezeWeight * 100).toFixed(1)}%
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      {(cal.marketInternalsMacroWeight * 100).toFixed(1)}%
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    {/if}
+
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 12px; padding: 12px;">
       <!-- Speed 3: Champion vs Challenger Walk-Forward Tournament -->
       <div class="glass-panel" style="background: var(--surface-0);">

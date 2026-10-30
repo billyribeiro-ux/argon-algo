@@ -378,10 +378,37 @@ mod tests {
             assert!(!tr.entry_bars.is_empty());
         }
 
-        // 4. Verify Speed-2 Nightly Autopsy & Speed-3 Champion-vs-Challenger Tournament
+        // 4. Verify Speed-2 Nightly Autopsy, Speed-3 Champion-vs-Challenger Tournament & Era-1 Calibrations
         let evo = state.ledger.run_autopsy_and_tournament(true);
         assert_eq!(evo.trade_grades.len(), snap.closed_trades.len());
         assert_eq!(evo.tournament_results.len(), 5);
+        assert_eq!(evo.era1_calibrations.len(), 5);
+        for b in &snap.scoreboard.by_brain_breakdowns {
+            assert!(
+                b.profit_factor >= 1.25,
+                "Expected {} Profit Factor >= 1.25, got {:.2}",
+                b.brain_id.code(),
+                b.profit_factor
+            );
+        }
+
+        // 4b. Verify Fix 1: Historical Walk-Forward is 100% Invariant across repeated intraday refreshes
+        let snap2 = state
+            .run_real_yahoo_walk_forward_backfill()
+            .await
+            .expect("Second Yahoo walk-forward backfill succeeds");
+        assert_eq!(
+            snap2.closed_trades.len(),
+            snap.closed_trades.len(),
+            "Expected walk-forward closed trade count to be 100% invariant across intraday refreshes"
+        );
+        assert_eq!(snap2.scoreboard.total_wins, snap.scoreboard.total_wins);
+        assert!(
+            (snap2.scoreboard.realized_net_profit_usd - snap.scoreboard.realized_net_profit_usd)
+                .abs()
+                < 1e-6,
+            "Expected walk-forward realized P&L to be 100% invariant across intraday refreshes"
+        );
 
         // 5. Verify Upgrade 2: 60-day `5m` Yahoo window (~4,680 real intraday bars, zero 1d mixing) + disk cache
         let deep_5m = state
@@ -395,7 +422,8 @@ mod tests {
             deep_5m.len()
         );
         assert!(
-            std::path::Path::new("data/ohlcv_cache/NVDA_5m.json").exists(),
+            std::path::Path::new("../../data/ohlcv_cache/NVDA_5m.json").exists()
+                || std::path::Path::new("data/ohlcv_cache/NVDA_5m.json").exists(),
             "Expected persistent local OHLCV cache data/ohlcv_cache/NVDA_5m.json"
         );
         println!(

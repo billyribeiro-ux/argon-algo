@@ -249,6 +249,20 @@ export interface ChampionChallengerEntry {
   promotionReason: string;
 }
 
+export interface Era1BrainCalibrationEntry {
+  brainId: string;
+  calibratedConfidenceFloor: number;
+  minPrecedentWinRatePct: number;
+  minExpectedRMultiple: number;
+  chartTapePhysicsWeight: number;
+  optionsGammaVannaWeight: number;
+  shortFloatSqueezeWeight: number;
+  marketInternalsMacroWeight: number;
+  era1SampleTrades: number;
+  era1CalibratedWinRatePct: number;
+  era1CalibratedProfitFactor: number;
+}
+
 export interface BrainEvolutionStatusPayload {
   lastAutopsyIso: string;
   totalAutopsyRuns: number;
@@ -258,6 +272,7 @@ export interface BrainEvolutionStatusPayload {
   chopConfidenceFloorPct: number;
   tradeGrades: AutopsyTradeGradeEntry[];
   tournamentResults: ChampionChallengerEntry[];
+  era1Calibrations: Era1BrainCalibrationEntry[];
 }
 
 const API_BASE = 'http://127.0.0.1:8080';
@@ -985,6 +1000,25 @@ export class TerminalStore {
         }))
       : [];
 
+    const era1Calibrations = Array.isArray(raw.era1_calibrations)
+      ? raw.era1_calibrations.map((c: Record<string, unknown>) => {
+          const sw = (c.stream_prior_weights ?? {}) as Record<string, unknown>;
+          return {
+            brainId: String(c.brain_id ?? 'BRAIN-02'),
+            calibratedConfidenceFloor: Number(c.calibrated_confidence_floor ?? 64.0),
+            minPrecedentWinRatePct: Number(c.min_precedent_win_rate_pct ?? 58.0),
+            minExpectedRMultiple: Number(c.min_expected_r_multiple ?? 1.35),
+            chartTapePhysicsWeight: Number(sw.chart_tape_physics_weight ?? 0.25),
+            optionsGammaVannaWeight: Number(sw.options_gamma_vanna_weight ?? 0.25),
+            shortFloatSqueezeWeight: Number(sw.short_float_squeeze_weight ?? 0.25),
+            marketInternalsMacroWeight: Number(sw.market_internals_macro_weight ?? 0.25),
+            era1SampleTrades: Number(c.era1_sample_trades ?? 96),
+            era1CalibratedWinRatePct: Number(c.era1_calibrated_win_rate_pct ?? 72.0),
+            era1CalibratedProfitFactor: Number(c.era1_calibrated_profit_factor ?? 1.95)
+          };
+        })
+      : [];
+
     this.evolutionStatus = {
       lastAutopsyIso: String(raw.last_autopsy_iso ?? new Date().toISOString()),
       totalAutopsyRuns: Number(raw.total_autopsy_runs ?? 1),
@@ -993,7 +1027,8 @@ export class TerminalStore {
       chopThrottleActive: Boolean(raw.chop_throttle_active ?? false),
       chopConfidenceFloorPct: Number(raw.chop_confidence_floor_pct ?? 68.0),
       tradeGrades: grades,
-      tournamentResults: tournament
+      tournamentResults: tournament,
+      era1Calibrations
     };
   }
 

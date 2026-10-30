@@ -91,22 +91,34 @@
     return windowedBars[hoveredBarIndex] ?? null;
   });
 
+  const activeInspectBar = $derived.by(() => {
+    if (hoveredBar) return hoveredBar;
+    return windowedBars.length > 0 ? windowedBars[windowedBars.length - 1]! : null;
+  });
+
   const hoveredBarLogReturnPct = $derived.by(() => {
-    if (!hoveredBar || hoveredBar.open <= 0) return 0;
-    return Math.log(hoveredBar.close / hoveredBar.open) * 100;
+    if (!activeInspectBar || activeInspectBar.open <= 0) return 0;
+    return Math.log(activeInspectBar.close / activeInspectBar.open) * 100;
   });
 
   const chartGeometry = $derived.by(() => {
     const bars = windowedBars;
-    const allPrices = [
+    const barPrices = bars
+      .flatMap((b) => [b.high, b.low])
+      .filter((p) => Number.isFinite(p) && p > 0);
+    const refMid =
+      barPrices.length > 0
+        ? (Math.min(...barPrices) + Math.max(...barPrices)) * 0.5
+        : blueprint.entryPrice || 100;
+    const levelCandidates = [
       blueprint.entryPrice,
       blueprint.structuralStopPrice,
       blueprint.target1Price,
-      blueprint.target2Price,
-      ...bars.flatMap((b) => [b.high, b.low]),
-      ...symbolClosedTrades.flatMap((t) => [t.entryPrice, t.exitPrice]),
-      ...symbolOpenPositions.flatMap((p) => [p.entryPrice, p.livePrice])
-    ].filter((p) => Number.isFinite(p) && p > 0);
+      blueprint.target2Price
+    ].filter(
+      (p) => Number.isFinite(p) && p > 0 && Math.abs(p - refMid) / Math.max(refMid, 0.00001) <= 0.22
+    );
+    const allPrices = [...barPrices, ...levelCandidates];
 
     const safePrices = allPrices.length > 0 ? allPrices : [100, 105];
     const minP = Math.min(...safePrices) * 0.996;
@@ -121,7 +133,10 @@
     const plotHeight = height - padTop - padBottom;
 
     const priceToY = (p: number) =>
-      padTop + plotHeight - ((p - minP) / rangeP) * plotHeight;
+      Math.max(
+        padTop,
+        Math.min(padTop + plotHeight, padTop + plotHeight - ((p - minP) / rangeP) * plotHeight)
+      );
 
     return {
       width,
@@ -429,28 +444,31 @@
     </div>
   </div>
 
-  <!-- Interactive Crosshair Hover Telemetry Bar -->
-  {#if hoveredBar}
-    <div
-      class="tabular-num"
-      style="display: flex; flex-wrap: wrap; gap: 12px; padding: 5px 12px; background: oklch(0.16 0.02 255); border-block-end: 1px solid var(--border-subtle); font-size: 0.69rem;"
-    >
+  <!-- Zero-CLS Always-Mounted Crosshair / Latest-Bar Telemetry Bar -->
+  <div
+    class="tabular-num"
+    style="display: flex; flex-wrap: wrap; gap: 12px; padding: 5px 12px; min-block-size: 27px; align-items: center; background: oklch(0.16 0.02 255); border-block-end: 1px solid var(--border-subtle); font-size: 0.69rem;"
+  >
+    {#if activeInspectBar}
       <span>
-        TIME: <strong>{new Date(hoveredBar.timestampMs).toISOString().replace('T', ' ').slice(0, 19)} UTC</strong>
+        {hoveredBar ? 'CROSSHAIR' : 'LATEST BAR'}:
+        <strong>{new Date(activeInspectBar.timestampMs).toISOString().replace('T', ' ').slice(0, 19)} UTC</strong>
       </span>
-      <span>O: <strong>{formatSubPennyPrice(hoveredBar.open)}</strong></span>
-      <span>H: <strong class="pnl-positive">{formatSubPennyPrice(hoveredBar.high)}</strong></span>
-      <span>L: <strong class="pnl-negative">{formatSubPennyPrice(hoveredBar.low)}</strong></span>
-      <span>C: <strong>{formatSubPennyPrice(hoveredBar.close)}</strong></span>
-      <span>VOL: <strong>{hoveredBar.volume.toLocaleString('en-US')}</strong></span>
+      <span>O: <strong>{formatSubPennyPrice(activeInspectBar.open)}</strong></span>
+      <span>H: <strong class="pnl-positive">{formatSubPennyPrice(activeInspectBar.high)}</strong></span>
+      <span>L: <strong class="pnl-negative">{formatSubPennyPrice(activeInspectBar.low)}</strong></span>
+      <span>C: <strong>{formatSubPennyPrice(activeInspectBar.close)}</strong></span>
+      <span>VOL: <strong>{activeInspectBar.volume.toLocaleString('en-US')}</strong></span>
       <span class={hoveredBarLogReturnPct >= 0 ? 'pnl-positive' : 'pnl-negative'}>
         LOG RET: <strong>{hoveredBarLogReturnPct >= 0 ? '+' : ''}{hoveredBarLogReturnPct.toFixed(3)}%</strong>
       </span>
       <span style="color: var(--signal-ai-core);">
-        ATTN WEIGHT: <strong>{(hoveredBar.attentionWeight * 100).toFixed(1)}%</strong>
+        ATTN WEIGHT: <strong>{(activeInspectBar.attentionWeight * 100).toFixed(1)}%</strong>
       </span>
-    </div>
-  {/if}
+    {:else}
+      <span style="color: var(--text-secondary);">Hover chart candlesticks to inspect sub-millisecond OHLCV &amp; attention telemetry</span>
+    {/if}
+  </div>
 
   <!-- Pure Raw Price & Volume Canvas + AI Attention Heatmap Overlay + Trade Entry/Exit Markers -->
   <div style="padding: 10px 12px; background: var(--surface-0); position: relative;">

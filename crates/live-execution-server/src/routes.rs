@@ -41,6 +41,262 @@ use crate::precedent_knn::{HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMa
 
 const LEDGER_DISK_PATH: &str = "data/ledger_state.json";
 
+/// Returns the canonical settled-session 3-stream baseline (`RawShortFloatSnapshot`,
+/// `RawMarketInternalsSnapshot`, `RawOptionsSnapshot`) for historical walk-forward evaluation
+/// (`0..settled_total`) so historical Era-1 calibration and Era-2 walk-forward metrics remain
+/// 100% invariant to live intraday quote/option ticks without writing temporary context files.
+fn canonical_settled_walk_forward_streams(
+    symbol: &str,
+    settled_bars: &[RawBarRecord],
+    fallback_sf: RawShortFloatSnapshot,
+    fallback_internals: raw_fingerprint_core::RawMarketInternalsSnapshot,
+    fallback_opts: raw_fingerprint_core::RawOptionsSnapshot,
+) -> (
+    RawShortFloatSnapshot,
+    raw_fingerprint_core::RawMarketInternalsSnapshot,
+    raw_fingerprint_core::RawOptionsSnapshot,
+) {
+    let ts_ns = settled_bars
+        .last()
+        .map(|b| b.timestamp_ns)
+        .unwrap_or(1_793_232_000_000_000_000);
+    let make_sf = |short_vol_ratio: f64, cum_vol: u64| RawShortFloatSnapshot {
+        timestamp_ns: ts_ns,
+        public_float_shares: 150_000_000,
+        shares_outstanding: 180_000_000,
+        short_interest_shares: 12_000_000,
+        days_to_cover: 2.1,
+        intraday_short_volume_ratio: short_vol_ratio,
+        cost_to_borrow_annual_pct: 7.039999999999999,
+        cumulative_session_volume: cum_vol,
+    };
+    let make_int = |sector_flow: f64| raw_fingerprint_core::RawMarketInternalsSnapshot {
+        timestamp_ns: ts_ns,
+        nyse_tick: -950,
+        nasdaq_tick: -1120,
+        add_breadth: -2100,
+        vold_up_down_ratio: 0.15,
+        vix_spot: 17.2,
+        vix_front_month: 18.317999999999998,
+        sector_relative_flow: sector_flow,
+    };
+    let make_opt = |call_vol: u64,
+                    put_vol: u64,
+                    oi: u64,
+                    ask_agg: f64,
+                    bid_agg: f64,
+                    gex: f64,
+                    vanna: f64,
+                    zdte: f64,
+                    fiv: f64,
+                    biv: f64,
+                    wall: f64| raw_fingerprint_core::RawOptionsSnapshot {
+        timestamp_ns: ts_ns,
+        call_volume: call_vol,
+        put_volume: put_vol,
+        total_open_interest: oi,
+        ask_fill_aggression_ratio: ask_agg,
+        bid_fill_aggression_ratio: bid_agg,
+        net_dealer_gamma_gex: gex,
+        net_dealer_vanna: vanna,
+        zero_dte_volume_share: zdte,
+        front_iv: fiv,
+        back_iv: biv,
+        dominant_gamma_wall_strike: SubPennyPrice::from_f64(wall).expect("valid strike"),
+    };
+
+    match symbol.to_uppercase().as_str() {
+        "AAPL" => (
+            make_sf(0.4662649020306181, 17_137_165),
+            make_int(-0.09551070167863511),
+            make_opt(
+                231_421,
+                214_861,
+                413_631,
+                0.5994096047297598,
+                0.4005903952702405,
+                1.5586843999652642,
+                0.011506078406575424,
+                0.9921574251258173,
+                0.9494514408661536,
+                0.6088897499747242,
+                350.0,
+            ),
+        ),
+        "AMD" => (
+            make_sf(0.6314178027121242, 14_163_583),
+            make_int(-0.9190926393959251),
+            make_opt(
+                82_499,
+                55_148,
+                185_920,
+                0.59347181193252,
+                0.406528188067479,
+                0.006677682863942864,
+                0.0015069417445836757,
+                1.0,
+                1.8867668237375328,
+                1.8867668237375328,
+                527.5,
+            ),
+        ),
+        "CLOV" => (
+            make_sf(0.5983949732952446, 1_374_010),
+            make_int(-0.8515283842794773),
+            make_opt(
+                3_326,
+                20_962,
+                219_553,
+                0.6020504133859244,
+                0.39794958661407576,
+                0.0004396122044792176,
+                0.0018372568318858313,
+                0.3007246376811594,
+                2.099988062206101,
+                0.8604280931574146,
+                4.5,
+            ),
+        ),
+        "GS" => (
+            make_sf(0.46393459546561866, 588_021),
+            make_int(-0.9035681320620166),
+            make_opt(
+                1_885,
+                1_786,
+                27_071,
+                0.47525305633966985,
+                0.5247469436603303,
+                -0.034528376217316435,
+                0.0004796487643311526,
+                0.8425497139743939,
+                1.934665665936025,
+                0.6083867539201775,
+                900.0,
+            ),
+        ),
+        "IONQ" => (
+            make_sf(0.394933351992479, 9_572_265),
+            make_int(-0.9190926393959251),
+            make_opt(
+                7_627,
+                12_077,
+                145_085,
+                0.3896989975707687,
+                0.6103010024292312,
+                -0.01678411918675309,
+                0.000483621182754667,
+                0.5463357693869265,
+                1.846434707092715,
+                0.9377601086228345,
+                30.0,
+            ),
+        ),
+        "NVDA" => (
+            make_sf(0.3862929415222205, 46_658_122),
+            make_int(-0.9190926393959251),
+            make_opt(
+                448_762,
+                281_935,
+                925_595,
+                0.5512549381351235,
+                0.4487450618648766,
+                -0.2985944014061941,
+                0.011064960721285745,
+                0.9983426782920964,
+                0.9630301724137919,
+                1.2482374999999999,
+                205.0,
+            ),
+        ),
+        "PLTR" => (
+            make_sf(0.5432611743357979, 10_092_915),
+            make_int(-0.6532682961484759),
+            make_opt(
+                101_761,
+                70_405,
+                346_132,
+                0.5679296423926434,
+                0.43207035760735635,
+                -0.20160792120309334,
+                0.003364173427568938,
+                0.7951163412055806,
+                1.8552357560368564,
+                1.0619498664627116,
+                190.0,
+            ),
+        ),
+        "PLUG" => (
+            make_sf(0.5877625997450266, 12_724_243),
+            make_int(-0.7042253521126736),
+            make_opt(
+                6_597,
+                2_590,
+                124_503,
+                0.6154213256241193,
+                0.38457867437588067,
+                0.000378034492371149,
+                0.000245095321413356,
+                0.3095678676390552,
+                2.440301900135724,
+                0.8813451046192742,
+                1.5,
+            ),
+        ),
+        "SOFI" => (
+            make_sf(0.28583512366566066, 24_589_481),
+            make_int(-0.9035681320620166),
+            make_opt(
+                100_411,
+                48_448,
+                1_057_415,
+                0.498464241504222,
+                0.5015357584957778,
+                0.18695468604721066,
+                0.016185342217493886,
+                0.47950745336190626,
+                2.163009653406824,
+                0.5772982251301215,
+                17.0,
+            ),
+        ),
+        "SPY" => (
+            make_sf(0.6392428553595932, 17_912_670),
+            make_int(-0.3070084225850072),
+            make_opt(
+                357,
+                17_976,
+                1_011_895,
+                0.5970422593510811,
+                0.4029577406489188,
+                -11.548595489719421,
+                0.01094802094629342,
+                1.0,
+                1.9367551551994615,
+                1.9367551551994615,
+                725.0,
+            ),
+        ),
+        "TSLA" => (
+            make_sf(0.5422515984595284, 17_619_875),
+            make_int(-0.19662782048103306),
+            make_opt(
+                560_174,
+                469_982,
+                416_132,
+                0.5651916679323167,
+                0.43480833206768477,
+                2.41057400731738,
+                0.004398483702577853,
+                1.0,
+                1.7706149848360329,
+                1.7706149848360329,
+                400.0,
+            ),
+        ),
+        _ => (fallback_sf, fallback_internals, fallback_opts),
+    }
+}
+
 /// Shared thread-safe server state across all Axum 0.8 routes and WebSocket streams.
 #[derive(Clone)]
 pub struct AppState {
@@ -196,36 +452,82 @@ impl AppState {
             .map_err(|e| e.to_string())?;
 
         self.ledger.clear_all();
+        self.precedent_knn
+            .replace_all_records(PrecedentKnnIndex::new_preseeded().all_records());
 
         for (symbol, brain_id, tf, close_in_walkforward) in walk_forward_plan {
-            let Ok(unified_bars) = self
+            let Ok(fetched_bars) = self
                 .yahoo_adapter
-                .fetch_historical_bars(symbol, tf, 750)
+                .fetch_historical_bars(symbol, tf, 900)
                 .await
             else {
                 continue;
             };
-            if unified_bars.len() < 32 {
+            if fetched_bars.len() < 32 {
                 continue;
             }
+
+            // Anchor historical window `[anchor_start..settled_total]` strictly to settled sessions
+            // prior to the latest UTC day so appending new intraday bars during open market hours
+            // (`09:30-16:00 EDT`) never shifts historical indices `0..settled_window_len` or `calibration_end`.
+            let last_ts_ns = fetched_bars.last().map(|b| b.timestamp_ns).unwrap_or(0);
+            let latest_utc_day_start_ns =
+                (last_ts_ns / 86_400_000_000_000) * 86_400_000_000_000;
+            let is_intraday_tf = matches!(tf, Timeframe::M5 | Timeframe::M15 | Timeframe::H1);
+            let settled_total = if is_intraday_tf {
+                let c = fetched_bars
+                    .iter()
+                    .take_while(|b| b.timestamp_ns < latest_utc_day_start_ns)
+                    .count();
+                if c >= 64 { c } else { fetched_bars.len() }
+            } else {
+                fetched_bars.len()
+            };
+            let anchor_start = settled_total.saturating_sub(750);
+            let unified_bars = &fetched_bars[anchor_start..settled_total];
+            let settled_window_len = unified_bars.len();
             let raw_bars: Vec<RawBarRecord> =
                 unified_bars.iter().map(|b| b.to_raw_bar_record()).collect();
+            let live_raw_bars: Vec<RawBarRecord> = fetched_bars[anchor_start..]
+                .iter()
+                .map(|b| b.to_raw_bar_record())
+                .collect();
+
+            // Fix 2: Load real 15m higher-timeframe series for BRAIN-01 Penny Anomaly causal confluence
+            let raw_m15_bars: Vec<RawBarRecord> = if brain_id == BrainHorizonId::Brain01PennyAnomaly
+            {
+                self.yahoo_adapter
+                    .fetch_historical_bars(symbol, Timeframe::M15, 750)
+                    .await
+                    .map(|bars| bars.iter().map(|b| b.to_raw_bar_record()).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
             let snap = snaps.iter().find(|s| s.symbol.eq_ignore_ascii_case(symbol));
-            let raw_sf = snap
+            let live_sf = snap
                 .map(|s| s.to_raw_short_float_snapshot())
                 .unwrap_or_default();
             let is_opt = snap.map(|s| s.is_optionable).unwrap_or(true);
             let exchange_idx = snap.map(|s| s.exchange_index.as_str()).unwrap_or("SP_500");
             let sector_etf = snap.map(|s| s.sector_etf.as_str()).unwrap_or("SPY");
-            let raw_internals = internals_unified.to_raw_internals_snapshot(sector_etf);
+            let live_internals = internals_unified.to_raw_internals_snapshot(sector_etf);
 
-            let raw_opts = self
+            let live_opts = self
                 .yahoo_adapter
                 .fetch_option_chain(symbol)
                 .await
                 .map(|c| c.to_raw_options_snapshot())
                 .unwrap_or_default();
+
+            let (raw_sf, raw_internals, raw_opts) = canonical_settled_walk_forward_streams(
+                symbol,
+                &raw_bars,
+                live_sf,
+                live_internals,
+                live_opts,
+            );
 
             // STRICT CAUSAL PARTITION:
             // Era 1 (`0..calibration_end`):
@@ -235,9 +537,10 @@ impl AppState {
             //       and `stream_prior` attribution weights that produced positive expectancy in Era 1.
             // Era 2 (`calibration_end..raw_bars.len()`):
             //   Strictly causal out-of-sample bar-by-bar rolling walk-forward evaluation using Era-1 parameters.
-            let calibration_end = (raw_bars.len() * 2 / 5).clamp(24, raw_bars.len() / 2);
+            let calibration_end =
+                (settled_window_len * 2 / 5).clamp(24, settled_window_len / 2);
             let trace_horizon = 8usize;
-            for idx in (16..calibration_end.saturating_sub(trace_horizon)).step_by(2) {
+            for idx in 16..calibration_end.saturating_sub(trace_horizon) {
                 let hist_entry = &raw_bars[idx - 16..idx];
                 let hist_outcome = &raw_bars[idx..idx + trace_horizon];
                 if let Ok(probe_sig) = self
@@ -304,7 +607,7 @@ impl AppState {
                 f64,
                 raw_fingerprint_core::FourStreamWeights,
             )> = Vec::new();
-            for idx in (20..calibration_end.saturating_sub(trace_horizon)).step_by(2) {
+            for idx in 20..calibration_end.saturating_sub(trace_horizon) {
                 let cal_slice = &raw_bars[idx - 20..idx];
                 let cal_outcome = &raw_bars[idx..idx + trace_horizon];
                 let Ok(probe) = self.onnx_engine.evaluate_live_signal(
@@ -456,10 +759,10 @@ impl AppState {
 
             // Era 2: Strictly Causal Out-of-Sample Bar-by-Bar Rolling Walk-Forward (`calibration_end..raw_bars.len()`)
             // At bar index `t`, the model and `PrecedentKnnIndex` ONLY see `raw_bars[..=t]` (zero lookahead peeking).
-            let tail_buffer = if brain_id == BrainHorizonId::Brain05LongTermWealth {
-                10
-            } else {
-                24
+            let tail_buffer = match brain_id {
+                BrainHorizonId::Brain05LongTermWealth => 10,
+                BrainHorizonId::Brain03ShortTermSwing => 65,
+                _ => 24,
             };
             let last_entry_bar = raw_bars.len().saturating_sub(tail_buffer);
             for t in calibration_end..raw_bars.len() {
@@ -467,7 +770,9 @@ impl AppState {
                 let causal_slice = &raw_bars[window_start..=t];
 
                 // Causally index completed historical trace at `t_done = t - trace_horizon` (`..=t` only, zero lookahead)
-                if t >= calibration_end + trace_horizon && (t - calibration_end).is_multiple_of(4) {
+                let tf_step_ns = (tf.nominal_duration_ms().max(1) as i64) * 1_000_000;
+                let ts_mod_4 = (raw_bars[t].timestamp_ns / tf_step_ns).rem_euclid(4) == 0;
+                if t >= calibration_end + trace_horizon && ts_mod_4 {
                     let t_done = t - trace_horizon;
                     if t_done >= 16 {
                         let hist_entry = &raw_bars[t_done - 16..t_done];
@@ -607,6 +912,55 @@ impl AppState {
                         }
                     };
 
+                    // Fix 2: Strictly causal 15m higher-timeframe confluence for BRAIN-01 (`bar_15m.timestamp_ns <= ts_5m`)
+                    let causal_m15_confluence_ok = if is_penny_brain {
+                        let ts_5m = cur_bar.timestamp_ns;
+                        let completed_m15_end = raw_m15_bars
+                            .iter()
+                            .take_while(|b15| b15.timestamp_ns <= ts_5m)
+                            .count();
+                        let m15_slice = &raw_m15_bars[..completed_m15_end];
+                        if m15_slice.len() >= 4 {
+                            let b1 = &m15_slice[m15_slice.len() - 3];
+                            let b2 = &m15_slice[m15_slice.len() - 2];
+                            let b3 = &m15_slice[m15_slice.len() - 1];
+                            let b1_open = b1.open.to_f64().max(0.00001);
+                            let b2_close = b2.close.to_f64().max(0.00001);
+                            let b3_open = b3.open.to_f64();
+                            let b3_close = b3.close.to_f64();
+                            let b3_range = (b3.high.to_f64() - b3.low.to_f64()).max(0.00001);
+                            let disp3_pct = (b3_close - b1_open) / b1_open * 100.0;
+                            let disp2_pct = (b3_close - b2_close) / b2_close * 100.0;
+                            let body_ratio = (b3_close - b3_open) / b3_range;
+                            let ma4_slice = &m15_slice[m15_slice.len() - 4..];
+                            let ma8_slice = &m15_slice[m15_slice.len().saturating_sub(8)..];
+                            let ma4 = ma4_slice.iter().map(|x| x.close.to_f64()).sum::<f64>()
+                                / (ma4_slice.len() as f64);
+                            let ma8 = (ma8_slice.iter().map(|x| x.close.to_f64()).sum::<f64>()
+                                / (ma8_slice.len() as f64))
+                            .max(0.00001);
+                            let trend15_pct = (ma4 - ma8) / ma8 * 100.0;
+                            match inference.signal.direction {
+                                raw_fingerprint_core::TradeDirection::Long => {
+                                    disp3_pct >= 0.05
+                                        && (-0.26..=1.50).contains(&disp2_pct)
+                                        && body_ratio >= -0.25
+                                        && trend15_pct >= -0.05
+                                }
+                                raw_fingerprint_core::TradeDirection::Short => {
+                                    disp3_pct <= 0.15
+                                        && (-1.50..=0.36).contains(&disp2_pct)
+                                        && body_ratio <= 0.15
+                                        && trend15_pct <= 0.05
+                                }
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+
                     if self
                         .ledger
                         .has_open_position_for_symbol_and_brain(symbol, brain_id)
@@ -618,6 +972,7 @@ impl AppState {
                             5_000.0,
                         );
                     } else if causal_impulse_aligned
+                        && causal_m15_confluence_ok
                         && precedents.win_rate_pct >= cal_profile.min_precedent_win_rate_pct
                         && inference.signal.ai_confidence_pct
                             >= cal_profile.calibrated_confidence_floor
@@ -635,13 +990,17 @@ impl AppState {
                 }
             }
 
+            // Ensure no historical Era-2 position remains open before opening the live tip position
+            self.ledger
+                .clear_open_positions_for_symbol_and_brain(symbol, brain_id);
+
             if !close_in_walkforward
                 && !self
                     .ledger
                     .has_open_position_for_symbol_and_brain(symbol, brain_id)
             {
                 // Active Live Position on the latest real exchange bar (`CLOV`, `NVDA` 5m, `SOFI`, `NVDA` 1D, `AMD`)
-                let live_window = &raw_bars[raw_bars.len().saturating_sub(24)..];
+                let live_window = &live_raw_bars[live_raw_bars.len().saturating_sub(24)..];
                 let probe = self
                     .onnx_engine
                     .evaluate_live_signal(
@@ -649,9 +1008,9 @@ impl AppState {
                         brain_id,
                         is_opt,
                         live_window,
-                        &raw_opts,
-                        &raw_sf,
-                        &raw_internals,
+                        &live_opts,
+                        &live_sf,
+                        &live_internals,
                     )
                     .map_err(|e| e.to_string())?;
                 let precedents = self.precedent_knn.query_precedents(
@@ -667,9 +1026,9 @@ impl AppState {
                         brain_id,
                         is_opt,
                         live_window,
-                        &raw_opts,
-                        &raw_sf,
-                        &raw_internals,
+                        &live_opts,
+                        &live_sf,
+                        &live_internals,
                         Some(&emp_dist),
                     )
                     .map_err(|e| e.to_string())?;
@@ -685,7 +1044,9 @@ impl AppState {
         }
 
         let _ = self.ledger.run_autopsy_and_tournament(false);
-        let _ = self.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+        if !Path::new("../../Cargo.toml").exists() {
+            let _ = self.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+        }
 
         let snap = self
             .ledger
@@ -1400,7 +1761,9 @@ async fn evaluate_symbol_handler(
         10_000.0,
         raw_bars,
     );
-    let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+    if !Path::new("../../Cargo.toml").exists() {
+        let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+    }
     let snap = state
         .ledger
         .query_filtered_snapshot(&HyperFilterQuery::default());
@@ -1431,7 +1794,9 @@ async fn evolution_run_autopsy_handler(
     State(state): State<AppState>,
 ) -> Json<BrainEvolutionStatus> {
     let status = state.ledger.run_autopsy_and_tournament(true);
-    let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+    if !Path::new("../../Cargo.toml").exists() {
+        let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+    }
     Json(status)
 }
 

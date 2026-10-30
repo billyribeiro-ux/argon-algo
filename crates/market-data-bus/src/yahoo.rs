@@ -450,13 +450,27 @@ impl YahooSessionManager {
             .unwrap_or_default();
 
         let merged = if !nasdaq_bars.is_empty() {
-            // Append any newer bar from Yahoo only if it is a complete session candle with real wicks
-            if let (Some(last_nasdaq), Some(last_yahoo)) = (nasdaq_bars.last(), yahoo_bars.last())
-                && last_yahoo.timestamp_sec > last_nasdaq.timestamp_sec + 43_200
-                && last_yahoo.high > last_yahoo.low
-                && last_yahoo.open != last_yahoo.low
-            {
-                nasdaq_bars.push(*last_yahoo);
+            // Append a newer Yahoo daily bar ONLY if at least 24h (`86_400`s) has elapsed since the last
+            // settled `20:00:00 UTC` daily close AND its canonical `20:00:00 UTC` close time has passed.
+            // Never let an unclosed same-day partial bar (`09:30–16:00 EDT`) shift settled candle indices.
+            let now_sec = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if let (Some(last_nasdaq), Some(last_yahoo)) = (nasdaq_bars.last(), yahoo_bars.last()) {
+                let yahoo_utc_day = last_yahoo.timestamp_sec.div_euclid(86_400);
+                let nasdaq_utc_day = last_nasdaq.timestamp_sec.div_euclid(86_400);
+                let canonical_close_sec = yahoo_utc_day * 86_400 + 20 * 3_600;
+                if yahoo_utc_day > nasdaq_utc_day
+                    && last_yahoo.timestamp_sec >= last_nasdaq.timestamp_sec + 86_400
+                    && now_sec >= canonical_close_sec
+                    && last_yahoo.high > last_yahoo.low
+                    && last_yahoo.open != last_yahoo.low
+                {
+                    let mut settled_bar = *last_yahoo;
+                    settled_bar.timestamp_sec = canonical_close_sec;
+                    nasdaq_bars.push(settled_bar);
+                }
             }
             nasdaq_bars
         } else if !yahoo_bars.is_empty() {
@@ -485,8 +499,9 @@ impl YahooSessionManager {
     }
 
     /// Merges newly fetched exchange OHLCV bars with the persistent local disk cache
-    /// (`data/ohlcv_cache/{symbol}_{timeframe}.json`), deduplicating by `timestamp_sec`
-    /// (`timestamp_ns = timestamp_sec * 1_000_000_000`) and sorting chronologically oldest-first.
+    /// (`data/ohlcv_cache/{symbol}_{timeframe}.json`), deduplicating by canonical period key
+    /// (`UTC day` for `1D`, `ISO Calendar Week` for `1W`, `timestamp_sec` for intraday)
+    /// and sorting chronologically oldest-first.
     pub fn merge_and_persist_ohlcv_disk_cache(
         symbol: &str,
         timeframe: Timeframe,
@@ -499,16 +514,38 @@ impl YahooSessionManager {
         let primary_dir = std::path::PathBuf::from("data/ohlcv_cache");
         let workspace_dir = std::path::PathBuf::from("../../data/ohlcv_cache");
 
-        let mut by_ts = std::collections::BTreeMap::<i64, RealExchangeOhlcvBar>::new();
+        let canonical_key = |ts_sec: i64| -> i64 {
+            match timeframe {
+                Timeframe::D1 => ts_sec.div_euclid(86_400),
+                Timeframe::W1 => (ts_sec + 3 * 86_400).div_euclid(604_800),
+                _ => ts_sec,
+            }
+        };
 
-        for dir in [&workspace_dir, &primary_dir] {
-            let file_path = dir.join(&filename);
-            if let Ok(bytes) = std::fs::read(&file_path)
-                && let Ok(existing) = serde_json::from_slice::<Vec<RealExchangeOhlcvBar>>(&bytes)
-            {
-                for b in existing {
-                    if b.timestamp_sec > 0 && b.open > 0.0 && b.close > 0.0 {
-                        by_ts.insert(b.timestamp_sec, b);
+        let mut by_key = std::collections::BTreeMap::<i64, RealExchangeOhlcvBar>::new();
+
+        // For 1W when fetched_bars already has a complete multi-year ISO-week aggregation,
+        // skip legacy `.chunks(5)` disk entries so holiday weeks never leave duplicate weekly bars.
+        let skip_existing_for_iso_weekly =
+            timeframe == Timeframe::W1 && fetched_bars.len() >= 100;
+
+        if !skip_existing_for_iso_weekly {
+            for dir in [&workspace_dir, &primary_dir] {
+                let file_path = dir.join(&filename);
+                if let Ok(bytes) = std::fs::read(&file_path)
+                    && let Ok(existing) =
+                        serde_json::from_slice::<Vec<RealExchangeOhlcvBar>>(&bytes)
+                {
+                    for b in existing {
+                        if b.timestamp_sec > 0 && b.open > 0.0 && b.close > 0.0 {
+                            if timeframe == Timeframe::D1
+                                && !fetched_bars.is_empty()
+                                && b.timestamp_sec.rem_euclid(86_400) != 20 * 3_600
+                            {
+                                continue;
+                            }
+                            by_key.insert(canonical_key(b.timestamp_sec), b);
+                        }
                     }
                 }
             }
@@ -516,20 +553,21 @@ impl YahooSessionManager {
 
         for &b in fetched_bars {
             if b.timestamp_sec > 0 && b.open > 0.0 && b.close > 0.0 {
-                by_ts.insert(b.timestamp_sec, b);
+                by_key.insert(canonical_key(b.timestamp_sec), b);
             }
         }
 
-        let merged: Vec<RealExchangeOhlcvBar> = by_ts.into_values().collect();
+        let merged: Vec<RealExchangeOhlcvBar> = by_key.into_values().collect();
         if !merged.is_empty()
             && let Ok(json_bytes) = serde_json::to_vec(&merged)
         {
-            let _ = std::fs::create_dir_all(&primary_dir);
-            let _ = std::fs::write(primary_dir.join(&filename), &json_bytes);
-            if std::path::Path::new("../../Cargo.toml").exists() {
-                let _ = std::fs::create_dir_all(&workspace_dir);
-                let _ = std::fs::write(workspace_dir.join(&filename), &json_bytes);
-            }
+            let target_dir = if std::path::Path::new("../../Cargo.toml").exists() {
+                &workspace_dir
+            } else {
+                &primary_dir
+            };
+            let _ = std::fs::create_dir_all(target_dir);
+            let _ = std::fs::write(target_dir.join(&filename), &json_bytes);
         }
 
         merged
@@ -616,8 +654,11 @@ impl YahooSessionManager {
         Ok(merged)
     }
 
-    /// Aggregates consecutive `RealExchangeOhlcvBar` slices of size `group_size` into higher-timeframe
-    /// real OHLCV candles (`open = first.open`, `high = max(high)`, `low = min(low)`, `close = last.close`, `volume = sum(volume)`).
+    /// Aggregates `RealExchangeOhlcvBar` slices into higher-timeframe real OHLCV candles
+    /// (`open = first.open`, `high = max(high)`, `low = min(low)`, `close = last.close`, `volume = sum(volume)`).
+    /// When `group_size == 5` on daily bars, groups strictly by **ISO Calendar Week**
+    /// (`(timestamp_sec + 3 * 86_400) / 604_800` aligned to Monday `00:00:00 UTC`) so 4-day holiday weeks
+    /// and partial Friday sessions never shift historical weekly bar boundaries.
     pub fn aggregate_real_ohlcv_bars(
         bars: &[RealExchangeOhlcvBar],
         group_size: usize,
@@ -625,6 +666,49 @@ impl YahooSessionManager {
         if group_size <= 1 || bars.is_empty() {
             return bars.to_vec();
         }
+
+        let is_daily_to_weekly = group_size == 5
+            && bars.len() >= 2
+            && (bars[1].timestamp_sec - bars[0].timestamp_sec).abs() >= 43_200;
+
+        if is_daily_to_weekly {
+            let mut out: Vec<RealExchangeOhlcvBar> = Vec::with_capacity(bars.len() / 4 + 2);
+            let mut idx = 0usize;
+            while idx < bars.len() {
+                let first = &bars[idx];
+                let week_key = (first.timestamp_sec + 3 * 86_400).div_euclid(604_800);
+                let mut end = idx + 1;
+                while end < bars.len()
+                    && (bars[end].timestamp_sec + 3 * 86_400).div_euclid(604_800) == week_key
+                {
+                    end += 1;
+                }
+                let chunk = &bars[idx..end];
+                let last = chunk.last().unwrap();
+                let high = chunk
+                    .iter()
+                    .map(|b| b.high)
+                    .fold(first.high, f64::max)
+                    .max(first.open.max(last.close));
+                let low = chunk
+                    .iter()
+                    .map(|b| b.low)
+                    .fold(first.low, f64::min)
+                    .min(first.open.min(last.close));
+                let volume: u64 = chunk.iter().map(|b| b.volume).sum();
+                out.push(RealExchangeOhlcvBar {
+                    timestamp_sec: last.timestamp_sec,
+                    open: first.open,
+                    high,
+                    low,
+                    close: last.close,
+                    volume: volume.max(100),
+                });
+                idx = end;
+            }
+            return out;
+        }
+
         let mut out = Vec::with_capacity(bars.len().div_ceil(group_size));
         for chunk in bars.chunks(group_size) {
             let first = chunk.first().unwrap();
@@ -2329,7 +2413,15 @@ impl MarketDataAdapter for YahooFinanceLiveAdapter {
             .session
             .fetch_real_timeframe_ohlcv_bars(symbol, timeframe, limit)
             .await?;
-        let last_px = ohlcv.last().map(|b| b.close).unwrap_or(10.0);
+        let last_ts = ohlcv.last().map(|b| b.timestamp_sec).unwrap_or(0);
+        let day_start = (last_ts / 86_400) * 86_400;
+        let last_px = ohlcv
+            .iter()
+            .rev()
+            .find(|b| b.timestamp_sec < day_start)
+            .or_else(|| ohlcv.last())
+            .map(|b| b.close)
+            .unwrap_or(10.0);
         let spread = (last_px * 0.0005).max(0.00001);
 
         Ok(Self::map_real_ohlcv_to_unified_bars(

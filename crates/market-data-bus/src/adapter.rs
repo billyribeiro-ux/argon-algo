@@ -40,7 +40,7 @@ pub struct ProviderTelemetry {
 }
 
 /// Standardized interface implemented by all free and institutional market data feeds.
-#[async_trait]
+#[allow(clippy::double_must_use)] #[async_trait]
 pub trait MarketDataAdapter: Send + Sync {
     /// Unique slot identifier (e.g., `"historical_replay"`, `"alpaca_free"`, `"schwab_direct"`).
     fn provider_id(&self) -> &'static str;

@@ -201,7 +201,7 @@ impl RawFingerprintEngine {
         let mut max_attn = 1e-6_f32;
 
         for (i, row) in flat_tensor
-            .chunks_exact_mut(FINGERPRINT_FEATURE_DIM)
+            .as_chunks_mut::<FINGERPRINT_FEATURE_DIM>().0.iter_mut()
             .enumerate()
         {
             let cur = &bars[i];
@@ -345,7 +345,7 @@ impl RawFingerprintEngine {
             .copy_from_slice(&flat_tensor[last_row_offset..last_row_offset + 32]);
 
         for (t, row) in flat_tensor
-            .chunks_exact(FINGERPRINT_FEATURE_DIM)
+            .as_chunks::<FINGERPRINT_FEATURE_DIM>().0.iter()
             .enumerate()
         {
             let is_recent = t >= recent_start;

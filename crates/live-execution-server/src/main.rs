@@ -56,26 +56,40 @@ async fn main() -> anyhow::Result<()> {
             let snap = bg_state
                 .ledger
                 .query_filtered_snapshot(&HyperFilterQuery::default());
-            let open_symbols: Vec<String> = snap
+            let open_targets: Vec<(String, raw_fingerprint_core::BrainHorizonId)> = snap
                 .positions_opened
                 .iter()
-                .map(|p| p.symbol.clone())
+                .map(|p| (p.symbol.clone(), p.brain_id))
                 .collect();
 
-            if !open_symbols.is_empty()
+            if !open_targets.is_empty()
                 && let Ok(internals_u) = bg_state.yahoo_adapter.fetch_market_internals().await
             {
                 let raw_internals = internals_u.to_raw_internals_snapshot("SPY");
-                for sym in &open_symbols {
+                for (sym, brain_id) in &open_targets {
+                    let native_tf = match brain_id {
+                        raw_fingerprint_core::BrainHorizonId::Brain01PennyAnomaly
+                        | raw_fingerprint_core::BrainHorizonId::Brain02IntradayDayTrade => {
+                            Timeframe::M5
+                        }
+                        raw_fingerprint_core::BrainHorizonId::Brain03ShortTermSwing => {
+                            Timeframe::H1
+                        }
+                        raw_fingerprint_core::BrainHorizonId::Brain04CoreSwing => Timeframe::D1,
+                        raw_fingerprint_core::BrainHorizonId::Brain05LongTermWealth => {
+                            Timeframe::W1
+                        }
+                    };
                     if let Ok(bars) = bg_state
                         .yahoo_adapter
-                        .fetch_historical_bars(sym, Timeframe::M5, 24)
+                        .fetch_historical_bars(sym, native_tf, 24)
                         .await
                     {
                         let raw_bars: Vec<RawBarRecord> =
                             bars.iter().map(|b| b.to_raw_bar_record()).collect();
-                        let _ = bg_state.ledger.process_live_bar_for_symbol(
+                        let _ = bg_state.ledger.process_live_bar_for_symbol_and_brain(
                             sym,
+                            *brain_id,
                             &raw_bars,
                             &raw_internals,
                         );

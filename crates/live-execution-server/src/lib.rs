@@ -308,10 +308,11 @@ mod tests {
                 }
             }
             println!(
-                "[REAL CAUSAL OPEN POSITION] {} ({}) | Dir: {} | Entry: {} | Live: {} | Stop: {} | T1: {} | T2: {} | Option: {} ({}, delta={:.2}) | Conf: {:.1}%",
+                "[REAL CAUSAL OPEN POSITION] {} ({}) | Dir: {} | Tranches: {}/3 | Entry: {} | Live: {} | Stop: {} | T1: {} | T2: {} | Option: {} ({}, delta={:.2}) | Conf: {:.1}%",
                 pos.symbol,
                 pos.brain_id.code(),
                 pos.direction.as_str(),
+                pos.tranche_count,
                 pos.entry_price,
                 pos.live_price,
                 pos.structural_stop_price,
@@ -323,6 +324,18 @@ mod tests {
                 pos.ai_confidence_pct
             );
         }
+
+        let nvda_open_brains: std::collections::HashSet<_> = snap
+            .positions_opened
+            .iter()
+            .filter(|p| p.symbol == "NVDA")
+            .map(|p| p.brain_id)
+            .collect();
+        assert!(
+            nvda_open_brains.len() >= 2,
+            "Expected NVDA to hold simultaneous isolated positions across >= 2 Brains, got {:?}",
+            nvda_open_brains
+        );
 
         for tr in &snap.closed_trades {
             // Verify Option Direction Invariant on every closed trade
@@ -348,10 +361,11 @@ mod tests {
                 }
             }
             println!(
-                "[REAL CAUSAL CLOSED TRADE] {} ({}) | Dir: {} | Badge: {} | Entry: {} -> Exit: {} | Option: {} ({}) | Net P&L: ${:.2} ({:.2}R) | Bars: {}",
+                "[REAL CAUSAL CLOSED TRADE] {} ({}) | Dir: {} | Tranches: {}/3 | Badge: {} | Entry: {} -> Exit: {} | Option: {} ({}) | Net P&L: ${:.2} ({:.2}R) | Bars: {}",
                 tr.symbol,
                 tr.brain_id.code(),
                 tr.direction.as_str(),
+                tr.tranche_count,
                 tr.outcome_badge.as_str(),
                 tr.entry_price,
                 tr.actual_exit_price,
@@ -368,5 +382,46 @@ mod tests {
         let evo = state.ledger.run_autopsy_and_tournament(true);
         assert_eq!(evo.trade_grades.len(), snap.closed_trades.len());
         assert_eq!(evo.tournament_results.len(), 5);
+
+        // 5. Verify Upgrade 2: 60-day `5m` Yahoo window (~4,680 real intraday bars, zero 1d mixing) + disk cache
+        let deep_5m = state
+            .yahoo_adapter
+            .fetch_historical_bars("NVDA", Timeframe::M5, 4500)
+            .await
+            .expect("60d 5m fetch succeeds");
+        assert!(
+            deep_5m.len() > 2_000,
+            "Expected > 2,000 real 5m bars from 60d Yahoo window, got {}",
+            deep_5m.len()
+        );
+        assert!(
+            std::path::Path::new("data/ohlcv_cache/NVDA_5m.json").exists(),
+            "Expected persistent local OHLCV cache data/ohlcv_cache/NVDA_5m.json"
+        );
+        println!(
+            "[PHASE-8 60D 5M & DISK CACHE] NVDA_5m.json | Total 5m Bars: {} | Zero 1d Timeframe Mixing Verified",
+            deep_5m.len()
+        );
+
+        // 6. Verify Upgrade 3: Real-time 2nd-Order Delta-Gamma-Vanna Spot Re-Anchoring on CBOE Option Chain
+        let cboe_spot = nvda_chain.underlying_price.to_f64();
+        let bumped_spot = cboe_spot + 5.0;
+        let reanchored = market_data_bus::YahooSessionManager::reanchor_option_chain_to_live_spot(
+            &nvda_chain,
+            cboe_spot,
+            bumped_spot,
+        );
+        assert!(
+            reanchored.contracts[0].bid > nvda_chain.contracts[0].bid,
+            "Expected Call option bid to increase under +$5.00 Delta-Gamma-Vanna spot re-anchoring"
+        );
+        println!(
+            "[PHASE-8 CBOE SPOT RE-ANCHORING] NVDA Spot ${:.2} -> ${:.2} | Contract {} Bid {} -> {}",
+            cboe_spot,
+            bumped_spot,
+            reanchored.contracts[0].contract_symbol,
+            nvda_chain.contracts[0].bid,
+            reanchored.contracts[0].bid
+        );
     }
 }

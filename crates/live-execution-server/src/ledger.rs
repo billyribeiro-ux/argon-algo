@@ -63,6 +63,10 @@ pub struct OpenPositionRow {
     pub peak_favorable_price: SubPennyPrice,
     pub max_adverse_price: SubPennyPrice,
     pub quantity_shares: f64,
+    #[serde(default = "default_tranche_count")]
+    pub tranche_count: u8,
+    #[serde(default)]
+    pub scale_in_history: Vec<String>,
     // Matched Options execution & live levels
     pub option_structure: String,
     pub matched_option_contract: String,
@@ -124,6 +128,10 @@ pub struct ClosedTradeRow {
     pub target_2_price: SubPennyPrice,
     pub actual_exit_price: SubPennyPrice,
     pub quantity_shares: f64,
+    #[serde(default = "default_tranche_count")]
+    pub tranche_count: u8,
+    #[serde(default)]
+    pub scale_in_history: Vec<String>,
     // Matched Options execution levels
     pub option_structure: String,
     pub matched_option_contract: String,
@@ -286,6 +294,10 @@ pub struct FilteredLedgerSnapshot {
     pub closed_trades: Vec<ClosedTradeRow>,
 }
 
+fn default_tranche_count() -> u8 {
+    1
+}
+
 fn format_timestamp_ns_iso(ts_ns: i64) -> String {
     let secs = ts_ns / 1_000_000_000;
     let nsecs = (ts_ns % 1_000_000_000).unsigned_abs() as u32;
@@ -335,6 +347,135 @@ impl RealTimeLedgerEngine {
             .read()
             .iter()
             .any(|p| p.symbol.eq_ignore_ascii_case(symbol))
+    }
+
+    /// Per-Brain position isolation check `(symbol, brain_id)`:
+    /// An open position in `BRAIN-05` or `BRAIN-04` on `NVDA` never blocks `BRAIN-02` or `BRAIN-03`
+    /// from opening an independent trade on `NVDA` in its own horizon.
+    pub fn has_open_position_for_symbol_and_brain(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+    ) -> bool {
+        self.positions_opened
+            .read()
+            .iter()
+            .any(|p| p.symbol.eq_ignore_ascii_case(symbol) && p.brain_id == brain_id)
+    }
+
+    /// Controlled Scale-In / Pyramiding Support (`max_tranches = 3`):
+    /// If `(symbol, brain_id)` already has an open position AND `trace_health_badge == TraceHealthBadge::Accelerating`
+    /// with `current_r_multiple >= 0.75` (stop already raised to breakeven or better) AND a new same-direction
+    /// signal fires with `confidence >= 82.0%` (`0.82`), scales in up to `tranche_count <= 3` by updating
+    /// volume-weighted average `entry_price`, `structural_stop_price`, and position size while logging the scale-in event.
+    pub fn try_scale_in_position(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+        inference: &LiveBrainInferenceOutput,
+        tranche_notional_usd: f64,
+    ) -> Option<OpenPositionRow> {
+        let sig = &inference.signal;
+        let opt = &inference.matched_option;
+        crate::onnx_engine::OnnxMultiBrainEngine::assert_option_direction_invariant(
+            sig.direction,
+            opt,
+        );
+
+        let normalized_conf = if sig.ai_confidence_pct <= 1.0 {
+            sig.ai_confidence_pct * 100.0
+        } else {
+            sig.ai_confidence_pct
+        };
+        if normalized_conf < 82.0 {
+            return None;
+        }
+
+        let mut open_list = self.positions_opened.write();
+        let pos = open_list
+            .iter_mut()
+            .find(|p| p.symbol.eq_ignore_ascii_case(symbol) && p.brain_id == brain_id)?;
+
+        let breakeven_or_better = match pos.direction {
+            TradeDirection::Long => pos.structural_stop_price >= pos.entry_price,
+            TradeDirection::Short => pos.structural_stop_price <= pos.entry_price,
+        };
+
+        if pos.tranche_count >= 3
+            || pos.direction != sig.direction
+            || !matches!(
+                pos.trace_health_badge,
+                TraceHealthBadge::Accelerating | TraceHealthBadge::TrailingTarget1
+            )
+            || pos.current_r_multiple < 0.75
+            || !breakeven_or_better
+        {
+            return None;
+        }
+
+        let old_shares = pos.quantity_shares.max(1.0);
+        let old_entry_f64 = pos.entry_price.to_f64().max(0.00001);
+        let new_entry_f64 = sig.entry_price.to_f64().max(0.00001);
+        let added_shares = (tranche_notional_usd.max(100.0) / new_entry_f64)
+            .round()
+            .max(1.0);
+        let total_shares = old_shares + added_shares;
+        let vwap_entry_f64 =
+            (old_shares * old_entry_f64 + added_shares * new_entry_f64) / total_shares;
+        let vwap_entry = SubPennyPrice::from_f64(vwap_entry_f64).unwrap_or(pos.entry_price);
+
+        pos.entry_price = vwap_entry;
+        pos.quantity_shares = total_shares;
+        pos.tranche_count += 1;
+
+        // Keep structural stop at or better than new volume-weighted breakeven
+        pos.structural_stop_price = match pos.direction {
+            TradeDirection::Long => pos
+                .structural_stop_price
+                .max(vwap_entry)
+                .max(sig.structural_stop_price),
+            TradeDirection::Short => pos
+                .structural_stop_price
+                .min(vwap_entry)
+                .min(sig.structural_stop_price),
+        };
+
+        let log_entry = format!(
+            "Tranche {}/3 @ ${:.5} -> VWAP ${:.5} | Stop ${:.5} | +{:.2}R | Conf {:.1}%",
+            pos.tranche_count,
+            new_entry_f64,
+            vwap_entry.to_f64(),
+            pos.structural_stop_price.to_f64(),
+            pos.current_r_multiple,
+            normalized_conf
+        );
+        pos.scale_in_history.push(log_entry);
+
+        if pos.option_contracts_count > 0 && opt.option_contracts_count > 0 {
+            let old_c = pos.option_contracts_count as f64;
+            let add_c = opt.option_contracts_count as f64;
+            let tot_c = old_c + add_c;
+            let vwap_prem = (old_c * pos.option_entry_premium.to_f64()
+                + add_c * opt.option_entry_premium.to_f64())
+                / tot_c;
+            pos.option_entry_premium =
+                SubPennyPrice::from_f64(vwap_prem).unwrap_or(pos.option_entry_premium);
+            pos.option_contracts_count += opt.option_contracts_count;
+        }
+
+        tracing::info!(
+            "[SCALE-IN PYRAMID] {} ({}) Tranche {}/3 | VWAP Entry: ${:.5} | Stop: ${:.5} | Total Shares: {:.0} | R: +{:.2}R | Conf: {:.1}%",
+            pos.symbol,
+            pos.brain_id.code(),
+            pos.tranche_count,
+            pos.entry_price.to_f64(),
+            pos.structural_stop_price.to_f64(),
+            pos.quantity_shares,
+            pos.current_r_multiple,
+            normalized_conf
+        );
+
+        Some(pos.clone())
     }
 
     /// Instantaneously births a new live signal into `POSITIONS OPENED`.
@@ -405,6 +546,8 @@ impl RealTimeLedgerEngine {
             peak_favorable_price: sig.entry_price,
             max_adverse_price: sig.entry_price,
             quantity_shares: qty,
+            tranche_count: 1,
+            scale_in_history: Vec::new(),
             option_structure: opt.option_structure.clone(),
             matched_option_contract: opt.matched_option_contract.clone(),
             option_entry_premium: opt.option_entry_premium,
@@ -447,6 +590,28 @@ impl RealTimeLedgerEngine {
         recent_bars: &[RawBarRecord],
         internals: &RawMarketInternalsSnapshot,
     ) -> Vec<ClosedTradeRow> {
+        self.process_live_bar_internal(symbol, None, recent_bars, internals)
+    }
+
+    /// Processes an incoming bar update scoped to `(symbol, brain_id)` so multi-horizon positions
+    /// on the same ticker only evaluate against their own horizon's bars.
+    pub fn process_live_bar_for_symbol_and_brain(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+        recent_bars: &[RawBarRecord],
+        internals: &RawMarketInternalsSnapshot,
+    ) -> Vec<ClosedTradeRow> {
+        self.process_live_bar_internal(symbol, Some(brain_id), recent_bars, internals)
+    }
+
+    fn process_live_bar_internal(
+        &self,
+        symbol: &str,
+        brain_filter: Option<BrainHorizonId>,
+        recent_bars: &[RawBarRecord],
+        internals: &RawMarketInternalsSnapshot,
+    ) -> Vec<ClosedTradeRow> {
         if recent_bars.is_empty() {
             return Vec::new();
         }
@@ -458,7 +623,9 @@ impl RealTimeLedgerEngine {
         let mut idx = 0;
 
         while idx < open_list.len() {
-            if !open_list[idx].symbol.eq_ignore_ascii_case(symbol) {
+            if !open_list[idx].symbol.eq_ignore_ascii_case(symbol)
+                || brain_filter.is_some_and(|b| open_list[idx].brain_id != b)
+            {
                 idx += 1;
                 continue;
             }
@@ -520,17 +687,29 @@ impl RealTimeLedgerEngine {
             let entry_notional = pos.entry_price.to_f64() * pos.quantity_shares;
             pos.unrealized_stock_pnl_usd = entry_notional * (signed_pct / 100.0);
 
-            // Update live Option premium & P&L if matched with an options contract
+            // Update live Option premium, P&L, and analytical Greeks via 2nd-order Delta-Gamma-Vanna re-anchoring
             if pos.option_contracts_count > 0 && pos.option_entry_premium.scaled_units() > 0 {
-                let ds =
-                    (pos.live_price.to_f64() - pos.entry_price.to_f64()) * pos.direction.sign();
                 let entry_prem = pos.option_entry_premium.to_f64();
-                let delta_abs = pos.contract_delta.abs().max(0.45);
-                let live_prem_f64 =
-                    (entry_prem + delta_abs * ds + 0.5 * pos.contract_gamma * ds * ds.abs())
-                        .max(0.01);
+                let (live_prem_f64, u_delta, u_gamma, u_vanna, u_theta, u_vega) =
+                    crate::onnx_engine::OnnxMultiBrainEngine::reanchor_option_mark_and_greeks(
+                        pos.direction,
+                        pos.entry_price.to_f64(),
+                        pos.live_price.to_f64(),
+                        entry_prem,
+                        pos.contract_delta,
+                        pos.contract_gamma,
+                        pos.contract_vanna,
+                        pos.contract_theta,
+                        pos.contract_vega,
+                        pos.contract_iv,
+                    );
                 pos.option_live_premium =
                     SubPennyPrice::from_f64(live_prem_f64).unwrap_or(pos.option_entry_premium);
+                pos.contract_delta = u_delta;
+                pos.contract_gamma = u_gamma;
+                pos.contract_vanna = u_vanna;
+                pos.contract_theta = u_theta;
+                pos.contract_vega = u_vega;
                 pos.unrealized_option_pnl_pct =
                     ((live_prem_f64 - entry_prem) / entry_prem.max(0.01)) * 100.0;
                 pos.unrealized_option_pnl_usd =
@@ -541,7 +720,7 @@ impl RealTimeLedgerEngine {
             let eval_ctx = OpenPositionEvaluationContext {
                 direction: pos.direction,
                 entry_price: pos.entry_price,
-                structural_stop_price: pos.structural_stop_price,
+                structural_stop_price: pos.initial_structural_stop,
                 target_1_price: pos.target_1_price,
                 target_2_price: pos.target_2_price,
                 peak_favorable_price: pos.peak_favorable_price,
@@ -553,7 +732,14 @@ impl RealTimeLedgerEngine {
                 internals,
             ) {
                 pos.trace_health_badge = health.badge;
-                pos.structural_stop_price = health.updated_structural_stop;
+                pos.structural_stop_price = match pos.direction {
+                    TradeDirection::Long => {
+                        pos.structural_stop_price.max(health.updated_structural_stop)
+                    }
+                    TradeDirection::Short => {
+                        pos.structural_stop_price.min(health.updated_structural_stop)
+                    }
+                };
                 pos.current_r_multiple = health.current_r_multiple;
             }
 
@@ -700,6 +886,8 @@ impl RealTimeLedgerEngine {
             target_2_price: pos.target_2_price,
             actual_exit_price: exit_price,
             quantity_shares: pos.quantity_shares,
+            tranche_count: pos.tranche_count,
+            scale_in_history: pos.scale_in_history,
             option_structure: pos.option_structure,
             matched_option_contract: pos.matched_option_contract,
             option_entry_premium: pos.option_entry_premium,

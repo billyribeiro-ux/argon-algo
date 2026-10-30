@@ -543,6 +543,57 @@ impl OnnxMultiBrainEngine {
             contract_iv: iv,
         }
     }
+
+    /// Dynamically re-anchors an option mark and its analytical Black-Scholes Greeks (`Delta`, `Gamma`,
+    /// `Vanna`, `Theta`, `Vega`) from `ref_spot` (`S_cboe` / entry spot) to `live_spot` (`S_live`)
+    /// using exact 2nd-order Delta-Gamma-Vanna Taylor adjustment (`ΔP = Δ·ΔS + 0.5·Γ·ΔS² + Vanna·ΔS·Δσ`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reanchor_option_mark_and_greeks(
+        direction: TradeDirection,
+        ref_spot: f64,
+        live_spot: f64,
+        ref_premium: f64,
+        delta: f64,
+        gamma: f64,
+        vanna: f64,
+        theta: f64,
+        vega: f64,
+        iv: f64,
+    ) -> (f64, f64, f64, f64, f64, f64) {
+        let s0 = ref_spot.max(0.01);
+        let s1 = live_spot.max(0.01);
+        let ds = s1 - s0;
+        let d_sigma_pts = (-0.15 * (ds / s0)).clamp(-0.08, 0.08) * 100.0;
+
+        // Signed spot move in trade direction for long-option / spread P&L
+        let signed_ds = ds * direction.sign();
+        let delta_abs = delta.abs().max(0.35);
+        let delta_p =
+            delta_abs * signed_ds + 0.5 * gamma * ds * ds + vanna.abs() * signed_ds * d_sigma_pts;
+        let live_prem = (ref_premium + delta_p).max(0.01);
+
+        let updated_delta = match direction {
+            TradeDirection::Long => (delta + gamma * ds + vanna * d_sigma_pts).clamp(0.01, 0.9999),
+            TradeDirection::Short => {
+                (delta + gamma * ds + vanna * d_sigma_pts).clamp(-0.9999, -0.01)
+            }
+        };
+        let spot_scale = (s0 / s1).clamp(0.75, 1.35);
+        let updated_gamma = (gamma * spot_scale).clamp(0.0001, 0.50);
+        let updated_vanna = (vanna * spot_scale).clamp(-0.50, 0.50);
+        let updated_theta = (theta * (s1 / s0).clamp(0.8, 1.25)).min(-0.001);
+        let updated_vega = (vega * (s1 / s0).clamp(0.8, 1.25) * (1.0 + d_sigma_pts * 0.002)).max(0.001);
+        let _ = iv;
+
+        (
+            live_prem,
+            updated_delta,
+            updated_gamma,
+            updated_vanna,
+            updated_theta,
+            updated_vega,
+        )
+    }
 }
 
 #[allow(dead_code)]

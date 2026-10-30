@@ -118,7 +118,7 @@ impl AppState {
                 "NVDA",
                 BrainHorizonId::Brain02IntradayDayTrade,
                 Timeframe::M5,
-                true,
+                false,
             ),
             (
                 "TSLA",
@@ -143,6 +143,12 @@ impl AppState {
                 BrainHorizonId::Brain03ShortTermSwing,
                 Timeframe::H1,
                 true,
+            ),
+            (
+                "NVDA",
+                BrainHorizonId::Brain04CoreSwing,
+                Timeframe::D1,
+                false,
             ),
             (
                 "AMD",
@@ -279,18 +285,22 @@ impl AppState {
                 let window_start = t.saturating_sub(23);
                 let causal_slice = &raw_bars[window_start..=t];
 
-                // Step 1: Advance any active open position for `symbol` using only `causal_slice` (`..=t`)
-                if self.ledger.has_open_position_for_symbol(symbol) {
-                    let _ = self.ledger.process_live_bar_for_symbol(
+                // Step 1: Advance any active open position for `(symbol, brain_id)` using only `causal_slice` (`..=t`)
+                if self
+                    .ledger
+                    .has_open_position_for_symbol_and_brain(symbol, brain_id)
+                {
+                    let _ = self.ledger.process_live_bar_for_symbol_and_brain(
                         symbol,
+                        brain_id,
                         causal_slice,
                         &raw_internals,
                     );
                 }
 
-                // Step 2: If no position is currently open for `symbol` and `t <= last_entry_bar`,
-                // evaluate causal signal on `causal_slice` (`..=t`) and enter at `raw_bars[t].close`
-                if !self.ledger.has_open_position_for_symbol(symbol) && t <= last_entry_bar {
+                // Step 2: Evaluate causal signal on `causal_slice` (`..=t`) to either scale-in (`max_tranches = 3`)
+                // or enter a new position for `(symbol, brain_id)` at `raw_bars[t].close`
+                if t <= last_entry_bar {
                     let Ok(probe) = self.onnx_engine.evaluate_live_signal(
                         symbol,
                         brain_id,
@@ -321,7 +331,17 @@ impl AppState {
                         continue;
                     };
 
-                    if inference.signal.ai_confidence_pct >= 58.0 {
+                    if self
+                        .ledger
+                        .has_open_position_for_symbol_and_brain(symbol, brain_id)
+                    {
+                        let _ = self.ledger.try_scale_in_position(
+                            symbol,
+                            brain_id,
+                            &inference,
+                            5_000.0,
+                        );
+                    } else if inference.signal.ai_confidence_pct >= 58.0 {
                         let _ = self.ledger.open_position_with_bars(
                             exchange_idx,
                             &inference,
@@ -333,8 +353,12 @@ impl AppState {
                 }
             }
 
-            if !close_in_walkforward && !self.ledger.has_open_position_for_symbol(symbol) {
-                // Active Live Position on the latest real exchange bar (`CLOV`, `SOFI`, `AMD`)
+            if !close_in_walkforward
+                && !self
+                    .ledger
+                    .has_open_position_for_symbol_and_brain(symbol, brain_id)
+            {
+                // Active Live Position on the latest real exchange bar (`CLOV`, `NVDA` 5m, `SOFI`, `NVDA` 1D, `AMD`)
                 let live_window = &raw_bars[raw_bars.len().saturating_sub(24)..];
                 let probe = self
                     .onnx_engine

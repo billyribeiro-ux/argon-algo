@@ -622,8 +622,8 @@ impl RawFingerprintEngine {
         // Compute Raw Evidence Confidence % directly from bar impulse attention + empirical precedent win rate + stream alignment
         let latest_attn = ((*tensor.bar_attention_heatmap.last().unwrap_or(&0.05) as f64)
             * (tensor.seq_len.max(1) as f64)
-            * 0.55)
-            .clamp(0.25, 1.0);
+            * 0.85)
+            .clamp(0.30, 1.0);
         let stream_concentration = (tensor
             .stream_weights
             .chart_tape_physics_weight
@@ -631,8 +631,13 @@ impl RawFingerprintEngine {
             .max(tensor.stream_weights.short_float_squeeze_weight)
             as f64)
             .clamp(0.25, 1.0);
-        let ai_confidence_pct =
-            (win_rate * 58.0 + latest_attn * 24.0 + stream_concentration * 16.0).clamp(55.0, 98.8);
+        let r_bonus = ((expected_r_multiple - 1.35).max(0.0) * 6.5).clamp(0.0, 14.0);
+        let ai_confidence_pct = (22.0
+            + win_rate * 38.0
+            + latest_attn * 22.0
+            + stream_concentration * 14.0
+            + r_bonus)
+            .clamp(55.0, 98.8);
         let primary_driver = tensor.stream_weights.primary_driver();
 
         Ok(AutonomousSignalBlueprint {
@@ -716,7 +721,7 @@ impl RawFingerprintEngine {
             + if macro_headwind { 0.25 } else { 0.0 })
         .clamp(0.0, 1.0);
 
-        // Check if Target 1 has been reached to raise the structural trailing stop to breakeven+
+        // Check if Target 1 or +0.75R acceleration has been reached to raise the structural trailing stop to breakeven+
         let t1_hit = match pos.direction {
             TradeDirection::Long => {
                 live_price >= pos.target_1_price || pos.peak_favorable_price >= pos.target_1_price
@@ -726,8 +731,12 @@ impl RawFingerprintEngine {
             }
         };
 
-        let updated_structural_stop = if t1_hit {
-            pos.entry_price
+        let breakeven_locked = t1_hit || current_r_multiple >= 0.75;
+        let updated_structural_stop = if breakeven_locked {
+            match pos.direction {
+                TradeDirection::Long => pos.structural_stop_price.max(pos.entry_price),
+                TradeDirection::Short => pos.structural_stop_price.min(pos.entry_price),
+            }
         } else {
             pos.structural_stop_price
         };

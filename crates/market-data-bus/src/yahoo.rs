@@ -259,6 +259,7 @@ struct CachedOhlcvEntry {
 #[derive(Clone)]
 struct CachedOptionChainEntry {
     chain: UnifiedOptionChain,
+    cboe_reference_spot: f64,
     inserted_at: Instant,
 }
 
@@ -483,8 +484,61 @@ impl YahooSessionManager {
         Ok(merged)
     }
 
-    /// Fetches real intraday OHLCV bars (`5m`, `15m`, `1h`) from Yahoo `v8/finance/chart` or Nasdaq `/chart`,
-    /// prepending real historical exchange OHLCV bars when a deep walk-forward window (`limit > intraday_len`) is requested.
+    /// Merges newly fetched exchange OHLCV bars with the persistent local disk cache
+    /// (`data/ohlcv_cache/{symbol}_{timeframe}.json`), deduplicating by `timestamp_sec`
+    /// (`timestamp_ns = timestamp_sec * 1_000_000_000`) and sorting chronologically oldest-first.
+    pub fn merge_and_persist_ohlcv_disk_cache(
+        symbol: &str,
+        timeframe: Timeframe,
+        fetched_bars: &[RealExchangeOhlcvBar],
+    ) -> Vec<RealExchangeOhlcvBar> {
+        let clean_sym = symbol.trim().to_uppercase();
+        let tf_str = timeframe.as_str();
+        let filename = format!("{clean_sym}_{tf_str}.json");
+
+        let primary_dir = std::path::PathBuf::from("data/ohlcv_cache");
+        let workspace_dir = std::path::PathBuf::from("../../data/ohlcv_cache");
+
+        let mut by_ts = std::collections::BTreeMap::<i64, RealExchangeOhlcvBar>::new();
+
+        for dir in [&workspace_dir, &primary_dir] {
+            let file_path = dir.join(&filename);
+            if let Ok(bytes) = std::fs::read(&file_path)
+                && let Ok(existing) = serde_json::from_slice::<Vec<RealExchangeOhlcvBar>>(&bytes)
+            {
+                for b in existing {
+                    if b.timestamp_sec > 0 && b.open > 0.0 && b.close > 0.0 {
+                        by_ts.insert(b.timestamp_sec, b);
+                    }
+                }
+            }
+        }
+
+        for &b in fetched_bars {
+            if b.timestamp_sec > 0 && b.open > 0.0 && b.close > 0.0 {
+                by_ts.insert(b.timestamp_sec, b);
+            }
+        }
+
+        let merged: Vec<RealExchangeOhlcvBar> = by_ts.into_values().collect();
+        if !merged.is_empty()
+            && let Ok(json_bytes) = serde_json::to_vec(&merged)
+        {
+            let _ = std::fs::create_dir_all(&primary_dir);
+            let _ = std::fs::write(primary_dir.join(&filename), &json_bytes);
+            if std::path::Path::new("../../Cargo.toml").exists() {
+                let _ = std::fs::create_dir_all(&workspace_dir);
+                let _ = std::fs::write(workspace_dir.join(&filename), &json_bytes);
+            }
+        }
+
+        merged
+    }
+
+    /// Fetches real intraday OHLCV bars (`1m`, `3m`, `5m`, `15m`, `1h`, `4h`) from Yahoo `v8/finance/chart`
+    /// using `range=60d` for `5m`/`15m` (~4,680 real intraday candles) and `range=730d` (`2y`) for `1h`,
+    /// merging into the persistent local disk cache (`data/ohlcv_cache/{symbol}_{timeframe}.json`).
+    /// Never mixes daily (`1d`) bars into intraday requests.
     pub async fn fetch_real_timeframe_ohlcv_bars(
         &self,
         symbol: &str,
@@ -503,27 +557,40 @@ impl YahooSessionManager {
                 Timeframe::Mo1 => Self::aggregate_real_ohlcv_bars(&daily, 21),
                 _ => daily,
             };
-            let len = aggregated.len();
+            let merged = Self::merge_and_persist_ohlcv_disk_cache(&clean_sym, timeframe, &aggregated);
+            let len = merged.len();
             if len > target_len {
-                return Ok(aggregated[len - target_len..].to_vec());
+                return Ok(merged[len - target_len..].to_vec());
             }
-            return Ok(aggregated);
+            return Ok(merged);
+        }
+
+        // Ensure Yahoo crumb is initialized so v8/finance/chart `range=60d` succeeds on first call
+        if self.crumb.read().is_none() {
+            let _ = self.fetch_yahoo_history_ssr_ohlcv(&clean_sym).await;
         }
 
         // For intraday timeframes (`1m`, `3m`, `5m`, `15m`, `1h`, `4h`):
-        // 1. First attempt direct Yahoo `v8/finance/chart` with real exchange intraday OHLCV
-        let (yf_interval, yf_range) = match timeframe {
-            Timeframe::Tick | Timeframe::M1 | Timeframe::M3 => ("1m", "5d"),
-            Timeframe::M5 => ("5m", "1mo"),
-            Timeframe::M15 => ("15m", "1mo"),
-            Timeframe::H1 | Timeframe::H4 => ("1h", "3mo"),
-            _ => ("1d", "1y"),
+        // Use deep `60d` window for `5m`/`15m` (~4,680 real intraday bars) and `730d` for `1h`.
+        let (yf_interval, primary_range, fallback_range) = match timeframe {
+            Timeframe::Tick | Timeframe::M1 | Timeframe::M3 => ("1m", "7d", "5d"),
+            Timeframe::M5 => ("5m", "60d", "1mo"),
+            Timeframe::M15 => ("15m", "60d", "1mo"),
+            Timeframe::H1 | Timeframe::H4 => ("1h", "730d", "3mo"),
+            _ => ("5m", "60d", "1mo"),
         };
 
         let mut intraday_bars = self
-            .try_fetch_v8_chart_ohlcv(&clean_sym, yf_interval, yf_range)
+            .try_fetch_v8_chart_ohlcv(&clean_sym, yf_interval, primary_range)
             .await
             .unwrap_or_default();
+
+        if intraday_bars.is_empty() {
+            intraday_bars = self
+                .try_fetch_v8_chart_ohlcv(&clean_sym, yf_interval, fallback_range)
+                .await
+                .unwrap_or_default();
+        }
 
         if matches!(timeframe, Timeframe::M3) && !intraday_bars.is_empty() {
             intraday_bars = Self::aggregate_real_ohlcv_bars(&intraday_bars, 3);
@@ -531,20 +598,22 @@ impl YahooSessionManager {
             intraday_bars = Self::aggregate_real_ohlcv_bars(&intraday_bars, 4);
         }
 
-        if intraday_bars.len() >= target_len {
-            let len = intraday_bars.len();
-            return Ok(intraday_bars[len - target_len..].to_vec());
+        // Merge with persistent local disk cache (`data/ohlcv_cache/{symbol}_{timeframe}.json`)
+        let merged = Self::merge_and_persist_ohlcv_disk_cache(&clean_sym, timeframe, &intraday_bars);
+        if merged.is_empty() {
+            return Err(DataBusError::ConnectionError(format!(
+                "No real intraday {} bars available for {}",
+                timeframe.as_str(),
+                clean_sym
+            )));
         }
 
-        // 2. Fetch deep real exchange OHLCV bars from Yahoo `/history/` + Nasdaq `/historical`
-        // Every single bar in `daily_real` has 100% genuine exchange Open, High, Low, Close, and Volume (`Open != Low != Close`).
-        let daily_real = self.fetch_real_daily_ohlcv_series(&clean_sym).await?;
-        if daily_real.len() >= target_len {
-            let len = daily_real.len();
-            return Ok(daily_real[len - target_len..].to_vec());
+        let len = merged.len();
+        if len > target_len {
+            return Ok(merged[len - target_len..].to_vec());
         }
 
-        Ok(daily_real)
+        Ok(merged)
     }
 
     /// Aggregates consecutive `RealExchangeOhlcvBar` slices of size `group_size` into higher-timeframe
@@ -891,19 +960,110 @@ impl YahooSessionManager {
         Ok(bars)
     }
 
+    /// Dynamically re-anchors a CBOE option chain snapshot captured at `s_cboe` to the real-time
+    /// Yahoo Finance spot price `s_live` using exact 2nd-order Delta-Gamma-Vanna Taylor expansion
+    /// (`ΔP = Δ·ΔS + 0.5·Γ·ΔS² + Vanna·ΔS·Δσ`) and updates analytical Black-Scholes Greeks
+    /// (`Delta`, `Gamma`, `Vanna`, `Theta`, `Vega`) at `s_live`.
+    pub fn reanchor_option_chain_to_live_spot(
+        chain: &UnifiedOptionChain,
+        s_cboe: f64,
+        s_live: f64,
+    ) -> UnifiedOptionChain {
+        let ref_spot = s_cboe.max(0.01);
+        let live_spot = s_live.max(0.01);
+        let ds = live_spot - ref_spot;
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+
+        let live_spot_sub = SubPennyPrice::from_f64(live_spot).unwrap_or(chain.underlying_price);
+        // Spot-volatility skew response (in vol points) for Vanna cross-derivative term
+        let d_sigma_pts = (-0.15 * (ds / ref_spot)).clamp(-0.08, 0.08) * 100.0;
+
+        let mut reanchored_contracts = Vec::with_capacity(chain.contracts.len());
+        for c in &chain.contracts {
+            let mut updated = c.clone();
+            updated.timestamp_ns = now_ns;
+
+            let strike_f64 = c.strike.to_f64().max(0.01);
+            let old_bid = c.bid.to_f64().max(0.01);
+            let old_ask = c.ask.to_f64().max(old_bid);
+            let old_last = c.last.to_f64().max(old_bid);
+            let spread = (old_ask - old_bid).max(0.01);
+
+            // Exact 2nd-order Delta-Gamma-Vanna option premium adjustment for ΔS = S_live - S_cboe
+            let delta_p = c.delta * ds + 0.5 * c.gamma * ds * ds + c.vanna * ds * d_sigma_pts;
+
+            let intrinsic = if c.right == OptionRight::Call {
+                (live_spot - strike_f64).max(0.0)
+            } else {
+                (strike_f64 - live_spot).max(0.0)
+            };
+
+            let new_bid_f64 = (old_bid + delta_p).max(intrinsic * 0.995).max(0.01);
+            let new_ask_f64 = (old_ask + delta_p).max(new_bid_f64 + spread);
+            let new_last_f64 = (old_last + delta_p).clamp(new_bid_f64, new_ask_f64);
+
+            updated.bid = SubPennyPrice::from_f64(new_bid_f64).unwrap_or(c.bid);
+            updated.ask = SubPennyPrice::from_f64(new_ask_f64).unwrap_or(updated.bid);
+            updated.last = SubPennyPrice::from_f64(new_last_f64).unwrap_or(updated.ask);
+
+            // Recompute analytical Black-Scholes Greeks at S_live & updated IV
+            let t_years = (c.dte.max(1) as f64 / 365.0).max(1.0 / 365.0);
+            let sqrt_t = t_years.sqrt();
+            let live_iv = (c.iv + d_sigma_pts * 0.01).clamp(0.05, 3.50);
+            let d1 = ((live_spot / strike_f64).ln() + (0.0425 + 0.5 * live_iv * live_iv) * t_years)
+                / (live_iv * sqrt_t).max(1e-6);
+            let d2 = d1 - live_iv * sqrt_t;
+            let pdf_d1 = (-0.5 * d1 * d1).exp() / (2.0 * std::f64::consts::PI).sqrt();
+
+            let taylor_delta = c.delta + c.gamma * ds + c.vanna * d_sigma_pts;
+            let bs_delta = if c.right == OptionRight::Call {
+                norm_cdf(d1).clamp(0.01, 0.99)
+            } else {
+                (norm_cdf(d1) - 1.0).clamp(-0.99, -0.01)
+            };
+            updated.delta = if c.right == OptionRight::Call {
+                (0.5 * taylor_delta + 0.5 * bs_delta).clamp(0.01, 0.9999)
+            } else {
+                (0.5 * taylor_delta + 0.5 * bs_delta).clamp(-0.9999, -0.01)
+            };
+            updated.gamma = (pdf_d1 / (live_spot * live_iv * sqrt_t).max(1e-4)).max(0.0001);
+            updated.vanna = -pdf_d1 * (d2 / live_iv.max(0.05)) * 0.01;
+            updated.theta = (-(live_spot * pdf_d1 * live_iv) / (2.0 * sqrt_t) / 365.0).min(-0.001);
+            updated.vega = (live_spot * pdf_d1 * sqrt_t * 0.01).max(0.001);
+            updated.iv = live_iv;
+
+            reanchored_contracts.push(updated);
+        }
+
+        UnifiedOptionChain {
+            underlying: chain.underlying.clone(),
+            underlying_price: live_spot_sub,
+            timestamp_ns: now_ns,
+            contracts: reanchored_contracts,
+        }
+    }
+
     /// Fetches real CBOE Delayed OPRA Options Chain (`https://cdn.cboe.com/api/global/delayed_quotes/options/{SYMBOL}.json`)
     /// with real OCC contracts, real `bid`, `ask`, `last_trade_price`, `volume`, `open_interest`,
-    /// `iv`, `delta`, `gamma`, `theta`, `vega`, and analytical Black-Scholes `vanna`.
+    /// `iv`, `delta`, `gamma`, `theta`, `vega`, and analytical Black-Scholes `vanna`,
+    /// dynamically re-anchored to the live Yahoo Finance spot price (`live_spot`).
     pub async fn fetch_cboe_option_chain(
         &self,
         symbol: &str,
-        fallback_spot: f64,
+        live_spot: f64,
     ) -> Result<UnifiedOptionChain, DataBusError> {
         let clean_sym = symbol.trim().to_uppercase();
         if let Some(cached) = self.option_chain_cache.read().get(&clean_sym).cloned()
             && cached.inserted_at.elapsed() < Duration::from_secs(45)
         {
-            return Ok(cached.chain);
+            return Ok(Self::reanchor_option_chain_to_live_spot(
+                &cached.chain,
+                cached.cboe_reference_spot,
+                live_spot.max(cached.cboe_reference_spot),
+            ));
         }
 
         let candidate_urls = [
@@ -934,7 +1094,7 @@ impl YahooSessionManager {
                 .get("current_price")
                 .and_then(Value::as_f64)
                 .filter(|&p| p > 0.0)
-                .unwrap_or(fallback_spot)
+                .unwrap_or(live_spot)
                 .max(0.01);
             let Some(options_arr) = data_obj.get("options").and_then(Value::as_array) else {
                 continue;
@@ -1120,10 +1280,16 @@ impl YahooSessionManager {
                     clean_sym,
                     CachedOptionChainEntry {
                         chain: chain.clone(),
+                        cboe_reference_spot: spot_f64,
                         inserted_at: Instant::now(),
                     },
                 );
-                return Ok(chain);
+                let target_live_spot = if live_spot > 0.01 { live_spot } else { spot_f64 };
+                return Ok(Self::reanchor_option_chain_to_live_spot(
+                    &chain,
+                    spot_f64,
+                    target_live_spot,
+                ));
             }
         }
 

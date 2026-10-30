@@ -6,11 +6,40 @@
     type ScannerSignalCandidate,
     type ChartTimeframeId,
     type ChartRangeId,
-    type RawBarCandle
+    type RawBarCandle,
+    type BrainId,
+    type LinkChannelColor
   } from '$lib/state/terminal.svelte';
 
   const TIMEFRAMES: ChartTimeframeId[] = ['1m', '3m', '5m', '15m', '1H', '4H', '1D', '1W', '1M'];
   const RANGES: ChartRangeId[] = ['1D', '5D', '1M', '6M', '1Y', '5Y'];
+  const BRAIN_OPTIONS: Array<Exclude<BrainId, 'ALL_5_BRAINS'>> = [
+    'BRAIN-01',
+    'BRAIN-02',
+    'BRAIN-03',
+    'BRAIN-04',
+    'BRAIN-05'
+  ];
+
+  let {
+    customBlueprint = undefined,
+    paneId = undefined,
+    paneTitle = undefined,
+    paneTimeframe = undefined,
+    paneRange = undefined,
+    paneBrainId = undefined,
+    paneLinkChannel = undefined,
+    paneLoading = false
+  }: {
+    customBlueprint?: ScannerSignalCandidate | null;
+    paneId?: string;
+    paneTitle?: string;
+    paneTimeframe?: ChartTimeframeId;
+    paneRange?: ChartRangeId;
+    paneBrainId?: Exclude<BrainId, 'ALL_5_BRAINS'>;
+    paneLinkChannel?: LinkChannelColor;
+    paneLoading?: boolean;
+  } = $props();
 
   let showVerificationPopover = $state(false);
   let customSymbolInput = $state('');
@@ -25,8 +54,21 @@
   let dragStartX = $state<number>(0);
   let dragStartPanOffset = $state<number>(0);
 
-  const blueprint = $derived<ScannerSignalCandidate>(terminalStore.activeBlueprint);
-  const symbolClosedTrades = $derived(terminalStore.selectedSymbolClosedTrades);
+  const blueprint = $derived<ScannerSignalCandidate>(
+    customBlueprint ?? terminalStore.activeBlueprint
+  );
+  const effectiveTimeframe = $derived<ChartTimeframeId>(
+    paneTimeframe ?? terminalStore.activeTimeframe
+  );
+  const effectiveRange = $derived<ChartRangeId>(paneRange ?? terminalStore.activeRange);
+  const isChartLoading = $derived<boolean>(
+    paneId ? paneLoading : terminalStore.chartLoading
+  );
+  const symbolClosedTrades = $derived(
+    terminalStore.closedLedger.filter(
+      (t) => t.symbol.toUpperCase() === blueprint.symbol.toUpperCase()
+    )
+  );
   const symbolOpenPositions = $derived(
     terminalStore.openPositions.filter(
       (p) => p.symbol.toUpperCase() === blueprint.symbol.toUpperCase()
@@ -100,7 +142,45 @@
     const sym = customSymbolInput.trim().toUpperCase();
     if (!sym) return;
     panOffsetBars = 0;
-    terminalStore.selectTicker(sym);
+    if (paneId) {
+      void terminalStore.updateViewportPane(paneId, { symbol: sym });
+    } else {
+      terminalStore.selectTicker(sym);
+    }
+  }
+
+  function handleTimeframeSelect(tf: ChartTimeframeId): void {
+    if (paneId) {
+      void terminalStore.updateViewportPane(paneId, { timeframe: tf });
+    } else {
+      terminalStore.setTimeframe(tf);
+    }
+  }
+
+  function handleRangeSelect(rg: ChartRangeId): void {
+    if (paneId) {
+      void terminalStore.updateViewportPane(paneId, { range: rg });
+    } else {
+      terminalStore.setRange(rg);
+    }
+  }
+
+  function handleBrainSelect(e: Event): void {
+    const val = (e.currentTarget as HTMLSelectElement).value as Exclude<BrainId, 'ALL_5_BRAINS'>;
+    if (paneId) {
+      void terminalStore.updateViewportPane(paneId, { brainId: val });
+    } else {
+      terminalStore.selectBrain(val);
+    }
+  }
+
+  function handlePopoutPane(): void {
+    void terminalStore.syncBus.detachPanelWindow(
+      '/blueprint',
+      `${blueprint.symbol} — ${paneBrainId ?? blueprint.brainId}`,
+      1,
+      paneLinkChannel ?? terminalStore.activeLinkChannel
+    );
   }
 
   function handleWheelZoom(e: WheelEvent): void {
@@ -158,6 +238,20 @@
 <section class="glass-panel panel-blueprint-canvas" aria-label="Raw Price & AI Trade Blueprint Canvas">
   <header class="panel-header" style="flex-wrap: wrap; gap: 8px;">
     <div class="panel-title" style="flex-wrap: wrap;">
+      {#if paneLinkChannel}
+        <span class="badge badge-ai-core">
+          {paneLinkChannel === 'RED'
+            ? '🔴 RED'
+            : paneLinkChannel === 'BLUE'
+              ? '🔵 BLUE'
+              : paneLinkChannel === 'GREEN'
+                ? '🟢 GREEN'
+                : '🟡 GOLD'}
+        </span>
+      {/if}
+      {#if paneTitle}
+        <span style="font-size: 0.72rem; color: var(--text-secondary);">{paneTitle}:</span>
+      {/if}
       <span class="badge {blueprint.direction === 'LONG' ? 'badge-long' : 'badge-short'}">
         {blueprint.direction}
       </span>
@@ -165,9 +259,23 @@
       <span class="tabular-num" style="color: var(--signal-ai-core);">
         {formatSubPennyPrice(blueprint.livePrice)}
       </span>
-      <span class="badge badge-ai-core">{blueprint.brainId}</span>
+      {#if paneId}
+        <select
+          class="select-control"
+          value={paneBrainId ?? blueprint.brainId}
+          onchange={handleBrainSelect}
+          aria-label="Viewport Brain Horizon Selector"
+          style="font-size: 0.68rem; padding: 2px 6px;"
+        >
+          {#each BRAIN_OPTIONS as bOpt (bOpt)}
+            <option value={bOpt}>{bOpt}</option>
+          {/each}
+        </select>
+      {:else}
+        <span class="badge badge-ai-core">{blueprint.brainId}</span>
+      {/if}
       <span class="badge badge-gamma">{blueprint.exchangeIndex}</span>
-      {#if terminalStore.chartLoading}
+      {#if isChartLoading}
         <span class="badge badge-squeeze">SYNCING YAHOO...</span>
       {:else}
         <span class="badge badge-long">YAHOO LIVE ({blueprint.bars.length} BARS)</span>
@@ -182,11 +290,22 @@
           class="input-control"
           placeholder="Ticker (NVDA, PLTR, BTC-USD...)"
           bind:value={customSymbolInput}
-          style="inline-size: 155px; font-size: 0.72rem;"
+          style="inline-size: 135px; font-size: 0.72rem;"
           aria-label="Search Any Yahoo Finance Ticker"
         />
         <button type="submit" class="action-btn">Load Yahoo</button>
       </form>
+
+      {#if paneId}
+        <button
+          type="button"
+          class="action-btn"
+          onclick={handlePopoutPane}
+          title="Pop out this viewport into a dedicated OS window"
+        >
+          ↗ Pop-Out
+        </button>
+      {/if}
 
       <button
         type="button"
@@ -215,8 +334,8 @@
         <button
           type="button"
           class="filter-pill"
-          data-selected={terminalStore.activeTimeframe === tf}
-          onclick={() => terminalStore.setTimeframe(tf)}
+          data-selected={effectiveTimeframe === tf}
+          onclick={() => handleTimeframeSelect(tf)}
           style="padding: 2px 7px; font-size: 0.68rem;"
         >
           {tf}
@@ -230,8 +349,8 @@
         <button
           type="button"
           class="filter-pill"
-          data-selected={terminalStore.activeRange === rg}
-          onclick={() => terminalStore.setRange(rg)}
+          data-selected={effectiveRange === rg}
+          onclick={() => handleRangeSelect(rg)}
           style="padding: 2px 7px; font-size: 0.68rem;"
         >
           {rg}

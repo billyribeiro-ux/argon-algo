@@ -188,12 +188,12 @@ impl AppState {
         for (symbol, brain_id, tf, close_in_walkforward) in walk_forward_plan {
             let Ok(unified_bars) = self
                 .yahoo_adapter
-                .fetch_historical_bars(symbol, tf, 48)
+                .fetch_historical_bars(symbol, tf, 300)
                 .await
             else {
                 continue;
             };
-            if unified_bars.len() < 16 {
+            if unified_bars.len() < 32 {
                 continue;
             }
             let raw_bars: Vec<RawBarRecord> =
@@ -215,180 +215,128 @@ impl AppState {
                 .map_err(|e| e.to_string())?;
             let raw_opts = opt_chain.to_raw_options_snapshot();
 
-            // Index a real historical pre-move window [0..14] into PrecedentKnnIndex with its real subsequent excursion
-            let split_idx = (raw_bars.len() * 2 / 3).clamp(10, raw_bars.len() - 4);
-            let entry_window = &raw_bars[..split_idx];
-            let future_window = &raw_bars[split_idx..];
+            // STRICT CAUSAL PARTITION:
+            // Era 1 (`0..calibration_end`): Index historical traces & subsequent excursions strictly inside the past memory era.
+            // Era 2 (`calibration_end..raw_bars.len()`): Strictly causal bar-by-bar rolling walk-forward evaluation.
+            let calibration_end = (raw_bars.len() * 2 / 5).clamp(24, raw_bars.len() / 2);
+            let trace_horizon = 8usize;
+            for idx in (16..calibration_end.saturating_sub(trace_horizon)).step_by(6) {
+                let hist_entry = &raw_bars[idx - 16..idx];
+                let hist_outcome = &raw_bars[idx..idx + trace_horizon];
+                if let Ok(pre_tensor) = self.onnx_engine.fingerprint_engine().build_sequence_tensor(
+                    hist_entry,
+                    &raw_opts,
+                    &raw_sf,
+                    &raw_internals,
+                ) {
+                    let ref_px = hist_entry.last().unwrap().close.to_f64().max(0.00001);
+                    let max_hi = hist_outcome
+                        .iter()
+                        .map(|b| b.high.to_f64())
+                        .fold(ref_px, f64::max);
+                    let min_lo = hist_outcome
+                        .iter()
+                        .map(|b| b.low.to_f64())
+                        .fold(ref_px, f64::min);
+                    let up_pct = ((max_hi - ref_px) / ref_px * 100.0).max(0.15);
+                    let dn_pct = ((ref_px - min_lo) / ref_px * 100.0).max(0.15);
+                    let was_win = up_pct >= dn_pct;
+                    let mfe = if was_win { up_pct } else { dn_pct };
+                    let mae = if was_win { dn_pct } else { up_pct };
 
-            if let Ok(pre_tensor) = self.onnx_engine.fingerprint_engine().build_sequence_tensor(
-                entry_window,
-                &raw_opts,
-                &raw_sf,
-                &raw_internals,
-            ) {
-                let ref_px = entry_window.last().unwrap().close.to_f64().max(0.00001);
-                let max_hi = future_window
-                    .iter()
-                    .map(|b| b.high.to_f64())
-                    .fold(ref_px, f64::max);
-                let min_lo = future_window
-                    .iter()
-                    .map(|b| b.low.to_f64())
-                    .fold(ref_px, f64::min);
-                let up_pct = ((max_hi - ref_px) / ref_px * 100.0).max(0.15);
-                let dn_pct = ((ref_px - min_lo) / ref_px * 100.0).max(0.15);
-                let was_win = up_pct >= dn_pct;
-                let mfe = if was_win { up_pct } else { dn_pct };
-                let mae = if was_win { dn_pct } else { up_pct };
-
-                self.precedent_knn.insert_trace(HistoricalTraceRecord {
-                    trace_id: Uuid::new_v4(),
-                    brain_id,
-                    symbol: symbol.to_string(),
-                    timeframe: tf.as_str().to_string(),
-                    timestamp_ns: entry_window.last().unwrap().timestamp_ns,
-                    realized_r_multiple: if was_win {
-                        (mfe / mae.max(0.25)).clamp(1.2, 6.5)
-                    } else {
-                        -1.0
-                    },
-                    mfe_pct: mfe.max(0.65),
-                    mae_pct: mae.clamp(0.25, 3.5),
-                    hold_duration_ms: (future_window.len() as i64)
-                        * (tf.nominal_duration_ms() as i64),
-                    was_winner: was_win,
-                    primary_driver: pre_tensor.stream_weights.primary_driver(),
-                    embedding_128: pre_tensor.latent_embedding_128,
-                });
+                    self.precedent_knn.insert_trace(HistoricalTraceRecord {
+                        trace_id: Uuid::new_v4(),
+                        brain_id,
+                        symbol: symbol.to_string(),
+                        timeframe: tf.as_str().to_string(),
+                        timestamp_ns: hist_entry.last().unwrap().timestamp_ns,
+                        realized_r_multiple: if was_win {
+                            (mfe / mae.max(0.25)).clamp(1.2, 6.5)
+                        } else {
+                            -1.0
+                        },
+                        mfe_pct: mfe.max(0.65),
+                        mae_pct: mae.clamp(0.25, 3.5),
+                        hold_duration_ms: (hist_outcome.len() as i64)
+                            * (tf.nominal_duration_ms() as i64),
+                        was_winner: was_win,
+                        primary_driver: pre_tensor.stream_weights.primary_driver(),
+                        embedding_128: pre_tensor.latent_embedding_128,
+                    });
+                }
             }
 
-            if close_in_walkforward {
-                // Walk-forward historical trade on the real Yahoo Finance bars:
-                // Enter at `entry_window` and step through `future_window`
-                let probe = self
-                    .onnx_engine
-                    .evaluate_live_signal(
+            // Era 2: Strictly Causal Bar-by-Bar Rolling Walk-Forward (`calibration_end..raw_bars.len()`)
+            // At bar index `t`, the model and `PrecedentKnnIndex` ONLY see `raw_bars[..=t]` (zero lookahead peeking).
+            let last_entry_bar = raw_bars.len().saturating_sub(26);
+            for t in calibration_end..raw_bars.len() {
+                let window_start = t.saturating_sub(23);
+                let causal_slice = &raw_bars[window_start..=t];
+
+                // Step 1: Advance any active open position for `symbol` using only `causal_slice` (`..=t`)
+                if self.ledger.has_open_position_for_symbol(symbol) {
+                    let _ = self.ledger.process_live_bar_for_symbol(
+                        symbol,
+                        causal_slice,
+                        &raw_internals,
+                    );
+                }
+
+                // Step 2: If no position is currently open for `symbol` and `t <= last_entry_bar`,
+                // evaluate causal signal on `causal_slice` (`..=t`) and enter at `raw_bars[t].close`
+                if !self.ledger.has_open_position_for_symbol(symbol) && t <= last_entry_bar {
+                    let Ok(probe) = self.onnx_engine.evaluate_live_signal(
                         symbol,
                         brain_id,
                         is_opt,
-                        entry_window,
+                        causal_slice,
                         &raw_opts,
                         &raw_sf,
                         &raw_internals,
-                    )
-                    .map_err(|e| e.to_string())?;
-                let precedents = self.precedent_knn.query_precedents(
-                    brain_id,
-                    &probe.signal.latent_embedding_128,
-                    25,
-                );
-                let emp_dist = precedents.to_empirical_distribution();
-                let mut inference = self
-                    .onnx_engine
-                    .evaluate_live_signal_with_precedents(
+                    ) else {
+                        continue;
+                    };
+                    let precedents = self.precedent_knn.query_precedents(
+                        brain_id,
+                        &probe.signal.latent_embedding_128,
+                        25,
+                    );
+                    let emp_dist = precedents.to_empirical_distribution();
+                    let Ok(inference) = self.onnx_engine.evaluate_live_signal_with_precedents(
                         symbol,
                         brain_id,
                         is_opt,
-                        entry_window,
+                        causal_slice,
                         &raw_opts,
                         &raw_sf,
                         &raw_internals,
                         Some(&emp_dist),
-                    )
-                    .map_err(|e| e.to_string())?;
+                    ) else {
+                        continue;
+                    };
 
-                // Align signal direction with the real Yahoo trajectory in `future_window`
-                // and calibrate structural targets within the actual observed Yahoo range so the
-                // walk-forward replay resolves on real Yahoo Finance candle prints!
-                let entry_px = entry_window.last().unwrap().close;
-                let last_future = future_window.last().unwrap();
-                let max_future_hi = future_window
-                    .iter()
-                    .map(|b| b.high)
-                    .max()
-                    .unwrap_or(last_future.high);
-                let min_future_lo = future_window
-                    .iter()
-                    .map(|b| b.low)
-                    .min()
-                    .unwrap_or(last_future.low);
-
-                let net_move_u = last_future.close.scaled_units() - entry_px.scaled_units();
-                let up_exc_u = (max_future_hi.scaled_units() - entry_px.scaled_units()).max(1);
-                let dn_exc_u = (entry_px.scaled_units() - min_future_lo.scaled_units()).max(1);
-
-                // IONQ demonstrates a real Yahoo stop-out for Speed-2 Hard-Negative Autopsy verification
-                let is_stop_case = symbol.eq_ignore_ascii_case("IONQ");
-                if !is_stop_case {
-                    if net_move_u >= 0 || up_exc_u >= dn_exc_u {
-                        inference.signal.direction = raw_fingerprint_core::TradeDirection::Long;
-                        let risk_u = (up_exc_u * 36 / 100).max(1);
-                        let t1_u = entry_px.scaled_units() + (up_exc_u * 85 / 100).max(1);
-                        let t2_u = entry_px.scaled_units() + (up_exc_u * 92 / 100).max(2);
-                        let stop_u = (entry_px.scaled_units() - dn_exc_u.max(risk_u) - 10).max(1);
-                        inference.signal.structural_stop_price =
-                            SubPennyPrice::from_scaled_units(stop_u).unwrap_or(entry_px);
-                        inference.signal.target_1_price =
-                            SubPennyPrice::from_scaled_units(t1_u).unwrap_or(max_future_hi);
-                        inference.signal.target_2_price =
-                            SubPennyPrice::from_scaled_units(t2_u).unwrap_or(max_future_hi);
-                    } else {
-                        inference.signal.direction = raw_fingerprint_core::TradeDirection::Short;
-                        let risk_u = (dn_exc_u * 36 / 100).max(1);
-                        let t1_u = (entry_px.scaled_units() - (dn_exc_u * 85 / 100).max(1)).max(1);
-                        let t2_u = (entry_px.scaled_units() - (dn_exc_u * 92 / 100).max(2)).max(1);
-                        let stop_u = entry_px.scaled_units() + up_exc_u.max(risk_u) + 10;
-                        inference.signal.structural_stop_price =
-                            SubPennyPrice::from_scaled_units(stop_u).unwrap_or(entry_px);
-                        inference.signal.target_1_price =
-                            SubPennyPrice::from_scaled_units(t1_u).unwrap_or(min_future_lo);
-                        inference.signal.target_2_price =
-                            SubPennyPrice::from_scaled_units(t2_u).unwrap_or(min_future_lo);
-                    }
-                } else {
-                    // Calibrate stop inside the observed real Yahoo adverse excursion so it triggers STOPPED OUT on a real Yahoo bar
-                    inference.signal.direction = raw_fingerprint_core::TradeDirection::Long;
-                    let stop_u = (entry_px.scaled_units() - (dn_exc_u * 65 / 100).max(1)).max(1);
-                    let t1_u = entry_px.scaled_units() + up_exc_u * 2;
-                    let t2_u = entry_px.scaled_units() + up_exc_u * 3;
-                    inference.signal.structural_stop_price =
-                        SubPennyPrice::from_scaled_units(stop_u).unwrap_or(min_future_lo);
-                    inference.signal.target_1_price =
-                        SubPennyPrice::from_scaled_units(t1_u).unwrap_or(max_future_hi);
-                    inference.signal.target_2_price =
-                        SubPennyPrice::from_scaled_units(t2_u).unwrap_or(max_future_hi);
-                }
-
-                let _ = self.ledger.open_position_with_bars(
-                    exchange_idx,
-                    &inference,
-                    &precedents,
-                    10_000.0,
-                    entry_window.to_vec(),
-                );
-
-                // Walk forward bar-by-bar through the real Yahoo Finance `future_window`
-                let mut running_window = entry_window.to_vec();
-                for next_bar in future_window {
-                    running_window.push(*next_bar);
-                    let closed = self.ledger.process_live_bar_for_symbol(
-                        symbol,
-                        &running_window,
-                        &raw_internals,
-                    );
-                    if !closed.is_empty() {
-                        break;
+                    if inference.signal.ai_confidence_pct >= 58.0 {
+                        let _ = self.ledger.open_position_with_bars(
+                            exchange_idx,
+                            &inference,
+                            &precedents,
+                            10_000.0,
+                            causal_slice.to_vec(),
+                        );
                     }
                 }
-            } else {
-                // Active Live Position on the latest real Yahoo Finance bar (`CLOV`, `SOFI`, `AMD`)
+            }
+
+            if !close_in_walkforward && !self.ledger.has_open_position_for_symbol(symbol) {
+                // Active Live Position on the latest real exchange bar (`CLOV`, `SOFI`, `AMD`)
+                let live_window = &raw_bars[raw_bars.len().saturating_sub(24)..];
                 let probe = self
                     .onnx_engine
                     .evaluate_live_signal(
                         symbol,
                         brain_id,
                         is_opt,
-                        &raw_bars,
+                        live_window,
                         &raw_opts,
                         &raw_sf,
                         &raw_internals,
@@ -406,7 +354,7 @@ impl AppState {
                         symbol,
                         brain_id,
                         is_opt,
-                        &raw_bars,
+                        live_window,
                         &raw_opts,
                         &raw_sf,
                         &raw_internals,
@@ -419,7 +367,7 @@ impl AppState {
                     &inference,
                     &precedents,
                     10_000.0,
-                    raw_bars.clone(),
+                    live_window.to_vec(),
                 );
             }
         }

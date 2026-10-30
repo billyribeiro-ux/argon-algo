@@ -330,6 +330,13 @@ impl RealTimeLedgerEngine {
         *self.running_net_profit_usd.write() = 0.0;
     }
 
+    pub fn has_open_position_for_symbol(&self, symbol: &str) -> bool {
+        self.positions_opened
+            .read()
+            .iter()
+            .any(|p| p.symbol.eq_ignore_ascii_case(symbol))
+    }
+
     /// Instantaneously births a new live signal into `POSITIONS OPENED`.
     pub fn open_position(
         &self,
@@ -358,6 +365,10 @@ impl RealTimeLedgerEngine {
     ) -> OpenPositionRow {
         let sig = &inference.signal;
         let opt = &inference.matched_option;
+        crate::onnx_engine::OnnxMultiBrainEngine::assert_option_direction_invariant(
+            sig.direction,
+            opt,
+        );
         let entry_f64 = sig.entry_price.to_f64().max(0.00001);
         let qty = (notional_allocation_usd.max(100.0) / entry_f64)
             .round()
@@ -569,23 +580,42 @@ impl RealTimeLedgerEngine {
                 }
             };
             let dynamic_exit = pos.trace_health_badge == TraceHealthBadge::DynamicExitTriggered;
+            let bars_since_open = pos
+                .entry_bars
+                .iter()
+                .filter(|b| b.timestamp_ns > pos.opened_timestamp_ns)
+                .count();
+            let max_hold_bars = match pos.brain_id {
+                BrainHorizonId::Brain01PennyAnomaly => 10,
+                BrainHorizonId::Brain02IntradayDayTrade => 12,
+                BrainHorizonId::Brain03ShortTermSwing => 14,
+                BrainHorizonId::Brain04CoreSwing => 18,
+                BrainHorizonId::Brain05LongTermWealth => 24,
+            };
+            let time_expired = bars_since_open >= max_hold_bars;
 
-            if target_hit || stop_hit || dynamic_exit {
+            if target_hit || stop_hit || dynamic_exit || time_expired {
                 let removed = open_list.remove(idx);
                 let (badge, exit_price) = if target_hit {
                     (ClosedOutcomeBadge::TargetHit, removed.target_2_price)
                 } else if dynamic_exit {
                     (ClosedOutcomeBadge::AiDynamicExit, removed.live_price)
+                } else if stop_hit {
+                    if removed.structural_stop_price == removed.entry_price {
+                        (
+                            ClosedOutcomeBadge::TrailingStop,
+                            removed.structural_stop_price,
+                        )
+                    } else {
+                        (
+                            ClosedOutcomeBadge::StoppedOut,
+                            removed.structural_stop_price,
+                        )
+                    }
                 } else if removed.structural_stop_price == removed.entry_price {
-                    (
-                        ClosedOutcomeBadge::TrailingStop,
-                        removed.structural_stop_price,
-                    )
+                    (ClosedOutcomeBadge::TrailingStop, removed.live_price)
                 } else {
-                    (
-                        ClosedOutcomeBadge::StoppedOut,
-                        removed.structural_stop_price,
-                    )
+                    (ClosedOutcomeBadge::AiDynamicExit, removed.live_price)
                 };
 
                 let archived =

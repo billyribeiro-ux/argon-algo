@@ -192,25 +192,36 @@ mod tests {
         // 1. Verify YahooFinanceLiveAdapter is the default primary adapter
         assert_eq!(state.data_bus.primary_provider_id(), "yahoo_finance_live");
 
-        // 2. Fetch real Yahoo Finance 5m bars for NVDA, TSLA, SPY, and SOFI
+        // 2. Fetch deep 300-bar real exchange OHLCV bars for NVDA, TSLA, SPY, and SOFI
+        // and verify genuine exchange Open, High, Low, Close, Volume (`Open != Low != Close`)
         for sym in ["NVDA", "TSLA", "SPY", "SOFI"] {
             let bars = state
                 .yahoo_adapter
-                .fetch_historical_bars(sym, Timeframe::M5, 32)
+                .fetch_historical_bars(sym, Timeframe::M5, 300)
                 .await
-                .unwrap_or_else(|e| panic!("Failed fetching real Yahoo bars for {sym}: {e}"));
+                .unwrap_or_else(|e| panic!("Failed fetching real OHLCV bars for {sym}: {e}"));
             assert!(
-                bars.len() >= 16,
-                "Expected >= 16 real Yahoo bars for {sym}, got {}",
+                bars.len() >= 200,
+                "Expected >= 200 deep real OHLCV bars for {sym}, got {}",
+                bars.len()
+            );
+            let distinct_wick_bars = bars
+                .iter()
+                .filter(|b| b.open != b.low && b.low != b.close && b.high > b.low)
+                .count();
+            assert!(
+                distinct_wick_bars > bars.len() / 2,
+                "Expected real exchange OHLCV wicks (Open != Low != Close) on {sym}, got {distinct_wick_bars}/{}",
                 bars.len()
             );
             let latest = bars.last().unwrap();
             assert!(latest.close.to_f64() > 0.50);
             assert!(latest.volume > 0);
             println!(
-                "[REAL YAHOO CHART] {} | Bars: {} | Latest Ts(ns): {} | Open: {} | High: {} | Low: {} | Close: {} | Vol: {}",
+                "[REAL EXCHANGE OHLCV] {} | Bars: {} (Distinct Wicks: {}) | Latest Ts(ns): {} | Open: {} | High: {} | Low: {} | Close: {} | Vol: {}",
                 sym,
                 bars.len(),
+                distinct_wick_bars,
                 latest.timestamp_ns,
                 latest.open,
                 latest.high,
@@ -220,7 +231,50 @@ mod tests {
             );
         }
 
-        // 3. Execute real Yahoo Finance walk-forward backfill across all 5 Brains
+        // 2b. Verify Real CBOE Delayed OPRA Options Chain (`cdn.cboe.com`) & Real FINRA RegSHO Short Volume (`cdn.finra.org`)
+        let nvda_chain = state
+            .yahoo_adapter
+            .fetch_option_chain("NVDA")
+            .await
+            .expect("Fetch real CBOE option chain for NVDA");
+        assert!(
+            !nvda_chain.contracts.is_empty(),
+            "Expected non-empty CBOE option chain for NVDA"
+        );
+        let sample_opt = &nvda_chain.contracts[0];
+        println!(
+            "[REAL CBOE OPTION] {} | Spot: {} | Contracts: {} | Sample: {} | Bid: {} | Ask: {} | Vol: {} | OI: {} | IV: {:.3} | Delta: {:.3}",
+            nvda_chain.underlying,
+            nvda_chain.underlying_price,
+            nvda_chain.contracts.len(),
+            sample_opt.contract_symbol,
+            sample_opt.bid,
+            sample_opt.ask,
+            sample_opt.volume,
+            sample_opt.open_interest,
+            sample_opt.iv,
+            sample_opt.delta
+        );
+
+        let finra_count = state
+            .yahoo_adapter
+            .session()
+            .ensure_finra_regsho_loaded()
+            .await;
+        assert!(
+            finra_count > 1_000,
+            "Expected > 1,000 FINRA RegSHO symbols loaded, got {finra_count}"
+        );
+        for sym in ["NVDA", "TSLA", "AMD", "PLTR", "SOFI", "IONQ", "CLOV"] {
+            if let Some(rec) = state.yahoo_adapter.session().get_finra_short_volume(sym) {
+                println!(
+                    "[REAL FINRA REGSHO] {} ({}) | ShortVol: {:.0} | TotalVol: {:.0} | ShortRatio: {:.4}",
+                    rec.symbol, rec.date, rec.short_volume, rec.total_volume, rec.short_vol_ratio
+                );
+            }
+        }
+
+        // 3. Execute strictly causal deep walk-forward backfill across all 5 Brains
         let snap = state
             .run_real_yahoo_walk_forward_backfill()
             .await
@@ -231,13 +285,30 @@ mod tests {
             "Expected live open positions from real Yahoo Finance data"
         );
         assert!(
-            !snap.closed_trades.is_empty(),
-            "Expected walk-forward closed trades from real Yahoo Finance data"
+            snap.closed_trades.len() >= 15,
+            "Expected >= 15 deep causal walk-forward closed trades, got {}",
+            snap.closed_trades.len()
         );
 
         for pos in &snap.positions_opened {
+            // Verify Option Direction Invariant on every open position
+            if pos.option_structure != "SHARES_ONLY" && pos.option_contracts_count > 0 {
+                if pos.direction == raw_fingerprint_core::TradeDirection::Long {
+                    assert!(
+                        pos.option_structure != "SINGLE_LEG_PUT"
+                            && !pos.matched_option_contract.ends_with('P')
+                            && pos.contract_delta >= 0.0
+                    );
+                } else {
+                    assert!(
+                        pos.option_structure != "SINGLE_LEG_CALL"
+                            && !pos.matched_option_contract.ends_with('C')
+                            && pos.contract_delta <= 0.0
+                    );
+                }
+            }
             println!(
-                "[REAL YAHOO OPEN POSITION] {} ({}) | Dir: {} | Entry: {} | Live: {} | Stop: {} | T1: {} | T2: {} | Option: {} ({}) | Conf: {:.1}%",
+                "[REAL CAUSAL OPEN POSITION] {} ({}) | Dir: {} | Entry: {} | Live: {} | Stop: {} | T1: {} | T2: {} | Option: {} ({}, delta={:.2}) | Conf: {:.1}%",
                 pos.symbol,
                 pos.brain_id.code(),
                 pos.direction.as_str(),
@@ -248,18 +319,44 @@ mod tests {
                 pos.target_2_price,
                 pos.matched_option_contract,
                 pos.option_structure,
+                pos.contract_delta,
                 pos.ai_confidence_pct
             );
         }
 
         for tr in &snap.closed_trades {
+            // Verify Option Direction Invariant on every closed trade
+            if tr.option_structure != "SHARES_ONLY" && tr.option_contracts_count > 0 {
+                if tr.direction == raw_fingerprint_core::TradeDirection::Long {
+                    assert!(
+                        tr.option_structure != "SINGLE_LEG_PUT"
+                            && !tr.matched_option_contract.ends_with('P'),
+                        "LONG closed trade {} had bearish option {} ({})",
+                        tr.symbol,
+                        tr.matched_option_contract,
+                        tr.option_structure
+                    );
+                } else {
+                    assert!(
+                        tr.option_structure != "SINGLE_LEG_CALL"
+                            && !tr.matched_option_contract.ends_with('C'),
+                        "SHORT closed trade {} had bullish option {} ({})",
+                        tr.symbol,
+                        tr.matched_option_contract,
+                        tr.option_structure
+                    );
+                }
+            }
             println!(
-                "[REAL YAHOO CLOSED TRADE] {} ({}) | Badge: {} | Entry: {} -> Exit: {} | Net P&L: ${:.2} ({:.2}R) | Bars: {}",
+                "[REAL CAUSAL CLOSED TRADE] {} ({}) | Dir: {} | Badge: {} | Entry: {} -> Exit: {} | Option: {} ({}) | Net P&L: ${:.2} ({:.2}R) | Bars: {}",
                 tr.symbol,
                 tr.brain_id.code(),
+                tr.direction.as_str(),
                 tr.outcome_badge.as_str(),
                 tr.entry_price,
                 tr.actual_exit_price,
+                tr.matched_option_contract,
+                tr.option_structure,
                 tr.net_pnl_usd,
                 tr.realized_r_multiple,
                 tr.entry_bars.len()

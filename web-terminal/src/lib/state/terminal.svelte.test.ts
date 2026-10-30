@@ -352,4 +352,27 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
     expect(csv).toContain('AI DYNAMIC EXIT');
     expect(csv).toContain('STOPPED OUT');
   });
+
+  it('maintains independent comparison viewports in SPLIT_50_50 and 4 Brain viewports in QUAD_2X2', async () => {
+    const store = new TerminalStore(false);
+    seedYahooBackendState(store);
+
+    expect(store.splitPanes.length).toBe(2);
+    expect(store.splitPanes[0]?.paneId).toBe('SPLIT_RED');
+    expect(store.splitPanes[1]?.paneId).toBe('SPLIT_BLUE');
+    expect(store.quadViewports.length).toBe(4);
+
+    store.setWorkspaceLayout('SPLIT_50_50');
+    expect(store.workspaceLayout).toBe('SPLIT_50_50');
+
+    await store.updateViewportPane('SPLIT_RED', {
+      symbol: 'PLUG',
+      brainId: 'BRAIN-01',
+      timeframe: '15m'
+    });
+    expect(store.splitPanes[0]?.symbol).toBe('PLUG');
+    expect(store.splitPanes[0]?.brainId).toBe('BRAIN-01');
+    expect(store.splitPanes[0]?.timeframe).toBe('15m');
+    expect(store.splitPanes[1]?.symbol).toBe('AMD');
+  });
 });

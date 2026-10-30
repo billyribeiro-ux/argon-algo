@@ -331,6 +331,7 @@ impl OnnxMultiBrainEngine {
             options.front_iv,
             options.net_dealer_vanna,
         );
+        Self::assert_option_direction_invariant(signal.direction, &matched_option);
 
         let latency_micros = start.elapsed().as_micros() as u64;
 
@@ -344,8 +345,44 @@ impl OnnxMultiBrainEngine {
         })
     }
 
+    /// Enforces the strict institutional Option Direction Invariant:
+    /// - A `LONG` trade MUST NEVER be paired with a bearish `SINGLE_LEG_PUT` or negative-delta contract.
+    /// - A `SHORT` trade MUST NEVER be paired with a bullish `SINGLE_LEG_CALL` or positive-delta contract.
+    pub fn assert_option_direction_invariant(
+        direction: TradeDirection,
+        opt: &MatchedOptionExecutionPlan,
+    ) {
+        if opt.option_structure == "SHARES_ONLY" || opt.option_contracts_count == 0 {
+            return;
+        }
+        match direction {
+            TradeDirection::Long => {
+                assert!(
+                    opt.option_structure != "SINGLE_LEG_PUT"
+                        && !opt.matched_option_contract.ends_with('P')
+                        && opt.contract_delta >= 0.0,
+                    "OPTION DIRECTION INVARIANT VIOLATION: LONG trade paired with bearish option ({}, {}, delta={})",
+                    opt.option_structure,
+                    opt.matched_option_contract,
+                    opt.contract_delta
+                );
+            }
+            TradeDirection::Short => {
+                assert!(
+                    opt.option_structure != "SINGLE_LEG_CALL"
+                        && !opt.matched_option_contract.ends_with('C')
+                        && opt.contract_delta <= 0.0,
+                    "OPTION DIRECTION INVARIANT VIOLATION: SHORT trade paired with bullish option ({}, {}, delta={})",
+                    opt.option_structure,
+                    opt.matched_option_contract,
+                    opt.contract_delta
+                );
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn match_option_contract(
+    pub fn match_option_contract(
         symbol: &str,
         brain_id: BrainHorizonId,
         direction: TradeDirection,

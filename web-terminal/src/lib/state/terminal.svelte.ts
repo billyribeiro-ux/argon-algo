@@ -466,8 +466,107 @@ export class TerminalStore {
   // Plug-and-Play Provider Status (Hydrated from /api/v1/providers)
   providers = $state<ProviderStatusEntry[]>([]);
 
+  // Independent Multi-Viewport Comparison Panes for SPLIT_50_50 and QUAD_2X2 modes
+  splitPanes = $state<
+    Array<{
+      paneId: string;
+      title: string;
+      linkChannel: LinkChannelColor;
+      brainId: Exclude<BrainId, 'ALL_5_BRAINS'>;
+      symbol: string;
+      timeframe: ChartTimeframeId;
+      range: ChartRangeId;
+      loading: boolean;
+      blueprint: ScannerSignalCandidate | null;
+    }>
+  >([
+    {
+      paneId: 'SPLIT_RED',
+      title: 'WORKSPACE A — RED CHANNEL',
+      linkChannel: 'RED',
+      brainId: 'BRAIN-02',
+      symbol: 'NVDA',
+      timeframe: '5m',
+      range: '1D',
+      loading: false,
+      blueprint: null
+    },
+    {
+      paneId: 'SPLIT_BLUE',
+      title: 'WORKSPACE B — BLUE CHANNEL',
+      linkChannel: 'BLUE',
+      brainId: 'BRAIN-04',
+      symbol: 'AMD',
+      timeframe: '1D',
+      range: '6M',
+      loading: false,
+      blueprint: null
+    }
+  ]);
+
+  quadViewports = $state<
+    Array<{
+      paneId: string;
+      title: string;
+      linkChannel: LinkChannelColor;
+      brainId: Exclude<BrainId, 'ALL_5_BRAINS'>;
+      symbol: string;
+      timeframe: ChartTimeframeId;
+      range: ChartRangeId;
+      loading: boolean;
+      blueprint: ScannerSignalCandidate | null;
+    }>
+  >([
+    {
+      paneId: 'QUAD_B1',
+      title: 'BRAIN-01 PENNY ANOMALY',
+      linkChannel: 'RED',
+      brainId: 'BRAIN-01',
+      symbol: 'CLOV',
+      timeframe: '5m',
+      range: '5D',
+      loading: false,
+      blueprint: null
+    },
+    {
+      paneId: 'QUAD_B2',
+      title: 'BRAIN-02 INTRADAY DAY TRADE',
+      linkChannel: 'BLUE',
+      brainId: 'BRAIN-02',
+      symbol: 'NVDA',
+      timeframe: '5m',
+      range: '1D',
+      loading: false,
+      blueprint: null
+    },
+    {
+      paneId: 'QUAD_B3',
+      title: 'BRAIN-03 SHORT-TERM SWING',
+      linkChannel: 'GREEN',
+      brainId: 'BRAIN-03',
+      symbol: 'PLTR',
+      timeframe: '1H',
+      range: '1M',
+      loading: false,
+      blueprint: null
+    },
+    {
+      paneId: 'QUAD_B4',
+      title: 'BRAIN-04 CORE SWING',
+      linkChannel: 'GOLD',
+      brainId: 'BRAIN-04',
+      symbol: 'AMD',
+      timeframe: '1D',
+      range: '6M',
+      loading: false,
+      blueprint: null
+    }
+  ]);
+
   public readonly syncBus: MultiWindowSyncBus;
   private wsConnection: WebSocket | null = null;
+  private wsReconnectAttempt = 0;
+  private wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Derived Filtered Scanner List
   filteredScannerCandidates = $derived.by(() => {
@@ -725,13 +824,25 @@ export class TerminalStore {
   private connectWebSocketStream(): void {
     if (typeof WebSocket === 'undefined') return;
     try {
+      if (this.wsReconnectTimer) {
+        clearTimeout(this.wsReconnectTimer);
+        this.wsReconnectTimer = null;
+      }
       if (this.wsConnection) {
+        this.wsConnection.onclose = null;
+        this.wsConnection.onerror = null;
         this.wsConnection.close();
       }
       const ws = new WebSocket(WS_URL);
       this.wsConnection = ws;
       ws.onopen = () => {
+        const wasReconnect = this.wsReconnectAttempt > 0;
+        this.wsReconnectAttempt = 0;
         this.backendConnected = true;
+        if (wasReconnect) {
+          void this.fetchLedgerSnapshot();
+          void this.fetchScannerCandidates();
+        }
       };
       ws.onmessage = (ev) => {
         try {
@@ -746,9 +857,18 @@ export class TerminalStore {
           // Ignore malformed WS frames
         }
       };
-      ws.onclose = () => {
+      const scheduleReconnect = () => {
         this.backendConnected = false;
+        if (this.wsReconnectTimer) return;
+        const delayMs = Math.min(5000, 500 * Math.pow(2, this.wsReconnectAttempt));
+        this.wsReconnectAttempt += 1;
+        this.wsReconnectTimer = setTimeout(() => {
+          this.wsReconnectTimer = null;
+          this.connectWebSocketStream();
+        }, delayMs);
       };
+      ws.onclose = scheduleReconnect;
+      ws.onerror = scheduleReconnect;
     } catch {
       this.backendConnected = false;
     }
@@ -1390,6 +1510,87 @@ export class TerminalStore {
 
   public setWorkspaceLayout(mode: WorkspaceLayoutMode): void {
     this.workspaceLayout = mode;
+    if (mode !== 'SINGLE' && typeof window !== 'undefined' && typeof fetch === 'function') {
+      void this.hydrateMultiViewports(mode);
+    }
+  }
+
+  public async hydrateMultiViewports(mode: WorkspaceLayoutMode = this.workspaceLayout): Promise<void> {
+    if (mode === 'SPLIT_50_50') {
+      await Promise.all(this.splitPanes.map((p) => this.fetchViewportPaneChart(p.paneId)));
+    } else if (mode === 'QUAD_2X2') {
+      await Promise.all(this.quadViewports.map((p) => this.fetchViewportPaneChart(p.paneId)));
+    }
+  }
+
+  public async updateViewportPane(
+    paneId: string,
+    patch: Partial<{
+      symbol: string;
+      brainId: Exclude<BrainId, 'ALL_5_BRAINS'>;
+      timeframe: ChartTimeframeId;
+      range: ChartRangeId;
+      linkChannel: LinkChannelColor;
+    }>
+  ): Promise<void> {
+    const cleanSym = patch.symbol ? patch.symbol.trim().toUpperCase() : undefined;
+    const sIdx = this.splitPanes.findIndex((p) => p.paneId === paneId);
+    if (sIdx >= 0) {
+      const cur = this.splitPanes[sIdx]!;
+      this.splitPanes[sIdx] = {
+        ...cur,
+        ...(patch.brainId ? { brainId: patch.brainId } : {}),
+        ...(cleanSym ? { symbol: cleanSym } : {}),
+        ...(patch.timeframe ? { timeframe: patch.timeframe } : {}),
+        ...(patch.range ? { range: patch.range } : {}),
+        ...(patch.linkChannel ? { linkChannel: patch.linkChannel } : {})
+      };
+      await this.fetchViewportPaneChart(paneId);
+      return;
+    }
+
+    const qIdx = this.quadViewports.findIndex((p) => p.paneId === paneId);
+    if (qIdx >= 0) {
+      const cur = this.quadViewports[qIdx]!;
+      this.quadViewports[qIdx] = {
+        ...cur,
+        ...(patch.brainId ? { brainId: patch.brainId } : {}),
+        ...(cleanSym ? { symbol: cleanSym } : {}),
+        ...(patch.timeframe ? { timeframe: patch.timeframe } : {}),
+        ...(patch.range ? { range: patch.range } : {}),
+        ...(patch.linkChannel ? { linkChannel: patch.linkChannel } : {})
+      };
+      await this.fetchViewportPaneChart(paneId);
+    }
+  }
+
+  public async fetchViewportPaneChart(paneId: string): Promise<void> {
+    const isSplit = paneId.startsWith('SPLIT_');
+    const list = isSplit ? this.splitPanes : this.quadViewports;
+    const idx = list.findIndex((p) => p.paneId === paneId);
+    if (idx < 0) return;
+
+    const pane = list[idx]!;
+    pane.loading = true;
+    try {
+      const url = `${API_BASE}/api/v1/chart/${encodeURIComponent(pane.symbol)}?interval=${encodeURIComponent(pane.timeframe)}&range=${encodeURIComponent(pane.range)}&brain_id=${encodeURIComponent(pane.brainId)}&limit=64`;
+      const res = await fetch(url);
+      if (res.ok) {
+        const payload = await res.json();
+        const candidate = this.ingestBackendChartResponse(payload);
+        pane.blueprint = candidate;
+      }
+    } catch {
+      // Fallback to matching scannerCandidate if offline in unit test
+      const fallback = this.scannerCandidates.find(
+        (c) => c.symbol.toUpperCase() === pane.symbol.toUpperCase()
+      );
+      if (fallback) {
+        pane.blueprint = fallback;
+      }
+    } finally {
+      pane.loading = false;
+    }
   }
 
   public setLinkChannel(color: LinkChannelColor, broadcast = false): void {

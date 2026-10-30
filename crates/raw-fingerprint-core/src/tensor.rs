@@ -620,7 +620,10 @@ impl RawFingerprintEngine {
         let expected_r_multiple = (p80_mfe_units as f64) / (risk_units as f64);
 
         // Compute Raw Evidence Confidence % directly from bar impulse attention + empirical precedent win rate + stream alignment
-        let latest_attn = *tensor.bar_attention_heatmap.last().unwrap_or(&0.5) as f64;
+        let latest_attn = ((*tensor.bar_attention_heatmap.last().unwrap_or(&0.05) as f64)
+            * (tensor.seq_len.max(1) as f64)
+            * 0.55)
+            .clamp(0.25, 1.0);
         let stream_concentration = (tensor
             .stream_weights
             .chart_tape_physics_weight

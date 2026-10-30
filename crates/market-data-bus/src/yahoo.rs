@@ -1151,7 +1151,7 @@ impl YahooSessionManager {
             .map(|r| r.short_vol_ratio);
 
         if let Some(mut cached) = self.symbol_cache.read().get(&clean_sym).cloned()
-            && cached.inserted_at.elapsed() < Duration::from_secs(20)
+            && cached.inserted_at.elapsed() < Duration::from_secs(120)
         {
             if cached.data.finra_short_vol_ratio.is_none() {
                 cached.data.finra_short_vol_ratio = finra_ratio;

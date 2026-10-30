@@ -162,6 +162,12 @@ impl AppState {
                 Timeframe::W1,
                 true,
             ),
+            (
+                "SPY",
+                BrainHorizonId::Brain05LongTermWealth,
+                Timeframe::W1,
+                true,
+            ),
         ];
 
         // 1. Fetch real Yahoo Finance universe snapshots concurrently
@@ -208,12 +214,12 @@ impl AppState {
             let sector_etf = snap.map(|s| s.sector_etf.as_str()).unwrap_or("SPY");
             let raw_internals = internals_unified.to_raw_internals_snapshot(sector_etf);
 
-            let opt_chain = self
+            let raw_opts = self
                 .yahoo_adapter
                 .fetch_option_chain(symbol)
                 .await
-                .map_err(|e| e.to_string())?;
-            let raw_opts = opt_chain.to_raw_options_snapshot();
+                .map(|c| c.to_raw_options_snapshot())
+                .unwrap_or_default();
 
             // STRICT CAUSAL PARTITION:
             // Era 1 (`0..calibration_end`): Index historical traces & subsequent excursions strictly inside the past memory era.

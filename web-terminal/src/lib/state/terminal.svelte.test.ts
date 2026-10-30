@@ -184,6 +184,21 @@ function seedYahooBackendState(store: TerminalStore): void {
         ai_confidence_pct: 92.5,
         primary_driver: 'GAMMA_SQUEEZE',
         precedent_win_rate_pct: 88.0,
+        kelly_fraction_pct: 2.15,
+        risk_budget_usd: 215.0,
+        notional_allocated_usd: 23809.52,
+        tranche_count: 2,
+        scale_in_history: ['TRANCHE 2 (+0.35R): +25 sh @ $391.25'],
+        entry_bar_idx: 2,
+        exit_bar_idx: 5,
+        entry_bars: [
+          { timestamp_ns: 1730199400000000000, open: 388.2, high: 389.1, low: 387.9, close: 388.8, volume: 420000, attention_weight: 0.45 },
+          { timestamp_ns: 1730199700000000000, open: 388.8, high: 390.1, low: 388.5, close: 389.9, volume: 610000, attention_weight: 0.68 },
+          { timestamp_ns: 1730200000000000000, open: 390.0, high: 391.5, low: 389.7, close: 391.2, volume: 980000, attention_weight: 0.89 },
+          { timestamp_ns: 1730200300000000000, open: 391.2, high: 394.3, low: 391.0, close: 394.1, volume: 1120000, attention_weight: 0.91 },
+          { timestamp_ns: 1730200600000000000, open: 394.1, high: 396.2, low: 393.8, close: 395.9, volume: 890000, attention_weight: 0.78 },
+          { timestamp_ns: 1730203600000000000, open: 395.9, high: 397.8, low: 395.5, close: 397.45, volume: 1250000, attention_weight: 0.93 }
+        ],
         stream_weights: {
           chart_tape_physics_weight: 0.35,
           options_gamma_vanna_weight: 0.4,
@@ -456,6 +471,87 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
 
     store.dismissBacktestSummary();
     expect(store.lastBacktestSummary).toBeNull();
+
+    vi.unstubAllGlobals();
+  });
+
+  it('hydrates Phase 12 Fractional-Kelly sizing, Full-Lifecycle Replay Scrubber bars, and Outbound Webhooks', async () => {
+    const store = new TerminalStore(false);
+    seedYahooBackendState(store);
+
+    const tslaTrade = store.closedLedger.find((t) => t.tradeId === 'TRD-8001');
+    expect(tslaTrade).toBeDefined();
+    expect(tslaTrade?.kellyFractionPct).toBeCloseTo(2.15, 2);
+    expect(tslaTrade?.riskBudgetUsd).toBeCloseTo(215.0, 2);
+    expect(tslaTrade?.notionalAllocatedUsd).toBeCloseTo(23809.52, 2);
+    expect(tslaTrade?.trancheCount).toBe(2);
+    expect(tslaTrade?.entryBarIdx).toBe(2);
+    expect(tslaTrade?.exitBarIdx).toBe(5);
+    expect(tslaTrade?.entryBars.length).toBe(6);
+
+    store.selectClosedTradeForReplay(tslaTrade!);
+    expect(store.activeReplayTrade?.tradeId).toBe('TRD-8001');
+    expect(store.activeBlueprint.bars.length).toBe(6);
+    store.clearReplayTrade();
+    expect(store.activeReplayTrade).toBeNull();
+
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        config: {
+          discord_webhook_url: 'https://discord.com/api/webhooks/test',
+          discord_enabled: true,
+          telegram_bot_token: '',
+          telegram_chat_id: '',
+          telegram_enabled: false,
+          slack_webhook_url: '',
+          slack_enabled: false,
+          custom_json_webhook_url: '',
+          custom_json_enabled: false
+        },
+        total_outbox_records: 1,
+        outbox_records: [
+          {
+            dispatch_id: 'WH-TEST-001',
+            dispatched_at_iso: '2026-10-30T13:30:00Z',
+            dispatched_timestamp_ms: 1730210000000,
+            event_type: 'SIGNAL_ENTRY_OPENED',
+            outcome_detail: 'OPEN ACTIVE',
+            symbol: 'NVDA',
+            brain_id: 'BRAIN-02',
+            brain_name: 'Intraday Day-Trading Algo',
+            direction: 'LONG',
+            entry_price: 210.14,
+            structural_stop_price: 207.2,
+            target_1_price: 214.8,
+            target_2_price: 219.5,
+            current_or_exit_price: 210.14,
+            kelly_fraction_pct: 1.95,
+            risk_budget_usd: 195.0,
+            notional_allocated_usd: 19500.0,
+            matched_option_contract: 'NVDA $210C',
+            greeks_summary: 'Δ 0.58 | Γ 0.044',
+            stream_attribution_summary: 'S1: 32% | S2: 41%',
+            precedent_win_rate_pct: 88.0,
+            ai_confidence_pct: 93.4,
+            pnl_usd: 0,
+            r_multiple: 0,
+            delivery_status: 'QUEUED_LOCAL_OUTBOX',
+            channels_targeted: ['DISCORD'],
+            discord_embed_json: '{"embeds":[{"title":"SIGNAL ENTRY OPENED"}]}',
+            telegram_markdown: '*SIGNAL ENTRY OPENED*',
+            slack_blocks_json: '{"blocks":[]}',
+            generic_webhook_json: '{}'
+          }
+        ]
+      })
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await store.fetchWebhookStatus();
+    expect(store.webhookStatus.config.discordEnabled).toBe(true);
+    expect(store.webhookStatus.totalOutboxRecords).toBe(1);
+    expect(store.webhookStatus.outboxRecords[0]?.dispatchId).toBe('WH-TEST-001');
 
     vi.unstubAllGlobals();
   });

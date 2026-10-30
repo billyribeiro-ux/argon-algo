@@ -43,6 +43,7 @@
           <th data-numeric="true">Live Price</th>
           <th data-numeric="true">Structural Stop</th>
           <th data-numeric="true">Target 1 / Target 2</th>
+          <th data-numeric="true">Kelly % / 1R Risk ($) / Notional ($)</th>
           <th data-numeric="true">Stock P&amp;L ($ / %)</th>
           <th>Options Contract</th>
           <th data-numeric="true">Opt Entry / Live</th>
@@ -80,6 +81,19 @@
             </td>
             <td data-numeric="true" class="pnl-positive">
               {formatSubPennyPrice(pos.target1Price)} / {formatSubPennyPrice(pos.target2Price)}
+            </td>
+            <td data-numeric="true" class="tabular-num">
+              <span class="badge badge-ai-core">{pos.kellyFractionPct.toFixed(2)}%</span>
+              <span style="margin-inline-start: 4px; color: var(--text-secondary);">
+                ${pos.riskBudgetUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+              /
+              <strong>
+                ${pos.notionalAllocatedUsd.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
+              </strong>
+              {#if pos.trancheCount > 1}
+                <span class="badge badge-long" style="margin-inline-start: 4px;">{pos.trancheCount}x Tranche</span>
+              {/if}
             </td>
             <td
               data-numeric="true"

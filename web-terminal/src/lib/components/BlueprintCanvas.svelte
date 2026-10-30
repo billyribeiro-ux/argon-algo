@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import {
     terminalStore,
     formatSubPennyPrice,
@@ -8,8 +9,10 @@
     type ChartRangeId,
     type RawBarCandle,
     type BrainId,
-    type LinkChannelColor
+    type LinkChannelColor,
+    type ClosedTradeLedgerItem
   } from '$lib/state/terminal.svelte';
+  import { executionAudio } from '$lib/audio/execution-audio';
 
   const TIMEFRAMES: ChartTimeframeId[] = ['1m', '3m', '5m', '15m', '1H', '4H', '1D', '1W', '1M'];
   const RANGES: ChartRangeId[] = ['1D', '5D', '1M', '6M', '1Y', '5Y'];
@@ -54,6 +57,13 @@
   let dragStartX = $state<number>(0);
   let dragStartPanOffset = $state<number>(0);
 
+  // Institutional Bar-by-Bar Trade Replay Scrubber state (Maximization 2)
+  let currentReplayBarIdx = $state<number>(0);
+  let isReplayPlaying = $state<boolean>(false);
+  let replaySpeedMultiplier = $state<1 | 4 | 10>(1);
+  let replayTimerId: ReturnType<typeof setInterval> | null = null;
+  let lastReplayTradeId = $state<string | null>(null);
+
   const blueprint = $derived<ScannerSignalCandidate>(
     customBlueprint ?? terminalStore.activeBlueprint
   );
@@ -75,7 +85,258 @@
     )
   );
 
+  const activeReplayTrade = $derived<ClosedTradeLedgerItem | null>(
+    !paneId ? terminalStore.activeReplayTrade : null
+  );
+
+  const replayLifecycle = $derived.by(() => {
+    const tr = activeReplayTrade;
+    if (!tr || !tr.entryBars || tr.entryBars.length === 0) return null;
+    const bars = tr.entryBars;
+    const total = bars.length;
+    const entryIdx = Math.max(
+      0,
+      Math.min(
+        total - 1,
+        tr.entryBarIdx > 0 && tr.entryBarIdx < total
+          ? tr.entryBarIdx
+          : Math.min(24, Math.max(0, total - 2))
+      )
+    );
+    const exitIdx = Math.max(
+      entryIdx,
+      Math.min(total - 1, tr.exitBarIdx > entryIdx ? tr.exitBarIdx : total - 1)
+    );
+    const isLong = tr.direction === 'LONG';
+    const entryPrice = tr.entryPrice;
+    const initialStop = tr.structuralStopAtEntry;
+    const risk1R = Math.max(0.00001, Math.abs(entryPrice - initialStop));
+    const t1Price = tr.target1AtEntry;
+    const t2Price = tr.target2AtEntry;
+    const runnerLockR = tr.brainId === 'BRAIN-01' ? 0.6 : 0.45;
+
+    let t1HitBarIdx: number | null = null;
+    let scaleInBarIdx: number | null = null;
+    for (let k = entryIdx + 1; k <= exitIdx; k++) {
+      const b = bars[k]!;
+      const favExcursion = isLong ? b.high - entryPrice : entryPrice - b.low;
+      if (
+        scaleInBarIdx === null &&
+        tr.trancheCount > 1 &&
+        favExcursion >= 0.32 * risk1R
+      ) {
+        scaleInBarIdx = k;
+      }
+      const reachedT1 = isLong ? b.high >= t1Price : b.low <= t1Price;
+      if (t1HitBarIdx === null && reachedT1) {
+        t1HitBarIdx = k;
+      }
+    }
+
+    const clampedCursor = Math.max(0, Math.min(total - 1, currentReplayBarIdx));
+    let activeStopPrice = initialStop;
+    let stopRatchetStage = 'INITIAL STOP (p85 MAE)';
+    let partialBankedAtCursor = false;
+    let activeTranchesAtCursor = clampedCursor >= entryIdx ? 1 : 0;
+
+    for (let k = entryIdx; k <= Math.min(clampedCursor, exitIdx); k++) {
+      const b = bars[k]!;
+      const favR = (isLong ? b.high - entryPrice : entryPrice - b.low) / risk1R;
+      if (scaleInBarIdx !== null && k >= scaleInBarIdx) {
+        activeTranchesAtCursor = tr.trancheCount;
+        const scaleStop = isLong ? entryPrice + 0.3 * risk1R : entryPrice - 0.3 * risk1R;
+        if ((isLong && scaleStop > activeStopPrice) || (!isLong && scaleStop < activeStopPrice)) {
+          activeStopPrice = scaleStop;
+          stopRatchetStage = 'SCALE-IN FLOOR (+0.30R)';
+        }
+      }
+      if (t1HitBarIdx !== null && k >= t1HitBarIdx) {
+        partialBankedAtCursor = true;
+        const runnerStop = isLong
+          ? entryPrice + runnerLockR * risk1R
+          : entryPrice - runnerLockR * risk1R;
+        if ((isLong && runnerStop > activeStopPrice) || (!isLong && runnerStop < activeStopPrice)) {
+          activeStopPrice = runnerStop;
+          stopRatchetStage = `RUNNER RATCHET (+${runnerLockR.toFixed(2)}R)`;
+        }
+      }
+      if (favR >= 1.7) {
+        const lock1R = isLong ? entryPrice + 1.0 * risk1R : entryPrice - 1.0 * risk1R;
+        if ((isLong && lock1R > activeStopPrice) || (!isLong && lock1R < activeStopPrice)) {
+          activeStopPrice = lock1R;
+          stopRatchetStage = 'RUNNER RATCHET (+1.00R LOCK)';
+        }
+      }
+    }
+
+    const curBar = bars[clampedCursor]!;
+    let simulatedR = 0;
+    let simulatedPnlUsd = 0;
+    let phaseBadge = 'PRE-ENTRY CONTEXT';
+
+    if (clampedCursor < entryIdx) {
+      phaseBadge = 'PRE-ENTRY CONTEXT';
+      simulatedR = 0;
+      simulatedPnlUsd = 0;
+    } else if (clampedCursor >= exitIdx) {
+      phaseBadge = `FINAL EXIT — ${tr.outcomeBadge}`;
+      simulatedR = tr.realizedRMultiple;
+      simulatedPnlUsd = tr.combinedTotalPnlUsd;
+    } else {
+      phaseBadge = partialBankedAtCursor ? 'RUNNER HOLD (BANKED 50% @ T1)' : 'ACTIVE HOLD';
+      const signedMove = isLong ? curBar.close - entryPrice : entryPrice - curBar.close;
+      const markR = signedMove / risk1R;
+      const t1R = Math.abs(t1Price - entryPrice) / risk1R;
+      simulatedR = partialBankedAtCursor ? 0.5 * t1R + 0.5 * markR : markR;
+      const effectiveRiskUsd = Math.max(75, tr.riskBudgetUsd || 150);
+      simulatedPnlUsd = simulatedR * effectiveRiskUsd;
+    }
+
+    return {
+      trade: tr,
+      bars,
+      total,
+      entryIdx,
+      exitIdx,
+      t1HitBarIdx,
+      scaleInBarIdx,
+      clampedCursor,
+      activeStopPrice,
+      stopRatchetStage,
+      partialBankedAtCursor,
+      activeTranchesAtCursor,
+      simulatedR,
+      simulatedPnlUsd,
+      phaseBadge,
+      t1Price,
+      t2Price
+    };
+  });
+
+  $effect(() => {
+    const tr = activeReplayTrade;
+    if (tr && tr.tradeId !== lastReplayTradeId) {
+      lastReplayTradeId = tr.tradeId;
+      stopReplayTimer();
+      const total = tr.entryBars.length;
+      const entryIdx =
+        tr.entryBarIdx > 0 && tr.entryBarIdx < total
+          ? tr.entryBarIdx
+          : Math.min(24, Math.max(0, total - 2));
+      currentReplayBarIdx = entryIdx;
+      panOffsetBars = 0;
+      visibleBarCount = Math.max(48, total);
+    } else if (!tr && lastReplayTradeId !== null) {
+      lastReplayTradeId = null;
+      stopReplayTimer();
+    }
+  });
+
+  function stopReplayTimer(): void {
+    isReplayPlaying = false;
+    if (replayTimerId !== null) {
+      clearInterval(replayTimerId);
+      replayTimerId = null;
+    }
+  }
+
+  onDestroy(() => {
+    stopReplayTimer();
+  });
+
+  function emitReplayAudioIfMilestone(nextBarIdx: number): void {
+    if (!replayLifecycle) return;
+    const { trade, entryIdx, t1HitBarIdx, scaleInBarIdx, exitIdx } = replayLifecycle;
+    if (nextBarIdx === entryIdx) {
+      executionAudio.playSignalEntryChime(trade.direction);
+    } else if (t1HitBarIdx !== null && nextBarIdx === t1HitBarIdx) {
+      executionAudio.playTarget1BankedChime();
+    } else if (scaleInBarIdx !== null && nextBarIdx === scaleInBarIdx) {
+      executionAudio.playScaleInChime();
+    } else if (nextBarIdx === exitIdx) {
+      executionAudio.playPositionClosedChime(trade.isWinner);
+    }
+  }
+
+  function stepReplayBy(delta: number): void {
+    if (!replayLifecycle) return;
+    const next = Math.max(0, Math.min(replayLifecycle.total - 1, currentReplayBarIdx + delta));
+    currentReplayBarIdx = next;
+    emitReplayAudioIfMilestone(next);
+    if (next >= replayLifecycle.total - 1) {
+      stopReplayTimer();
+    }
+  }
+
+  function jumpReplayToEntry(): void {
+    if (!replayLifecycle) return;
+    stopReplayTimer();
+    currentReplayBarIdx = replayLifecycle.entryIdx;
+    emitReplayAudioIfMilestone(replayLifecycle.entryIdx);
+  }
+
+  function jumpReplayToFullOutcome(): void {
+    if (!replayLifecycle) return;
+    stopReplayTimer();
+    currentReplayBarIdx = replayLifecycle.exitIdx;
+    emitReplayAudioIfMilestone(replayLifecycle.exitIdx);
+  }
+
+  function startReplayInterval(): void {
+    if (replayTimerId !== null) {
+      clearInterval(replayTimerId);
+    }
+    const intervalMs = replaySpeedMultiplier === 10 ? 75 : replaySpeedMultiplier === 4 ? 180 : 480;
+    replayTimerId = setInterval(() => {
+      if (!replayLifecycle) {
+        stopReplayTimer();
+        return;
+      }
+      if (currentReplayBarIdx >= replayLifecycle.total - 1) {
+        stopReplayTimer();
+        return;
+      }
+      stepReplayBy(1);
+    }, intervalMs);
+  }
+
+  function toggleReplayPlayPause(): void {
+    if (!replayLifecycle) return;
+    if (isReplayPlaying) {
+      stopReplayTimer();
+      return;
+    }
+    if (currentReplayBarIdx >= replayLifecycle.total - 1) {
+      currentReplayBarIdx = replayLifecycle.entryIdx;
+    }
+    isReplayPlaying = true;
+    startReplayInterval();
+  }
+
+  function setReplaySpeed(mult: 1 | 4 | 10): void {
+    replaySpeedMultiplier = mult;
+    if (isReplayPlaying) {
+      startReplayInterval();
+    }
+  }
+
+  function toggleReplayModeButton(): void {
+    if (activeReplayTrade) {
+      stopReplayTimer();
+      terminalStore.clearReplayTrade();
+      return;
+    }
+    const candidate =
+      symbolClosedTrades[0] ?? terminalStore.closedLedger[0] ?? null;
+    if (candidate) {
+      terminalStore.selectClosedTradeForReplay(candidate);
+    }
+  }
+
   const windowedBars = $derived.by((): RawBarCandle[] => {
+    if (replayLifecycle) {
+      return replayLifecycle.bars.slice(0, replayLifecycle.clampedCursor + 1);
+    }
     const total = blueprint.bars.length;
     if (total === 0) return [];
     const count = Math.max(8, Math.min(total, visibleBarCount));
@@ -102,7 +363,7 @@
   });
 
   const chartGeometry = $derived.by(() => {
-    const bars = windowedBars;
+    const bars = replayLifecycle ? replayLifecycle.bars : windowedBars;
     const barPrices = bars
       .flatMap((b) => [b.high, b.low])
       .filter((p) => Number.isFinite(p) && p > 0);
@@ -114,9 +375,10 @@
       blueprint.entryPrice,
       blueprint.structuralStopPrice,
       blueprint.target1Price,
-      blueprint.target2Price
+      blueprint.target2Price,
+      replayLifecycle?.activeStopPrice ?? 0
     ].filter(
-      (p) => Number.isFinite(p) && p > 0 && Math.abs(p - refMid) / Math.max(refMid, 0.00001) <= 0.22
+      (p) => Number.isFinite(p) && p > 0 && Math.abs(p - refMid) / Math.max(refMid, 0.00001) <= 0.25
     );
     const allPrices = [...barPrices, ...levelCandidates];
 
@@ -146,6 +408,9 @@
       maxVol,
       entryY: priceToY(blueprint.entryPrice || safePrices[0]!),
       stopY: priceToY(blueprint.structuralStopPrice || safePrices[0]!),
+      activeReplayStopY: priceToY(
+        replayLifecycle?.activeStopPrice ?? blueprint.structuralStopPrice ?? safePrices[0]!
+      ),
       t1Y: priceToY(blueprint.target1Price || safePrices[0]!),
       t2Y: priceToY(blueprint.target2Price || safePrices[0]!),
       priceToY
@@ -327,6 +592,17 @@
           : `⚡ Deep Backtest ${blueprint.symbol} on ${paneBrainId ?? blueprint.brainId}`}
       </button>
 
+      {#if !paneId}
+        <button
+          type="button"
+          class="action-btn {activeReplayTrade ? 'action-btn-primary' : ''}"
+          onclick={toggleReplayModeButton}
+          title="Toggle Full-Lifecycle (PRE-ENTRY + HOLD + EXIT) Bar-by-Bar Trade Replay Scrubber"
+        >
+          {activeReplayTrade ? '🎬 Exit Replay Mode' : '🎬 Replay Mode'}
+        </button>
+      {/if}
+
       {#if paneId}
         <button
           type="button"
@@ -403,6 +679,125 @@
       >
         Dismiss ✕
       </button>
+    </div>
+  {/if}
+
+  {#if replayLifecycle}
+    <div
+      role="region"
+      aria-label="Institutional Trade Replay Control Deck"
+      style="display: flex; flex-direction: column; gap: 8px; padding: 9px 12px; background: oklch(0.18 0.04 275 / 0.92); border-block-end: 1px solid oklch(0.65 0.16 275 / 0.55); font-size: 0.72rem;"
+    >
+      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <span class="badge badge-ai-core">🎬 FULL-LIFECYCLE TRADE REPLAY</span>
+          <strong>
+            {replayLifecycle.trade.tradeId} · {replayLifecycle.trade.symbol} ({replayLifecycle.trade.brainId})
+          </strong>
+          <span class="badge {replayLifecycle.simulatedPnlUsd >= 0 ? 'badge-long' : 'badge-short'}">
+            {replayLifecycle.phaseBadge}
+          </span>
+          <span class="tabular-num">
+            Simulated P&amp;L:
+            <strong class={replayLifecycle.simulatedPnlUsd >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+              {formatSignedUsd(replayLifecycle.simulatedPnlUsd)} ({replayLifecycle.simulatedR >= 0 ? '+' : ''}{replayLifecycle.simulatedR.toFixed(2)}R)
+            </strong>
+          </span>
+          <span class="tabular-num" style="color: var(--text-secondary);">
+            Stop Ratchet:
+            <strong style="color: oklch(0.82 0.16 80);">
+              {formatSubPennyPrice(replayLifecycle.activeStopPrice)} ({replayLifecycle.stopRatchetStage})
+            </strong>
+          </span>
+          <span class="tabular-num">
+            Tranches: <strong>{replayLifecycle.activeTranchesAtCursor}/{replayLifecycle.trade.trancheCount}</strong>
+          </span>
+          {#if replayLifecycle.partialBankedAtCursor}
+            <span class="badge badge-long">BANKED 50% @ T1</span>
+          {/if}
+          <span class="tabular-num" style="color: var(--text-secondary);">
+            Kelly: <strong>{replayLifecycle.trade.kellyFractionPct.toFixed(2)}%</strong>
+            (1R: ${replayLifecycle.trade.riskBudgetUsd.toFixed(0)} | Notional: ${replayLifecycle.trade.notionalAllocatedUsd.toFixed(0)})
+          </span>
+        </div>
+
+        <button
+          type="button"
+          class="action-btn"
+          onclick={() => {
+            stopReplayTimer();
+            terminalStore.clearReplayTrade();
+          }}
+          style="padding: 2px 8px; font-size: 0.66rem;"
+        >
+          ✕ Close Replay
+        </button>
+      </div>
+
+      <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+        <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+          <button type="button" class="action-btn" onclick={jumpReplayToEntry}>
+            [ ⏮ Jump to Entry ]
+          </button>
+          <button
+            type="button"
+            class="action-btn"
+            onclick={() => stepReplayBy(-1)}
+            disabled={replayLifecycle.clampedCursor <= 0}
+          >
+            [ ◀ -1 Bar ]
+          </button>
+          <button
+            type="button"
+            class="action-btn action-btn-primary"
+            onclick={toggleReplayPlayPause}
+          >
+            {isReplayPlaying ? '[ ⏸ Pause ]' : '[ ▶ Play ]'}
+          </button>
+          <button
+            type="button"
+            class="action-btn"
+            onclick={() => stepReplayBy(1)}
+            disabled={replayLifecycle.clampedCursor >= replayLifecycle.total - 1}
+          >
+            [ +1 Bar ▶ ]
+          </button>
+          <button type="button" class="action-btn" onclick={jumpReplayToFullOutcome}>
+            [ ⏭ Full Outcome ]
+          </button>
+
+          <div style="display: inline-flex; align-items: center; gap: 3px; margin-inline-start: 6px;">
+            <span style="color: var(--text-secondary); font-size: 0.66rem;">Speed:</span>
+            {#each [1, 4, 10] as spd (spd)}
+              <button
+                type="button"
+                class="filter-pill"
+                data-selected={replaySpeedMultiplier === spd}
+                onclick={() => setReplaySpeed(spd as 1 | 4 | 10)}
+                style="padding: 1px 6px; font-size: 0.65rem;"
+              >
+                {spd}x
+              </button>
+            {/each}
+          </div>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 8px; flex: 1; min-inline-size: 220px;">
+          <span class="tabular-num" style="font-size: 0.68rem; white-space: nowrap;">
+            Bar <strong>{replayLifecycle.clampedCursor + 1}</strong> of <strong>{replayLifecycle.total}</strong>
+            (Entry #{replayLifecycle.entryIdx + 1} → Exit #{replayLifecycle.exitIdx + 1})
+          </span>
+          <input
+            type="range"
+            min="0"
+            max={Math.max(1, replayLifecycle.total - 1)}
+            step="1"
+            bind:value={currentReplayBarIdx}
+            aria-label="Trade Replay Bar Scrubber"
+            style="flex: 1;"
+          />
+        </div>
+      </div>
     </div>
   {/if}
 
@@ -629,6 +1024,28 @@
         AI STRUCTURAL STOP (p85 MAE): {formatSubPennyPrice(blueprint.structuralStopPrice)}
       </text>
 
+      {#if replayLifecycle}
+        <line
+          x1="0"
+          y1={chartGeometry.activeReplayStopY}
+          x2={chartGeometry.width}
+          y2={chartGeometry.activeReplayStopY}
+          stroke="oklch(0.84 0.17 85)"
+          stroke-dasharray="6 2"
+          stroke-width="2"
+        />
+        <text
+          x={chartGeometry.width - 340}
+          y={Math.max(14, chartGeometry.activeReplayStopY - 6)}
+          fill="oklch(0.84 0.17 85)"
+          font-size="10"
+          font-weight="bold"
+          font-family="monospace"
+        >
+          DYNAMIC STOP [{replayLifecycle.stopRatchetStage}]: {formatSubPennyPrice(replayLifecycle.activeStopPrice)}
+        </text>
+      {/if}
+
       <!-- Raw Yahoo Finance Candles + Transformer Attention Glow + Raw Volume Profile -->
       {#each windowedBars as bar, idx (bar.timestampMs + '-' + idx)}
         {@const stepX = (chartGeometry.width - 140) / Math.max(1, windowedBars.length)}
@@ -675,6 +1092,75 @@
           fill={bar.attentionWeight > 0.72 ? 'oklch(0.78 0.17 295 / 0.78)' : color}
           opacity="0.55"
         />
+
+        {#if replayLifecycle}
+          {#if idx === replayLifecycle.entryIdx}
+            <line
+              x1={xCenter}
+              y1="20"
+              x2={xCenter}
+              y2={chartGeometry.height - 55}
+              stroke="oklch(0.74 0.16 235 / 0.75)"
+              stroke-dasharray="2 2"
+              stroke-width="1.3"
+            />
+            <circle cx={xCenter} cy={chartGeometry.entryY} r="4.5" fill="oklch(0.74 0.16 235)" />
+            <text
+              x={Math.max(8, xCenter - 26)}
+              y="16"
+              fill="oklch(0.84 0.14 235)"
+              font-size="9"
+              font-weight="bold"
+              font-family="monospace"
+            >
+              ENTRY #{idx + 1}
+            </text>
+          {/if}
+          {#if replayLifecycle.scaleInBarIdx !== null && idx === replayLifecycle.scaleInBarIdx}
+            <circle cx={xCenter} cy={highY - 8} r="4" fill="oklch(0.82 0.17 295)" />
+            <text
+              x={Math.max(8, xCenter - 28)}
+              y={Math.max(26, highY - 13)}
+              fill="oklch(0.86 0.15 295)"
+              font-size="8.5"
+              font-weight="bold"
+              font-family="monospace"
+            >
+              SCALE-IN ({replayLifecycle.trade.trancheCount}x)
+            </text>
+          {/if}
+          {#if replayLifecycle.t1HitBarIdx !== null && idx === replayLifecycle.t1HitBarIdx}
+            <circle cx={xCenter} cy={chartGeometry.t1Y} r="4.5" fill="oklch(0.84 0.18 85)" />
+            <text
+              x={Math.max(8, xCenter - 34)}
+              y={Math.max(26, chartGeometry.t1Y - 8)}
+              fill="oklch(0.86 0.18 85)"
+              font-size="8.5"
+              font-weight="bold"
+              font-family="monospace"
+            >
+              BANKED 50% @ T1
+            </text>
+          {/if}
+          {#if idx === replayLifecycle.exitIdx}
+            <circle
+              cx={xCenter}
+              cy={closeY}
+              r="5"
+              fill={replayLifecycle.trade.isWinner ? 'oklch(0.80 0.20 152)' : 'oklch(0.68 0.22 22)'}
+            />
+            <text
+              x={Math.max(8, Math.min(chartGeometry.width - 140, xCenter - 38))}
+              y={Math.max(28, closeY - 9)}
+              fill={replayLifecycle.trade.isWinner ? 'oklch(0.80 0.20 152)' : 'oklch(0.68 0.22 22)'}
+              font-size="9"
+              font-weight="bold"
+              font-family="monospace"
+            >
+              EXIT ({replayLifecycle.trade.outcomeBadge})
+            </text>
+          {/if}
+        {/if}
       {/each}
 
       <!-- Historical Closed Trade Entry & Exit Markers on Real Yahoo Chart -->

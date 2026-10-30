@@ -15,6 +15,126 @@ use uuid::Uuid;
 
 use crate::onnx_engine::LiveBrainInferenceOutput;
 use crate::precedent_knn::PrecedentMatchSummary;
+use crate::webhooks::{
+    OutboundWebhookDispatcher, WebhookChannelConfig, WebhookDispatchRecord, WebhookEventPayload,
+    WebhookEventType,
+};
+
+/// Causal Fractional-Kelly Capital Allocation Plan computed for each opened position.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct KellyAllocationPlan {
+    pub win_probability: f64,
+    pub payoff_ratio_b: f64,
+    pub raw_kelly_fraction: f64,
+    pub kelly_fraction_pct: f64,
+    pub risk_budget_usd: f64,
+    pub notional_allocated_usd: f64,
+    pub quantity_shares: f64,
+}
+
+/// Institutional Causal Fractional-Kelly & Portfolio Heat Capital Allocator.
+///
+/// Replaces static flat notional sizing with causal empirical Fractional-Kelly risk sizing:
+/// - Causal win probability $W \in [0.50, 0.92]$ blending `PrecedentKnnIndex` causal win rate,
+///   Era-1 calibrated win rate, and normalized AI confidence.
+/// - Causal payoff ratio $b = \text{clamp}(\text{Empirical } p_{50}\text{ MFE} / \text{Empirical } p_{85}\text{ MAE}, 1.15, 5.00)$
+///   blended with the Brain's Era-1 calibrated Profit Factor.
+/// - Raw Kelly Fraction: $f_{\text{raw}} = W - \frac{1 - W}{b}$
+/// - **0.35x Fractional-Kelly Scaling** modulated by Brain Expectancy Tier and clamped to
+///   institutional risk bounds (`0.50%` minimum to `2.75%` maximum of account equity risked per
+///   `1.0R` stop distance; notional position value clamped between `$5,000` and `$35,000` per tranche).
+pub struct KellyCapitalAllocator;
+
+impl KellyCapitalAllocator {
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_allocation(
+        account_equity_usd: f64,
+        brain_id: BrainHorizonId,
+        entry_price: SubPennyPrice,
+        stop_price: SubPennyPrice,
+        ai_confidence_pct: f64,
+        precedent_win_rate_pct: f64,
+        p50_mfe_pct: f64,
+        p85_mae_pct: f64,
+        era1_calibrated_win_rate_pct: f64,
+        era1_calibrated_profit_factor: f64,
+    ) -> KellyAllocationPlan {
+        let equity = account_equity_usd.max(50_000.0);
+        let norm_conf = if ai_confidence_pct <= 1.0 {
+            ai_confidence_pct
+        } else {
+            ai_confidence_pct / 100.0
+        };
+        let w_knn = (precedent_win_rate_pct / 100.0).clamp(0.45, 0.95);
+        let w_era1 = (era1_calibrated_win_rate_pct / 100.0).clamp(0.50, 0.92);
+        let w_conf = norm_conf.clamp(0.50, 0.95);
+        let win_probability = (0.45 * w_knn + 0.35 * w_era1 + 0.20 * w_conf).clamp(0.50, 0.92);
+
+        let empirical_ratio = (p50_mfe_pct.max(0.25) / p85_mae_pct.max(0.15)).clamp(1.15, 5.00);
+        let pf_clamped = era1_calibrated_profit_factor.clamp(1.15, 5.00);
+        let payoff_ratio_b = (0.60 * empirical_ratio + 0.40 * pf_clamped).clamp(1.15, 5.00);
+
+        let raw_kelly_fraction =
+            (win_probability - (1.0 - win_probability) / payoff_ratio_b).max(0.015);
+
+        let entry_f64 = entry_price.to_f64().max(0.00001);
+        let stop_f64 = stop_price.to_f64().max(0.00001);
+        let stop_dist_per_share = (entry_f64 - stop_f64)
+            .abs()
+            .max(0.005 * entry_f64)
+            .max(0.00001);
+
+        // Brain Expectancy Tier portfolio heat factor across concurrent multi-brain slots
+        let tier_expectancy_mod = match brain_id {
+            BrainHorizonId::Brain01PennyAnomaly => 0.042,
+            BrainHorizonId::Brain02IntradayDayTrade => 0.056,
+            BrainHorizonId::Brain03ShortTermSwing => 0.092,
+            BrainHorizonId::Brain04CoreSwing => 0.138,
+            BrainHorizonId::Brain05LongTermWealth => 0.158,
+        };
+
+        let stop_pct = (stop_dist_per_share / entry_f64).clamp(0.005, 0.25);
+        let ref_stop_pct = match brain_id {
+            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => 0.011,
+            BrainHorizonId::Brain03ShortTermSwing => 0.017,
+            BrainHorizonId::Brain04CoreSwing | BrainHorizonId::Brain05LongTermWealth => 0.045,
+        };
+        // Inverse stop-variance dampening: wide stops have higher variance (sigma^2), reducing Kelly fraction
+        let variance_dampener = (ref_stop_pct / stop_pct).clamp(0.38, 1.35);
+
+        let kelly_risk_frac =
+            (0.35 * raw_kelly_fraction * tier_expectancy_mod * variance_dampener)
+                .clamp(0.005, 0.0275);
+        let target_risk_budget_usd = equity * kelly_risk_frac;
+
+        // Normalize per-tranche risk parity against the $35,000 notional ceiling so wide-stop trades
+        // never risk more dollars than tight-stop trades capped by the $35k notional limit
+        let max_1r_at_ceiling = 35_000.0 * ref_stop_pct * (kelly_risk_frac / 0.0065).clamp(0.65, 1.85);
+        let effective_1r_risk_usd = target_risk_budget_usd.min(max_1r_at_ceiling * variance_dampener);
+
+        let raw_shares = (effective_1r_risk_usd / stop_dist_per_share)
+            .round()
+            .max(1.0);
+        let raw_notional = raw_shares * entry_f64;
+
+        // Clamp notional position value between $5,000 and $35,000 per tranche
+        let clamped_notional = raw_notional.clamp(5_000.0, 35_000.0);
+        let quantity_shares = (clamped_notional / entry_f64).round().max(1.0);
+        let notional_allocated_usd = ((quantity_shares * entry_f64) * 100.0).round() / 100.0;
+        let risk_budget_usd = ((target_risk_budget_usd) * 100.0).round() / 100.0;
+        let kelly_fraction_pct = ((kelly_risk_frac * 100.0) * 100.0).round() / 100.0;
+
+        KellyAllocationPlan {
+            win_probability,
+            payoff_ratio_b,
+            raw_kelly_fraction,
+            kelly_fraction_pct,
+            risk_budget_usd,
+            notional_allocated_usd,
+            quantity_shares,
+        }
+    }
+}
 
 /// Immutable final outcome badge assigned when a position transitions to `closed_trade_ledger`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -63,6 +183,12 @@ pub struct OpenPositionRow {
     pub peak_favorable_price: SubPennyPrice,
     pub max_adverse_price: SubPennyPrice,
     pub quantity_shares: f64,
+    #[serde(default)]
+    pub kelly_fraction_pct: f64,
+    #[serde(default)]
+    pub risk_budget_usd: f64,
+    #[serde(default)]
+    pub notional_allocated_usd: f64,
     #[serde(default = "default_tranche_count")]
     pub tranche_count: u8,
     #[serde(default)]
@@ -103,6 +229,8 @@ pub struct OpenPositionRow {
     pub price_sparkline: Vec<f64>,
     #[serde(default)]
     pub entry_bars: Vec<RawBarRecord>,
+    #[serde(default)]
+    pub entry_bar_idx: usize,
 }
 
 /// Completed immutable row in the Historical Closed Trade Ledger (`closed_trade_ledger` table).
@@ -128,6 +256,12 @@ pub struct ClosedTradeRow {
     pub target_2_price: SubPennyPrice,
     pub actual_exit_price: SubPennyPrice,
     pub quantity_shares: f64,
+    #[serde(default)]
+    pub kelly_fraction_pct: f64,
+    #[serde(default)]
+    pub risk_budget_usd: f64,
+    #[serde(default)]
+    pub notional_allocated_usd: f64,
     #[serde(default = "default_tranche_count")]
     pub tranche_count: u8,
     #[serde(default)]
@@ -172,6 +306,10 @@ pub struct ClosedTradeRow {
     pub price_sparkline: Vec<f64>,
     #[serde(default)]
     pub entry_bars: Vec<RawBarRecord>,
+    #[serde(default)]
+    pub entry_bar_idx: usize,
+    #[serde(default)]
+    pub exit_bar_idx: usize,
 }
 
 /// Speed-2 Nightly Autopsy Grade for a single closed trade (`A+`, `B`, `C`, `F`).
@@ -321,6 +459,10 @@ pub struct Era1BrainCalibrationProfile {
     pub era1_sample_trades: usize,
     pub era1_calibrated_win_rate_pct: f64,
     pub era1_calibrated_profit_factor: f64,
+    #[serde(default)]
+    pub era1_learned_min_displacement_pct: f64,
+    #[serde(default)]
+    pub era1_learned_max_displacement_pct: f64,
 }
 
 /// Thread-safe, sub-millisecond Real-Time Execution Ledger Engine.
@@ -331,7 +473,9 @@ pub struct RealTimeLedgerEngine {
     running_net_profit_usd: RwLock<f64>,
     autopsy_runs_count: RwLock<u64>,
     last_autopsy_iso: RwLock<String>,
-    era1_calibrations: RwLock< std::collections::HashMap<BrainHorizonId, Era1BrainCalibrationProfile> >,
+    era1_calibrations:
+        RwLock<std::collections::HashMap<BrainHorizonId, Era1BrainCalibrationProfile>>,
+    webhook_dispatcher: OutboundWebhookDispatcher,
 }
 
 impl Default for RealTimeLedgerEngine {
@@ -350,7 +494,12 @@ impl RealTimeLedgerEngine {
             autopsy_runs_count: RwLock::new(1),
             last_autopsy_iso: RwLock::new(Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string()),
             era1_calibrations: RwLock::new(std::collections::HashMap::new()),
+            webhook_dispatcher: OutboundWebhookDispatcher::new(),
         }
+    }
+
+    pub fn webhooks(&self) -> &OutboundWebhookDispatcher {
+        &self.webhook_dispatcher
     }
 
     pub fn set_era1_brain_calibration(&self, profile: Era1BrainCalibrationProfile) {
@@ -372,6 +521,14 @@ impl RealTimeLedgerEngine {
             existing.era1_calibrated_profit_factor = (existing.era1_calibrated_profit_factor * n1
                 + profile.era1_calibrated_profit_factor * n2)
                 / tot;
+            existing.era1_learned_min_displacement_pct =
+                (existing.era1_learned_min_displacement_pct * n1
+                    + profile.era1_learned_min_displacement_pct * n2)
+                    / tot;
+            existing.era1_learned_max_displacement_pct =
+                (existing.era1_learned_max_displacement_pct * n1
+                    + profile.era1_learned_max_displacement_pct * n2)
+                    / tot;
             existing.calibrated_confidence_floor = existing
                 .calibrated_confidence_floor
                 .max(profile.calibrated_confidence_floor);
@@ -420,6 +577,7 @@ impl RealTimeLedgerEngine {
         self.positions_opened.write().clear();
         self.closed_ledger.write().clear();
         self.era1_calibrations.write().clear();
+        self.webhook_dispatcher.clear_outbox();
         *self.running_net_profit_usd.write() = 0.0;
     }
 
@@ -455,6 +613,8 @@ impl RealTimeLedgerEngine {
                         era1_sample_trades: 96,
                         era1_calibrated_win_rate_pct: 72.5,
                         era1_calibrated_profit_factor: 1.95,
+                        era1_learned_min_displacement_pct: 0.15,
+                        era1_learned_max_displacement_pct: 12.0,
                     })
             })
             .collect()
@@ -623,6 +783,8 @@ impl RealTimeLedgerEngine {
             .unwrap_or(pos.initial_structural_stop),
         };
         pos.quantity_shares = total_shares;
+        pos.notional_allocated_usd = ((total_shares * vwap_entry.to_f64()) * 100.0).round() / 100.0;
+        pos.risk_budget_usd = ((pos.risk_budget_usd + target_tranche_risk_usd) * 100.0).round() / 100.0;
         pos.tranche_count += 1;
 
         // Rule B: Profitable Pyramid Stop Floor at VWAP_Entry ± 0.30R (never 0.00R flat)
@@ -659,7 +821,7 @@ impl RealTimeLedgerEngine {
             pos.current_r_multiple,
             normalized_conf
         );
-        pos.scale_in_history.push(log_entry);
+        pos.scale_in_history.push(log_entry.clone());
 
         if pos.option_contracts_count > 0 && opt.option_contracts_count > 0 {
             let old_c = pos.option_contracts_count as f64;
@@ -673,19 +835,52 @@ impl RealTimeLedgerEngine {
             pos.option_contracts_count += opt.option_contracts_count;
         }
 
+        let updated_pos = pos.clone();
+        drop(open_list);
+
+        self.webhook_dispatcher
+            .record_lifecycle_event(WebhookEventPayload {
+                event_type: WebhookEventType::ScaleInTrancheAdded,
+                outcome_detail: log_entry,
+                symbol: updated_pos.symbol.clone(),
+                brain_id: updated_pos.brain_id,
+                brain_name: updated_pos.brain_name.clone(),
+                direction: updated_pos.direction,
+                entry_price: updated_pos.entry_price,
+                structural_stop_price: updated_pos.structural_stop_price,
+                target_1_price: updated_pos.target_1_price,
+                target_2_price: updated_pos.target_2_price,
+                current_or_exit_price: updated_pos.live_price,
+                kelly_fraction_pct: updated_pos.kelly_fraction_pct,
+                risk_budget_usd: updated_pos.risk_budget_usd,
+                notional_allocated_usd: updated_pos.notional_allocated_usd,
+                matched_option_contract: updated_pos.matched_option_contract.clone(),
+                contract_delta: updated_pos.contract_delta,
+                contract_gamma: updated_pos.contract_gamma,
+                contract_vanna: updated_pos.contract_vanna,
+                contract_iv: updated_pos.contract_iv,
+                stream_weights: updated_pos.stream_weights,
+                precedent_win_rate_pct: updated_pos.precedent_win_rate_pct,
+                ai_confidence_pct: updated_pos.ai_confidence_pct,
+                pnl_usd: updated_pos.unrealized_stock_pnl_usd,
+                r_multiple: updated_pos.current_r_multiple,
+                tranche_count: updated_pos.tranche_count,
+                event_timestamp_ns: sig.timestamp_ns,
+            });
+
         tracing::info!(
             "[SCALE-IN PYRAMID] {} ({}) Tranche {}/3 | VWAP Entry: ${:.5} | Stop: ${:.5} | Total Shares: {:.0} | R: +{:.2}R | Conf: {:.1}%",
-            pos.symbol,
-            pos.brain_id.code(),
-            pos.tranche_count,
-            pos.entry_price.to_f64(),
-            pos.structural_stop_price.to_f64(),
-            pos.quantity_shares,
-            pos.current_r_multiple,
+            updated_pos.symbol,
+            updated_pos.brain_id.code(),
+            updated_pos.tranche_count,
+            updated_pos.entry_price.to_f64(),
+            updated_pos.structural_stop_price.to_f64(),
+            updated_pos.quantity_shares,
+            updated_pos.current_r_multiple,
             normalized_conf
         );
 
-        Some(pos.clone())
+        Some(updated_pos)
     }
 
     /// Instantaneously births a new live signal into `POSITIONS OPENED`.
@@ -721,25 +916,46 @@ impl RealTimeLedgerEngine {
             opt,
         );
         let entry_f64 = sig.entry_price.to_f64().max(0.00001);
-        let stop_f64 = sig.structural_stop_price.to_f64().max(0.00001);
-        let risk_per_share = (entry_f64 - stop_f64).abs().max(entry_f64 * 0.005);
-        let horizon_mult = match sig.brain_id {
-            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => 1.0,
-            BrainHorizonId::Brain03ShortTermSwing => 1.5,
-            BrainHorizonId::Brain04CoreSwing | BrainHorizonId::Brain05LongTermWealth => 2.5,
+        let base_equity = if notional_allocation_usd >= 25_000.0 {
+            notional_allocation_usd
+        } else {
+            100_000.0
         };
-        // Risk-parity 1.0R position sizing: uniform dollar risk per 1.0R structural stop distance
-        let target_1r_risk_usd =
-            (notional_allocation_usd.max(100.0) * 0.035 * horizon_mult).max(25.0);
-        let max_notional_shares =
-            (notional_allocation_usd.max(100.0) * 2.5 * horizon_mult) / entry_f64;
-        let qty = (target_1r_risk_usd / risk_per_share)
-            .min(max_notional_shares)
-            .round()
-            .max(1.0);
+        let live_equity = (base_equity + *self.running_net_profit_usd.read()).max(50_000.0);
+        let (era1_wr, era1_pf) = self
+            .get_era1_brain_calibration(sig.brain_id)
+            .map(|c| {
+                (
+                    c.era1_calibrated_win_rate_pct,
+                    c.era1_calibrated_profit_factor,
+                )
+            })
+            .unwrap_or((72.5, 1.95));
 
-        let sparkline: Vec<f64> = if !entry_bars.is_empty() {
+        let kelly_plan = KellyCapitalAllocator::compute_allocation(
+            live_equity,
+            sig.brain_id,
+            sig.entry_price,
+            sig.structural_stop_price,
+            sig.ai_confidence_pct,
+            precedents.win_rate_pct,
+            precedents.p50_mfe_pct,
+            precedents.p85_mae_pct,
+            era1_wr,
+            era1_pf,
+        );
+        let qty = kelly_plan.quantity_shares;
+
+        // Retain up to 24 pre-entry context bars leading into opened_timestamp_ns
+        let bounded_pre_entry: Vec<RawBarRecord> = if entry_bars.len() > 24 {
+            entry_bars[entry_bars.len() - 24..].to_vec()
+        } else {
             entry_bars
+        };
+        let entry_bar_idx = bounded_pre_entry.len().saturating_sub(1);
+
+        let sparkline: Vec<f64> = if !bounded_pre_entry.is_empty() {
+            bounded_pre_entry
                 .iter()
                 .rev()
                 .take(24)
@@ -769,6 +985,9 @@ impl RealTimeLedgerEngine {
             peak_favorable_price: sig.entry_price,
             max_adverse_price: sig.entry_price,
             quantity_shares: qty,
+            kelly_fraction_pct: kelly_plan.kelly_fraction_pct,
+            risk_budget_usd: kelly_plan.risk_budget_usd,
+            notional_allocated_usd: kelly_plan.notional_allocated_usd,
             tranche_count: 1,
             scale_in_history: Vec::new(),
             option_structure: opt.option_structure.clone(),
@@ -798,10 +1017,45 @@ impl RealTimeLedgerEngine {
             precedent_win_rate_pct: precedents.win_rate_pct,
             stream_weights: sig.stream_weights,
             price_sparkline: sparkline,
-            entry_bars,
+            entry_bars: bounded_pre_entry,
+            entry_bar_idx,
         };
 
         self.positions_opened.write().push(row.clone());
+
+        self.webhook_dispatcher
+            .record_lifecycle_event(WebhookEventPayload {
+                event_type: WebhookEventType::SignalEntryOpened,
+                outcome_detail: format!(
+                    "OPENED TRANCHE 1/3 @ {} | Kelly {:.2}% (${:.0} Notional)",
+                    row.entry_price, row.kelly_fraction_pct, row.notional_allocated_usd
+                ),
+                symbol: row.symbol.clone(),
+                brain_id: row.brain_id,
+                brain_name: row.brain_name.clone(),
+                direction: row.direction,
+                entry_price: row.entry_price,
+                structural_stop_price: row.structural_stop_price,
+                target_1_price: row.target_1_price,
+                target_2_price: row.target_2_price,
+                current_or_exit_price: row.live_price,
+                kelly_fraction_pct: row.kelly_fraction_pct,
+                risk_budget_usd: row.risk_budget_usd,
+                notional_allocated_usd: row.notional_allocated_usd,
+                matched_option_contract: row.matched_option_contract.clone(),
+                contract_delta: row.contract_delta,
+                contract_gamma: row.contract_gamma,
+                contract_vanna: row.contract_vanna,
+                contract_iv: row.contract_iv,
+                stream_weights: row.stream_weights,
+                precedent_win_rate_pct: row.precedent_win_rate_pct,
+                ai_confidence_pct: row.ai_confidence_pct,
+                pnl_usd: 0.0,
+                r_multiple: 0.0,
+                tranche_count: row.tranche_count,
+                event_timestamp_ns: row.opened_timestamp_ns,
+            });
+
         row
     }
 
@@ -868,8 +1122,10 @@ impl RealTimeLedgerEngine {
                 .last()
                 .is_none_or(|b| b.timestamp_ns < latest.timestamp_ns)
             {
-                if pos.entry_bars.len() >= 64 {
-                    pos.entry_bars.remove(0);
+                // Preserve all pre-entry context bars (0..=entry_bar_idx) plus every held bar up to 192 total bars
+                if pos.entry_bars.len() >= 192 {
+                    let remove_idx = (pos.entry_bar_idx + 1).min(pos.entry_bars.len() - 1);
+                    pos.entry_bars.remove(remove_idx);
                 }
                 pos.entry_bars.push(*latest);
             }
@@ -1094,12 +1350,42 @@ impl RealTimeLedgerEngine {
                         .unwrap_or(pos.entry_price),
                     ),
                 };
-                pos.scale_in_history.push(format!(
+                let bank_msg = format!(
                     "Banked 50% @ T1 (${:.5}, +1.00R) | Runner Stop -> ${:.5} (+{:.2}R)",
                     t1_bank_price.to_f64(),
                     pos.structural_stop_price.to_f64(),
                     runner_r_floor
-                ));
+                );
+                pos.scale_in_history.push(bank_msg.clone());
+                self.webhook_dispatcher
+                    .record_lifecycle_event(WebhookEventPayload {
+                        event_type: WebhookEventType::Target1PartialBankedAndStopRatcheted,
+                        outcome_detail: bank_msg,
+                        symbol: pos.symbol.clone(),
+                        brain_id: pos.brain_id,
+                        brain_name: pos.brain_name.clone(),
+                        direction: pos.direction,
+                        entry_price: pos.entry_price,
+                        structural_stop_price: pos.structural_stop_price,
+                        target_1_price: pos.target_1_price,
+                        target_2_price: pos.target_2_price,
+                        current_or_exit_price: pos.live_price,
+                        kelly_fraction_pct: pos.kelly_fraction_pct,
+                        risk_budget_usd: pos.risk_budget_usd,
+                        notional_allocated_usd: pos.notional_allocated_usd,
+                        matched_option_contract: pos.matched_option_contract.clone(),
+                        contract_delta: pos.contract_delta,
+                        contract_gamma: pos.contract_gamma,
+                        contract_vanna: pos.contract_vanna,
+                        contract_iv: pos.contract_iv,
+                        stream_weights: pos.stream_weights,
+                        precedent_win_rate_pct: pos.precedent_win_rate_pct,
+                        ai_confidence_pct: pos.ai_confidence_pct,
+                        pnl_usd: pos.unrealized_stock_pnl_usd,
+                        r_multiple: pos.current_r_multiple.max(1.0),
+                        tranche_count: pos.tranche_count,
+                        event_timestamp_ns: latest.timestamp_ns,
+                    });
             }
 
             let dynamic_exit = pos.trace_health_badge == TraceHealthBadge::DynamicExitTriggered;
@@ -1232,6 +1518,7 @@ impl RealTimeLedgerEngine {
 
         let hold_duration_ms = ((closed_ts_ns - pos.opened_timestamp_ns) / 1_000_000).max(1_000);
         let is_winner = net_pnl_usd > 0.0;
+        let exit_bar_idx = pos.entry_bars.len().saturating_sub(1);
 
         let row = ClosedTradeRow {
             trade_id: Uuid::new_v4(),
@@ -1253,6 +1540,9 @@ impl RealTimeLedgerEngine {
             target_2_price: pos.target_2_price,
             actual_exit_price: exit_price,
             quantity_shares: pos.quantity_shares,
+            kelly_fraction_pct: pos.kelly_fraction_pct,
+            risk_budget_usd: pos.risk_budget_usd,
+            notional_allocated_usd: pos.notional_allocated_usd,
             tranche_count: pos.tranche_count,
             scale_in_history: pos.scale_in_history,
             option_structure: pos.option_structure,
@@ -1285,9 +1575,42 @@ impl RealTimeLedgerEngine {
             stream_weights: pos.stream_weights,
             price_sparkline: pos.price_sparkline,
             entry_bars: pos.entry_bars,
+            entry_bar_idx: pos.entry_bar_idx,
+            exit_bar_idx,
         };
 
         self.closed_ledger.write().push(row.clone());
+
+        self.webhook_dispatcher
+            .record_lifecycle_event(WebhookEventPayload {
+                event_type: WebhookEventType::PositionClosed,
+                outcome_detail: row.outcome_badge.as_str().to_string(),
+                symbol: row.symbol.clone(),
+                brain_id: row.brain_id,
+                brain_name: row.brain_name.clone(),
+                direction: row.direction,
+                entry_price: row.entry_price,
+                structural_stop_price: row.initial_structural_stop,
+                target_1_price: row.target_1_price,
+                target_2_price: row.target_2_price,
+                current_or_exit_price: row.actual_exit_price,
+                kelly_fraction_pct: row.kelly_fraction_pct,
+                risk_budget_usd: row.risk_budget_usd,
+                notional_allocated_usd: row.notional_allocated_usd,
+                matched_option_contract: row.matched_option_contract.clone(),
+                contract_delta: row.contract_delta,
+                contract_gamma: row.contract_gamma,
+                contract_vanna: row.contract_vanna,
+                contract_iv: row.contract_iv,
+                stream_weights: row.stream_weights,
+                precedent_win_rate_pct: row.precedent_win_rate_pct,
+                ai_confidence_pct: row.ai_confidence_pct,
+                pnl_usd: row.net_pnl_usd,
+                r_multiple: row.realized_r_multiple,
+                tranche_count: row.tranche_count,
+                event_timestamp_ns: row.closed_timestamp_ns,
+            });
+
         row
     }
 
@@ -1833,7 +2156,7 @@ impl RealTimeLedgerEngine {
         }
     }
 
-    /// Saves the current `positions_opened`, `closed_ledger`, and `era1_calibrations` state to disk as JSON.
+    /// Saves the current `positions_opened`, `closed_ledger`, `era1_calibrations`, and `webhook_outbox` state to disk as JSON.
     pub fn save_to_disk(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1845,12 +2168,14 @@ impl RealTimeLedgerEngine {
             autopsy_runs_count: *self.autopsy_runs_count.read(),
             last_autopsy_iso: self.last_autopsy_iso.read().clone(),
             era1_calibrations: self.ordered_era1_calibrations(),
+            webhook_config: self.webhook_dispatcher.get_config(),
+            webhook_outbox: self.webhook_dispatcher.export_outbox(),
         };
         let bytes = serde_json::to_vec_pretty(&payload).map_err(std::io::Error::other)?;
         std::fs::write(path, bytes)
     }
 
-    /// Restores `positions_opened`, `closed_ledger`, and `era1_calibrations` from disk if present and non-empty.
+    /// Restores `positions_opened`, `closed_ledger`, `era1_calibrations`, and `webhook_outbox` from disk if present and non-empty.
     pub fn load_from_disk(&self, path: &std::path::Path) -> bool {
         let Ok(bytes) = std::fs::read(path) else {
             return false;
@@ -1872,6 +2197,8 @@ impl RealTimeLedgerEngine {
                 cal_map.insert(p.brain_id, p);
             }
         }
+        self.webhook_dispatcher
+            .restore_state(parsed.webhook_config, parsed.webhook_outbox);
         true
     }
 }
@@ -1885,4 +2212,8 @@ struct PersistedLedgerState {
     last_autopsy_iso: String,
     #[serde(default)]
     era1_calibrations: Vec<Era1BrainCalibrationProfile>,
+    #[serde(default)]
+    webhook_config: WebhookChannelConfig,
+    #[serde(default)]
+    webhook_outbox: Vec<WebhookDispatchRecord>,
 }

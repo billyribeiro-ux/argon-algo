@@ -38,6 +38,7 @@ use crate::ledger::{
 };
 use crate::onnx_engine::{LiveBrainInferenceOutput, OnnxMultiBrainEngine};
 use crate::precedent_knn::{HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMatchSummary};
+use crate::webhooks::{WebhookChannelConfig, WebhookDispatchRecord, WebhookStatusResponse};
 
 const LEDGER_DISK_PATH: &str = "data/ledger_state.json";
 
@@ -607,6 +608,8 @@ impl AppState {
             prefetch_reqs.push((symbol.to_string(), tf, 900));
             if brain_id == BrainHorizonId::Brain01PennyAnomaly {
                 prefetch_reqs.push((symbol.to_string(), Timeframe::M15, 750));
+            } else if brain_id == BrainHorizonId::Brain03ShortTermSwing {
+                prefetch_reqs.push((symbol.to_string(), Timeframe::D1, 750));
             }
         }
         self.yahoo_adapter
@@ -656,6 +659,10 @@ impl AppState {
         }
         let tf = native_timeframe_for_brain(brain_id);
 
+        let had_open = self
+            .ledger
+            .has_open_position_for_symbol_and_brain(&clean_sym, brain_id);
+
         // Replace any prior walk-forward rows and traces for `(clean_sym, brain_id)` to prevent duplicates
         self.ledger
             .clear_trades_and_positions_for_symbol_and_brain(&clean_sym, brain_id);
@@ -678,7 +685,7 @@ impl AppState {
                 &clean_sym,
                 brain_id,
                 tf,
-                false,
+                !had_open,
                 &snaps,
                 &internals_unified,
                 false,
@@ -750,6 +757,17 @@ impl AppState {
         let raw_m15_bars: Vec<RawBarRecord> = if brain_id == BrainHorizonId::Brain01PennyAnomaly {
             self.yahoo_adapter
                 .fetch_historical_bars(symbol, Timeframe::M15, 750)
+                .await
+                .map(|bars| bars.iter().map(|b| b.to_raw_bar_record()).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Load real 1D higher-timeframe series for BRAIN-03 Short-Term Swing (1H + 1D) causal confluence
+        let raw_d1_bars: Vec<RawBarRecord> = if brain_id == BrainHorizonId::Brain03ShortTermSwing {
+            self.yahoo_adapter
+                .fetch_historical_bars(symbol, Timeframe::D1, 750)
                 .await
                 .map(|bars| bars.iter().map(|b| b.to_raw_bar_record()).collect())
                 .unwrap_or_default()
@@ -848,6 +866,7 @@ impl AppState {
             f64,
             f64,
             f64,
+            f64,
             raw_fingerprint_core::FourStreamWeights,
         )> = Vec::new();
         for idx in 20..calibration_end.saturating_sub(trace_horizon) {
@@ -864,9 +883,13 @@ impl AppState {
             ) else {
                 continue;
             };
-            let prec =
-                self.precedent_knn
-                    .query_precedents(brain_id, &probe.signal.latent_embedding_128, 11);
+            let prec = self.precedent_knn.query_causal_precedents(
+                brain_id,
+                Some(symbol),
+                i64::MAX,
+                &probe.signal.latent_embedding_128,
+                11,
+            );
             let emp = prec.to_empirical_distribution();
             let Ok(inf) = self.onnx_engine.evaluate_live_signal_with_precedents(
                 symbol,
@@ -881,6 +904,10 @@ impl AppState {
                 continue;
             };
             let ref_px = cal_slice.last().unwrap().close.to_f64().max(0.00001);
+            let anchor10_px = cal_slice[cal_slice.len().saturating_sub(10)]
+                .close
+                .to_f64()
+                .max(0.00001);
             let max_hi = cal_outcome
                 .iter()
                 .map(|b| b.high.to_f64())
@@ -891,10 +918,11 @@ impl AppState {
                 .fold(ref_px, f64::min);
             let up_pct = ((max_hi - ref_px) / ref_px * 100.0).max(0.10);
             let dn_pct = ((ref_px - min_lo) / ref_px * 100.0).max(0.10);
-            let (fav_pct, adv_pct) = match inf.signal.direction {
-                raw_fingerprint_core::TradeDirection::Long => (up_pct, dn_pct),
-                raw_fingerprint_core::TradeDirection::Short => (dn_pct, up_pct),
+            let (fav_pct, adv_pct, dir_sign) = match inf.signal.direction {
+                raw_fingerprint_core::TradeDirection::Long => (up_pct, dn_pct, 1.0),
+                raw_fingerprint_core::TradeDirection::Short => (dn_pct, up_pct, -1.0),
             };
+            let raw_disp10_pct = dir_sign * (ref_px - anchor10_px) / anchor10_px * 100.0;
             let sim_r = if fav_pct >= adv_pct * 0.72 {
                 (fav_pct / adv_pct.max(0.25)).clamp(0.68, 4.5)
             } else {
@@ -905,6 +933,7 @@ impl AppState {
                 inf.signal.ai_confidence_pct,
                 prec.win_rate_pct,
                 sim_r,
+                raw_disp10_pct,
                 inf.signal.stream_weights,
             ));
         }
@@ -916,27 +945,27 @@ impl AppState {
         for &floor in &candidate_floors {
             let matching: Vec<_> = era1_samples
                 .iter()
-                .filter(|(_, c, pw, _, _)| *c >= floor && *pw >= 58.0)
+                .filter(|(_, c, pw, _, _, _)| *c >= floor && *pw >= 58.0)
                 .collect();
             if matching.len() < 3 {
                 continue;
             }
             let wins_r: f64 = matching
                 .iter()
-                .filter(|(_, _, _, r, _)| *r > 0.0)
-                .map(|(_, _, _, r, _)| *r)
+                .filter(|(_, _, _, r, _, _)| *r > 0.0)
+                .map(|(_, _, _, r, _, _)| *r)
                 .sum();
             let loss_r: f64 = matching
                 .iter()
-                .filter(|(_, _, _, r, _)| *r <= 0.0)
-                .map(|(_, _, _, r, _)| r.abs())
+                .filter(|(_, _, _, r, _, _)| *r <= 0.0)
+                .map(|(_, _, _, r, _, _)| r.abs())
                 .sum();
             let pf = if loss_r > 0.0 {
                 wins_r / loss_r
             } else {
                 3.0
             };
-            let wr = (matching.iter().filter(|(_, _, _, r, _)| *r > 0.0).count() as f64)
+            let wr = (matching.iter().filter(|(_, _, _, r, _, _)| *r > 0.0).count() as f64)
                 / (matching.len() as f64)
                 * 100.0;
             if pf >= best_pf {
@@ -952,31 +981,52 @@ impl AppState {
         let mut w_s4 = 0.25_f32;
         let win_samples: Vec<_> = era1_samples
             .iter()
-            .filter(|(_, _, _, r, _)| *r > 0.0)
+            .filter(|(_, _, _, r, _, _)| *r > 0.0)
             .collect();
         if !win_samples.is_empty() {
             let n = win_samples.len() as f32;
             w_s1 = win_samples
                 .iter()
-                .map(|(_, _, _, _, w)| w.chart_tape_physics_weight)
+                .map(|(_, _, _, _, _, w)| w.chart_tape_physics_weight)
                 .sum::<f32>()
                 / n;
             w_s2 = win_samples
                 .iter()
-                .map(|(_, _, _, _, w)| w.options_gamma_vanna_weight)
+                .map(|(_, _, _, _, _, w)| w.options_gamma_vanna_weight)
                 .sum::<f32>()
                 / n;
             w_s3 = win_samples
                 .iter()
-                .map(|(_, _, _, _, w)| w.short_float_squeeze_weight)
+                .map(|(_, _, _, _, _, w)| w.short_float_squeeze_weight)
                 .sum::<f32>()
                 / n;
             w_s4 = win_samples
                 .iter()
-                .map(|(_, _, _, _, w)| w.market_internals_macro_weight)
+                .map(|(_, _, _, _, _, w)| w.market_internals_macro_weight)
                 .sum::<f32>()
                 / n;
         }
+
+        // Self-learn the empirical 15th-to-90th percentile winning raw directional displacement envelope
+        // directly from Era-1 winning traces (`0..calibration_end`), with zero hardcoded indicator bounds.
+        let mut pos_win_disps: Vec<f64> = win_samples
+            .iter()
+            .map(|(_, _, _, _, disp, _)| *disp)
+            .filter(|d| *d > 0.0)
+            .collect();
+        pos_win_disps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let (learned_min_disp_pct, learned_max_disp_pct) = if pos_win_disps.len() >= 4 {
+            let p15_idx = ((pos_win_disps.len() as f64) * 0.15).floor() as usize;
+            let p90_idx = (((pos_win_disps.len() as f64) * 0.90).floor() as usize)
+                .min(pos_win_disps.len() - 1);
+            (
+                pos_win_disps[p15_idx],
+                pos_win_disps[p90_idx].max(pos_win_disps[p15_idx] + 0.50),
+            )
+        } else {
+            (0.10, 15.0)
+        };
+
         let cal_profile = crate::ledger::Era1BrainCalibrationProfile {
             brain_id,
             calibrated_confidence_floor: if brain_id == BrainHorizonId::Brain01PennyAnomaly {
@@ -995,6 +1045,8 @@ impl AppState {
             era1_sample_trades: era1_samples.len(),
             era1_calibrated_win_rate_pct: best_wr,
             era1_calibrated_profit_factor: best_pf,
+            era1_learned_min_displacement_pct: learned_min_disp_pct,
+            era1_learned_max_displacement_pct: learned_max_disp_pct,
         };
         if accumulate_calibration {
             self.ledger
@@ -1099,8 +1151,10 @@ impl AppState {
                 ) else {
                     continue;
                 };
-                let precedents = self.precedent_knn.query_precedents(
+                let precedents = self.precedent_knn.query_causal_precedents(
                     brain_id,
+                    Some(symbol),
+                    raw_bars[t].timestamp_ns,
                     &probe.signal.latent_embedding_128,
                     11,
                 );
@@ -1121,34 +1175,51 @@ impl AppState {
                 let is_penny_brain = brain_id == BrainHorizonId::Brain01PennyAnomaly;
                 let cur_bar = &causal_slice[causal_slice.len() - 1];
                 let prev_bar = &causal_slice[causal_slice.len() - 2];
-                let fast_slice = &raw_bars[t.saturating_sub(9)..=t];
-                let slow_lookback = if is_penny_brain { 23 } else { 27 };
-                let slow_slice = &raw_bars[t.saturating_sub(slow_lookback)..=t];
-                let macro_slice = &raw_bars[t.saturating_sub(79)..=t];
-                let ma_fast = fast_slice.iter().map(|b| b.close.to_f64()).sum::<f64>()
-                    / (fast_slice.len() as f64);
-                let ma_slow = slow_slice.iter().map(|b| b.close.to_f64()).sum::<f64>()
-                    / (slow_slice.len() as f64);
-                let ma_macro = macro_slice.iter().map(|b| b.close.to_f64()).sum::<f64>()
-                    / (macro_slice.len() as f64);
-                let close_f64 = cur_bar.close.to_f64();
+                let close_f64 = cur_bar.close.to_f64().max(0.00001);
+                let anchor4_px = raw_bars[t.saturating_sub(4)].close.to_f64().max(0.00001);
+                let anchor10_px = raw_bars[t.saturating_sub(9)].close.to_f64().max(0.00001);
+                let anchor24_px = raw_bars[t.saturating_sub(23)].close.to_f64().max(0.00001);
+                let anchor64_px = raw_bars[t.saturating_sub(63)].close.to_f64().max(0.00001);
 
-                let causal_impulse_aligned = match inference.signal.direction {
-                    raw_fingerprint_core::TradeDirection::Long => {
-                        cur_bar.close >= cur_bar.open
-                            && cur_bar.close >= prev_bar.close
-                            && close_f64 >= ma_fast
-                            && ma_fast >= ma_slow * 0.998
-                            && (is_penny_brain || ma_slow >= ma_macro * 0.995)
-                    }
-                    raw_fingerprint_core::TradeDirection::Short => {
-                        cur_bar.close <= cur_bar.open
-                            && cur_bar.close <= prev_bar.close
-                            && close_f64 <= ma_fast
-                            && ma_fast <= ma_slow * 1.002
-                            && (is_penny_brain || ma_slow <= ma_macro * 1.005)
-                    }
+                let ten_bar_window = &raw_bars[t.saturating_sub(9)..=t];
+                let window10_hi = ten_bar_window
+                    .iter()
+                    .map(|b| b.high.to_f64())
+                    .fold(close_f64, f64::max);
+                let window10_lo = ten_bar_window
+                    .iter()
+                    .map(|b| b.low.to_f64())
+                    .fold(close_f64, f64::min);
+                let raw_range10_mid = 0.5 * (window10_hi + window10_lo);
+
+                let dir_sign = match inference.signal.direction {
+                    raw_fingerprint_core::TradeDirection::Long => 1.0,
+                    raw_fingerprint_core::TradeDirection::Short => -1.0,
                 };
+                let raw_disp10_pct = dir_sign * (close_f64 - anchor10_px) / anchor10_px * 100.0;
+                let within_era1_learned_envelope = (cal_profile.era1_learned_min_displacement_pct
+                    ..=cal_profile.era1_learned_max_displacement_pct)
+                    .contains(&raw_disp10_pct);
+
+                let causal_impulse_aligned = within_era1_learned_envelope
+                    && match inference.signal.direction {
+                        raw_fingerprint_core::TradeDirection::Long => {
+                            cur_bar.close >= cur_bar.open
+                                && cur_bar.close >= prev_bar.close
+                                && close_f64 >= raw_range10_mid
+                                && close_f64 >= anchor4_px
+                                && anchor10_px >= anchor24_px * 0.992
+                                && (is_penny_brain || anchor24_px >= anchor64_px * 0.985)
+                        }
+                        raw_fingerprint_core::TradeDirection::Short => {
+                            cur_bar.close <= cur_bar.open
+                                && cur_bar.close <= prev_bar.close
+                                && close_f64 <= raw_range10_mid
+                                && close_f64 <= anchor4_px
+                                && anchor10_px <= anchor24_px * 1.008
+                                && (is_penny_brain || anchor24_px <= anchor64_px * 1.015)
+                        }
+                    };
 
                 let causal_m15_confluence_ok = if is_penny_brain {
                     let ts_5m = cur_bar.timestamp_ns;
@@ -1158,37 +1229,32 @@ impl AppState {
                         .count();
                     let m15_slice = &raw_m15_bars[..completed_m15_end];
                     if m15_slice.len() >= 4 {
+                        let b0 = &m15_slice[m15_slice.len() - 4];
                         let b1 = &m15_slice[m15_slice.len() - 3];
                         let b2 = &m15_slice[m15_slice.len() - 2];
                         let b3 = &m15_slice[m15_slice.len() - 1];
+                        let b0_close = b0.close.to_f64().max(0.00001);
                         let b1_open = b1.open.to_f64().max(0.00001);
                         let b2_close = b2.close.to_f64().max(0.00001);
                         let b3_open = b3.open.to_f64();
                         let b3_close = b3.close.to_f64();
                         let b3_range = (b3.high.to_f64() - b3.low.to_f64()).max(0.00001);
+                        let disp4_pct = (b3_close - b0_close) / b0_close * 100.0;
                         let disp3_pct = (b3_close - b1_open) / b1_open * 100.0;
                         let disp2_pct = (b3_close - b2_close) / b2_close * 100.0;
                         let body_ratio = (b3_close - b3_open) / b3_range;
-                        let ma4_slice = &m15_slice[m15_slice.len() - 4..];
-                        let ma8_slice = &m15_slice[m15_slice.len().saturating_sub(8)..];
-                        let ma4 = ma4_slice.iter().map(|x| x.close.to_f64()).sum::<f64>()
-                            / (ma4_slice.len() as f64);
-                        let ma8 = (ma8_slice.iter().map(|x| x.close.to_f64()).sum::<f64>()
-                            / (ma8_slice.len() as f64))
-                        .max(0.00001);
-                        let trend15_pct = (ma4 - ma8) / ma8 * 100.0;
                         match inference.signal.direction {
                             raw_fingerprint_core::TradeDirection::Long => {
                                 disp3_pct >= 0.05
                                     && (-0.26..=1.50).contains(&disp2_pct)
                                     && body_ratio >= -0.25
-                                    && trend15_pct >= -0.05
+                                    && disp4_pct >= -0.10
                             }
                             raw_fingerprint_core::TradeDirection::Short => {
                                 disp3_pct <= 0.15
                                     && (-1.50..=0.36).contains(&disp2_pct)
                                     && body_ratio <= 0.15
-                                    && trend15_pct <= 0.05
+                                    && disp4_pct <= 0.10
                             }
                         }
                     } else {
@@ -1198,23 +1264,44 @@ impl AppState {
                     true
                 };
 
-                let causal_h1_swing_confluence_ok =
+                let causal_d1_swing_confluence_ok =
                     if brain_id == BrainHorizonId::Brain03ShortTermSwing {
-                        let atr_1h = (slow_slice
+                        let ts_1h = cur_bar.timestamp_ns;
+                        let cur_utc_day_start_ns =
+                            (ts_1h / 86_400_000_000_000) * 86_400_000_000_000;
+                        let completed_d1_end = raw_d1_bars
                             .iter()
-                            .map(|b| (b.high.to_f64() - b.low.to_f64()).max(0.0001))
-                            .sum::<f64>()
-                            / (slow_slice.len().max(1) as f64))
-                            .max(close_f64 * 0.003);
-                        let trend_sep_atr = (ma_fast - ma_slow) / atr_1h;
-                        let b4_close = raw_bars[t.saturating_sub(4)].close.to_f64();
-                        match inference.signal.direction {
-                            raw_fingerprint_core::TradeDirection::Long => {
-                                (0.42..=1.75).contains(&trend_sep_atr) && close_f64 > b4_close
+                            .take_while(|b1d| {
+                                b1d.timestamp_ns <= ts_1h && b1d.timestamp_ns < cur_utc_day_start_ns
+                            })
+                            .count();
+                        let d1_slice = &raw_d1_bars[..completed_d1_end];
+                        if d1_slice.len() >= 4 {
+                            let d1 = &d1_slice[d1_slice.len() - 3];
+                            let d2 = &d1_slice[d1_slice.len() - 2];
+                            let d3 = &d1_slice[d1_slice.len() - 1];
+                            let d1_open = d1.open.to_f64().max(0.00001);
+                            let d2_close = d2.close.to_f64().max(0.00001);
+                            let d3_open = d3.open.to_f64();
+                            let d3_close = d3.close.to_f64();
+                            let d3_range = (d3.high.to_f64() - d3.low.to_f64()).max(0.00001);
+                            let d1_disp3_pct = (d3_close - d1_open) / d1_open * 100.0;
+                            let d1_disp1_pct = (d3_close - d2_close) / d2_close * 100.0;
+                            let d1_body_ratio = (d3_close - d3_open) / d3_range;
+                            match inference.signal.direction {
+                                raw_fingerprint_core::TradeDirection::Long => {
+                                    d1_disp3_pct >= -1.50
+                                        && (-2.50..=6.50).contains(&d1_disp1_pct)
+                                        && d1_body_ratio >= -0.45
+                                }
+                                raw_fingerprint_core::TradeDirection::Short => {
+                                    d1_disp3_pct <= 1.50
+                                        && (-6.50..=2.50).contains(&d1_disp1_pct)
+                                        && d1_body_ratio <= 0.45
+                                }
                             }
-                            raw_fingerprint_core::TradeDirection::Short => {
-                                (-1.75..=-0.42).contains(&trend_sep_atr) && close_f64 < b4_close
-                            }
+                        } else {
+                            true
                         }
                     } else {
                         true
@@ -1229,7 +1316,7 @@ impl AppState {
                             .try_scale_in_position(symbol, brain_id, &inference, 5_000.0);
                 } else if causal_impulse_aligned
                     && causal_m15_confluence_ok
-                    && causal_h1_swing_confluence_ok
+                    && causal_d1_swing_confluence_ok
                     && precedents.win_rate_pct >= cal_profile.min_precedent_win_rate_pct
                     && inference.signal.ai_confidence_pct
                         >= cal_profile.calibrated_confidence_floor
@@ -1648,6 +1735,12 @@ pub fn build_axum_router(state: AppState) -> Router {
         .route("/api/v1/ledger/export.csv", get(export_csv_handler))
         .route("/api/v1/export/xlsx", get(export_xlsx_handler))
         .route("/api/v1/ledger/export.xlsx", get(export_xlsx_handler))
+        .route("/api/v1/webhooks/status", get(webhooks_status_handler))
+        .route(
+            "/api/v1/webhooks/configure",
+            post(webhooks_configure_handler),
+        )
+        .route("/api/v1/webhooks/test", post(webhooks_test_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -2105,6 +2198,38 @@ async fn evolution_run_autopsy_handler(
         let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
     }
     Json(status)
+}
+
+async fn webhooks_status_handler(State(state): State<AppState>) -> Json<WebhookStatusResponse> {
+    Json(state.ledger.webhooks().status_snapshot())
+}
+
+async fn webhooks_configure_handler(
+    State(state): State<AppState>,
+    Json(cfg): Json<WebhookChannelConfig>,
+) -> Json<WebhookStatusResponse> {
+    state.ledger.webhooks().update_config(cfg);
+    if !Path::new("../../Cargo.toml").exists() {
+        let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+    }
+    Json(state.ledger.webhooks().status_snapshot())
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WebhookTestRequest {
+    pub symbol: Option<String>,
+}
+
+async fn webhooks_test_handler(
+    State(state): State<AppState>,
+    payload: Option<Json<WebhookTestRequest>>,
+) -> Json<WebhookDispatchRecord> {
+    let sym = payload.and_then(|Json(req)| req.symbol);
+    let record = state.ledger.webhooks().fire_test_alert(sym).await;
+    if !Path::new("../../Cargo.toml").exists() {
+        let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+    }
+    Json(record)
 }
 
 async fn replay_simulate_handler(

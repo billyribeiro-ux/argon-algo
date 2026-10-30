@@ -175,12 +175,37 @@ impl PrecedentKnnIndex {
         query_embedding_128: &[f32],
         top_k: usize,
     ) -> PrecedentMatchSummary {
+        self.query_causal_precedents(brain_id, None, i64::MAX, query_embedding_128, top_k)
+    }
+
+    /// Queries strictly causal historical precedent traces for `(brain_id, symbol)` completed at or before `max_timestamp_ns`.
+    pub fn query_causal_precedents(
+        &self,
+        brain_id: BrainHorizonId,
+        symbol: Option<&str>,
+        max_timestamp_ns: i64,
+        query_embedding_128: &[f32],
+        top_k: usize,
+    ) -> PrecedentMatchSummary {
         let records = self.records.read();
         let k = top_k.max(1);
 
         let mut scored: Vec<(f32, &HistoricalTraceRecord)> = records
             .iter()
-            .filter(|r| r.brain_id == brain_id)
+            .filter(|r| {
+                if r.brain_id != brain_id {
+                    return false;
+                }
+                let is_preseeded = r.timestamp_ns < 1_761_000_000_000_000_000;
+                if is_preseeded {
+                    return true;
+                }
+                let sym_ok = symbol.is_none_or(|s| r.symbol.eq_ignore_ascii_case(s));
+                let settled_ts = r
+                    .timestamp_ns
+                    .saturating_add(r.hold_duration_ms.saturating_mul(1_000_000));
+                sym_ok && settled_ts <= max_timestamp_ns
+            })
             .map(|r| {
                 let mut dot = 0.0_f32;
                 for (a, b) in r.embedding_128.iter().zip(query_embedding_128.iter()) {

@@ -1,13 +1,36 @@
 <script lang="ts">
-  import { terminalStore } from '$lib/state/terminal.svelte';
+  import { onMount } from 'svelte';
+  import { terminalStore, type WebhookChannelConfigState } from '$lib/state/terminal.svelte';
   import BrainAutopsyLab from '$lib/components/BrainAutopsyLab.svelte';
 
   const internals = $derived(terminalStore.macroInternals);
   const providers = $derived(terminalStore.providers);
+  const webhookStatus = $derived(terminalStore.webhookStatus);
   const REPLAY_SPEEDS: Array<'1x' | '5x' | '10x' | '50x' | 'MAX'> = ['1x', '5x', '10x', '50x', 'MAX'];
 
   let scanningYahoo = $state(false);
   let swappingProviderId = $state<string | null>(null);
+  let savingWebhooks = $state(false);
+  let selectedOutboxEventId = $state<string | null>(null);
+  let activePayloadTab = $state<'DISCORD' | 'TELEGRAM' | 'SLACK'>('DISCORD');
+
+  let draftConfig = $state<WebhookChannelConfigState>({
+    discordWebhookUrl: '',
+    discordEnabled: false,
+    telegramBotToken: '',
+    telegramChatId: '',
+    telegramEnabled: false,
+    slackWebhookUrl: '',
+    slackEnabled: false,
+    customJsonWebhookUrl: '',
+    customJsonEnabled: false
+  });
+
+  onMount(() => {
+    void terminalStore.fetchWebhookStatus().then(() => {
+      draftConfig = { ...terminalStore.webhookStatus.config };
+    });
+  });
 
   async function handleYahooScan(): Promise<void> {
     scanningYahoo = true;
@@ -19,6 +42,20 @@
     swappingProviderId = providerId;
     await terminalStore.hotSwapProvider(providerId);
     swappingProviderId = null;
+  }
+
+  async function handleSaveWebhooks(): Promise<void> {
+    savingWebhooks = true;
+    await terminalStore.saveWebhookConfig(draftConfig);
+    draftConfig = { ...terminalStore.webhookStatus.config };
+    savingWebhooks = false;
+  }
+
+  async function handleFireTestWebhook(): Promise<void> {
+    await terminalStore.fireTestWebhookAlert();
+    if (terminalStore.webhookStatus.outboxRecords.length > 0 && !selectedOutboxEventId) {
+      selectedOutboxEventId = terminalStore.webhookStatus.outboxRecords[0]!.dispatchId;
+    }
   }
 </script>
 
@@ -153,4 +190,238 @@
 
   <!-- 3-Speed Continuous Self-Learning & Nightly Autopsy Lab -->
   <BrainAutopsyLab />
+
+  <!-- Outbound Execution Webhooks (Discord / Telegram / Slack / Custom JSON) & Live Outbox Inspector -->
+  <section
+    class="glass-panel"
+    style="grid-column: span 12;"
+    aria-label="Outbound Execution Webhooks and Live Outbox Inspector"
+  >
+    <header class="panel-header" style="flex-wrap: wrap; gap: 8px;">
+      <div class="panel-title">
+        <span>Outbound Execution Webhooks (Discord / Telegram / Slack / Custom JSON) &amp; Live Outbox Inspector</span>
+        <span class="badge badge-ai-core">{webhookStatus.totalOutboxRecords} EVENTS RECORDED</span>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+        <button
+          type="button"
+          class="action-btn"
+          onclick={handleSaveWebhooks}
+          disabled={savingWebhooks}
+        >
+          {savingWebhooks ? 'Saving...' : '[ 💾 Save Webhook Config ]'}
+        </button>
+        <button
+          type="button"
+          class="action-btn action-btn-primary"
+          onclick={handleFireTestWebhook}
+          disabled={terminalStore.webhookTesting}
+        >
+          {terminalStore.webhookTesting
+            ? 'Dispatching Test Alert...'
+            : '[ 🚀 Fire Test Execution Alert ]'}
+        </button>
+      </div>
+    </header>
+
+    <!-- Channel Configuration Matrix -->
+    <div
+      style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 10px; padding: 12px; background: var(--surface-1); border-block-end: 1px solid var(--border-subtle); font-size: 0.72rem;"
+    >
+      <div style="display: flex; flex-direction: column; gap: 6px; padding: 8px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <strong>Discord Rich Embed Webhook</strong>
+          <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer;">
+            <input type="checkbox" bind:checked={draftConfig.discordEnabled} />
+            <span>Enabled</span>
+          </label>
+        </div>
+        <input
+          type="url"
+          class="input-control"
+          placeholder="https://discord.com/api/webhooks/..."
+          bind:value={draftConfig.discordWebhookUrl}
+          aria-label="Discord Webhook URL"
+        />
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 6px; padding: 8px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <strong>Telegram Bot API Markdown</strong>
+          <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer;">
+            <input type="checkbox" bind:checked={draftConfig.telegramEnabled} />
+            <span>Enabled</span>
+          </label>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+          <input
+            type="text"
+            class="input-control"
+            placeholder="Bot Token (123456:ABC...)"
+            bind:value={draftConfig.telegramBotToken}
+            aria-label="Telegram Bot Token"
+          />
+          <input
+            type="text"
+            class="input-control"
+            placeholder="Chat ID (-100...)"
+            bind:value={draftConfig.telegramChatId}
+            aria-label="Telegram Chat ID"
+          />
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 6px; padding: 8px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <strong>Slack Block Kit Webhook</strong>
+          <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer;">
+            <input type="checkbox" bind:checked={draftConfig.slackEnabled} />
+            <span>Enabled</span>
+          </label>
+        </div>
+        <input
+          type="url"
+          class="input-control"
+          placeholder="https://hooks.slack.com/services/..."
+          bind:value={draftConfig.slackWebhookUrl}
+          aria-label="Slack Webhook URL"
+        />
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 6px; padding: 8px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <strong>Generic JSON Execution Webhook</strong>
+          <label style="display: inline-flex; align-items: center; gap: 4px; cursor: pointer;">
+            <input type="checkbox" bind:checked={draftConfig.customJsonEnabled} />
+            <span>Enabled</span>
+          </label>
+        </div>
+        <input
+          type="url"
+          class="input-control"
+          placeholder="https://your-prop-desk.internal/webhooks/argon"
+          bind:value={draftConfig.customJsonWebhookUrl}
+          aria-label="Custom JSON Webhook URL"
+        />
+      </div>
+    </div>
+
+    <!-- Live Webhook Delivery Outbox Table -->
+    <div class="data-table-container">
+      <table class="telemetry-table">
+        <thead>
+          <tr>
+            <th>Event ID</th>
+            <th>Lifecycle Event Type</th>
+            <th>Symbol</th>
+            <th>Brain</th>
+            <th>Dir</th>
+            <th data-numeric="true">Price / Stop / T1 / T2</th>
+            <th data-numeric="true">Kelly % ($1R Risk / Notional)</th>
+            <th data-numeric="true">P&amp;L / R-Mult</th>
+            <th>HTTP / Outbox State</th>
+            <th>Formatted Payload Preview</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each webhookStatus.outboxRecords.slice(0, 25) as rec (rec.dispatchId)}
+            <tr
+              data-selected={selectedOutboxEventId === rec.dispatchId}
+              onclick={() =>
+                (selectedOutboxEventId =
+                  selectedOutboxEventId === rec.dispatchId ? null : rec.dispatchId)}
+              style="cursor: pointer;"
+            >
+              <td class="tabular-num">{rec.dispatchId}</td>
+              <td>
+                <span
+                  class="badge {rec.eventType === 'POSITION_CLOSED'
+                    ? 'badge-long'
+                    : rec.eventType === 'TARGET_1_PARTIAL_BANKED_AND_STOP_RATCHETED'
+                      ? 'badge-squeeze'
+                      : 'badge-ai-core'}"
+                >
+                  {rec.eventType}
+                </span>
+              </td>
+              <td><strong>{rec.symbol}</strong></td>
+              <td><span class="badge badge-ai-core">{rec.brainId}</span></td>
+              <td>
+                <span class="badge {rec.direction === 'LONG' ? 'badge-long' : 'badge-short'}">
+                  {rec.direction}
+                </span>
+              </td>
+              <td data-numeric="true" class="tabular-num">
+                ${rec.entryPrice.toFixed(2)} / Stop ${rec.structuralStopPrice.toFixed(2)} / T1 ${rec.target1Price.toFixed(2)} / T2 ${rec.target2Price.toFixed(2)}
+              </td>
+              <td data-numeric="true" class="tabular-num">
+                <strong>{rec.kellyFractionPct.toFixed(2)}%</strong>
+                (${rec.riskBudgetUsd.toFixed(0)} / ${rec.notionalAllocatedUsd.toFixed(0)})
+              </td>
+              <td
+                data-numeric="true"
+                class="tabular-num {rec.pnlUsd >= 0 ? 'pnl-positive' : 'pnl-negative'}"
+              >
+                {rec.pnlUsd >= 0 ? '+' : ''}${rec.pnlUsd.toFixed(2)} ({rec.rMultiple >= 0 ? '+' : ''}{rec.rMultiple.toFixed(2)}R)
+              </td>
+              <td>
+                <span class="badge badge-long">{rec.deliveryStatus}</span>
+              </td>
+              <td>
+                <button
+                  type="button"
+                  class="action-btn"
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    selectedOutboxEventId =
+                      selectedOutboxEventId === rec.dispatchId ? null : rec.dispatchId;
+                  }}
+                >
+                  {selectedOutboxEventId === rec.dispatchId ? 'Hide Preview' : 'Inspect Embed / Markdown'}
+                </button>
+              </td>
+            </tr>
+
+            {#if selectedOutboxEventId === rec.dispatchId}
+              <tr>
+                <td colspan="10" style="background: oklch(0.14 0.02 260); padding: 10px 14px;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-block-end: 8px; flex-wrap: wrap; gap: 8px;">
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                      <strong style="font-size: 0.72rem;">Formatted Wire Payload ({rec.dispatchId}):</strong>
+                      {#each ['DISCORD', 'TELEGRAM', 'SLACK'] as tab (tab)}
+                        <button
+                          type="button"
+                          class="filter-pill"
+                          data-selected={activePayloadTab === tab}
+                          onclick={() => (activePayloadTab = tab as 'DISCORD' | 'TELEGRAM' | 'SLACK')}
+                          style="padding: 2px 8px; font-size: 0.66rem;"
+                        >
+                          {tab === 'DISCORD'
+                            ? 'Discord Rich Embed JSON'
+                            : tab === 'TELEGRAM'
+                              ? 'Telegram Bot Markdown'
+                              : 'Slack Block Kit JSON'}
+                        </button>
+                      {/each}
+                    </div>
+                    <span style="font-size: 0.68rem; color: var(--text-secondary);">
+                      Option: {rec.matchedOptionContract} | Outcome: {rec.outcomeDetail}
+                    </span>
+                  </div>
+                  <pre
+                    style="margin: 0; padding: 10px; background: oklch(0.11 0.015 255); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); font-family: monospace; font-size: 0.68rem; overflow-x: auto; white-space: pre-wrap; color: oklch(0.88 0.04 240);"
+                  >{activePayloadTab === 'DISCORD'
+                      ? rec.discordEmbedJson
+                      : activePayloadTab === 'TELEGRAM'
+                        ? rec.telegramMarkdown
+                        : rec.slackBlocksJson}</pre>
+                </td>
+              </tr>
+            {/if}
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  </section>
 </div>

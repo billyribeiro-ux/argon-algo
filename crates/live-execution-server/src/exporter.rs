@@ -112,6 +112,9 @@ pub fn export_to_csv_bytes(
         "cumulative_net_profit_usd",
         "ai_confidence_pct",
         "primary_fingerprint_driver",
+        "kelly_fraction_pct",
+        "risk_budget_usd",
+        "notional_allocated_usd",
     ])?;
 
     for open in &snapshot.positions_opened {
@@ -149,6 +152,9 @@ pub fn export_to_csv_bytes(
             &format!("{:.5}", snapshot.scoreboard.combined_net_profit_usd),
             &format!("{:.2}", open.ai_confidence_pct),
             open.primary_driver.as_str(),
+            &format!("{:.2}", open.kelly_fraction_pct),
+            &format!("{:.2}", open.risk_budget_usd),
+            &format!("{:.2}", open.notional_allocated_usd),
         ])?;
     }
 
@@ -188,6 +194,9 @@ pub fn export_to_csv_bytes(
                 &format!("{:.5}", closed.cumulative_net_profit_usd),
                 &format!("{:.2}", closed.ai_confidence_pct),
                 closed.primary_driver.as_str(),
+                &format!("{:.2}", closed.kelly_fraction_pct),
+                &format!("{:.2}", closed.risk_budget_usd),
+                &format!("{:.2}", closed.notional_allocated_usd),
             ])?;
         }
     }
@@ -496,6 +505,9 @@ fn build_sheet2_positions_opened_xml(open_rows: &[OpenPositionRow]) -> String {
         "Trace_Health_Badge",
         "Primary_Driver",
         "AI_Confidence_Pct",
+        "Kelly_Fraction_Pct",
+        "Risk_Budget_USD",
+        "Notional_Allocated_USD",
     ];
 
     xml.push_str(r#"<row r="1">"#);
@@ -550,12 +562,15 @@ fn build_sheet2_positions_opened_xml(open_rows: &[OpenPositionRow]) -> String {
         xml.push_str(&cell_str(excel_row, 16, 0, row.trace_health_badge.as_str()));
         xml.push_str(&cell_str(excel_row, 17, 0, row.primary_driver.as_str()));
         xml.push_str(&cell_num(excel_row, 18, 0, row.ai_confidence_pct));
+        xml.push_str(&cell_num(excel_row, 19, 0, row.kelly_fraction_pct));
+        xml.push_str(&cell_num(excel_row, 20, 2, row.risk_budget_usd));
+        xml.push_str(&cell_num(excel_row, 21, 2, row.notional_allocated_usd));
         xml.push_str("</row>");
     }
 
     let last_row = (open_rows.len() + 1).max(1);
     xml.push_str("</sheetData>");
-    xml.push_str(&format!(r#"<autoFilter ref="A1:R{last_row}"/>"#));
+    xml.push_str(&format!(r#"<autoFilter ref="A1:U{last_row}"/>"#));
     xml.push_str("</worksheet>");
     xml
 }
@@ -593,6 +608,9 @@ fn build_sheet3_closed_ledger_xml(closed_rows: &[ClosedTradeRow]) -> String {
         "Option_Net_PnL_USD",
         "Primary_Driver",
         "AI_Confidence_Pct",
+        "Kelly_Fraction_Pct",
+        "Risk_Budget_USD",
+        "Notional_Allocated_USD",
     ];
 
     xml.push_str(r#"<row r="1">"#);
@@ -645,12 +663,15 @@ fn build_sheet3_closed_ledger_xml(closed_rows: &[ClosedTradeRow]) -> String {
         xml.push_str(&cell_num(excel_row, 21, pnl_style, row.option_net_pnl_usd));
         xml.push_str(&cell_str(excel_row, 22, 0, row.primary_driver.as_str()));
         xml.push_str(&cell_num(excel_row, 23, 0, row.ai_confidence_pct));
+        xml.push_str(&cell_num(excel_row, 24, 0, row.kelly_fraction_pct));
+        xml.push_str(&cell_num(excel_row, 25, 2, row.risk_budget_usd));
+        xml.push_str(&cell_num(excel_row, 26, 2, row.notional_allocated_usd));
         xml.push_str("</row>");
     }
 
     let last_row = (closed_rows.len() + 1).max(1);
     xml.push_str("</sheetData>");
-    xml.push_str(&format!(r#"<autoFilter ref="A1:W{last_row}"/>"#));
+    xml.push_str(&format!(r#"<autoFilter ref="A1:Z{last_row}"/>"#));
     xml.push_str("</worksheet>");
     xml
 }

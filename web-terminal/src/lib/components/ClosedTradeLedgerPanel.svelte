@@ -209,6 +209,7 @@
           <th>Outcome Badge</th>
           <th data-numeric="true">Entry → Exit Price</th>
           <th data-numeric="true">Stop / T1 / T2</th>
+          <th data-numeric="true">Kelly % / 1R Risk ($) / Notional ($)</th>
           <th data-numeric="true">Stock P&amp;L ($ / %)</th>
           <th>Option Contract</th>
           <th data-numeric="true">Opt Entry → Exit</th>
@@ -219,15 +220,16 @@
           <th data-numeric="true">AI Conf</th>
           <th>Primary Driver &amp; Autopsy</th>
           <th>Hold Duration</th>
+          <th>Bar-by-Bar Scrubber</th>
         </tr>
       </thead>
       <tbody>
         {#each rows as row (row.tradeId)}
           <tr
-            data-selected={terminalStore.selectedTicker === row.symbol}
+            data-selected={terminalStore.activeReplayTrade?.tradeId === row.tradeId || terminalStore.selectedTicker === row.symbol}
             onclick={() => terminalStore.selectClosedTradeForReplay(row)}
             style="cursor: pointer;"
-            title="Click to inspect real Yahoo Finance chart & trade markers for {row.symbol}"
+            title="Click to launch Full-Lifecycle Bar-by-Bar Trade Replay Scrubber for {row.symbol} ({row.tradeId})"
           >
             <td class="tabular-num">{row.tradeId}</td>
             <td>
@@ -252,6 +254,19 @@
             </td>
             <td data-numeric="true" style="font-size: 0.68rem; color: var(--text-secondary);">
               {formatSubPennyPrice(row.structuralStopAtEntry)} / {formatSubPennyPrice(row.target1AtEntry)} / {formatSubPennyPrice(row.target2AtEntry)}
+            </td>
+            <td data-numeric="true" class="tabular-num">
+              <span class="badge badge-ai-core">{row.kellyFractionPct.toFixed(2)}%</span>
+              <span style="margin-inline-start: 4px; color: var(--text-secondary);">
+                ${row.riskBudgetUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+              /
+              <strong>
+                ${row.notionalAllocatedUsd.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
+              </strong>
+              {#if row.trancheCount > 1}
+                <span class="badge badge-long" style="margin-inline-start: 4px;">{row.trancheCount}x</span>
+              {/if}
             </td>
             <td data-numeric="true" class={row.realizedStockPnlUsd >= 0 ? 'pnl-positive' : 'pnl-negative'}>
               {formatSignedUsd(row.realizedStockPnlUsd)} ({formatSignedPct(row.realizedStockPnlPct)})
@@ -298,6 +313,18 @@
               </span>
             </td>
             <td class="tabular-num">{formatHoldDuration(row.holdDurationMs)}</td>
+            <td>
+              <button
+                type="button"
+                class="action-btn {terminalStore.activeReplayTrade?.tradeId === row.tradeId ? 'action-btn-primary' : ''}"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  terminalStore.selectClosedTradeForReplay(row);
+                }}
+              >
+                [ 🎬 Replay ({row.entryBars.length}b) ]
+              </button>
+            </td>
           </tr>
         {/each}
       </tbody>

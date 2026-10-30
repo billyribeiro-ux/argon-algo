@@ -136,6 +136,12 @@ export interface OpenPositionItem {
   entryPrice: number;
   livePrice: number;
   quantityShares: number;
+  kellyFractionPct: number;
+  riskBudgetUsd: number;
+  notionalAllocatedUsd: number;
+  trancheCount: number;
+  scaleInHistory: string[];
+  entryBarIdx: number;
   structuralStopPrice: number;
   target1Price: number;
   target2Price: number;
@@ -185,6 +191,13 @@ export interface ClosedTradeLedgerItem {
   entryPrice: number;
   exitPrice: number;
   quantityShares: number;
+  kellyFractionPct: number;
+  riskBudgetUsd: number;
+  notionalAllocatedUsd: number;
+  trancheCount: number;
+  scaleInHistory: string[];
+  entryBarIdx: number;
+  exitBarIdx: number;
   structuralStopAtEntry: number;
   target1AtEntry: number;
   target2AtEntry: number;
@@ -215,7 +228,7 @@ export interface ClosedTradeLedgerItem {
   };
   precedentSimilarityScore: number;
   autopsyRootCauseCode: string;
-  entryBars?: RawBarCandle[];
+  entryBars: RawBarCandle[];
 }
 
 export interface ProviderStatusEntry {
@@ -267,6 +280,8 @@ export interface Era1BrainCalibrationEntry {
   era1SampleTrades: number;
   era1CalibratedWinRatePct: number;
   era1CalibratedProfitFactor: number;
+  era1LearnedMinDisplacementPct: number;
+  era1LearnedMaxDisplacementPct: number;
 }
 
 export interface BrainEvolutionStatusPayload {
@@ -294,6 +309,57 @@ export interface CustomSymbolBacktestSummary {
   realizedStockNetPnlUsd: number;
   realizedOptionNetPnlUsd: number;
   completedAtIso: string;
+}
+
+export interface WebhookChannelConfigState {
+  discordWebhookUrl: string;
+  discordEnabled: boolean;
+  telegramBotToken: string;
+  telegramChatId: string;
+  telegramEnabled: boolean;
+  slackWebhookUrl: string;
+  slackEnabled: boolean;
+  customJsonWebhookUrl: string;
+  customJsonEnabled: boolean;
+}
+
+export interface WebhookDispatchRecordEntry {
+  dispatchId: string;
+  dispatchedAtIso: string;
+  dispatchedTimestampMs: number;
+  eventType: string;
+  outcomeDetail: string;
+  symbol: string;
+  brainId: string;
+  brainName: string;
+  direction: TradeDirection;
+  entryPrice: number;
+  structuralStopPrice: number;
+  target1Price: number;
+  target2Price: number;
+  currentOrExitPrice: number;
+  kellyFractionPct: number;
+  riskBudgetUsd: number;
+  notionalAllocatedUsd: number;
+  matchedOptionContract: string;
+  greeksSummary: string;
+  streamAttributionSummary: string;
+  precedentWinRatePct: number;
+  aiConfidencePct: number;
+  pnlUsd: number;
+  rMultiple: number;
+  deliveryStatus: string;
+  channelsTargeted: string[];
+  discordEmbedJson: string;
+  telegramMarkdown: string;
+  slackBlocksJson: string;
+  genericWebhookJson: string;
+}
+
+export interface WebhookStatusPayload {
+  config: WebhookChannelConfigState;
+  totalOutboxRecords: number;
+  outboxRecords: WebhookDispatchRecordEntry[];
 }
 
 const API_BASE = 'http://127.0.0.1:8080';
@@ -476,6 +542,23 @@ export class TerminalStore {
   openPositions = $state<OpenPositionItem[]>([]);
   closedLedger = $state<ClosedTradeLedgerItem[]>([]);
   evolutionStatus = $state<BrainEvolutionStatusPayload | null>(null);
+  activeReplayTrade = $state<ClosedTradeLedgerItem | null>(null);
+  webhookStatus = $state<WebhookStatusPayload>({
+    config: {
+      discordWebhookUrl: '',
+      discordEnabled: false,
+      telegramBotToken: '',
+      telegramChatId: '',
+      telegramEnabled: false,
+      slackWebhookUrl: '',
+      slackEnabled: false,
+      customJsonWebhookUrl: '',
+      customJsonEnabled: false
+    },
+    totalOutboxRecords: 0,
+    outboxRecords: []
+  });
+  webhookTesting = $state<boolean>(false);
 
   // 6-Dimension Hyper-Filter State for Closed Trade Ledger
   quickPill = $state<QuickFilterPillId>('ALL');
@@ -860,6 +943,7 @@ export class TerminalStore {
       this.fetchScannerCandidates(),
       this.fetchProvidersTelemetry(),
       this.fetchEvolutionStatus(),
+      this.fetchWebhookStatus(),
       this.fetchLiveChartForSymbol(this.selectedTicker, this.activeTimeframe, this.activeRange)
     ]);
     this.connectWebSocketStream();
@@ -1043,7 +1127,9 @@ export class TerminalStore {
             marketInternalsMacroWeight: Number(sw.market_internals_macro_weight ?? 0.25),
             era1SampleTrades: Number(c.era1_sample_trades ?? 96),
             era1CalibratedWinRatePct: Number(c.era1_calibrated_win_rate_pct ?? 72.0),
-            era1CalibratedProfitFactor: Number(c.era1_calibrated_profit_factor ?? 1.95)
+            era1CalibratedProfitFactor: Number(c.era1_calibrated_profit_factor ?? 1.95),
+            era1LearnedMinDisplacementPct: Number(c.era1_learned_min_displacement_pct ?? 0.15),
+            era1LearnedMaxDisplacementPct: Number(c.era1_learned_max_displacement_pct ?? 12.0)
           };
         })
       : [];
@@ -1248,6 +1334,16 @@ export class TerminalStore {
         entryPrice: Number(p.entry_price ?? 0),
         livePrice: Number(p.live_price ?? 0),
         quantityShares: Number(p.quantity_shares ?? 1),
+        kellyFractionPct: Number(p.kelly_fraction_pct ?? 1.25),
+        riskBudgetUsd: Number(p.risk_budget_usd ?? 500),
+        notionalAllocatedUsd: Number(
+          p.notional_allocated_usd ?? Number(p.entry_price ?? 0) * Number(p.quantity_shares ?? 1)
+        ),
+        trancheCount: Number(p.tranche_count ?? 1),
+        scaleInHistory: Array.isArray(p.scale_in_history)
+          ? p.scale_in_history.map((s: unknown) => String(s))
+          : [],
+        entryBarIdx: Number(p.entry_bar_idx ?? 0),
         structuralStopPrice: Number(p.structural_stop_price ?? 0),
         target1Price: Number(p.target_1_price ?? 0),
         target2Price: Number(p.target_2_price ?? 0),
@@ -1308,6 +1404,20 @@ export class TerminalStore {
         entryPrice: Number(c.entry_price ?? 0),
         exitPrice: Number(c.actual_exit_price ?? 0),
         quantityShares: Number(c.quantity_shares ?? 1),
+        kellyFractionPct: Number(c.kelly_fraction_pct ?? 1.25),
+        riskBudgetUsd: Number(c.risk_budget_usd ?? 500),
+        notionalAllocatedUsd: Number(
+          c.notional_allocated_usd ?? Number(c.entry_price ?? 0) * Number(c.quantity_shares ?? 1)
+        ),
+        trancheCount: Number(c.tranche_count ?? 1),
+        scaleInHistory: Array.isArray(c.scale_in_history)
+          ? c.scale_in_history.map((s: unknown) => String(s))
+          : [],
+        entryBarIdx: Number(c.entry_bar_idx ?? 0),
+        exitBarIdx: Number(
+          c.exit_bar_idx ??
+            Math.max(0, (Array.isArray(c.entry_bars) ? c.entry_bars.length : 1) - 1)
+        ),
         structuralStopAtEntry: Number(c.initial_structural_stop ?? 0),
         target1AtEntry: Number(c.target_1_price ?? 0),
         target2AtEntry: Number(c.target_2_price ?? 0),
@@ -1565,6 +1675,126 @@ export class TerminalStore {
     this.lastBacktestSummary = null;
   }
 
+  public clearReplayTrade(): void {
+    this.activeReplayTrade = null;
+  }
+
+  private mapWebhookStatusPayload(raw: Record<string, unknown>): WebhookStatusPayload {
+    const cfg = (raw.config ?? {}) as Record<string, unknown>;
+    const rawRecs = Array.isArray(raw.outbox_records) ? raw.outbox_records : [];
+    return {
+      config: {
+        discordWebhookUrl: String(cfg.discord_webhook_url ?? ''),
+        discordEnabled: Boolean(cfg.discord_enabled ?? false),
+        telegramBotToken: String(cfg.telegram_bot_token ?? ''),
+        telegramChatId: String(cfg.telegram_chat_id ?? ''),
+        telegramEnabled: Boolean(cfg.telegram_enabled ?? false),
+        slackWebhookUrl: String(cfg.slack_webhook_url ?? ''),
+        slackEnabled: Boolean(cfg.slack_enabled ?? false),
+        customJsonWebhookUrl: String(cfg.custom_json_webhook_url ?? ''),
+        customJsonEnabled: Boolean(cfg.custom_json_enabled ?? false)
+      },
+      totalOutboxRecords: Number(raw.total_outbox_records ?? rawRecs.length),
+      outboxRecords: rawRecs.map((r: Record<string, unknown>) => ({
+        dispatchId: String(r.dispatch_id ?? ''),
+        dispatchedAtIso: String(r.dispatched_at_iso ?? ''),
+        dispatchedTimestampMs: Number(r.dispatched_timestamp_ms ?? Date.now()),
+        eventType: String(r.event_type ?? 'SIGNAL_ENTRY_OPENED'),
+        outcomeDetail: String(r.outcome_detail ?? ''),
+        symbol: String(r.symbol ?? ''),
+        brainId: String(r.brain_id ?? 'BRAIN-02'),
+        brainName: String(r.brain_name ?? ''),
+        direction: (String(r.direction ?? 'LONG').toUpperCase() === 'SHORT'
+          ? 'SHORT'
+          : 'LONG') as TradeDirection,
+        entryPrice: Number(r.entry_price ?? 0),
+        structuralStopPrice: Number(r.structural_stop_price ?? 0),
+        target1Price: Number(r.target_1_price ?? 0),
+        target2Price: Number(r.target_2_price ?? 0),
+        currentOrExitPrice: Number(r.current_or_exit_price ?? 0),
+        kellyFractionPct: Number(r.kelly_fraction_pct ?? 1.25),
+        riskBudgetUsd: Number(r.risk_budget_usd ?? 500),
+        notionalAllocatedUsd: Number(r.notional_allocated_usd ?? 10000),
+        matchedOptionContract: String(r.matched_option_contract ?? 'SHARES_ONLY'),
+        greeksSummary: String(r.greeks_summary ?? ''),
+        streamAttributionSummary: String(r.stream_attribution_summary ?? ''),
+        precedentWinRatePct: Number(r.precedent_win_rate_pct ?? 75.0),
+        aiConfidencePct: Number(r.ai_confidence_pct ?? 85.0),
+        pnlUsd: Number(r.pnl_usd ?? 0),
+        rMultiple: Number(r.r_multiple ?? 0),
+        deliveryStatus: String(r.delivery_status ?? 'QUEUED_LOCAL_OUTBOX'),
+        channelsTargeted: Array.isArray(r.channels_targeted)
+          ? r.channels_targeted.map((c: unknown) => String(c))
+          : ['LOCAL_OUTBOX'],
+        discordEmbedJson: String(r.discord_embed_json ?? ''),
+        telegramMarkdown: String(r.telegram_markdown ?? ''),
+        slackBlocksJson: String(r.slack_blocks_json ?? ''),
+        genericWebhookJson: String(r.generic_webhook_json ?? '')
+      }))
+    };
+  }
+
+  public async fetchWebhookStatus(): Promise<WebhookStatusPayload | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/webhooks/status`);
+      if (!res.ok) return null;
+      const raw = (await res.json()) as Record<string, unknown>;
+      const mapped = this.mapWebhookStatusPayload(raw);
+      this.webhookStatus = mapped;
+      return mapped;
+    } catch {
+      return null;
+    }
+  }
+
+  public async saveWebhookConfig(
+    cfg: WebhookChannelConfigState
+  ): Promise<WebhookStatusPayload | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/webhooks/configure`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          discord_webhook_url: cfg.discordWebhookUrl,
+          discord_enabled: cfg.discordEnabled,
+          telegram_bot_token: cfg.telegramBotToken,
+          telegram_chat_id: cfg.telegramChatId,
+          telegram_enabled: cfg.telegramEnabled,
+          slack_webhook_url: cfg.slackWebhookUrl,
+          slack_enabled: cfg.slackEnabled,
+          custom_json_webhook_url: cfg.customJsonWebhookUrl,
+          custom_json_enabled: cfg.customJsonEnabled
+        })
+      });
+      if (!res.ok) return null;
+      const raw = (await res.json()) as Record<string, unknown>;
+      const mapped = this.mapWebhookStatusPayload(raw);
+      this.webhookStatus = mapped;
+      return mapped;
+    } catch {
+      return null;
+    }
+  }
+
+  public async fireTestWebhookAlert(symbol: string = this.selectedTicker): Promise<boolean> {
+    this.webhookTesting = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/webhooks/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol })
+      });
+      this.webhookTesting = false;
+      if (!res.ok) return false;
+      await this.fetchWebhookStatus();
+      executionAudio.playSignalEntryChime('LONG');
+      return true;
+    } catch {
+      this.webhookTesting = false;
+      return false;
+    }
+  }
+
   /**
    * Executes an on-demand causal Era-1 Calibration + Era-2 Walk-Forward Backtest for any valid
    * Yahoo Finance ticker (`POST /api/v1/brains/{brain_id}/backtest/{symbol}`).
@@ -1608,7 +1838,9 @@ export class TerminalStore {
           marketInternalsMacroWeight: Number(sw.market_internals_macro_weight ?? 0.25),
           era1SampleTrades: Number(cal.era1_sample_trades ?? 0),
           era1CalibratedWinRatePct: Number(cal.era1_calibrated_win_rate_pct ?? 70.0),
-          era1CalibratedProfitFactor: Number(cal.era1_calibrated_profit_factor ?? 1.5)
+          era1CalibratedProfitFactor: Number(cal.era1_calibrated_profit_factor ?? 1.5),
+          era1LearnedMinDisplacementPct: Number(cal.era1_learned_min_displacement_pct ?? 0.15),
+          era1LearnedMaxDisplacementPct: Number(cal.era1_learned_max_displacement_pct ?? 12.0)
         },
         closedTradesGenerated: Number(raw.closed_trades_generated ?? 0),
         openPositionActive: Boolean(raw.open_position_active ?? false),
@@ -1649,6 +1881,7 @@ export class TerminalStore {
    */
   public selectClosedTradeForReplay(row: ClosedTradeLedgerItem): void {
     this.selectedTicker = row.symbol;
+    this.activeReplayTrade = row;
     if (row.entryBars && row.entryBars.length > 0) {
       const candidate: ScannerSignalCandidate = {
         symbol: row.symbol,
@@ -1919,6 +2152,12 @@ export class TerminalStore {
       entryPrice: candidate.entryPrice,
       livePrice: candidate.livePrice,
       quantityShares: qty,
+      kellyFractionPct: 1.35,
+      riskBudgetUsd: 135.0,
+      notionalAllocatedUsd: notionalUsd,
+      trancheCount: 1,
+      scaleInHistory: [],
+      entryBarIdx: Math.max(0, candidate.bars.length - 1),
       structuralStopPrice: candidate.structuralStopPrice,
       target1Price: candidate.target1Price,
       target2Price: candidate.target2Price,
@@ -2025,6 +2264,13 @@ export class TerminalStore {
       entryPrice: pos.entryPrice,
       exitPrice,
       quantityShares: pos.quantityShares,
+      kellyFractionPct: pos.kellyFractionPct,
+      riskBudgetUsd: pos.riskBudgetUsd,
+      notionalAllocatedUsd: pos.notionalAllocatedUsd,
+      trancheCount: pos.trancheCount,
+      scaleInHistory: [...pos.scaleInHistory],
+      entryBarIdx: pos.entryBarIdx,
+      exitBarIdx: Math.max(pos.entryBarIdx, 24),
       structuralStopAtEntry: pos.structuralStopPrice,
       target1AtEntry: pos.target1Price,
       target2AtEntry: pos.target2Price,
@@ -2051,7 +2297,8 @@ export class TerminalStore {
       precedentSimilarityScore: 0.928,
       autopsyRootCauseCode: isWinner
         ? 'VERIFIED_REAL_YAHOO_EXPANSION'
-        : 'STOP_DISTANCE_TIGHTENED_BY_ABSORPTION_WICK'
+        : 'STOP_DISTANCE_TIGHTENED_BY_ABSORPTION_WICK',
+      entryBars: []
     };
 
     this.closedLedger = [closedItem, ...this.closedLedger];

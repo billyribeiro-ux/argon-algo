@@ -8,12 +8,14 @@ pub mod ledger;
 pub mod onnx_engine;
 pub mod precedent_knn;
 pub mod routes;
+pub mod webhooks;
 
 pub use exporter::{ExportError, ExportScope, export_to_csv_bytes, export_to_xlsx_bytes};
 pub use ledger::{
     AutopsyTradeGrade, BrainBreakdownSummary, BrainEvolutionStatus, ChampionChallengerComparison,
     ClosedOutcomeBadge, ClosedTradeRow, FilteredLedgerSnapshot, HyperFilterQuery,
-    MasterExecutiveScoreboard, OpenPositionRow, RealTimeLedgerEngine,
+    KellyAllocationPlan, KellyCapitalAllocator, MasterExecutiveScoreboard, OpenPositionRow,
+    RealTimeLedgerEngine,
 };
 pub use onnx_engine::{
     InferenceError, LiveBrainInferenceOutput, LoadedOnnxBrainModel, MatchedOptionExecutionPlan,
@@ -23,6 +25,10 @@ pub use precedent_knn::{HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMatch
 pub use routes::{
     AppState, CustomBacktestSummaryResponse, LiveChartResponse, ScannerCandidatesResponse,
     build_axum_router,
+};
+pub use webhooks::{
+    OutboundWebhookDispatcher, WebhookChannelConfig, WebhookDispatchRecord, WebhookEventPayload,
+    WebhookEventType, WebhookStatusResponse,
 };
 
 #[cfg(test)]
@@ -485,6 +491,56 @@ mod tests {
             custom_bt.win_rate_pct,
             custom_bt.profit_factor,
             custom_bt.realized_stock_net_pnl_usd
+        );
+
+        // 8. Verify Phase-12 Maximization 1, 2, & 3:
+        //    - Causal Fractional-Kelly sizing (`kelly_fraction_pct` in 0.50..=2.75, `notional_allocated_usd` in 5_000..=35_000)
+        //    - Full-Lifecycle Bar-by-Bar Replay indices (`entry_bar_idx <= exit_bar_idx < entry_bars.len()`)
+        //    - Outbound Webhook Dispatcher ring-buffer outbox (`<= 100` records with Discord/Telegram/Slack payloads)
+        for tr in &snap.closed_trades {
+            assert!(
+                (0.50..=2.75).contains(&tr.kelly_fraction_pct),
+                "Expected kelly_fraction_pct in 0.50..=2.75 for {}, got {:.2}",
+                tr.symbol,
+                tr.kelly_fraction_pct
+            );
+            assert!(
+                tr.risk_budget_usd >= 250.0,
+                "Expected positive risk_budget_usd for {}, got {:.2}",
+                tr.symbol,
+                tr.risk_budget_usd
+            );
+            let max_tranche_notional = 36_000.0 * (tr.tranche_count.max(1) as f64);
+            assert!(
+                (4_500.0..=max_tranche_notional).contains(&tr.notional_allocated_usd),
+                "Expected notional_allocated_usd in $5k..${:.0} for {} (tranches={}), got {:.2}",
+                max_tranche_notional,
+                tr.symbol,
+                tr.tranche_count,
+                tr.notional_allocated_usd
+            );
+            assert!(
+                tr.entry_bar_idx <= tr.exit_bar_idx && tr.exit_bar_idx < tr.entry_bars.len(),
+                "Expected valid full-lifecycle replay indices entry_bar_idx ({}) <= exit_bar_idx ({}) < entry_bars.len() ({})",
+                tr.entry_bar_idx,
+                tr.exit_bar_idx,
+                tr.entry_bars.len()
+            );
+        }
+        let wh_status = state.ledger.webhooks().status_snapshot();
+        assert!(
+            wh_status.total_outbox_records > 0 && wh_status.total_outbox_records <= 100,
+            "Expected bounded webhook outbox (1..=100), got {}",
+            wh_status.total_outbox_records
+        );
+        assert!(
+            wh_status.outbox_records[0]
+                .discord_embed_json
+                .contains("Fractional-Kelly & Risk Budget")
+        );
+        println!(
+            "[PHASE-12 VERIFIED] Kelly Sizing Active | Replay Indices Verified | Webhook Outbox Records: {}",
+            wh_status.total_outbox_records
         );
     }
 }

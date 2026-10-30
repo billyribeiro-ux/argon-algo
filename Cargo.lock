@@ -984,6 +984,7 @@ dependencies = [
  "market-data-bus",
  "parking_lot",
  "raw-fingerprint-core",
+ "reqwest",
  "rust_decimal",
  "serde",
  "serde_json",

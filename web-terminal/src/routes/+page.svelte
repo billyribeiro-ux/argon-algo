@@ -143,7 +143,25 @@
           <span>Yahoo Finance Live Scanner</span>
           <span class="badge badge-ai-core">{candidates.length} SIGNALS</span>
         </div>
-        <div style="display: flex; align-items: center; gap: 6px;">
+        <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+          <button
+            type="button"
+            class="action-btn"
+            onclick={() =>
+              terminalStore.runCustomSymbolBacktest(
+                terminalStore.selectedTicker,
+                terminalStore.activeBrain === 'ALL_5_BRAINS'
+                  ? terminalStore.activeBlueprint.brainId
+                  : terminalStore.activeBrain
+              )}
+            disabled={terminalStore.backtestLoading}
+            style="padding: 2px 7px; font-size: 0.67rem;"
+            title="Run 100% Causal Walk-Forward Backtest on the currently selected symbol"
+          >
+            {terminalStore.backtestLoading
+              ? '⚡ Backtesting...'
+              : `⚡ Deep Backtest ${terminalStore.selectedTicker}`}
+          </button>
           <button
             type="button"
             class="action-btn"

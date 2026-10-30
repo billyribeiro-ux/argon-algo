@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   TerminalStore,
   formatSubPennyPrice,
   CSV_LEDGER_HEADERS
 } from './terminal.svelte';
+import { ExecutionAudioEngine } from '../audio/execution-audio';
 
 function seedYahooBackendState(store: TerminalStore): void {
   // Ingest real-shape Yahoo Finance chart responses across sub-penny and institutional tickers
@@ -374,5 +375,88 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
     expect(store.splitPanes[0]?.brainId).toBe('BRAIN-01');
     expect(store.splitPanes[0]?.timeframe).toBe('15m');
     expect(store.splitPanes[1]?.symbol).toBe('AMD');
+  });
+
+  it('cycles ExecutionAudioEngine modes and deduplicates multi-monitor audio events across windows', () => {
+    const audioEngine = new ExecutionAudioEngine('VOICE_AND_CHIMES');
+    expect(audioEngine.getMode()).toBe('VOICE_AND_CHIMES');
+
+    expect(audioEngine.cycleMode()).toBe('CHIMES_ONLY');
+    expect(audioEngine.cycleMode()).toBe('MUTED');
+    expect(audioEngine.cycleMode()).toBe('VOICE_AND_CHIMES');
+
+    // Verify acoustic methods execute safely without throwing in headless test environment
+    expect(() => audioEngine.playSignalEntryChime('LONG')).not.toThrow();
+    expect(audioEngine.getLastChimeSignature()).toBe('ENTRY_LONG_523.25_659.25');
+    expect(() => audioEngine.playSignalEntryChime('SHORT')).not.toThrow();
+    expect(audioEngine.getLastChimeSignature()).toBe('ENTRY_SHORT_587.33_440.00');
+    expect(() => audioEngine.playTarget1BankedChime()).not.toThrow();
+    expect(audioEngine.getLastChimeSignature()).toBe('TARGET1_BANKED_880.00_1174.66');
+    expect(() => audioEngine.playScaleInChime()).not.toThrow();
+    expect(audioEngine.getLastChimeSignature()).toBe('SCALE_IN_880.00_1174.66');
+    expect(() => audioEngine.playPositionClosedChime(true)).not.toThrow();
+    expect(() => audioEngine.playPositionClosedChime(false)).not.toThrow();
+    expect(() =>
+      audioEngine.speakExecutionCallout(
+        'Argon Brain 2: Long Entry on N V D A at $142.85, Target 1 $145.40, Confidence 94 percent.'
+      )
+    ).not.toThrow();
+    expect(audioEngine.getLastSpokenText()).toContain('Argon Brain 2: Long Entry');
+  });
+
+  it('executes on-demand custom ticker walk-forward backtests via runCustomSymbolBacktest and updates telemetry state', async () => {
+    const store = new TerminalStore(false);
+    seedYahooBackendState(store);
+
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        symbol: 'MSTR',
+        brain_id: 'BRAIN-03',
+        timeframe: '1H',
+        total_bars_scanned: 750,
+        era1_calibration: {
+          brain_id: 'BRAIN-03',
+          calibrated_confidence_floor: 64.0,
+          min_precedent_win_rate_pct: 58.0,
+          min_expected_r_multiple: 1.35,
+          stream_prior_weights: {
+            chart_tape_physics_weight: 0.25,
+            options_gamma_vanna_weight: 0.25,
+            short_float_squeeze_weight: 0.25,
+            market_internals_macro_weight: 0.25
+          },
+          era1_sample_trades: 96,
+          era1_calibrated_win_rate_pct: 72.0,
+          era1_calibrated_profit_factor: 1.95
+        },
+        closed_trades_generated: 8,
+        open_position_active: false,
+        win_rate_pct: 62.5,
+        profit_factor: 1.25,
+        realized_stock_net_pnl_usd: 462.13,
+        realized_option_net_pnl_usd: 215.4
+      })
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    expect(store.audioMode).toBe('VOICE_AND_CHIMES');
+    store.cycleAudioMode();
+    expect(store.audioMode).toBe('CHIMES_ONLY');
+    store.setAudioMode('VOICE_AND_CHIMES');
+
+    const result = await store.runCustomSymbolBacktest('MSTR', 'BRAIN-03');
+    expect(result).not.toBeNull();
+    expect(result?.symbol).toBe('MSTR');
+    expect(result?.brainId).toBe('BRAIN-03');
+    expect(result?.totalBarsScanned).toBe(750);
+    expect(result?.closedTradesGenerated).toBe(8);
+    expect(result?.profitFactor).toBeCloseTo(1.25, 2);
+    expect(store.lastBacktestSummary?.symbol).toBe('MSTR');
+
+    store.dismissBacktestSummary();
+    expect(store.lastBacktestSummary).toBeNull();
+
+    vi.unstubAllGlobals();
   });
 });

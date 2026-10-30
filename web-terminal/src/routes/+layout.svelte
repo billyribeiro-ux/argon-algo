@@ -156,6 +156,39 @@
       >
         Launch 4-Monitor Preset
       </button>
+
+      <!-- Multi-Monitor Web Audio & Speech Synthesis Controls -->
+      <div
+        style="display: flex; align-items: center; gap: 4px; padding: 2px 6px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
+        role="group"
+        aria-label="Execution Audio Alert Controls"
+      >
+        <button
+          type="button"
+          class="filter-pill"
+          data-selected={terminalStore.audioMode !== 'MUTED'}
+          onclick={() => terminalStore.cycleAudioMode()}
+          title="Cycle Execution Audio Alert Mode (Chimes + Voice / Chimes Only / Muted)"
+          style="padding: 2px 7px; font-size: 0.66rem; font-weight: 700;"
+        >
+          {#if terminalStore.audioMode === 'VOICE_AND_CHIMES'}
+            🔊 Audio: Chimes + Voice
+          {:else if terminalStore.audioMode === 'CHIMES_ONLY'}
+            🔔 Audio: Chimes Only
+          {:else}
+            🔇 Audio: Muted
+          {/if}
+        </button>
+        <button
+          type="button"
+          class="action-btn"
+          onclick={() => terminalStore.testExecutionAudio()}
+          style="padding: 2px 6px; font-size: 0.65rem;"
+          title="Play Web Audio API Chime & Speech Synthesis Verification"
+        >
+          Test Sound
+        </button>
+      </div>
     </div>
   </header>
 

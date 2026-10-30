@@ -20,7 +20,10 @@ pub use onnx_engine::{
     OnnxMultiBrainEngine,
 };
 pub use precedent_knn::{HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMatchSummary};
-pub use routes::{AppState, LiveChartResponse, ScannerCandidatesResponse, build_axum_router};
+pub use routes::{
+    AppState, CustomBacktestSummaryResponse, LiveChartResponse, ScannerCandidatesResponse,
+    build_axum_router,
+};
 
 #[cfg(test)]
 mod tests {
@@ -384,6 +387,17 @@ mod tests {
         assert_eq!(evo.tournament_results.len(), 5);
         assert_eq!(evo.era1_calibrations.len(), 5);
         for b in &snap.scoreboard.by_brain_breakdowns {
+            println!(
+                "[PHASE-11 BRAIN BREAKDOWN] {} | Closed: {} | WinRate: {:.2}% | PF: {:.2} | Realized Net P&L: ${:.2} | Unrealized Open P&L: ${:.2}",
+                b.brain_id.code(),
+                b.closed_trades_count,
+                b.win_rate_pct,
+                b.profit_factor,
+                b.realized_net_profit_usd,
+                b.unrealized_open_pnl_usd
+            );
+        }
+        for b in &snap.scoreboard.by_brain_breakdowns {
             assert!(
                 b.profit_factor >= 1.25,
                 "Expected {} Profit Factor >= 1.25, got {:.2}",
@@ -450,6 +464,27 @@ mod tests {
             reanchored.contracts[0].contract_symbol,
             nvda_chain.contracts[0].bid,
             reanchored.contracts[0].bid
+        );
+        // 7. Verify Phase-11 On-Demand "Any-Ticker" Causal Walk-Forward Backtester (`POST /api/v1/brains/{brain_id}/backtest/{symbol}`)
+        let custom_bt = state
+            .run_custom_symbol_walk_forward_backtest("PLTR", BrainHorizonId::Brain03ShortTermSwing)
+            .await
+            .expect("On-demand custom symbol backtest for PLTR on BRAIN-03 succeeds");
+        assert_eq!(custom_bt.symbol, "PLTR");
+        assert_eq!(custom_bt.brain_id, BrainHorizonId::Brain03ShortTermSwing);
+        assert_eq!(custom_bt.timeframe, "1H");
+        assert!(custom_bt.total_bars_scanned >= 100);
+        assert!(custom_bt.profit_factor >= 1.25);
+        println!(
+            "[PHASE-11 CUSTOM BACKTEST] {} ({} @ {}) | Bars: {} | Closed Trades: {} | WinRate: {:.1}% | PF: {:.2} | Net P&L: ${:.2}",
+            custom_bt.symbol,
+            custom_bt.brain_id.code(),
+            custom_bt.timeframe,
+            custom_bt.total_bars_scanned,
+            custom_bt.closed_trades_generated,
+            custom_bt.win_rate_pct,
+            custom_bt.profit_factor,
+            custom_bt.realized_stock_net_pnl_usd
         );
     }
 }

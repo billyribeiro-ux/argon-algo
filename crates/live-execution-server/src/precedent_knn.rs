@@ -160,6 +160,13 @@ impl PrecedentKnnIndex {
         }
     }
 
+    /// Removes previously indexed traces for `(symbol, brain_id)` before re-running an on-demand custom backtest.
+    pub fn clear_traces_for_symbol_and_brain(&self, symbol: &str, brain_id: BrainHorizonId) {
+        self.records
+            .write()
+            .retain(|r| !(r.brain_id == brain_id && r.symbol.eq_ignore_ascii_case(symbol)));
+    }
+
     /// Queries the top-$K$ historical precedent traces for `brain_id` in `<1ms` via cosine similarity
     /// and computes the empirical 85th-percentile MAE, 50th/80th-percentile MFE, and median hold duration.
     pub fn query_precedents(

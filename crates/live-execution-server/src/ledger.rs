@@ -359,6 +359,56 @@ impl RealTimeLedgerEngine {
             .insert(profile.brain_id, profile);
     }
 
+    pub fn accumulate_era1_brain_calibration(&self, profile: Era1BrainCalibrationProfile) {
+        let mut map = self.era1_calibrations.write();
+        if let Some(existing) = map.get_mut(&profile.brain_id) {
+            let n1 = existing.era1_sample_trades.max(1) as f64;
+            let n2 = profile.era1_sample_trades.max(1) as f64;
+            let tot = n1 + n2;
+            existing.era1_sample_trades += profile.era1_sample_trades;
+            existing.era1_calibrated_win_rate_pct = (existing.era1_calibrated_win_rate_pct * n1
+                + profile.era1_calibrated_win_rate_pct * n2)
+                / tot;
+            existing.era1_calibrated_profit_factor = (existing.era1_calibrated_profit_factor * n1
+                + profile.era1_calibrated_profit_factor * n2)
+                / tot;
+            existing.calibrated_confidence_floor = existing
+                .calibrated_confidence_floor
+                .max(profile.calibrated_confidence_floor);
+            let w1 = n1 as f32;
+            let w2 = n2 as f32;
+            let wtot = w1 + w2;
+            existing.stream_prior_weights = FourStreamWeights {
+                chart_tape_physics_weight: (existing
+                    .stream_prior_weights
+                    .chart_tape_physics_weight
+                    * w1
+                    + profile.stream_prior_weights.chart_tape_physics_weight * w2)
+                    / wtot,
+                options_gamma_vanna_weight: (existing
+                    .stream_prior_weights
+                    .options_gamma_vanna_weight
+                    * w1
+                    + profile.stream_prior_weights.options_gamma_vanna_weight * w2)
+                    / wtot,
+                short_float_squeeze_weight: (existing
+                    .stream_prior_weights
+                    .short_float_squeeze_weight
+                    * w1
+                    + profile.stream_prior_weights.short_float_squeeze_weight * w2)
+                    / wtot,
+                market_internals_macro_weight: (existing
+                    .stream_prior_weights
+                    .market_internals_macro_weight
+                    * w1
+                    + profile.stream_prior_weights.market_internals_macro_weight * w2)
+                    / wtot,
+            };
+        } else {
+            map.insert(profile.brain_id, profile);
+        }
+    }
+
     pub fn get_era1_brain_calibration(
         &self,
         brain_id: BrainHorizonId,
@@ -439,6 +489,49 @@ impl RealTimeLedgerEngine {
         self.positions_opened
             .write()
             .retain(|p| !(p.symbol.eq_ignore_ascii_case(symbol) && p.brain_id == brain_id));
+    }
+
+    pub fn clear_trades_and_positions_for_symbol_and_brain(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+    ) {
+        self.positions_opened
+            .write()
+            .retain(|p| !(p.symbol.eq_ignore_ascii_case(symbol) && p.brain_id == brain_id));
+        let mut closed = self.closed_ledger.write();
+        closed.retain(|t| !(t.symbol.eq_ignore_ascii_case(symbol) && t.brain_id == brain_id));
+        let mut running = 0.0_f64;
+        for row in closed.iter_mut() {
+            running += row.net_pnl_usd;
+            row.cumulative_net_profit_usd = running;
+        }
+        *self.running_net_profit_usd.write() = running;
+    }
+
+    pub fn trades_for_symbol_and_brain(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+    ) -> Vec<ClosedTradeRow> {
+        self.closed_ledger
+            .read()
+            .iter()
+            .filter(|t| t.symbol.eq_ignore_ascii_case(symbol) && t.brain_id == brain_id)
+            .cloned()
+            .collect()
+    }
+
+    pub fn open_position_for_symbol_and_brain(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+    ) -> Option<OpenPositionRow> {
+        self.positions_opened
+            .read()
+            .iter()
+            .find(|p| p.symbol.eq_ignore_ascii_case(symbol) && p.brain_id == brain_id)
+            .cloned()
     }
 
     /// Controlled Scale-In / Pyramiding Support (`max_tranches = 3`):
@@ -935,10 +1028,10 @@ impl RealTimeLedgerEngine {
                 - pos.initial_structural_stop.scaled_units())
             .abs()
             .max(1);
-            let trigger_pct = if pos.brain_id == BrainHorizonId::Brain01PennyAnomaly {
-                95
-            } else {
-                80
+            let trigger_pct = match pos.brain_id {
+                BrainHorizonId::Brain01PennyAnomaly => 95,
+                BrainHorizonId::Brain03ShortTermSwing => 48,
+                _ => 80,
             };
             let trigger_dist_u = (risk_u * trigger_pct / 100).max(1);
             let t1_trigger_price = match pos.direction {

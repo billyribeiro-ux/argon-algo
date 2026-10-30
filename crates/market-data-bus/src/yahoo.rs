@@ -86,11 +86,46 @@ pub const REAL_YAHOO_CORE_UNIVERSE: &[RealUniverseTickerMeta] = &[
         is_optionable: true,
         is_otc_penny: false,
     },
+    RealUniverseTickerMeta {
+        symbol: "AVGO",
+        exchange_index: "NASDAQ_100",
+        sector_etf: "SMH",
+        is_optionable: true,
+        is_otc_penny: false,
+    },
+    RealUniverseTickerMeta {
+        symbol: "MSTR",
+        exchange_index: "NASDAQ_100",
+        sector_etf: "IGV",
+        is_optionable: true,
+        is_otc_penny: false,
+    },
+    RealUniverseTickerMeta {
+        symbol: "SMCI",
+        exchange_index: "NASDAQ_100",
+        sector_etf: "SMH",
+        is_optionable: true,
+        is_otc_penny: false,
+    },
+    RealUniverseTickerMeta {
+        symbol: "QQQ",
+        exchange_index: "NASDAQ_100",
+        sector_etf: "QQQ",
+        is_optionable: true,
+        is_otc_penny: false,
+    },
     // S&P 500 Leaders
     RealUniverseTickerMeta {
         symbol: "PLTR",
         exchange_index: "SP_500",
         sector_etf: "IGV",
+        is_optionable: true,
+        is_otc_penny: false,
+    },
+    RealUniverseTickerMeta {
+        symbol: "COIN",
+        exchange_index: "SP_500",
+        sector_etf: "XLF",
         is_optionable: true,
         is_otc_penny: false,
     },
@@ -147,6 +182,13 @@ pub const REAL_YAHOO_CORE_UNIVERSE: &[RealUniverseTickerMeta] = &[
         is_otc_penny: true,
     },
     RealUniverseTickerMeta {
+        symbol: "KULR",
+        exchange_index: "OTC_PENNY",
+        sector_etf: "XLI",
+        is_optionable: true,
+        is_otc_penny: true,
+    },
+    RealUniverseTickerMeta {
         symbol: "OPEN",
         exchange_index: "OTC_PENNY",
         sector_etf: "XLF",
@@ -172,7 +214,7 @@ pub const REAL_YAHOO_CORE_UNIVERSE: &[RealUniverseTickerMeta] = &[
         exchange_index: "RUSSELL_2000",
         sector_etf: "IGV",
         is_optionable: true,
-        is_otc_penny: false,
+        is_otc_penny: true,
     },
 ];
 
@@ -573,6 +615,36 @@ impl YahooSessionManager {
         merged
     }
 
+    /// Attempts to load a warm local OHLCV disk cache (`data/ohlcv_cache/{SYMBOL}_{TF}.json`)
+    /// if the file exists, contains at least `min_bars` candles, and was updated within `max_age_secs`.
+    pub fn try_load_warm_ohlcv_disk_cache(
+        symbol: &str,
+        timeframe: Timeframe,
+        min_bars: usize,
+        max_age_secs: u64,
+    ) -> Option<Vec<RealExchangeOhlcvBar>> {
+        let clean_sym = symbol.trim().to_uppercase();
+        let tf_str = timeframe.as_str();
+        let filename = format!("{clean_sym}_{tf_str}.json");
+        let primary_dir = std::path::PathBuf::from("data/ohlcv_cache");
+        let workspace_dir = std::path::PathBuf::from("../../data/ohlcv_cache");
+
+        for dir in [&workspace_dir, &primary_dir] {
+            let file_path = dir.join(&filename);
+            if let Ok(meta) = std::fs::metadata(&file_path)
+                && let Ok(modified) = meta.modified()
+                && modified.elapsed().unwrap_or(Duration::from_secs(0))
+                    <= Duration::from_secs(max_age_secs)
+                && let Ok(bytes) = std::fs::read(&file_path)
+                && let Ok(bars) = serde_json::from_slice::<Vec<RealExchangeOhlcvBar>>(&bytes)
+                && bars.len() >= min_bars
+            {
+                return Some(bars);
+            }
+        }
+        None
+    }
+
     /// Fetches real intraday OHLCV bars (`1m`, `3m`, `5m`, `15m`, `1h`, `4h`) from Yahoo `v8/finance/chart`
     /// using `range=60d` for `5m`/`15m` (~4,680 real intraday candles) and `range=730d` (`2y`) for `1h`,
     /// merging into the persistent local disk cache (`data/ohlcv_cache/{symbol}_{timeframe}.json`).
@@ -585,6 +657,20 @@ impl YahooSessionManager {
     ) -> Result<Vec<RealExchangeOhlcvBar>, DataBusError> {
         let clean_sym = symbol.trim().to_uppercase();
         let target_len = limit.max(8);
+
+        let min_cached_bars = match timeframe {
+            Timeframe::W1 | Timeframe::Mo1 => 100,
+            _ => 250.max(target_len.min(2000)),
+        };
+        if let Some(cached) =
+            Self::try_load_warm_ohlcv_disk_cache(&clean_sym, timeframe, min_cached_bars, 3600)
+        {
+            let len = cached.len();
+            if len > target_len {
+                return Ok(cached[len - target_len..].to_vec());
+            }
+            return Ok(cached);
+        }
 
         // For 1D, 1W, 1M, use the deep real daily exchange OHLCV series and aggregate strictly
         if matches!(timeframe, Timeframe::D1 | Timeframe::W1 | Timeframe::Mo1) {
@@ -2269,6 +2355,37 @@ impl YahooFinanceLiveAdapter {
             underlying_price: spot,
             timestamp_ns: ts_ns,
             contracts,
+        }
+    }
+
+    /// Phase 11 Upgrade 1: Fast Parallel Disk-Cache Hydration with Token-Bucket Pacing.
+    /// Immediately hydrates warm `data/ohlcv_cache/{SYMBOL}_{TF}.json` series and fetches any missing
+    /// symbol/timeframe pairs concurrently across bounded worker permits (`max_concurrency = 4`, `35ms` pacing).
+    pub async fn prefetch_ohlcv_series_parallel(&self, requests: &[(String, Timeframe, usize)]) {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut tasks = Vec::new();
+
+        for (idx, (sym, tf, limit)) in requests.iter().cloned().enumerate() {
+            let min_cached = match tf {
+                Timeframe::W1 | Timeframe::Mo1 => 100,
+                _ => 250.max(limit.min(2000)),
+            };
+            if YahooSessionManager::try_load_warm_ohlcv_disk_cache(&sym, tf, min_cached, 3600)
+                .is_some()
+            {
+                continue;
+            }
+            let session = self.session.clone();
+            let sem = semaphore.clone();
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.ok();
+                tokio::time::sleep(Duration::from_millis((idx as u64 % 4) * 35)).await;
+                let _ = session.fetch_real_timeframe_ohlcv_bars(&sym, tf, limit).await;
+            }));
+        }
+
+        for t in tasks {
+            let _ = t.await;
         }
     }
 }

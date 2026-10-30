@@ -11,8 +11,14 @@ import {
   type LinkChannelColor,
   type WorkspaceLayoutMode
 } from '../multi-window/window-sync';
+import {
+  ExecutionAudioEngine,
+  executionAudio,
+  type ExecutionAudioMode
+} from '../audio/execution-audio';
 
-export type { LinkChannelColor, WorkspaceLayoutMode };
+export type { LinkChannelColor, WorkspaceLayoutMode, ExecutionAudioMode };
+export { ExecutionAudioEngine, executionAudio };
 
 export type BrainId =
   | 'ALL_5_BRAINS'
@@ -275,6 +281,21 @@ export interface BrainEvolutionStatusPayload {
   era1Calibrations: Era1BrainCalibrationEntry[];
 }
 
+export interface CustomSymbolBacktestSummary {
+  symbol: string;
+  brainId: Exclude<BrainId, 'ALL_5_BRAINS'>;
+  timeframe: string;
+  totalBarsScanned: number;
+  era1Calibration: Era1BrainCalibrationEntry;
+  closedTradesGenerated: number;
+  openPositionActive: boolean;
+  winRatePct: number;
+  profitFactor: number;
+  realizedStockNetPnlUsd: number;
+  realizedOptionNetPnlUsd: number;
+  completedAtIso: string;
+}
+
 const API_BASE = 'http://127.0.0.1:8080';
 const WS_URL = 'ws://127.0.0.1:8080/ws/v1/stream';
 
@@ -439,8 +460,16 @@ export class TerminalStore {
   // Connection & Loading Telemetry
   backendConnected = $state<boolean>(false);
   chartLoading = $state<boolean>(false);
+  backtestLoading = $state<boolean>(false);
+  lastBacktestSummary = $state<CustomSymbolBacktestSummary | null>(null);
+  audioMode = $state<ExecutionAudioMode>(executionAudio.getMode());
   lastSyncTimestampIso = $state<string>('');
   replaySpeed = $state<'1x' | '5x' | '10x' | '50x' | 'MAX'>('1x');
+
+  private hasHydratedInitialSnapshot = false;
+  private knownOpenPositionIds = new Set<string>();
+  private knownOpenTrancheCounts = new Map<string, number>();
+  private knownClosedTradeIds = new Set<string>();
 
   // Scanner, Live Positions & Closed Trade Ledger State (100% Real Yahoo Finance Backend Hydrated)
   scannerCandidates = $state<ScannerSignalCandidate[]>([]);
@@ -1324,6 +1353,62 @@ export class TerminalStore {
           : []
       };
     });
+
+    // Trigger institutional Web Audio chimes and voice callouts on newly opened, scaled-in, or closed positions
+    if (this.hasHydratedInitialSnapshot) {
+      for (const p of rawOpen as Array<Record<string, unknown>>) {
+        const posId = String(p.position_id ?? '');
+        const trancheCnt = Number(p.tranche_count ?? 1);
+        const sym = String(p.symbol ?? '');
+        const brainNum = String(p.brain_id ?? 'BRAIN-02').replace('BRAIN-0', '');
+        const dir: TradeDirection =
+          String(p.direction ?? 'LONG').toUpperCase() === 'SHORT' ? 'SHORT' : 'LONG';
+        const entryPx = Number(p.entry_price ?? 0).toFixed(2);
+        const confPct = Math.round(Number(p.ai_confidence_pct ?? 80));
+
+        if (posId && !this.knownOpenPositionIds.has(posId)) {
+          if (executionAudio.claimCrossWindowAudioEvent(`OPEN:${posId}`)) {
+            executionAudio.playSignalEntryChime(dir);
+            const spelled = ExecutionAudioEngine.formatSymbolForSpeech(sym);
+            executionAudio.speakExecutionCallout(
+              `Argon Brain ${brainNum}: ${dir === 'LONG' ? 'Long' : 'Short'} ${spelled} entered at ${entryPx}, confidence ${confPct} percent`
+            );
+          }
+        } else if (posId && (this.knownOpenTrancheCounts.get(posId) ?? 1) < trancheCnt) {
+          if (executionAudio.claimCrossWindowAudioEvent(`SCALE:${posId}:${trancheCnt}`)) {
+            executionAudio.playScaleInChime();
+            const spelled = ExecutionAudioEngine.formatSymbolForSpeech(sym);
+            executionAudio.speakExecutionCallout(
+              `Argon Brain ${brainNum}: Scaled into ${spelled} tranche ${trancheCnt} of 3`
+            );
+          }
+        }
+      }
+
+      for (const tr of this.closedLedger) {
+        if (tr.tradeId && !this.knownClosedTradeIds.has(tr.tradeId)) {
+          if (executionAudio.claimCrossWindowAudioEvent(`CLOSED:${tr.tradeId}`)) {
+            executionAudio.playPositionClosedChime(tr.isWinner);
+            const spelled = ExecutionAudioEngine.formatSymbolForSpeech(tr.symbol);
+            const brainNum = tr.brainId.replace('BRAIN-0', '');
+            executionAudio.speakExecutionCallout(
+              `Argon Brain ${brainNum}: ${spelled} ${tr.outcomeBadge.toLowerCase()}, ${tr.isWinner ? 'profit' : 'loss'} ${Math.abs(Math.round(tr.realizedStockPnlUsd))} dollars`
+            );
+          }
+          break;
+        }
+      }
+    }
+
+    this.knownOpenPositionIds = new Set(this.openPositions.map((p) => p.tradeId));
+    this.knownOpenTrancheCounts = new Map(
+      (rawOpen as Array<Record<string, unknown>>).map((p) => [
+        String(p.position_id ?? ''),
+        Number(p.tranche_count ?? 1)
+      ])
+    );
+    this.knownClosedTradeIds = new Set(this.closedLedger.map((t) => t.tradeId));
+    this.hasHydratedInitialSnapshot = true;
   }
 
   private ingestScannerPromotions(promotions: Array<Record<string, unknown>>): void {
@@ -1444,6 +1529,12 @@ export class TerminalStore {
     this.selectedTicker = clean;
     if (typeof window !== 'undefined' && typeof fetch === 'function') {
       void this.fetchLiveChartForSymbol(clean, this.activeTimeframe, this.activeRange);
+      const hasExistingHistory =
+        this.closedLedger.some((t) => t.symbol.toUpperCase() === clean) ||
+        this.openPositions.some((p) => p.symbol.toUpperCase() === clean);
+      if (!hasExistingHistory && this.backendConnected) {
+        void this.runCustomSymbolBacktest(clean, this.activeBrain);
+      }
     }
     if (broadcast) {
       this.syncBus.publish({
@@ -1451,6 +1542,104 @@ export class TerminalStore {
         symbol: clean,
         linkChannel: this.activeLinkChannel
       });
+    }
+  }
+
+  public setAudioMode(mode: ExecutionAudioMode): void {
+    executionAudio.setMode(mode);
+    this.audioMode = mode;
+  }
+
+  public cycleAudioMode(): ExecutionAudioMode {
+    const next = executionAudio.cycleMode();
+    this.audioMode = next;
+    return next;
+  }
+
+  public testExecutionAudio(): void {
+    executionAudio.playTestSound();
+    this.audioMode = executionAudio.getMode();
+  }
+
+  public dismissBacktestSummary(): void {
+    this.lastBacktestSummary = null;
+  }
+
+  /**
+   * Executes an on-demand causal Era-1 Calibration + Era-2 Walk-Forward Backtest for any valid
+   * Yahoo Finance ticker (`POST /api/v1/brains/{brain_id}/backtest/{symbol}`).
+   */
+  public async runCustomSymbolBacktest(
+    symbol: string = this.selectedTicker,
+    brainId: BrainId = this.activeBrain
+  ): Promise<CustomSymbolBacktestSummary | null> {
+    const cleanSym = symbol.trim().toUpperCase();
+    if (!cleanSym) return null;
+    const targetBrain: Exclude<BrainId, 'ALL_5_BRAINS'> =
+      brainId === 'ALL_5_BRAINS' ? 'BRAIN-02' : brainId;
+
+    this.backtestLoading = true;
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/v1/brains/${encodeURIComponent(targetBrain)}/backtest/${encodeURIComponent(cleanSym)}`,
+        { method: 'POST' }
+      );
+      if (!res.ok) {
+        this.backtestLoading = false;
+        return null;
+      }
+      const raw = (await res.json()) as Record<string, unknown>;
+      const cal = (raw.era1_calibration ?? {}) as Record<string, unknown>;
+      const sw = (cal.stream_prior_weights ?? {}) as Record<string, unknown>;
+
+      const summary: CustomSymbolBacktestSummary = {
+        symbol: String(raw.symbol ?? cleanSym).toUpperCase(),
+        brainId: String(raw.brain_id ?? targetBrain) as Exclude<BrainId, 'ALL_5_BRAINS'>,
+        timeframe: String(raw.timeframe ?? '5m'),
+        totalBarsScanned: Number(raw.total_bars_scanned ?? 0),
+        era1Calibration: {
+          brainId: String(cal.brain_id ?? targetBrain),
+          calibratedConfidenceFloor: Number(cal.calibrated_confidence_floor ?? 64.0),
+          minPrecedentWinRatePct: Number(cal.min_precedent_win_rate_pct ?? 58.0),
+          minExpectedRMultiple: Number(cal.min_expected_r_multiple ?? 1.35),
+          chartTapePhysicsWeight: Number(sw.chart_tape_physics_weight ?? 0.25),
+          optionsGammaVannaWeight: Number(sw.options_gamma_vanna_weight ?? 0.25),
+          shortFloatSqueezeWeight: Number(sw.short_float_squeeze_weight ?? 0.25),
+          marketInternalsMacroWeight: Number(sw.market_internals_macro_weight ?? 0.25),
+          era1SampleTrades: Number(cal.era1_sample_trades ?? 0),
+          era1CalibratedWinRatePct: Number(cal.era1_calibrated_win_rate_pct ?? 70.0),
+          era1CalibratedProfitFactor: Number(cal.era1_calibrated_profit_factor ?? 1.5)
+        },
+        closedTradesGenerated: Number(raw.closed_trades_generated ?? 0),
+        openPositionActive: Boolean(raw.open_position_active ?? false),
+        winRatePct: Number(raw.win_rate_pct ?? 0),
+        profitFactor: Number(raw.profit_factor ?? 0),
+        realizedStockNetPnlUsd: Number(raw.realized_stock_net_pnl_usd ?? 0),
+        realizedOptionNetPnlUsd: Number(raw.realized_option_net_pnl_usd ?? 0),
+        completedAtIso: new Date().toISOString()
+      };
+
+      this.lastBacktestSummary = summary;
+      this.backtestLoading = false;
+
+      if (executionAudio.claimCrossWindowAudioEvent(`BACKTEST:${summary.symbol}:${summary.brainId}:${summary.closedTradesGenerated}`)) {
+        executionAudio.playTarget1BankedChime();
+        const spelled = ExecutionAudioEngine.formatSymbolForSpeech(summary.symbol);
+        const brainNum = summary.brainId.replace('BRAIN-0', '');
+        executionAudio.speakExecutionCallout(
+          `Deep backtest complete for ${spelled} on Brain ${brainNum}: ${summary.closedTradesGenerated} trades, profit factor ${summary.profitFactor.toFixed(2)}`
+        );
+      }
+
+      await Promise.all([
+        this.fetchLedgerSnapshot(),
+        this.fetchEvolutionStatus(),
+        this.fetchLiveChartForSymbol(summary.symbol, this.activeTimeframe, this.activeRange)
+      ]);
+      return summary;
+    } catch {
+      this.backtestLoading = false;
+      return null;
     }
   }
 
@@ -1760,6 +1949,14 @@ export class TerminalStore {
       streamWeights: { ...candidate.streamWeights }
     };
     this.openPositions = [newPos, ...this.openPositions];
+    if (executionAudio.claimCrossWindowAudioEvent(`LOCAL_OPEN:${newPos.tradeId}`)) {
+      executionAudio.playSignalEntryChime(newPos.direction);
+      const spelled = ExecutionAudioEngine.formatSymbolForSpeech(newPos.symbol);
+      const brainNum = newPos.brainId.replace('BRAIN-0', '');
+      executionAudio.speakExecutionCallout(
+        `Argon Brain ${brainNum}: ${newPos.direction === 'LONG' ? 'Long' : 'Short'} ${spelled} entered at ${newPos.entryPrice.toFixed(2)}, confidence ${Math.round(newPos.aiConfidencePct)} percent`
+      );
+    }
     return newPos;
   }
 
@@ -1858,6 +2055,9 @@ export class TerminalStore {
     };
 
     this.closedLedger = [closedItem, ...this.closedLedger];
+    if (executionAudio.claimCrossWindowAudioEvent(`LOCAL_CLOSED:${closedItem.tradeId}`)) {
+      executionAudio.playPositionClosedChime(closedItem.isWinner);
+    }
     return closedItem;
   }
 

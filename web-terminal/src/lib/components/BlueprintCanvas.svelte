@@ -311,6 +311,22 @@
         <button type="submit" class="action-btn">Load Yahoo</button>
       </form>
 
+      <button
+        type="button"
+        class="action-btn"
+        onclick={() =>
+          terminalStore.runCustomSymbolBacktest(
+            blueprint.symbol,
+            paneBrainId ?? blueprint.brainId
+          )}
+        disabled={terminalStore.backtestLoading}
+        title="Run 100% Causal Walk-Forward Backtest (Era-1 Calibration + Era-2 Out-of-Sample Execution) on this ticker"
+      >
+        {terminalStore.backtestLoading
+          ? `⚡ Backtesting ${blueprint.symbol}...`
+          : `⚡ Deep Backtest ${blueprint.symbol} on ${paneBrainId ?? blueprint.brainId}`}
+      </button>
+
       {#if paneId}
         <button
           type="button"
@@ -338,6 +354,57 @@
       </button>
     </div>
   </header>
+
+  {#if terminalStore.lastBacktestSummary}
+    {@const bt = terminalStore.lastBacktestSummary}
+    {@const totalNetPnl = bt.realizedStockNetPnlUsd + bt.realizedOptionNetPnlUsd}
+    <div
+      role="status"
+      aria-label="Causal Walk-Forward Backtest Telemetry Banner"
+      style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; padding: 7px 12px; background: oklch(0.2 0.04 250 / 0.85); border-block-end: 1px solid oklch(0.65 0.16 250 / 0.5); font-size: 0.72rem;"
+    >
+      <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+        <span class="badge badge-ai-core">⚡ CAUSAL WALK-FORWARD BACKTEST COMPLETE</span>
+        <strong>{bt.symbol} · {bt.brainId} ({bt.timeframe})</strong>
+        <span class="tabular-num" style="color: var(--text-secondary);">
+          Bars Scanned: <strong style="color: var(--text-primary);">{bt.totalBarsScanned}</strong>
+          (Era-1 Floor: {bt.era1Calibration.calibratedConfidenceFloor.toFixed(1)}%)
+        </span>
+        <span class="tabular-num">
+          Trades: <strong>{bt.closedTradesGenerated}</strong>
+          {#if bt.openPositionActive}
+            (+1 OPEN)
+          {/if}
+        </span>
+        <span class="tabular-num">
+          Win Rate:
+          <strong class={bt.winRatePct >= 50 ? 'pnl-positive' : 'pnl-negative'}>
+            {bt.winRatePct.toFixed(1)}%
+          </strong>
+        </span>
+        <span class="tabular-num">
+          Profit Factor:
+          <strong class={bt.profitFactor >= 1.25 ? 'pnl-positive' : 'pnl-negative'}>
+            {bt.profitFactor.toFixed(2)}
+          </strong>
+        </span>
+        <span class="tabular-num">
+          Net P&amp;L:
+          <strong class={totalNetPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+            {formatSignedUsd(totalNetPnl)}
+          </strong>
+        </span>
+      </div>
+      <button
+        type="button"
+        class="action-btn"
+        onclick={() => terminalStore.dismissBacktestSummary()}
+        style="padding: 2px 7px; font-size: 0.65rem;"
+      >
+        Dismiss ✕
+      </button>
+    </div>
+  {/if}
 
   <!-- Multi-Timeframe & Range Switcher Strip -->
   <div

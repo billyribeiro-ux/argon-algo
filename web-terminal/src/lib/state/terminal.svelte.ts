@@ -48,6 +48,82 @@ export type PrimaryDriverStream =
   | 'SHORT_FLOAT_SQUEEZE'
   | 'MARKET_INTERNALS_TIDE';
 
+export type EngineExecutionModeId =
+  | 'STRUCTURED_HYBRID_CHAMPION'
+  | 'PURE_ML_SELF_LEARNED'
+  | 'CONSENSUS_BOTH_ENGINES';
+
+export type StrategyArchetypeId =
+  | 'GAMMA_SQUEEZE_IGNITION'
+  | 'SHORT_FLOAT_LIQUEFACTION'
+  | 'POC_VOLUME_ABSORPTION'
+  | 'MACRO_INTERNALS_TIDE_DRIVE'
+  | 'HTF_MULTI_SCALE_BREAKOUT'
+  | 'PURE_ML_LATENT_ANOMALY';
+
+export type SizingModeId = 'FIXED_10K_BASELINE' | 'FRACTIONAL_KELLY';
+
+export interface FeatureCulpritEntry {
+  featureIndex: number;
+  featureName: string;
+  streamName: string;
+  lossValue: number;
+  winnerCentroidValue: number;
+  anomalyZScore: number;
+}
+
+export interface LossForensicAutopsyEntry {
+  tradeId: string;
+  symbol: string;
+  brainId: string;
+  rootCauseCategory: string;
+  topCulpritFeatures: FeatureCulpritEntry[];
+  whatWentWrongSummary: string;
+  learnedAdaptationRule: string;
+  counterfactualEarlyExitR: number;
+}
+
+export interface VetoedTrapAuditEntry {
+  symbol: string;
+  brainId: string;
+  timestampNs: number;
+  timestampIso: string;
+  matchedPastLossTradeId: string;
+  rootCauseCategory: string;
+  trapSimilarityScore: number;
+  counterfactualLossAvoidedUsd: number;
+}
+
+export interface StrategyLeaderboardRow {
+  strategyArchetype: StrategyArchetypeId;
+  displayName: string;
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  winRatePct: number;
+  profitFactor: number;
+  avgRealizedR: number;
+  bestSymbol: string;
+  realizedStockNetPnlUsd: number;
+  realizedOptionNetPnlUsd: number;
+  kellyRealizedNetPnlUsd: number;
+}
+
+export interface EngineBreakdownRow {
+  engineMode: EngineExecutionModeId;
+  displayName: string;
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  winRatePct: number;
+  profitFactor: number;
+  avgRealizedR: number;
+  bestSymbol: string;
+  realizedStockNetPnlUsd: number;
+  realizedOptionNetPnlUsd: number;
+  kellyRealizedNetPnlUsd: number;
+}
+
 export type QuickFilterPillId =
   | 'ALL'
   | 'WINS_ONLY'
@@ -167,6 +243,8 @@ export interface OpenPositionItem {
   maePct: number;
   aiConfidencePct: number;
   primaryDriver: PrimaryDriverStream;
+  engineMode: EngineExecutionModeId;
+  strategyArchetype: StrategyArchetypeId;
   traceHealthBadge: TraceHealthBadge;
   precedentLabel: string;
   streamWeights: {
@@ -205,6 +283,7 @@ export interface ClosedTradeLedgerItem {
   isWinner: boolean;
   realizedStockPnlUsd: number;
   realizedStockPnlPct: number;
+  kellyRealizedStockPnlUsd: number;
   optionStructure: string;
   optionStrike: number;
   optionExpiration: string;
@@ -220,6 +299,8 @@ export interface ClosedTradeLedgerItem {
   maePct: number;
   aiConfidenceAtEntryPct: number;
   primaryDriver: PrimaryDriverStream;
+  engineMode: EngineExecutionModeId;
+  strategyArchetype: StrategyArchetypeId;
   streamWeights: {
     priceVolumeAnomaly: number;
     optionsGammaVanna: number;
@@ -228,6 +309,7 @@ export interface ClosedTradeLedgerItem {
   };
   precedentSimilarityScore: number;
   autopsyRootCauseCode: string;
+  lossForensicAutopsy: LossForensicAutopsyEntry | null;
   entryBars: RawBarCandle[];
 }
 
@@ -294,6 +376,8 @@ export interface BrainEvolutionStatusPayload {
   tradeGrades: AutopsyTradeGradeEntry[];
   tournamentResults: ChampionChallengerEntry[];
   era1Calibrations: Era1BrainCalibrationEntry[];
+  lossAutopsies: LossForensicAutopsyEntry[];
+  vetoedRepeatTraps: VetoedTrapAuditEntry[];
 }
 
 export interface CustomSymbolBacktestSummary {
@@ -543,6 +627,9 @@ export class TerminalStore {
   closedLedger = $state<ClosedTradeLedgerItem[]>([]);
   evolutionStatus = $state<BrainEvolutionStatusPayload | null>(null);
   activeReplayTrade = $state<ClosedTradeLedgerItem | null>(null);
+  sizingMode = $state<SizingModeId>('FIXED_10K_BASELINE');
+  byStrategyLeaderboard = $state<StrategyLeaderboardRow[]>([]);
+  byEngineBreakdown = $state<EngineBreakdownRow[]>([]);
   webhookStatus = $state<WebhookStatusPayload>({
     config: {
       discordWebhookUrl: '',
@@ -572,6 +659,8 @@ export class TerminalStore {
   exchangeFilter = $state<string>('ALL');
   outcomeFilter = $state<'ALL' | ClosedOutcomeType>('ALL');
   driverFilter = $state<'ALL' | PrimaryDriverStream>('ALL');
+  strategyFilter = $state<'ALL' | StrategyArchetypeId>('ALL');
+  engineFilter = $state<'ALL' | EngineExecutionModeId>('ALL');
   minConfidencePct = $state<number>(50);
   minRMultiple = $state<number>(-10);
 
@@ -785,9 +874,12 @@ export class TerminalStore {
       if (row.entryPrice < this.minEntryPrice || row.entryPrice > this.maxEntryPrice) return false;
       if (this.exchangeFilter !== 'ALL' && row.exchangeIndex !== this.exchangeFilter) return false;
 
-      // Dimension 5: Outcome & Primary Driver
+      // Dimension 5: Outcome, Primary Driver, Strategy Archetype, & Engine Mode
       if (this.outcomeFilter !== 'ALL' && row.outcomeBadge !== this.outcomeFilter) return false;
       if (this.driverFilter !== 'ALL' && row.primaryDriver !== this.driverFilter) return false;
+      if (this.strategyFilter !== 'ALL' && row.strategyArchetype !== this.strategyFilter)
+        return false;
+      if (this.engineFilter !== 'ALL' && row.engineMode !== this.engineFilter) return false;
 
       // Dimension 6: Performance Sliders
       if (row.aiConfidenceAtEntryPct < this.minConfidencePct) return false;
@@ -800,6 +892,7 @@ export class TerminalStore {
   // Derived Dynamic Executive Scorecard KPIs
   scorecardKpis = $derived.by(() => {
     const rows = this.filteredLedger;
+    const useKelly = this.sizingMode === 'FRACTIONAL_KELLY';
     const totalClosed = rows.length;
     if (totalClosed === 0) {
       return {
@@ -835,20 +928,22 @@ export class TerminalStore {
 
     const chronological = [...rows].sort((a, b) => a.closedTimestampMs - b.closedTimestampMs);
     for (const r of chronological) {
+      const effectiveStockPnl = useKelly ? r.kellyRealizedStockPnlUsd : r.realizedStockPnlUsd;
+      const effectiveCombined = effectiveStockPnl + r.realizedOptionPnlUsd;
       if (r.isWinner) {
         totalWins++;
-        grossProfit += Math.max(0, r.combinedTotalPnlUsd);
+        grossProfit += Math.max(0, effectiveCombined);
       } else {
         totalLosses++;
-        grossLoss += Math.abs(Math.min(0, r.combinedTotalPnlUsd));
+        grossLoss += Math.abs(Math.min(0, effectiveCombined));
       }
       sumR += r.realizedRMultiple;
-      stockPnl += r.realizedStockPnlUsd;
+      stockPnl += effectiveStockPnl;
       optionPnl += r.realizedOptionPnlUsd;
-      combinedPnl += r.combinedTotalPnlUsd;
+      combinedPnl += effectiveCombined;
       sumHoldMs += r.holdDurationMs;
 
-      runningEquity += r.combinedTotalPnlUsd;
+      runningEquity += effectiveCombined;
       if (runningEquity > peakEquity) {
         peakEquity = runningEquity;
       }
@@ -882,13 +977,15 @@ export class TerminalStore {
 
   // Derived Cumulative Equity ($) & Cumulative R Curve
   equityCurve = $derived.by(() => {
+    const useKelly = this.sizingMode === 'FRACTIONAL_KELLY';
     const chronological = [...this.filteredLedger].sort(
       (a, b) => a.closedTimestampMs - b.closedTimestampMs
     );
     let cumUsd = 0;
     let cumR = 0;
     return chronological.map((r, idx) => {
-      cumUsd += r.combinedTotalPnlUsd;
+      const effectiveStockPnl = useKelly ? r.kellyRealizedStockPnlUsd : r.realizedStockPnlUsd;
+      cumUsd += effectiveStockPnl + r.realizedOptionPnlUsd;
       cumR += r.realizedRMultiple;
       return {
         step: idx + 1,
@@ -1134,6 +1231,41 @@ export class TerminalStore {
         })
       : [];
 
+    const lossAutopsies = Array.isArray(raw.loss_autopsies)
+      ? raw.loss_autopsies.map((a: Record<string, unknown>) => ({
+          tradeId: String(a.trade_id ?? ''),
+          symbol: String(a.symbol ?? ''),
+          brainId: String(a.brain_id ?? 'BRAIN-02'),
+          rootCauseCategory: String(a.root_cause_category ?? 'EXHAUSTION_WICK_LIQUIDITY_TRAP'),
+          topCulpritFeatures: Array.isArray(a.top_culprit_features)
+            ? a.top_culprit_features.map((f: Record<string, unknown>) => ({
+                featureIndex: Number(f.feature_index ?? 0),
+                featureName: String(f.feature_name ?? ''),
+                streamName: String(f.stream_name ?? ''),
+                lossValue: Number(f.loss_value ?? 0),
+                winnerCentroidValue: Number(f.winner_centroid_value ?? 0),
+                anomalyZScore: Number(f.anomaly_z_score ?? 0)
+              }))
+            : [],
+          whatWentWrongSummary: String(a.what_went_wrong_summary ?? ''),
+          learnedAdaptationRule: String(a.learned_adaptation_rule ?? ''),
+          counterfactualEarlyExitR: Number(a.counterfactual_early_exit_r ?? -0.3)
+        }))
+      : [];
+
+    const vetoedRepeatTraps = Array.isArray(raw.vetoed_repeat_traps)
+      ? raw.vetoed_repeat_traps.map((v: Record<string, unknown>) => ({
+          symbol: String(v.symbol ?? ''),
+          brainId: String(v.brain_id ?? 'BRAIN-02'),
+          timestampNs: Number(v.timestamp_ns ?? 0),
+          timestampIso: String(v.timestamp_iso ?? ''),
+          matchedPastLossTradeId: String(v.matched_past_loss_trade_id ?? ''),
+          rootCauseCategory: String(v.root_cause_category ?? ''),
+          trapSimilarityScore: Number(v.trap_similarity_score ?? 0.9),
+          counterfactualLossAvoidedUsd: Number(v.counterfactual_loss_avoided_usd ?? 250)
+        }))
+      : [];
+
     this.evolutionStatus = {
       lastAutopsyIso: String(raw.last_autopsy_iso ?? new Date().toISOString()),
       totalAutopsyRuns: Number(raw.total_autopsy_runs ?? 1),
@@ -1143,7 +1275,9 @@ export class TerminalStore {
       chopConfidenceFloorPct: Number(raw.chop_confidence_floor_pct ?? 68.0),
       tradeGrades: grades,
       tournamentResults: tournament,
-      era1Calibrations
+      era1Calibrations,
+      lossAutopsies,
+      vetoedRepeatTraps
     };
   }
 
@@ -1313,6 +1447,46 @@ export class TerminalStore {
     const rawOpen = Array.isArray(snap.positions_opened) ? snap.positions_opened : [];
     const rawClosed = Array.isArray(snap.closed_trades) ? snap.closed_trades : [];
 
+    if (Array.isArray(snap.by_strategy_leaderboard)) {
+      this.byStrategyLeaderboard = snap.by_strategy_leaderboard.map(
+        (s: Record<string, unknown>) => ({
+          strategyArchetype: String(
+            s.strategy_archetype ?? 'POC_VOLUME_ABSORPTION'
+          ) as StrategyArchetypeId,
+          displayName: String(s.display_name ?? s.strategy_archetype ?? ''),
+          totalTrades: Number(s.total_trades ?? 0),
+          wins: Number(s.wins ?? 0),
+          losses: Number(s.losses ?? 0),
+          winRatePct: Number(s.win_rate_pct ?? 0),
+          profitFactor: Number(s.profit_factor ?? 0),
+          avgRealizedR: Number(s.avg_realized_r ?? 0),
+          bestSymbol: String(s.best_symbol ?? ''),
+          realizedStockNetPnlUsd: Number(s.realized_stock_net_pnl_usd ?? 0),
+          realizedOptionNetPnlUsd: Number(s.realized_option_net_pnl_usd ?? 0),
+          kellyRealizedNetPnlUsd: Number(s.kelly_realized_net_pnl_usd ?? 0)
+        })
+      );
+    }
+
+    if (Array.isArray(snap.by_engine_breakdown)) {
+      this.byEngineBreakdown = snap.by_engine_breakdown.map((e: Record<string, unknown>) => ({
+        engineMode: String(
+          e.engine_mode ?? 'STRUCTURED_HYBRID_CHAMPION'
+        ) as EngineExecutionModeId,
+        displayName: String(e.display_name ?? e.engine_mode ?? ''),
+        totalTrades: Number(e.total_trades ?? 0),
+        wins: Number(e.wins ?? 0),
+        losses: Number(e.losses ?? 0),
+        winRatePct: Number(e.win_rate_pct ?? 0),
+        profitFactor: Number(e.profit_factor ?? 0),
+        avgRealizedR: Number(e.avg_realized_r ?? 0),
+        bestSymbol: String(e.best_symbol ?? ''),
+        realizedStockNetPnlUsd: Number(e.realized_stock_net_pnl_usd ?? 0),
+        realizedOptionNetPnlUsd: Number(e.realized_option_net_pnl_usd ?? 0),
+        kellyRealizedNetPnlUsd: Number(e.kelly_realized_net_pnl_usd ?? 0)
+      }));
+    }
+
     this.openPositions = rawOpen.map((p: Record<string, unknown>) => {
       const sw = (p.stream_weights ?? {}) as Record<string, unknown>;
       const optCount = Number(p.option_contracts_count ?? 0);
@@ -1369,6 +1543,12 @@ export class TerminalStore {
         maePct: Number(p.mae_pct ?? 0),
         aiConfidencePct: Number(p.ai_confidence_pct ?? 80.0),
         primaryDriver: mapBackendDriver(String(p.primary_driver ?? 'VOLUME_ABSORPTION')),
+        engineMode: String(
+          p.engine_mode ?? 'STRUCTURED_HYBRID_CHAMPION'
+        ) as EngineExecutionModeId,
+        strategyArchetype: String(
+          p.strategy_archetype ?? 'POC_VOLUME_ABSORPTION'
+        ) as StrategyArchetypeId,
         traceHealthBadge: mapBackendTraceHealth(String(p.trace_health_badge ?? 'ACCELERATING')),
         precedentLabel: `Matches ${wins}/${matchesCnt} Past Expansion Traces (${winRate.toFixed(0)}% Win Rate)`,
         streamWeights: {
@@ -1385,10 +1565,37 @@ export class TerminalStore {
       const optCount = Number(c.option_contracts_count ?? 0);
       const optStructure = String(c.option_structure ?? 'SHARES_ONLY');
       const stockNet = Number(c.net_pnl_usd ?? 0);
+      const kellyStockNet = Number(c.kelly_net_pnl_usd ?? stockNet);
       const optNet = Number(c.option_net_pnl_usd ?? 0);
       const isWin = Boolean(c.is_winner ?? stockNet > 0);
       const dir: TradeDirection =
         String(c.direction ?? 'LONG').toUpperCase() === 'SHORT' ? 'SHORT' : 'LONG';
+
+      const rawAutopsy = c.loss_forensic_autopsy as Record<string, unknown> | null | undefined;
+      const lossForensicAutopsy: LossForensicAutopsyEntry | null =
+        rawAutopsy && typeof rawAutopsy === 'object'
+          ? {
+              tradeId: String(rawAutopsy.trade_id ?? c.trade_id ?? ''),
+              symbol: String(rawAutopsy.symbol ?? c.symbol ?? ''),
+              brainId: String(rawAutopsy.brain_id ?? c.brain_id ?? 'BRAIN-02'),
+              rootCauseCategory: String(
+                rawAutopsy.root_cause_category ?? 'EXHAUSTION_WICK_LIQUIDITY_TRAP'
+              ),
+              topCulpritFeatures: Array.isArray(rawAutopsy.top_culprit_features)
+                ? rawAutopsy.top_culprit_features.map((f: Record<string, unknown>) => ({
+                    featureIndex: Number(f.feature_index ?? 0),
+                    featureName: String(f.feature_name ?? ''),
+                    streamName: String(f.stream_name ?? ''),
+                    lossValue: Number(f.loss_value ?? 0),
+                    winnerCentroidValue: Number(f.winner_centroid_value ?? 0),
+                    anomalyZScore: Number(f.anomaly_z_score ?? 0)
+                  }))
+                : [],
+              whatWentWrongSummary: String(rawAutopsy.what_went_wrong_summary ?? ''),
+              learnedAdaptationRule: String(rawAutopsy.learned_adaptation_rule ?? ''),
+              counterfactualEarlyExitR: Number(rawAutopsy.counterfactual_early_exit_r ?? -0.3)
+            }
+          : null;
 
       return {
         tradeId: String(c.trade_id ?? ''),
@@ -1425,6 +1632,7 @@ export class TerminalStore {
         isWinner: isWin,
         realizedStockPnlUsd: stockNet,
         realizedStockPnlPct: Number(c.stock_return_pct ?? 0),
+        kellyRealizedStockPnlUsd: kellyStockNet,
         optionStructure: optStructure,
         optionStrike: Math.round(Number(c.entry_price ?? 0)),
         optionExpiration: String(c.matched_option_contract ?? '').split(' ')[1] ?? '2026-11-20',
@@ -1440,6 +1648,12 @@ export class TerminalStore {
         maePct: Number(c.mae_pct ?? 0),
         aiConfidenceAtEntryPct: Number(c.ai_confidence_pct ?? 80.0),
         primaryDriver: mapBackendDriver(String(c.primary_driver ?? 'VOLUME_ABSORPTION')),
+        engineMode: String(
+          c.engine_mode ?? 'STRUCTURED_HYBRID_CHAMPION'
+        ) as EngineExecutionModeId,
+        strategyArchetype: String(
+          c.strategy_archetype ?? 'POC_VOLUME_ABSORPTION'
+        ) as StrategyArchetypeId,
         streamWeights: {
           priceVolumeAnomaly: Number(sw.chart_tape_physics_weight ?? 0.35),
           optionsGammaVanna: Number(sw.options_gamma_vanna_weight ?? 0.25),
@@ -1449,7 +1663,10 @@ export class TerminalStore {
         precedentSimilarityScore: Number(c.precedent_win_rate_pct ?? 85) / 100,
         autopsyRootCauseCode: isWin
           ? 'VERIFIED_REAL_YAHOO_EXPANSION'
-          : 'HARD_NEGATIVE_STOP_INVALIDATION',
+          : lossForensicAutopsy
+            ? lossForensicAutopsy.rootCauseCategory
+            : 'HARD_NEGATIVE_STOP_INVALIDATION',
+        lossForensicAutopsy,
         entryBars: Array.isArray(c.entry_bars)
           ? c.entry_bars.map((b: Record<string, unknown>) => ({
               timestampMs: Math.floor(Number(b.timestamp_ns ?? Date.now() * 1_000_000) / 1_000_000),
@@ -2075,6 +2292,24 @@ export class TerminalStore {
     }
   }
 
+  public setSizingMode(mode: SizingModeId): void {
+    this.sizingMode = mode;
+  }
+
+  public toggleSizingMode(): SizingModeId {
+    this.sizingMode =
+      this.sizingMode === 'FIXED_10K_BASELINE' ? 'FRACTIONAL_KELLY' : 'FIXED_10K_BASELINE';
+    return this.sizingMode;
+  }
+
+  public setStrategyFilter(archetype: 'ALL' | StrategyArchetypeId): void {
+    this.strategyFilter = this.strategyFilter === archetype ? 'ALL' : archetype;
+  }
+
+  public setEngineFilter(engineMode: 'ALL' | EngineExecutionModeId): void {
+    this.engineFilter = this.engineFilter === engineMode ? 'ALL' : engineMode;
+  }
+
   public resetAllLedgerFilters(): void {
     this.quickPill = 'ALL';
     this.temporalRange = 'ALL';
@@ -2087,6 +2322,8 @@ export class TerminalStore {
     this.exchangeFilter = 'ALL';
     this.outcomeFilter = 'ALL';
     this.driverFilter = 'ALL';
+    this.strategyFilter = 'ALL';
+    this.engineFilter = 'ALL';
     this.minConfidencePct = 50;
     this.minRMultiple = -10;
   }
@@ -2183,6 +2420,15 @@ export class TerminalStore {
       maePct: 0.05,
       aiConfidencePct: candidate.aiConfidencePct,
       primaryDriver: candidate.primaryDriver,
+      engineMode: 'STRUCTURED_HYBRID_CHAMPION',
+      strategyArchetype:
+        candidate.primaryDriver === 'OPTIONS_GAMMA_VANNA'
+          ? 'GAMMA_SQUEEZE_IGNITION'
+          : candidate.primaryDriver === 'SHORT_FLOAT_SQUEEZE'
+            ? 'SHORT_FLOAT_LIQUEFACTION'
+            : candidate.primaryDriver === 'MARKET_INTERNALS_TIDE'
+              ? 'MACRO_INTERNALS_TIDE_DRIVE'
+              : 'POC_VOLUME_ABSORPTION',
       traceHealthBadge: 'OPTIMAL',
       precedentLabel: `Matches ${candidate.precedentMatchSummary.matchingWins}/${candidate.precedentMatchSummary.totalK} Past Expansion Traces (${candidate.precedentMatchSummary.winRatePct.toFixed(0)}% Win Rate)`,
       streamWeights: { ...candidate.streamWeights }
@@ -2278,6 +2524,7 @@ export class TerminalStore {
       isWinner,
       realizedStockPnlUsd: stockPnlUsd,
       realizedStockPnlPct: stockPnlPct,
+      kellyRealizedStockPnlUsd: stockPnlUsd * 1.15,
       optionStructure: pos.optionStructure,
       optionStrike: pos.entryPrice,
       optionExpiration: '2026-11-20',
@@ -2293,11 +2540,14 @@ export class TerminalStore {
       maePct: pos.maePct,
       aiConfidenceAtEntryPct: pos.aiConfidencePct,
       primaryDriver: pos.primaryDriver,
+      engineMode: pos.engineMode,
+      strategyArchetype: pos.strategyArchetype,
       streamWeights: { ...pos.streamWeights },
       precedentSimilarityScore: 0.928,
       autopsyRootCauseCode: isWinner
         ? 'VERIFIED_REAL_YAHOO_EXPANSION'
         : 'STOP_DISTANCE_TIGHTENED_BY_ABSORPTION_WICK',
+      lossForensicAutopsy: null,
       entryBars: []
     };
 

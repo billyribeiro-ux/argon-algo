@@ -555,4 +555,156 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
 
     vi.unstubAllGlobals();
   });
+
+  it('hydrates Phase 12 Loss Forensic Autopsies, Parallel Engine & Strategy Leaderboards, and Non-Destructive Sizing Toggle', () => {
+    const store = new TerminalStore(false);
+    store.ingestBackendSnapshot({
+      positions_opened: [],
+      closed_trades: [
+        {
+          trade_id: 'TRD-9001',
+          opened_timestamp_ns: 1_730_200_000_000_000_000,
+          closed_timestamp_ns: 1_730_203_600_000_000_000,
+          hold_duration_ms: 3_600_000,
+          symbol: 'NVDA',
+          exchange_index: 'NASDAQ_100',
+          brain_id: 'BRAIN-02',
+          direction: 'LONG',
+          entry_price: 200.0,
+          actual_exit_price: 206.0,
+          quantity_shares: 50,
+          kelly_fraction_pct: 2.1,
+          risk_budget_usd: 210.0,
+          notional_allocated_usd: 21000.0,
+          kelly_net_pnl_usd: 630.0,
+          initial_structural_stop: 198.0,
+          target_1_price: 204.0,
+          target_2_price: 208.0,
+          outcome_badge: 'CLOSED - TARGET HIT',
+          is_winner: true,
+          net_pnl_usd: 300.0,
+          stock_return_pct: 3.0,
+          option_contracts_count: 0,
+          option_net_pnl_usd: 0.0,
+          realized_r_multiple: 3.0,
+          mfe_pct: 3.2,
+          mae_pct: 0.4,
+          ai_confidence_pct: 91.5,
+          primary_driver: 'GAMMA_SQUEEZE',
+          engine_mode: 'CONSENSUS_BOTH_ENGINES',
+          strategy_archetype: 'GAMMA_SQUEEZE_IGNITION',
+          loss_forensic_autopsy: null
+        },
+        {
+          trade_id: 'TRD-9002',
+          opened_timestamp_ns: 1_730_205_000_000_000_000,
+          closed_timestamp_ns: 1_730_208_600_000_000_000,
+          hold_duration_ms: 3_600_000,
+          symbol: 'MARA',
+          exchange_index: 'NASDAQ_100',
+          brain_id: 'BRAIN-02',
+          direction: 'LONG',
+          entry_price: 18.0,
+          actual_exit_price: 17.5,
+          quantity_shares: 500,
+          kelly_fraction_pct: 1.0,
+          risk_budget_usd: 100.0,
+          notional_allocated_usd: 9000.0,
+          kelly_net_pnl_usd: -100.0,
+          initial_structural_stop: 17.5,
+          target_1_price: 18.8,
+          target_2_price: 19.5,
+          outcome_badge: 'CLOSED - STOPPED OUT',
+          is_winner: false,
+          net_pnl_usd: -250.0,
+          stock_return_pct: -2.77,
+          option_contracts_count: 0,
+          option_net_pnl_usd: 0.0,
+          realized_r_multiple: -1.0,
+          mfe_pct: 0.5,
+          mae_pct: 2.77,
+          ai_confidence_pct: 72.0,
+          primary_driver: 'SHORT_SQUEEZE',
+          engine_mode: 'PURE_ML_SELF_LEARNED',
+          strategy_archetype: 'PURE_ML_LATENT_ANOMALY',
+          loss_forensic_autopsy: {
+            trade_id: 'TRD-9002',
+            symbol: 'MARA',
+            brain_id: 'BRAIN-02',
+            root_cause_category: 'EXHAUSTION_WICK_LIQUIDITY_TRAP',
+            top_culprit_features: [
+              {
+                feature_index: 5,
+                feature_name: 's1_upper_wick_exhaustion_ratio',
+                stream_name: 'Stream 1 (Chart & Tape Physics)',
+                loss_value: 0.84,
+                winner_centroid_value: 0.21,
+                anomaly_z_score: 2.65
+              }
+            ],
+            what_went_wrong_summary: 'Entry hit upper-wick liquidity trap on bar 4.',
+            learned_adaptation_rule: 'Veto when s1_upper_wick_exhaustion_ratio > 0.72.',
+            counterfactual_early_exit_r: -0.28
+          }
+        }
+      ],
+      by_strategy_leaderboard: [
+        {
+          strategy_archetype: 'GAMMA_SQUEEZE_IGNITION',
+          display_name: 'Gamma Squeeze Ignition',
+          total_trades: 1,
+          wins: 1,
+          losses: 0,
+          win_rate_pct: 100.0,
+          profit_factor: 99.99,
+          avg_realized_r: 3.0,
+          best_symbol: 'NVDA',
+          realized_stock_net_pnl_usd: 300.0,
+          realized_option_net_pnl_usd: 0.0,
+          kelly_realized_net_pnl_usd: 630.0
+        }
+      ],
+      by_engine_breakdown: [
+        {
+          engine_mode: 'CONSENSUS_BOTH_ENGINES',
+          display_name: 'Consensus (Engine-A + Engine-B)',
+          total_trades: 1,
+          wins: 1,
+          losses: 0,
+          win_rate_pct: 100.0,
+          profit_factor: 99.99,
+          avg_realized_r: 3.0,
+          best_symbol: 'NVDA',
+          realized_stock_net_pnl_usd: 300.0,
+          realized_option_net_pnl_usd: 0.0,
+          kelly_realized_net_pnl_usd: 630.0
+        }
+      ]
+    });
+
+    expect(store.byStrategyLeaderboard.length).toBe(1);
+    expect(store.byEngineBreakdown.length).toBe(1);
+    expect(store.closedLedger[1]?.lossForensicAutopsy?.rootCauseCategory).toBe(
+      'EXHAUSTION_WICK_LIQUIDITY_TRAP'
+    );
+
+    // Non-destructive sizing mode toggle: Fixed $10K Baseline ($300 - $250 = +$50) vs Fractional-Kelly ($630 - $100 = +$530)
+    expect(store.sizingMode).toBe('FIXED_10K_BASELINE');
+    expect(store.scorecardKpis.netRealizedStockPnlUsd).toBeCloseTo(50.0, 2);
+
+    store.toggleSizingMode();
+    expect(store.sizingMode).toBe('FRACTIONAL_KELLY');
+    expect(store.scorecardKpis.netRealizedStockPnlUsd).toBeCloseTo(530.0, 2);
+
+    // Filter by Strategy Archetype & Engine Mode
+    store.setStrategyFilter('GAMMA_SQUEEZE_IGNITION');
+    expect(store.filteredLedger.length).toBe(1);
+    expect(store.filteredLedger[0]?.symbol).toBe('NVDA');
+
+    store.setEngineFilter('PURE_ML_SELF_LEARNED');
+    expect(store.filteredLedger.length).toBe(0);
+
+    store.resetAllLedgerFilters();
+    expect(store.filteredLedger.length).toBe(2);
+  });
 });

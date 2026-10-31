@@ -33,11 +33,14 @@ use uuid::Uuid;
 
 use crate::exporter::{ExportScope, export_to_csv_bytes, export_to_xlsx_bytes};
 use crate::ledger::{
-    BrainEvolutionStatus, ClosedTradeRow, FilteredLedgerSnapshot, HyperFilterQuery,
-    OpenPositionRow, RealTimeLedgerEngine,
+    BrainEvolutionStatus, ClosedTradeRow, EngineExecutionMode, FilteredLedgerSnapshot,
+    HyperFilterQuery, LossRootCauseCategory, OpenPositionRow, RealTimeLedgerEngine,
+    StrategyArchetype, VetoedTrapAuditRecord,
 };
 use crate::onnx_engine::{LiveBrainInferenceOutput, OnnxMultiBrainEngine};
-use crate::precedent_knn::{HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMatchSummary};
+use crate::precedent_knn::{
+    HardNegativeTrapRecord, HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMatchSummary,
+};
 use crate::webhooks::{WebhookChannelConfig, WebhookDispatchRecord, WebhookStatusResponse};
 
 const LEDGER_DISK_PATH: &str = "data/ledger_state.json";
@@ -617,6 +620,7 @@ impl AppState {
             .await;
 
         self.ledger.clear_all();
+        self.precedent_knn.clear_all_hard_negative_traps();
         self.precedent_knn
             .replace_all_records(PrecedentKnnIndex::new_preseeded().all_records());
 
@@ -869,6 +873,8 @@ impl AppState {
             f64,
             raw_fingerprint_core::FourStreamWeights,
         )> = Vec::new();
+        // Era-1 Pure ML Ridge Training Samples (`ENGINE-B`: 32 direction-aligned raw features -> realized R)
+        let mut era1_ml_samples: Vec<([f64; 32], f64)> = Vec::new();
         for idx in 20..calibration_end.saturating_sub(trace_horizon) {
             let cal_slice = &raw_bars[idx - 20..idx];
             let cal_outcome = &raw_bars[idx..idx + trace_horizon];
@@ -928,6 +934,13 @@ impl AppState {
             } else {
                 -1.0
             };
+            if inf.signal.latent_embedding_128.len() >= 32 {
+                let mut x_raw = [0.0_f64; 32];
+                for (k, slot) in x_raw.iter_mut().enumerate() {
+                    *slot = (inf.signal.latent_embedding_128[k] as f64) * dir_sign;
+                }
+                era1_ml_samples.push((x_raw, sim_r));
+            }
             era1_samples.push((
                 inf.signal.direction,
                 inf.signal.ai_confidence_pct,
@@ -936,6 +949,48 @@ impl AppState {
                 raw_disp10_pct,
                 inf.signal.stream_weights,
             ));
+        }
+
+        // Fit Era-1 Pure ML Ridge Regression weight vector w* in R^32 for ENGINE-B (`PURE_ML_SELF_LEARNED`)
+        let mut ml_x_mean = [0.0_f64; 32];
+        let mut ml_w_ridge = [0.0_f64; 32];
+        let mut ml_r_mean = 0.45_f64;
+        let mut ml_r_threshold = 1.45_f64;
+        if era1_ml_samples.len() >= 6 {
+            let n_ml = era1_ml_samples.len() as f64;
+            ml_r_mean = era1_ml_samples.iter().map(|(_, r)| *r).sum::<f64>() / n_ml;
+            for (x_vec, _) in &era1_ml_samples {
+                for (k, &v) in x_vec.iter().enumerate() {
+                    ml_x_mean[k] += v / n_ml;
+                }
+            }
+            let ridge_lambda = 0.08_f64;
+            for k in 0..32 {
+                let mut cov = 0.0_f64;
+                let mut var = 0.0_f64;
+                for (x_vec, r) in &era1_ml_samples {
+                    let dx = x_vec[k] - ml_x_mean[k];
+                    cov += dx * (*r - ml_r_mean);
+                    var += dx * dx;
+                }
+                ml_w_ridge[k] = (cov / (var + ridge_lambda)).clamp(-4.5, 4.5);
+            }
+            let mut pred_win_rs: Vec<f64> = era1_ml_samples
+                .iter()
+                .filter(|(_, r)| *r > 0.0)
+                .map(|(x_vec, _)| {
+                    let mut p = ml_r_mean;
+                    for k in 0..32 {
+                        p += ml_w_ridge[k] * (x_vec[k] - ml_x_mean[k]);
+                    }
+                    p
+                })
+                .collect();
+            pred_win_rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if !pred_win_rs.is_empty() {
+                let q75_idx = ((pred_win_rs.len() as f64) * 0.72).floor() as usize;
+                ml_r_threshold = pred_win_rs[q75_idx.min(pred_win_rs.len() - 1)].clamp(0.85, 2.35);
+            }
         }
 
         let candidate_floors = [60.0_f64, 62.0, 64.0, 66.0, 68.0];
@@ -1060,6 +1115,7 @@ impl AppState {
             _ => 24,
         };
         let last_entry_bar = raw_bars.len().saturating_sub(tail_buffer);
+        let mut last_veto_bar_idx: Option<usize> = None;
         for t in calibration_end..raw_bars.len() {
             let window_start = t.saturating_sub(23);
             let causal_slice = &raw_bars[window_start..=t];
@@ -1131,12 +1187,53 @@ impl AppState {
                 .ledger
                 .has_open_position_for_symbol_and_brain(symbol, brain_id)
             {
-                let _ = self.ledger.process_live_bar_for_symbol_and_brain(
+                let newly_closed = self.ledger.process_live_bar_for_symbol_and_brain(
                     symbol,
                     brain_id,
                     causal_slice,
                     &raw_internals,
                 );
+                // Upgrade 1: Causal Hard-Negative Trap Memory Indexing ($t = T_{\text{loss\_closed}}$)
+                // Immediately index any newly closed losing trade into `PrecedentKnnIndex` at `closed_timestamp_ns`
+                // so future bars $t > T_{\text{loss\_closed}}$ on this Brain acquire adaptive trap immunity.
+                for closed_row in newly_closed {
+                    if !closed_row.is_winner && closed_row.entry_embedding_128.len() == 128 {
+                        let (root_cat, culprit_indices, culprit_signs) =
+                            if let Some(ref autopsy) = closed_row.loss_forensic_autopsy {
+                                let mut idx_arr = [0usize; 3];
+                                let mut sign_arr = [1.0_f32; 3];
+                                for (k, c) in autopsy.top_culprit_features.iter().take(3).enumerate()
+                                {
+                                    idx_arr[k] = c.feature_index.min(31);
+                                    sign_arr[k] = if c.loss_value >= 0.0 { 1.0 } else { -1.0 };
+                                }
+                                (
+                                    autopsy.root_cause_category.as_str().to_string(),
+                                    idx_arr,
+                                    sign_arr,
+                                )
+                            } else {
+                                (
+                                    "HTF_STRUCTURAL_HEADWIND".to_string(),
+                                    [0, 1, 2],
+                                    [1.0, 1.0, 1.0],
+                                )
+                            };
+                        self.precedent_knn
+                            .insert_hard_negative_trap(HardNegativeTrapRecord {
+                                loss_trade_id: closed_row.trade_id,
+                                brain_id: closed_row.brain_id,
+                                symbol: closed_row.symbol.clone(),
+                                closed_timestamp_ns: closed_row.closed_timestamp_ns,
+                                direction: closed_row.direction,
+                                root_cause_category: root_cat,
+                                embedding_128: closed_row.entry_embedding_128.clone(),
+                                culprit_feature_indices: culprit_indices,
+                                culprit_feature_signs: culprit_signs,
+                                realized_loss_usd: closed_row.net_pnl_usd.abs(),
+                            });
+                    }
+                }
             }
 
             if t <= last_entry_bar && causal_slice.len() >= 6 {
@@ -1314,21 +1411,140 @@ impl AppState {
                     let _ =
                         self.ledger
                             .try_scale_in_position(symbol, brain_id, &inference, 5_000.0);
-                } else if causal_impulse_aligned
-                    && causal_m15_confluence_ok
-                    && causal_d1_swing_confluence_ok
-                    && precedents.win_rate_pct >= cal_profile.min_precedent_win_rate_pct
-                    && inference.signal.ai_confidence_pct
-                        >= cal_profile.calibrated_confidence_floor
-                    && inference.signal.expected_r_multiple >= cal_profile.min_expected_r_multiple
-                {
-                    let _ = self.ledger.open_position_with_bars(
-                        exchange_idx,
-                        &inference,
-                        &precedents,
-                        10_000.0,
-                        causal_slice.to_vec(),
+                } else {
+                    // Upgrade 1: Query Causal Hard-Negative Trap Memory ($t > T_{\text{loss\_closed}}$)
+                    let trap_match = self.precedent_knn.query_causal_trap_match(
+                        brain_id,
+                        symbol,
+                        inference.signal.direction,
+                        raw_bars[t].timestamp_ns,
+                        &inference.signal.latent_embedding_128,
                     );
+
+                    // Record a VetoedTrapAuditRecord when a candidate setup at $t > T_{\text{loss\_closed}}$
+                    // matches a previously closed HardNegativeTrapRecord (`trap_similarity >= 0.88`)
+                    if let Some((trap_sim, ref matched_trap)) = trap_match
+                        && inference.signal.ai_confidence_pct
+                            >= cal_profile.calibrated_confidence_floor - 4.0
+                        && last_veto_bar_idx.is_none_or(|prev_t| t >= prev_t + 16)
+                    {
+                        last_veto_bar_idx = Some(t);
+                        let ts_sec = raw_bars[t].timestamp_ns / 1_000_000_000;
+                        let veto_iso = chrono::DateTime::from_timestamp(ts_sec, 0)
+                            .unwrap_or_else(chrono::Utc::now)
+                            .format("%Y-%m-%dT%H:%M:%S.000Z")
+                            .to_string();
+                        let root_cat_enum = match matched_trap.root_cause_category.as_str() {
+                            "OPTIONS_GAMMA_WALL_REJECTION" => {
+                                LossRootCauseCategory::OptionsGammaWallRejection
+                            }
+                            "MACRO_INTERNALS_TIDE_DIVERGENCE" => {
+                                LossRootCauseCategory::MacroInternalsTideDivergence
+                            }
+                            "EXHAUSTION_WICK_LIQUIDITY_TRAP" => {
+                                LossRootCauseCategory::ExhaustionWickLiquidityTrap
+                            }
+                            "SHORT_FLOAT_OR_SPREAD_FRICTION" => {
+                                LossRootCauseCategory::ShortFloatOrSpreadFriction
+                            }
+                            "POST_ENTRY_VOLUME_VACUUM" => {
+                                LossRootCauseCategory::PostEntryVolumeVacuum
+                            }
+                            _ => LossRootCauseCategory::HtfStructuralHeadwind,
+                        };
+                        self.ledger.record_vetoed_trap(VetoedTrapAuditRecord {
+                            symbol: symbol.to_uppercase(),
+                            brain_id,
+                            timestamp_ns: raw_bars[t].timestamp_ns,
+                            timestamp_iso: veto_iso,
+                            matched_past_loss_trade_id: matched_trap.loss_trade_id,
+                            root_cause_category: root_cat_enum,
+                            trap_similarity_score: (trap_sim * 10000.0).round() / 10000.0,
+                            counterfactual_loss_avoided_usd: matched_trap
+                                .realized_loss_usd
+                                .max(185.0),
+                        });
+                    }
+
+                    // Upgrade 2: Evaluate ENGINE-A (`STRUCTURED_HYBRID_CHAMPION`) and ENGINE-B (`PURE_ML_SELF_LEARNED`)
+                    let engine_a_fires = causal_impulse_aligned
+                        && causal_m15_confluence_ok
+                        && causal_d1_swing_confluence_ok
+                        && precedents.win_rate_pct >= cal_profile.min_precedent_win_rate_pct
+                        && inference.signal.ai_confidence_pct
+                            >= cal_profile.calibrated_confidence_floor
+                        && inference.signal.expected_r_multiple
+                            >= cal_profile.min_expected_r_multiple;
+
+                    // Compute ENGINE-B (`PURE_ML_SELF_LEARNED`) predicted R-multiple from Era-1 ridge weights w* in R^32
+                    let mut predicted_ml_r = ml_r_mean;
+                    if inference.signal.latent_embedding_128.len() >= 32 {
+                        for k in 0..32 {
+                            let x_k = (inference.signal.latent_embedding_128[k] as f64) * dir_sign;
+                            predicted_ml_r += ml_w_ridge[k] * (x_k - ml_x_mean[k]);
+                        }
+                    }
+                    let p_win_knn = (precedents.win_rate_pct / 100.0).clamp(0.0, 1.0);
+                    let payoff_knn =
+                        (precedents.p50_mfe_pct / precedents.p85_mae_pct.max(0.25)).clamp(0.8, 5.0);
+                    let expected_r_knn = p_win_knn * payoff_knn - (1.0 - p_win_knn);
+
+                    let ml_bar_aligned = match inference.signal.direction {
+                        raw_fingerprint_core::TradeDirection::Long => {
+                            cur_bar.close >= cur_bar.open
+                                && cur_bar.close >= prev_bar.close
+                                && close_f64 >= anchor4_px * 1.003
+                                && anchor10_px >= anchor24_px
+                                && raw_disp10_pct >= cal_profile.era1_learned_min_displacement_pct * 0.70
+                                && raw_disp10_pct <= cal_profile.era1_learned_max_displacement_pct * 1.15
+                        }
+                        raw_fingerprint_core::TradeDirection::Short => {
+                            cur_bar.close <= cur_bar.open
+                                && cur_bar.close <= prev_bar.close
+                                && close_f64 <= anchor4_px * 0.997
+                                && anchor10_px <= anchor24_px
+                                && raw_disp10_pct >= cal_profile.era1_learned_min_displacement_pct * 0.70
+                                && raw_disp10_pct <= cal_profile.era1_learned_max_displacement_pct * 1.15
+                        }
+                    };
+
+                    let engine_b_pure_ml_dominant = predicted_ml_r >= (ml_r_threshold + 0.08)
+                        && expected_r_knn >= 1.10
+                        && precedents.win_rate_pct >= 72.0;
+                    let engine_b_consensus_ok = predicted_ml_r >= ml_r_threshold
+                        && expected_r_knn >= 0.72
+                        && precedents.win_rate_pct >= 62.0;
+                    // Pure ML standalone entry requires zero active trap match and ultra-high ML + KNN conviction
+                    let engine_b_standalone_fires = !engine_a_fires
+                        && trap_match.is_none()
+                        && ml_bar_aligned
+                        && causal_m15_confluence_ok
+                        && causal_d1_swing_confluence_ok
+                        && predicted_ml_r >= (ml_r_threshold + 0.45)
+                        && expected_r_knn >= 1.55
+                        && precedents.win_rate_pct >= 82.0
+                        && inference.signal.ai_confidence_pct
+                            >= (cal_profile.calibrated_confidence_floor + 7.5)
+                        && inference.signal.expected_r_multiple
+                            >= (cal_profile.min_expected_r_multiple + 0.45);
+
+                    if engine_a_fires || engine_b_standalone_fires {
+                        let exec_mode = if engine_b_standalone_fires || engine_b_pure_ml_dominant {
+                            EngineExecutionMode::PureMlSelfLearned
+                        } else if engine_a_fires && engine_b_consensus_ok {
+                            EngineExecutionMode::ConsensusBothEngines
+                        } else {
+                            EngineExecutionMode::StructuredHybridChampion
+                        };
+                        let _ = self.ledger.open_position_with_bars_and_engine(
+                            exchange_idx,
+                            &inference,
+                            &precedents,
+                            10_000.0,
+                            causal_slice.to_vec(),
+                            exec_mode,
+                        );
+                    }
                 }
             }
         }
@@ -1979,6 +2195,8 @@ pub struct LedgerFilterParams {
     pub max_hold_ms: Option<i64>,
     pub min_confidence_pct: Option<f64>,
     pub primary_driver: Option<String>,
+    pub strategy_archetype: Option<String>,
+    pub engine_mode: Option<String>,
     pub scope: Option<String>,
 }
 
@@ -1986,6 +2204,11 @@ impl LedgerFilterParams {
     pub fn into_hyper_filter(&self) -> HyperFilterQuery {
         let brain_id = self.brain_id.as_deref().and_then(parse_brain_id);
         let primary_driver = self.primary_driver.as_deref().and_then(parse_driver);
+        let strategy_archetype = self
+            .strategy_archetype
+            .as_deref()
+            .and_then(parse_strategy_archetype);
+        let engine_mode = self.engine_mode.as_deref().and_then(parse_engine_mode);
         let symbols = self.symbols.as_ref().map(|s| {
             s.split(',')
                 .map(|tok| tok.trim().to_uppercase())
@@ -2013,7 +2236,34 @@ impl LedgerFilterParams {
             max_hold_duration_ms: self.max_hold_ms,
             min_confidence_pct: self.min_confidence_pct,
             primary_driver,
+            strategy_archetype,
+            engine_mode,
         }
+    }
+}
+
+fn parse_strategy_archetype(code: &str) -> Option<StrategyArchetype> {
+    match code.to_uppercase().as_str() {
+        "GAMMA_SQUEEZE_IGNITION" => Some(StrategyArchetype::GammaSqueezeIgnition),
+        "SHORT_FLOAT_LIQUEFACTION" => Some(StrategyArchetype::ShortFloatLiquefaction),
+        "POC_VOLUME_ABSORPTION" => Some(StrategyArchetype::PocVolumeAbsorption),
+        "MACRO_INTERNALS_TIDE_DRIVE" => Some(StrategyArchetype::MacroInternalsTideDrive),
+        "HTF_MULTI_SCALE_BREAKOUT" => Some(StrategyArchetype::HtfMultiScaleBreakout),
+        "PURE_ML_LATENT_ANOMALY" => Some(StrategyArchetype::PureMlLatentAnomaly),
+        _ => None,
+    }
+}
+
+fn parse_engine_mode(code: &str) -> Option<EngineExecutionMode> {
+    match code.to_uppercase().as_str() {
+        "STRUCTURED_HYBRID_CHAMPION" | "ENGINE-A" | "ENGINE_A" => {
+            Some(EngineExecutionMode::StructuredHybridChampion)
+        }
+        "PURE_ML_SELF_LEARNED" | "ENGINE-B" | "ENGINE_B" => {
+            Some(EngineExecutionMode::PureMlSelfLearned)
+        }
+        "CONSENSUS_BOTH_ENGINES" | "CONSENSUS" => Some(EngineExecutionMode::ConsensusBothEngines),
+        _ => None,
     }
 }
 

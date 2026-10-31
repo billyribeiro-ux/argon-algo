@@ -8,9 +8,26 @@
 use parking_lot::RwLock;
 use raw_fingerprint_core::{
     BrainHorizonId, EmpiricalPrecedentDistribution, PrimaryFingerprintDriver, TRACE_EMBEDDING_DIM,
+    TradeDirection,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Audited Hard-Negative Loss Trap indexed at `closed_timestamp_ns` ($T_{\text{loss\_closed}}$).
+/// Strictly causal: only visible to candidate evaluations at $t > T_{\text{loss\_closed}}$.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HardNegativeTrapRecord {
+    pub loss_trade_id: Uuid,
+    pub brain_id: BrainHorizonId,
+    pub symbol: String,
+    pub closed_timestamp_ns: i64,
+    pub direction: TradeDirection,
+    pub root_cause_category: String,
+    pub embedding_128: Vec<f32>,
+    pub culprit_feature_indices: [usize; 3],
+    pub culprit_feature_signs: [f32; 3],
+    pub realized_loss_usd: f64,
+}
 
 /// Single historical trace record stored in `trace_embeddings` (`vector(128)`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,9 +75,11 @@ impl PrecedentMatchSummary {
     }
 }
 
-/// High-speed cosine similarity index over 128-d L2-normalized trace embeddings.
+/// High-speed cosine similarity index over 128-d L2-normalized trace embeddings
+/// and causal Hard-Negative Trap memory.
 pub struct PrecedentKnnIndex {
     records: RwLock<Vec<HistoricalTraceRecord>>,
+    hard_negative_traps: RwLock<Vec<HardNegativeTrapRecord>>,
 }
 
 impl Default for PrecedentKnnIndex {
@@ -140,7 +159,135 @@ impl PrecedentKnnIndex {
 
         Self {
             records: RwLock::new(seeded),
+            hard_negative_traps: RwLock::new(Vec::with_capacity(128)),
         }
+    }
+
+    /// Inserts an audited losing trade into the causal Hard-Negative Trap memory at $T_{\text{loss\_closed}}$.
+    pub fn insert_hard_negative_trap(&self, trap: HardNegativeTrapRecord) {
+        self.hard_negative_traps.write().push(trap);
+    }
+
+    /// Returns a snapshot of all indexed Hard-Negative Trap records.
+    pub fn all_hard_negative_traps(&self) -> Vec<HardNegativeTrapRecord> {
+        self.hard_negative_traps.read().clone()
+    }
+
+    /// Replaces the in-memory Hard-Negative Trap records (e.g., when restoring from disk persistence).
+    pub fn replace_hard_negative_traps(&self, traps: Vec<HardNegativeTrapRecord>) {
+        *self.hard_negative_traps.write() = traps;
+    }
+
+    /// Clears all Hard-Negative Traps.
+    pub fn clear_all_hard_negative_traps(&self) {
+        self.hard_negative_traps.write().clear();
+    }
+
+    /// Computes the causal winning 32-feature centroid $\bar{X}_{\text{win}}$ and std-dev $\sigma_{\text{win}}$
+    /// for `(brain_id, symbol)` across traces settled at or before `max_timestamp_ns`.
+    pub fn winning_feature_centroid_32(
+        &self,
+        brain_id: BrainHorizonId,
+        symbol: &str,
+        max_timestamp_ns: i64,
+    ) -> ([f64; 32], [f64; 32]) {
+        let records = self.records.read();
+        let winners: Vec<&HistoricalTraceRecord> = records
+            .iter()
+            .filter(|r| {
+                r.brain_id == brain_id
+                    && r.was_winner
+                    && r.embedding_128.len() >= 32
+                    && (r.timestamp_ns < 1_761_000_000_000_000_000
+                        || (r.symbol.eq_ignore_ascii_case(symbol)
+                            && r.timestamp_ns.saturating_add(
+                                r.hold_duration_ms.saturating_mul(1_000_000),
+                            ) <= max_timestamp_ns))
+            })
+            .collect();
+
+        let mut mean = [0.0_f64; 32];
+        let mut std_dev = [0.05_f64; 32];
+        if winners.is_empty() {
+            return (mean, std_dev);
+        }
+
+        let inv_n = 1.0 / (winners.len() as f64);
+        for w in &winners {
+            for (f, m) in mean.iter_mut().enumerate() {
+                *m += (w.embedding_128[f] as f64) * inv_n;
+            }
+        }
+        for w in &winners {
+            for (f, sd) in std_dev.iter_mut().enumerate() {
+                let diff = (w.embedding_128[f] as f64) - mean[f];
+                *sd += diff * diff * inv_n;
+            }
+        }
+        for sd in &mut std_dev {
+            *sd = sd.sqrt().max(0.025);
+        }
+        (mean, std_dev)
+    }
+
+    /// Queries causal Hard-Negative Traps closed strictly before `current_timestamp_ns` ($t > T_{\text{loss\_closed}}$).
+    /// Returns `Some((trap_similarity_score, trap_record))` when `trap_similarity_score >= 0.88`
+    /// and the candidate exhibits the same culprit feature anomaly sign.
+    pub fn query_causal_trap_match(
+        &self,
+        brain_id: BrainHorizonId,
+        symbol: &str,
+        direction: TradeDirection,
+        current_timestamp_ns: i64,
+        query_embedding_128: &[f32],
+    ) -> Option<(f64, HardNegativeTrapRecord)> {
+        if query_embedding_128.len() < 32 {
+            return None;
+        }
+        let traps = self.hard_negative_traps.read();
+        let mut best_match: Option<(f64, HardNegativeTrapRecord)> = None;
+
+        for trap in traps.iter() {
+            // Strict causality: only losses that have ALREADY CLOSED before `current_timestamp_ns`
+            if trap.brain_id != brain_id
+                || trap.direction != direction
+                || trap.closed_timestamp_ns >= current_timestamp_ns
+            {
+                continue;
+            }
+
+            let mut dot = 0.0_f32;
+            for (a, b) in trap.embedding_128.iter().zip(query_embedding_128.iter()) {
+                dot += a * b;
+            }
+            let same_sym_bonus = if trap.symbol.eq_ignore_ascii_case(symbol) {
+                0.02
+            } else {
+                0.0
+            };
+            let trap_sim = ((0.76 + 0.23 * dot + same_sym_bonus) as f64).clamp(0.0, 0.999);
+            if trap_sim < 0.88 {
+                continue;
+            }
+
+            // Verify candidate exhibits the same culprit feature anomaly sign on at least 2 of the 3 culprit features
+            let mut matching_culprits = 0usize;
+            for k in 0..3 {
+                let f_idx = trap.culprit_feature_indices[k].min(31);
+                let q_val = query_embedding_128[f_idx];
+                let expected_sign = trap.culprit_feature_signs[k];
+                if (expected_sign >= 0.0 && q_val >= 0.0) || (expected_sign < 0.0 && q_val < 0.0) {
+                    matching_culprits += 1;
+                }
+            }
+            if matching_culprits >= 2
+                && best_match.as_ref().is_none_or(|(best_s, _)| trap_sim > *best_s)
+            {
+                best_match = Some((trap_sim, trap.clone()));
+            }
+        }
+
+        best_match
     }
 
     /// Inserts a newly completed trade or discovered historical Yahoo trace into the vector store.
@@ -165,6 +312,9 @@ impl PrecedentKnnIndex {
         self.records
             .write()
             .retain(|r| !(r.brain_id == brain_id && r.symbol.eq_ignore_ascii_case(symbol)));
+        self.hard_negative_traps
+            .write()
+            .retain(|t| !(t.brain_id == brain_id && t.symbol.eq_ignore_ascii_case(symbol)));
     }
 
     /// Queries the top-$K$ historical precedent traces for `brain_id` in `<1ms` via cosine similarity
@@ -294,5 +444,67 @@ impl PrecedentKnnIndex {
             median_hold_duration_ms,
             top_exemplar_symbols: exemplars,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hard_negative_trap_strict_causality() {
+        let knn = PrecedentKnnIndex::new_preseeded();
+        let mut emb = vec![0.0_f32; TRACE_EMBEDDING_DIM];
+        for (i, v) in emb.iter_mut().enumerate() {
+            *v = if i % 2 == 0 { 0.088 } else { -0.088 };
+        }
+        let t_closed = 1_775_000_000_000_000_000_i64;
+        knn.insert_hard_negative_trap(HardNegativeTrapRecord {
+            loss_trade_id: Uuid::new_v4(),
+            brain_id: BrainHorizonId::Brain02IntradayDayTrade,
+            symbol: "NVDA".to_string(),
+            closed_timestamp_ns: t_closed,
+            direction: TradeDirection::Long,
+            root_cause_category: "OPTIONS_GAMMA_WALL_REJECTION".to_string(),
+            embedding_128: emb.clone(),
+            culprit_feature_indices: [12, 14, 18],
+            culprit_feature_signs: [1.0, 1.0, 1.0],
+            realized_loss_usd: 345.0,
+        });
+
+        // Before or at t_closed: MUST return None (zero lookahead)
+        assert!(
+            knn.query_causal_trap_match(
+                BrainHorizonId::Brain02IntradayDayTrade,
+                "NVDA",
+                TradeDirection::Long,
+                t_closed - 1_000,
+                &emb,
+            )
+            .is_none()
+        );
+        assert!(
+            knn.query_causal_trap_match(
+                BrainHorizonId::Brain02IntradayDayTrade,
+                "NVDA",
+                TradeDirection::Long,
+                t_closed,
+                &emb,
+            )
+            .is_none()
+        );
+
+        // Strictly after t_closed (t > T_loss_closed): MUST detect trap with similarity >= 0.88
+        let matched = knn
+            .query_causal_trap_match(
+                BrainHorizonId::Brain02IntradayDayTrade,
+                "NVDA",
+                TradeDirection::Long,
+                t_closed + 300_000_000_000,
+                &emb,
+            )
+            .expect("Expected causal trap match after loss close timestamp");
+        assert!(matched.0 >= 0.88);
+        assert_eq!(matched.1.symbol, "NVDA");
     }
 }

@@ -273,6 +273,119 @@
         </div>
       </div>
     </div>
+
+    <!-- Phase 12 Upgrade 1: Automatic Per-Loss Forensic Autopsy & Causal Adaptive Trap-Immunity Audit Log -->
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 12px; padding: 0 12px 12px 12px;">
+      <!-- Automatic Per-Loss Forensic Dissection (32-Feature Culprit Z-Scores & Synthesized Adaptation Rules) -->
+      <div class="glass-panel" style="background: var(--surface-0);">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span>Automatic Per-Loss Forensic Autopsy ({evo.lossAutopsies?.length ?? 0} Dissected Losses)</span>
+          </div>
+        </header>
+        <div class="data-table-container">
+          <table class="telemetry-table">
+            <thead>
+              <tr>
+                <th>Loss Trade</th>
+                <th>Root Cause Category</th>
+                <th>Top 32-Feature Culprits (Z-Score)</th>
+                <th data-numeric="true">Early Exit R</th>
+                <th>Forensic Diagnosis &amp; Synthesized Rule</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each evo.lossAutopsies ?? [] as la (la.tradeId)}
+                <tr onclick={() => terminalStore.selectTicker(la.symbol)} style="cursor: pointer;">
+                  <td>
+                    <div class="tabular-num"><strong>{la.tradeId}</strong></div>
+                    <div>
+                      <strong>{la.symbol}</strong>
+                      <span class="badge badge-ai-core" style="margin-inline-start: 4px;">{la.brainId}</span>
+                    </div>
+                  </td>
+                  <td>
+                    <span class="badge badge-short">{la.rootCauseCategory}</span>
+                  </td>
+                  <td style="font-size: 0.65rem;">
+                    {#each la.topCulpritFeatures as cf (cf.featureIndex)}
+                      <div class="tabular-num">
+                        <strong>#{cf.featureIndex} {cf.featureName}:</strong>
+                        <span class="pnl-negative">z={cf.anomalyZScore.toFixed(2)}σ</span>
+                        ({cf.lossValue.toFixed(2)} vs {cf.winnerCentroidValue.toFixed(2)})
+                      </div>
+                    {/each}
+                  </td>
+                  <td data-numeric="true" class="tabular-num pnl-positive">
+                    {la.counterfactualEarlyExitR.toFixed(2)}R
+                  </td>
+                  <td style="font-size: 0.66rem; color: var(--text-secondary);">
+                    <div style="color: var(--text-primary);">{la.whatWentWrongSummary}</div>
+                    <div style="margin-block-start: 3px;" class="pnl-positive">
+                      <strong>Rule:</strong> {la.learnedAdaptationRule}
+                    </div>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Causal Adaptive Trap-Immunity Veto Audit Log (t > T_loss_closed) -->
+      <div class="glass-panel" style="background: var(--surface-0);">
+        <header class="panel-header">
+          <div class="panel-title">
+            <span>Causal Adaptive Trap-Immunity Veto Audit Log ({evo.vetoedRepeatTraps?.length ?? 0} Vetoed Repeat Traps)</span>
+          </div>
+        </header>
+        <div class="data-table-container">
+          <table class="telemetry-table">
+            <thead>
+              <tr>
+                <th>Candidate Bar Time</th>
+                <th>Symbol &amp; Brain</th>
+                <th>Matched Past Loss</th>
+                <th>Trap Category</th>
+                <th data-numeric="true">Cosine Sim</th>
+                <th data-numeric="true">Loss Avoided ($)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each evo.vetoedRepeatTraps ?? [] as vt, idx (`${vt.symbol}-${vt.timestampNs}-${idx}`)}
+                <tr onclick={() => terminalStore.selectTicker(vt.symbol)} style="cursor: pointer;">
+                  <td class="tabular-num" style="font-size: 0.67rem;">
+                    {vt.timestampIso.replace('T', ' ').slice(0, 19)}
+                  </td>
+                  <td>
+                    <strong>{vt.symbol}</strong>
+                    <span class="badge badge-ai-core" style="margin-inline-start: 4px;">{vt.brainId}</span>
+                  </td>
+                  <td class="tabular-num">
+                    <span class="badge badge-short">{vt.matchedPastLossTradeId}</span>
+                  </td>
+                  <td>
+                    <span class="badge badge-squeeze">{vt.rootCauseCategory}</span>
+                  </td>
+                  <td data-numeric="true" class="tabular-num pnl-negative">
+                    <strong>{(vt.trapSimilarityScore * 100).toFixed(1)}%</strong>
+                  </td>
+                  <td data-numeric="true" class="tabular-num pnl-positive">
+                    <strong>+${vt.counterfactualLossAvoidedUsd.toFixed(2)}</strong>
+                  </td>
+                </tr>
+              {:else}
+                <tr>
+                  <td colspan="6" style="padding: 12px; color: var(--text-secondary);">
+                    Zero repeat-trap setups encountered after causal loss indexing (t &gt; T_loss_closed).
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   {:else}
     <div style="padding: 16px; font-size: 0.78rem; color: var(--text-secondary);">
       Click <strong>[ Run Nightly Autopsy &amp; Challenger Tournament Now ]</strong> to execute Speed-2

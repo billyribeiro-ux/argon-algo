@@ -86,6 +86,34 @@
         <option value="STOCKS">EQUITY ONLY</option>
       </select>
 
+      <!-- Non-Destructive Capital Sizing Mode Toggle ([ Fixed $10K Baseline ] vs [ Fractional-Kelly Sizing ]) -->
+      <div
+        style="display: flex; align-items: center; gap: 3px; padding: 2px 6px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
+        role="group"
+        aria-label="Capital Sizing Mode"
+      >
+        <button
+          type="button"
+          class="filter-pill"
+          data-selected={terminalStore.sizingMode === 'FIXED_10K_BASELINE'}
+          onclick={() => terminalStore.setSizingMode('FIXED_10K_BASELINE')}
+          style="padding: 2px 6px; font-size: 0.66rem; font-weight: 700;"
+          title="Phase 11.1 Non-Destructive Fixed $10K Notional Baseline"
+        >
+          Fixed $10K Baseline
+        </button>
+        <button
+          type="button"
+          class="filter-pill"
+          data-selected={terminalStore.sizingMode === 'FRACTIONAL_KELLY'}
+          onclick={() => terminalStore.setSizingMode('FRACTIONAL_KELLY')}
+          style="padding: 2px 6px; font-size: 0.66rem; font-weight: 700;"
+          title="Phase 12 Causal Fractional-Kelly Risk Sizing (0.35x Kelly)"
+        >
+          Fractional-Kelly Sizing
+        </button>
+      </div>
+
       <!-- Side-by-Side Workspace Layout Mode Selector -->
       <div
         style="display: flex; align-items: center; gap: 3px; padding: 2px 6px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"

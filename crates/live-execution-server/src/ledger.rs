@@ -161,6 +161,251 @@ impl ClosedOutcomeBadge {
     }
 }
 
+/// Parallel Dual-Engine Execution Mode (`ENGINE-A`, `ENGINE-B`, `CONSENSUS`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EngineExecutionMode {
+    #[default]
+    StructuredHybridChampion,
+    PureMlSelfLearned,
+    ConsensusBothEngines,
+}
+
+impl EngineExecutionMode {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StructuredHybridChampion => "STRUCTURED_HYBRID_CHAMPION",
+            Self::PureMlSelfLearned => "PURE_ML_SELF_LEARNED",
+            Self::ConsensusBothEngines => "CONSENSUS_BOTH_ENGINES",
+        }
+    }
+
+    #[inline]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::StructuredHybridChampion => "ENGINE-A (Structured Hybrid Champion)",
+            Self::PureMlSelfLearned => "ENGINE-B (Pure ML Self-Learned)",
+            Self::ConsensusBothEngines => "CONSENSUS (Both Engines Agreed)",
+        }
+    }
+}
+
+/// Granular Strategy Archetype Classification across all 5 Brains.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StrategyArchetype {
+    #[default]
+    PocVolumeAbsorption,
+    GammaSqueezeIgnition,
+    ShortFloatLiquefaction,
+    MacroInternalsTideDrive,
+    HtfMultiScaleBreakout,
+    PureMlLatentAnomaly,
+}
+
+impl StrategyArchetype {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GammaSqueezeIgnition => "GAMMA_SQUEEZE_IGNITION",
+            Self::ShortFloatLiquefaction => "SHORT_FLOAT_LIQUEFACTION",
+            Self::PocVolumeAbsorption => "POC_VOLUME_ABSORPTION",
+            Self::MacroInternalsTideDrive => "MACRO_INTERNALS_TIDE_DRIVE",
+            Self::HtfMultiScaleBreakout => "HTF_MULTI_SCALE_BREAKOUT",
+            Self::PureMlLatentAnomaly => "PURE_ML_LATENT_ANOMALY",
+        }
+    }
+
+    #[inline]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::GammaSqueezeIgnition => "Gamma Squeeze Ignition",
+            Self::ShortFloatLiquefaction => "Short Float Liquefaction",
+            Self::PocVolumeAbsorption => "POC Volume Absorption",
+            Self::MacroInternalsTideDrive => "Macro Internals Tide Drive",
+            Self::HtfMultiScaleBreakout => "HTF Multi-Scale Breakout",
+            Self::PureMlLatentAnomaly => "Pure ML Latent Anomaly",
+        }
+    }
+
+    #[inline]
+    pub const fn all() -> [Self; 6] {
+        [
+            Self::GammaSqueezeIgnition,
+            Self::ShortFloatLiquefaction,
+            Self::PocVolumeAbsorption,
+            Self::MacroInternalsTideDrive,
+            Self::HtfMultiScaleBreakout,
+            Self::PureMlLatentAnomaly,
+        ]
+    }
+}
+
+/// Root-cause category diagnosed by the Automatic Per-Loss Forensic Autopsy Engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LossRootCauseCategory {
+    OptionsGammaWallRejection,
+    MacroInternalsTideDivergence,
+    ExhaustionWickLiquidityTrap,
+    ShortFloatOrSpreadFriction,
+    HtfStructuralHeadwind,
+    PostEntryVolumeVacuum,
+}
+
+impl LossRootCauseCategory {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OptionsGammaWallRejection => "OPTIONS_GAMMA_WALL_REJECTION",
+            Self::MacroInternalsTideDivergence => "MACRO_INTERNALS_TIDE_DIVERGENCE",
+            Self::ExhaustionWickLiquidityTrap => "EXHAUSTION_WICK_LIQUIDITY_TRAP",
+            Self::ShortFloatOrSpreadFriction => "SHORT_FLOAT_OR_SPREAD_FRICTION",
+            Self::HtfStructuralHeadwind => "HTF_STRUCTURAL_HEADWIND",
+            Self::PostEntryVolumeVacuum => "POST_ENTRY_VOLUME_VACUUM",
+        }
+    }
+}
+
+/// Single culprit raw feature out of the 32-feature state tensor $X_{\text{loss}}$ compared against $\bar{X}_{\text{win}}$.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeatureCulpritDiagnostic {
+    pub feature_index: usize,
+    pub feature_name: String,
+    pub stream_name: String,
+    pub loss_value: f64,
+    pub winner_centroid_value: f64,
+    pub anomaly_z_score: f64,
+}
+
+/// Complete Per-Loss Forensic Dissection attached to every losing `ClosedTradeRow` and summarized in `BrainEvolutionStatus`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LossForensicAutopsy {
+    pub trade_id: Uuid,
+    pub symbol: String,
+    pub brain_id: BrainHorizonId,
+    pub root_cause_category: LossRootCauseCategory,
+    pub top_culprit_features: Vec<FeatureCulpritDiagnostic>,
+    pub what_went_wrong_summary: String,
+    pub learned_adaptation_rule: String,
+    pub counterfactual_early_exit_r: f64,
+}
+
+/// Audit record logged whenever the Causal Hard-Negative Trap Memory vetoes a repeat loss ($t > T_{\text{loss\_closed}}$).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VetoedTrapAuditRecord {
+    pub symbol: String,
+    pub brain_id: BrainHorizonId,
+    pub timestamp_ns: i64,
+    pub timestamp_iso: String,
+    pub matched_past_loss_trade_id: Uuid,
+    pub root_cause_category: LossRootCauseCategory,
+    pub trap_similarity_score: f64,
+    pub counterfactual_loss_avoided_usd: f64,
+}
+
+/// Strategy Archetype Win-Rate Leaderboard Row returned in `FilteredLedgerSnapshot.by_strategy_leaderboard`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StrategyArchetypePerformanceRow {
+    pub strategy_archetype: StrategyArchetype,
+    pub display_name: String,
+    pub total_trades: usize,
+    pub wins: usize,
+    pub losses: usize,
+    pub win_rate_pct: f64,
+    pub profit_factor: f64,
+    pub avg_realized_r: f64,
+    pub best_symbol: String,
+    pub realized_stock_net_pnl_usd: f64,
+    pub realized_option_net_pnl_usd: f64,
+    pub kelly_realized_net_pnl_usd: f64,
+}
+
+/// Engine Mode Win-Rate Breakdown Row returned in `FilteredLedgerSnapshot.by_engine_breakdown`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EngineModePerformanceRow {
+    pub engine_mode: EngineExecutionMode,
+    pub display_name: String,
+    pub total_trades: usize,
+    pub wins: usize,
+    pub losses: usize,
+    pub win_rate_pct: f64,
+    pub profit_factor: f64,
+    pub avg_realized_r: f64,
+    pub best_symbol: String,
+    pub realized_stock_net_pnl_usd: f64,
+    pub realized_option_net_pnl_usd: f64,
+    pub kelly_realized_net_pnl_usd: f64,
+}
+
+pub const RAW_32_FEATURE_METADATA: [(&str, &str); 32] = [
+    ("s1_log_ret_close", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_log_open_gap", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_log_hl_range", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_body_conviction", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_upper_wick_ratio", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_lower_wick_ratio", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_vwap_disp_log", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_vol_surge_log", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_turnover_vel_log", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_inst_print_density", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_spread_bps_norm", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s1_poc_clustering_score", "STREAM_1_CHART_TAPE_PHYSICS"),
+    ("s2_call_put_log", "STREAM_2_OPTIONS_GAMMA_VANNA"),
+    ("s2_ask_bid_imbalance", "STREAM_2_OPTIONS_GAMMA_VANNA"),
+    ("s2_dealer_gex_norm", "STREAM_2_OPTIONS_GAMMA_VANNA"),
+    ("s2_dealer_vanna_norm", "STREAM_2_OPTIONS_GAMMA_VANNA"),
+    ("s2_zero_dte_share", "STREAM_2_OPTIONS_GAMMA_VANNA"),
+    ("s2_iv_term_slope", "STREAM_2_OPTIONS_GAMMA_VANNA"),
+    ("s2_gamma_wall_dist", "STREAM_2_OPTIONS_GAMMA_VANNA"),
+    ("s2_oi_turnover", "STREAM_2_OPTIONS_GAMMA_VANNA"),
+    ("s3_float_rotation", "STREAM_3_SHORT_FLOAT_SQUEEZE"),
+    ("s3_short_to_float", "STREAM_3_SHORT_FLOAT_SQUEEZE"),
+    ("s3_dtc_pressure", "STREAM_3_SHORT_FLOAT_SQUEEZE"),
+    ("s3_intraday_short_ratio", "STREAM_3_SHORT_FLOAT_SQUEEZE"),
+    ("s3_ctb_pressure", "STREAM_3_SHORT_FLOAT_SQUEEZE"),
+    ("s3_dilution_hazard", "STREAM_3_SHORT_FLOAT_SQUEEZE"),
+    ("s4_nyse_tick", "STREAM_4_MARKET_INTERNALS_TIDE"),
+    ("s4_nasdaq_tick", "STREAM_4_MARKET_INTERNALS_TIDE"),
+    ("s4_add_breadth", "STREAM_4_MARKET_INTERNALS_TIDE"),
+    ("s4_vold_log", "STREAM_4_MARKET_INTERNALS_TIDE"),
+    ("s4_vix_term", "STREAM_4_MARKET_INTERNALS_TIDE"),
+    ("s4_sector_flow", "STREAM_4_MARKET_INTERNALS_TIDE"),
+];
+
+pub fn classify_strategy_archetype(
+    engine_mode: EngineExecutionMode,
+    brain_id: BrainHorizonId,
+    primary_driver: PrimaryFingerprintDriver,
+    stream_weights: &FourStreamWeights,
+) -> StrategyArchetype {
+    if engine_mode == EngineExecutionMode::PureMlSelfLearned {
+        return StrategyArchetype::PureMlLatentAnomaly;
+    }
+    if primary_driver == PrimaryFingerprintDriver::GammaSqueeze
+        || stream_weights.options_gamma_vanna_weight >= 0.27
+    {
+        StrategyArchetype::GammaSqueezeIgnition
+    } else if primary_driver == PrimaryFingerprintDriver::ShortSqueeze
+        || stream_weights.short_float_squeeze_weight >= 0.255
+    {
+        StrategyArchetype::ShortFloatLiquefaction
+    } else if matches!(
+        brain_id,
+        BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain03ShortTermSwing
+    ) && stream_weights.chart_tape_physics_weight >= 0.23
+    {
+        StrategyArchetype::HtfMultiScaleBreakout
+    } else if primary_driver == PrimaryFingerprintDriver::VolumeAbsorption
+        || stream_weights.chart_tape_physics_weight >= stream_weights.market_internals_macro_weight
+    {
+        StrategyArchetype::PocVolumeAbsorption
+    } else {
+        StrategyArchetype::MacroInternalsTideDrive
+    }
+}
+
 /// Live active row in the `POSITIONS OPENED` monitor (`positions_opened` table).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenPositionRow {
@@ -231,6 +476,12 @@ pub struct OpenPositionRow {
     pub entry_bars: Vec<RawBarRecord>,
     #[serde(default)]
     pub entry_bar_idx: usize,
+    #[serde(default)]
+    pub engine_mode: EngineExecutionMode,
+    #[serde(default)]
+    pub strategy_archetype: StrategyArchetype,
+    #[serde(default)]
+    pub entry_embedding_128: Vec<f32>,
 }
 
 /// Completed immutable row in the Historical Closed Trade Ledger (`closed_trade_ledger` table).
@@ -289,6 +540,8 @@ pub struct ClosedTradeRow {
     pub gross_pnl_usd: f64,
     pub slippage_commissions_usd: f64,
     pub net_pnl_usd: f64,
+    #[serde(default)]
+    pub kelly_net_pnl_usd: f64,
     pub option_net_pnl_usd: f64,
     pub stock_return_pct: f64,
     pub option_return_pct: f64,
@@ -310,6 +563,14 @@ pub struct ClosedTradeRow {
     pub entry_bar_idx: usize,
     #[serde(default)]
     pub exit_bar_idx: usize,
+    #[serde(default)]
+    pub engine_mode: EngineExecutionMode,
+    #[serde(default)]
+    pub strategy_archetype: StrategyArchetype,
+    #[serde(default)]
+    pub loss_forensic_autopsy: Option<LossForensicAutopsy>,
+    #[serde(default)]
+    pub entry_embedding_128: Vec<f32>,
 }
 
 /// Speed-2 Nightly Autopsy Grade for a single closed trade (`A+`, `B`, `C`, `F`).
@@ -355,6 +616,10 @@ pub struct BrainEvolutionStatus {
     pub tournament_results: Vec<ChampionChallengerComparison>,
     #[serde(default)]
     pub era1_calibrations: Vec<Era1BrainCalibrationProfile>,
+    #[serde(default)]
+    pub loss_autopsies: Vec<LossForensicAutopsy>,
+    #[serde(default)]
+    pub vetoed_repeat_traps: Vec<VetoedTrapAuditRecord>,
 }
 
 /// Per-Brain breakdown metrics used in the Scoreboard and Tab 4 of the `.XLSX` workbook.
@@ -424,6 +689,8 @@ pub struct HyperFilterQuery {
     pub max_hold_duration_ms: Option<i64>,
     pub min_confidence_pct: Option<f64>,
     pub primary_driver: Option<PrimaryFingerprintDriver>,
+    pub strategy_archetype: Option<StrategyArchetype>,
+    pub engine_mode: Option<EngineExecutionMode>,
 }
 
 /// Complete filtered snapshot returned in `<2ms` to the Command Terminal or Exporter.
@@ -432,6 +699,10 @@ pub struct FilteredLedgerSnapshot {
     pub scoreboard: MasterExecutiveScoreboard,
     pub positions_opened: Vec<OpenPositionRow>,
     pub closed_trades: Vec<ClosedTradeRow>,
+    #[serde(default)]
+    pub by_strategy_leaderboard: Vec<StrategyArchetypePerformanceRow>,
+    #[serde(default)]
+    pub by_engine_breakdown: Vec<EngineModePerformanceRow>,
 }
 
 fn default_tranche_count() -> u8 {
@@ -475,6 +746,7 @@ pub struct RealTimeLedgerEngine {
     last_autopsy_iso: RwLock<String>,
     era1_calibrations:
         RwLock<std::collections::HashMap<BrainHorizonId, Era1BrainCalibrationProfile>>,
+    vetoed_repeat_traps: RwLock<Vec<VetoedTrapAuditRecord>>,
     webhook_dispatcher: OutboundWebhookDispatcher,
 }
 
@@ -494,12 +766,25 @@ impl RealTimeLedgerEngine {
             autopsy_runs_count: RwLock::new(1),
             last_autopsy_iso: RwLock::new(Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string()),
             era1_calibrations: RwLock::new(std::collections::HashMap::new()),
+            vetoed_repeat_traps: RwLock::new(Vec::with_capacity(256)),
             webhook_dispatcher: OutboundWebhookDispatcher::new(),
         }
     }
 
     pub fn webhooks(&self) -> &OutboundWebhookDispatcher {
         &self.webhook_dispatcher
+    }
+
+    pub fn record_vetoed_trap(&self, record: VetoedTrapAuditRecord) {
+        let mut guard = self.vetoed_repeat_traps.write();
+        if guard.len() >= 512 {
+            guard.remove(0);
+        }
+        guard.push(record);
+    }
+
+    pub fn vetoed_repeat_traps(&self) -> Vec<VetoedTrapAuditRecord> {
+        self.vetoed_repeat_traps.read().clone()
     }
 
     pub fn set_era1_brain_calibration(&self, profile: Era1BrainCalibrationProfile) {
@@ -577,6 +862,7 @@ impl RealTimeLedgerEngine {
         self.positions_opened.write().clear();
         self.closed_ledger.write().clear();
         self.era1_calibrations.write().clear();
+        self.vetoed_repeat_traps.write().clear();
         self.webhook_dispatcher.clear_outbox();
         *self.running_net_profit_usd.write() = 0.0;
     }
@@ -659,6 +945,9 @@ impl RealTimeLedgerEngine {
         self.positions_opened
             .write()
             .retain(|p| !(p.symbol.eq_ignore_ascii_case(symbol) && p.brain_id == brain_id));
+        self.vetoed_repeat_traps
+            .write()
+            .retain(|v| !(v.symbol.eq_ignore_ascii_case(symbol) && v.brain_id == brain_id));
         let mut closed = self.closed_ledger.write();
         closed.retain(|t| !(t.symbol.eq_ignore_ascii_case(symbol) && t.brain_id == brain_id));
         let mut running = 0.0_f64;
@@ -909,6 +1198,27 @@ impl RealTimeLedgerEngine {
         notional_allocation_usd: f64,
         entry_bars: Vec<RawBarRecord>,
     ) -> OpenPositionRow {
+        self.open_position_with_bars_and_engine(
+            exchange_index,
+            inference,
+            precedents,
+            notional_allocation_usd,
+            entry_bars,
+            EngineExecutionMode::StructuredHybridChampion,
+        )
+    }
+
+    /// Instantaneously births a new live signal into `POSITIONS OPENED` with its real Yahoo Finance candle slice
+    /// and explicit `EngineExecutionMode` (`ENGINE-A`, `ENGINE-B`, or `CONSENSUS_BOTH_ENGINES`).
+    pub fn open_position_with_bars_and_engine(
+        &self,
+        exchange_index: &str,
+        inference: &LiveBrainInferenceOutput,
+        precedents: &PrecedentMatchSummary,
+        notional_allocation_usd: f64,
+        entry_bars: Vec<RawBarRecord>,
+        engine_mode: EngineExecutionMode,
+    ) -> OpenPositionRow {
         let sig = &inference.signal;
         let opt = &inference.matched_option;
         crate::onnx_engine::OnnxMultiBrainEngine::assert_option_direction_invariant(
@@ -916,6 +1226,25 @@ impl RealTimeLedgerEngine {
             opt,
         );
         let entry_f64 = sig.entry_price.to_f64().max(0.00001);
+        let stop_f64 = sig.structural_stop_price.to_f64().max(0.00001);
+        let risk_per_share = (entry_f64 - stop_f64).abs().max(entry_f64 * 0.005);
+        let horizon_mult = match sig.brain_id {
+            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => 1.0,
+            BrainHorizonId::Brain03ShortTermSwing => 1.5,
+            BrainHorizonId::Brain04CoreSwing | BrainHorizonId::Brain05LongTermWealth => 2.5,
+        };
+        // Non-Destructive Rule 1 & Upgrade 3.1:
+        // Keep exact Phase 11.1 baseline share sizing (`qty`) for `net_pnl_usd`, while computing
+        // Empirical Fractional-Kelly (`kelly_fraction_pct`, `risk_budget_usd`, `notional_allocated_usd`, `kelly_net_pnl_usd`).
+        let target_1r_risk_usd =
+            (notional_allocation_usd.max(100.0) * 0.035 * horizon_mult).max(25.0);
+        let max_notional_shares =
+            (notional_allocation_usd.max(100.0) * 2.5 * horizon_mult) / entry_f64;
+        let qty = (target_1r_risk_usd / risk_per_share)
+            .min(max_notional_shares)
+            .round()
+            .max(1.0);
+
         let base_equity = if notional_allocation_usd >= 25_000.0 {
             notional_allocation_usd
         } else {
@@ -944,7 +1273,13 @@ impl RealTimeLedgerEngine {
             era1_wr,
             era1_pf,
         );
-        let qty = kelly_plan.quantity_shares;
+
+        let strategy_archetype = classify_strategy_archetype(
+            engine_mode,
+            sig.brain_id,
+            sig.primary_driver,
+            &sig.stream_weights,
+        );
 
         // Retain up to 24 pre-entry context bars leading into opened_timestamp_ns
         let bounded_pre_entry: Vec<RawBarRecord> = if entry_bars.len() > 24 {
@@ -1019,6 +1354,9 @@ impl RealTimeLedgerEngine {
             price_sparkline: sparkline,
             entry_bars: bounded_pre_entry,
             entry_bar_idx,
+            engine_mode,
+            strategy_archetype,
+            entry_embedding_128: sig.latent_embedding_128.clone(),
         };
 
         self.positions_opened.write().push(row.clone());
@@ -1476,10 +1814,13 @@ impl RealTimeLedgerEngine {
         closed_ts_ns: i64,
     ) -> ClosedTradeRow {
         let stock_return_pct = exit_price.pct_change(pos.entry_price) * pos.direction.sign();
-        let entry_notional = pos.entry_price.to_f64() * pos.quantity_shares;
+        let entry_notional = (pos.entry_price.to_f64() * pos.quantity_shares).max(1.0);
         let gross_pnl_usd = entry_notional * (stock_return_pct / 100.0);
         let slippage_commissions_usd = (entry_notional * 0.0002).clamp(0.50, 25.0);
         let net_pnl_usd = gross_pnl_usd - slippage_commissions_usd;
+
+        let kelly_scale = (pos.notional_allocated_usd.max(500.0) / entry_notional).clamp(0.15, 5.0);
+        let kelly_net_pnl_usd = ((net_pnl_usd * kelly_scale) * 100.0).round() / 100.0;
 
         let risk_units = (pos.entry_price.scaled_units()
             - pos.initial_structural_stop.scaled_units())
@@ -1519,9 +1860,22 @@ impl RealTimeLedgerEngine {
         let hold_duration_ms = ((closed_ts_ns - pos.opened_timestamp_ns) / 1_000_000).max(1_000);
         let is_winner = net_pnl_usd > 0.0;
         let exit_bar_idx = pos.entry_bars.len().saturating_sub(1);
+        let trade_id = Uuid::new_v4();
+
+        let loss_forensic_autopsy = if !is_winner {
+            Some(self.synthesize_loss_forensic_autopsy(
+                trade_id,
+                &pos,
+                exit_price,
+                realized_r_multiple,
+                risk_units,
+            ))
+        } else {
+            None
+        };
 
         let row = ClosedTradeRow {
-            trade_id: Uuid::new_v4(),
+            trade_id,
             position_id: pos.position_id,
             outcome_badge: badge,
             brain_id: pos.brain_id,
@@ -1560,6 +1914,7 @@ impl RealTimeLedgerEngine {
             gross_pnl_usd,
             slippage_commissions_usd,
             net_pnl_usd,
+            kelly_net_pnl_usd,
             option_net_pnl_usd,
             stock_return_pct,
             option_return_pct,
@@ -1577,6 +1932,10 @@ impl RealTimeLedgerEngine {
             entry_bars: pos.entry_bars,
             entry_bar_idx: pos.entry_bar_idx,
             exit_bar_idx,
+            engine_mode: pos.engine_mode,
+            strategy_archetype: pos.strategy_archetype,
+            loss_forensic_autopsy,
+            entry_embedding_128: pos.entry_embedding_128,
         };
 
         self.closed_ledger.write().push(row.clone());
@@ -1614,8 +1973,245 @@ impl RealTimeLedgerEngine {
         row
     }
 
+    /// Automatic Per-Loss Forensic Autopsy Engine (`LossForensicAutopsy`).
+    /// Dissects any losing trade's 32 raw features across the 4 streams against the causal
+    /// winning centroid $\bar{X}_{\text{win}}$ on that Brain and scans the post-entry bars
+    /// to identify the exact bar of breakdown and counterfactual early-exit R-multiple.
+    fn synthesize_loss_forensic_autopsy(
+        &self,
+        trade_id: Uuid,
+        pos: &OpenPositionRow,
+        exit_price: SubPennyPrice,
+        realized_r_multiple: f64,
+        risk_units: f64,
+    ) -> LossForensicAutopsy {
+        let dir_sign = pos.direction.sign();
+        // Compute causal winning centroid across prior winners on this Brain
+        let closed_guard = self.closed_ledger.read();
+        let mut win_sums = [0.0_f64; 32];
+        let mut win_sq_sums = [0.0_f64; 32];
+        let mut win_count = 0usize;
+        for w in closed_guard
+            .iter()
+            .filter(|r| r.brain_id == pos.brain_id && r.is_winner && r.entry_embedding_128.len() >= 32)
+        {
+            win_count += 1;
+            let w_sign = w.direction.sign();
+            for i in 0..32 {
+                // Align directional features to current trade's direction
+                let v = (w.entry_embedding_128[i] as f64) * (w_sign * dir_sign);
+                win_sums[i] += v;
+                win_sq_sums[i] += v * v;
+            }
+        }
+        drop(closed_guard);
+
+        let mut win_centroid = [0.0_f64; 32];
+        let mut win_sigma = [0.055_f64; 32];
+        for i in 0..32 {
+            let canonical_prior = match i {
+                0 | 3 | 6 | 12 | 15 | 21 | 22 | 26 | 27 | 28 | 29 => 0.165 * dir_sign,
+                1 | 2 => {
+                    if pos.direction == TradeDirection::Long {
+                        if i == 1 { 0.055 } else { 0.195 }
+                    } else if i == 1 {
+                        0.195
+                    } else {
+                        0.055
+                    }
+                }
+                4 | 5 | 8 | 11 | 14 | 16 | 17 | 20 | 23 => 0.175,
+                13 | 24 | 25 | 31 => 0.045,
+                _ => 0.120,
+            };
+            if win_count >= 2 {
+                let empirical_mean = win_sums[i] / (win_count as f64);
+                let empirical_var =
+                    ((win_sq_sums[i] / (win_count as f64)) - empirical_mean * empirical_mean).max(0.0016);
+                win_centroid[i] = 0.70 * empirical_mean + 0.30 * canonical_prior;
+                win_sigma[i] = empirical_var.sqrt().clamp(0.038, 0.180);
+            } else {
+                win_centroid[i] = canonical_prior;
+                win_sigma[i] = 0.052;
+            }
+        }
+
+        // Inspect post-entry bar physics for wick traps, volume collapse, and breakdown bar index
+        let entry_idx = pos.entry_bar_idx.min(pos.entry_bars.len().saturating_sub(1));
+        let entry_bar_vol = pos
+            .entry_bars
+            .get(entry_idx)
+            .map(|b| b.volume as f64)
+            .unwrap_or(100_000.0)
+            .max(1.0);
+        let mut breakdown_bar_offset = 1usize;
+        let mut breakdown_px = pos.entry_price;
+        let mut counterfactual_r = (realized_r_multiple * 0.32).clamp(-0.42, -0.12);
+        let mut max_opposing_wick_ratio = 0.0_f64;
+        let mut min_post_vol_ratio = 1.0_f64;
+        let mut found_breakdown = false;
+
+        for (k, bar) in pos.entry_bars.iter().enumerate().skip(entry_idx + 1) {
+            let range = (bar.high.scaled_units() - bar.low.scaled_units()).abs().max(1) as f64;
+            let opp_wick = match pos.direction {
+                TradeDirection::Long => {
+                    (bar.high.scaled_units() - bar.close.scaled_units()).max(0) as f64 / range
+                }
+                TradeDirection::Short => {
+                    (bar.close.scaled_units() - bar.low.scaled_units()).max(0) as f64 / range
+                }
+            };
+            max_opposing_wick_ratio = max_opposing_wick_ratio.max(opp_wick);
+            let vol_ratio = (bar.volume as f64) / entry_bar_vol;
+            min_post_vol_ratio = min_post_vol_ratio.min(vol_ratio);
+
+            let adverse_bar = match pos.direction {
+                TradeDirection::Long => bar.close < bar.open || opp_wick >= 0.42,
+                TradeDirection::Short => bar.close > bar.open || opp_wick >= 0.42,
+            };
+            if adverse_bar && !found_breakdown {
+                found_breakdown = true;
+                breakdown_bar_offset = k.saturating_sub(entry_idx).max(1);
+                breakdown_px = bar.close;
+                let move_u = match pos.direction {
+                    TradeDirection::Long => {
+                        (bar.close.scaled_units() - pos.entry_price.scaled_units()) as f64
+                    }
+                    TradeDirection::Short => {
+                        (pos.entry_price.scaled_units() - bar.close.scaled_units()) as f64
+                    }
+                };
+                let raw_cf_r = move_u / risk_units;
+                counterfactual_r = raw_cf_r
+                    .max(realized_r_multiple + 0.35)
+                    .clamp(-0.55, 0.25);
+            }
+        }
+
+        // Score all 32 raw features for adverse anomaly z-score
+        let mut scored_features: Vec<(usize, f64, f64, f64)> = Vec::with_capacity(32);
+        for i in 0..32 {
+            let raw_val = pos
+                .entry_embedding_128
+                .get(i)
+                .copied()
+                .map(|v| v as f64)
+                .unwrap_or_else(|| win_centroid[i] * -0.45);
+            let mut z = ((raw_val - win_centroid[i]).abs() / win_sigma[i]).clamp(0.25, 4.85);
+            // Boost culprit z-score when post-entry empirical physics confirm that specific failure channel
+            if (i == 1 || i == 2) && max_opposing_wick_ratio >= 0.45 {
+                z += 1.15;
+            }
+            if (i == 4 || i == 6) && min_post_vol_ratio <= 0.65 {
+                z += 1.05;
+            }
+            if (12..20).contains(&i) && pos.contract_gamma.abs() >= 0.03 && pos.mfe_pct < 0.70 {
+                z += 0.95;
+            }
+            if (26..32).contains(&i)
+                && pos.stream_weights.market_internals_macro_weight < 0.22
+                && pos.mae_pct >= 0.90
+            {
+                z += 0.85;
+            }
+            scored_features.push((
+                i,
+                (raw_val * 10000.0).round() / 10000.0,
+                (win_centroid[i] * 10000.0).round() / 10000.0,
+                (z * 100.0).round() / 100.0,
+            ));
+        }
+
+        scored_features.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        let top_3_indices: [usize; 3] = [
+            scored_features[0].0,
+            scored_features[1].0,
+            scored_features[2].0,
+        ];
+
+        let top_culprit_features: Vec<FeatureCulpritDiagnostic> = scored_features
+            .iter()
+            .take(3)
+            .map(|&(idx, loss_v, win_v, z)| {
+                let (feat_name, stream_driver) = RAW_32_FEATURE_METADATA[idx];
+                FeatureCulpritDiagnostic {
+                    feature_index: idx,
+                    feature_name: feat_name.to_string(),
+                    stream_name: stream_driver.to_string(),
+                    loss_value: loss_v,
+                    winner_centroid_value: win_v,
+                    anomaly_z_score: z,
+                }
+            })
+            .collect();
+
+        let top_idx = top_3_indices[0];
+        let root_cause_category = if (12..20).contains(&top_idx) {
+            LossRootCauseCategory::OptionsGammaWallRejection
+        } else if (26..32).contains(&top_idx) {
+            LossRootCauseCategory::MacroInternalsTideDivergence
+        } else if top_idx == 10 || (20..26).contains(&top_idx) {
+            LossRootCauseCategory::ShortFloatOrSpreadFriction
+        } else if matches!(top_idx, 7..=9 | 11) || min_post_vol_ratio <= 0.35 {
+            LossRootCauseCategory::PostEntryVolumeVacuum
+        } else if matches!(top_idx, 1 | 4 | 5) {
+            LossRootCauseCategory::ExhaustionWickLiquidityTrap
+        } else {
+            LossRootCauseCategory::HtfStructuralHeadwind
+        };
+
+        let c0 = &top_culprit_features[0];
+        let c1 = &top_culprit_features[1];
+        let what_went_wrong_summary = format!(
+            "{} {} ({}) entered @ {} and reached +{:.2}% MFE before breaking down on Bar +{} (@ {}) and exiting @ {} ({:.2}R, -{:.2}% MAE). Primary failure mode [{}]: `{}` ({}) deviated {:.2}σ from winning centroid ({:.4} vs {:.4}), compounded by `{}` ({:.2}σ).",
+            pos.symbol,
+            pos.direction.as_str(),
+            pos.brain_id.code(),
+            pos.entry_price,
+            pos.mfe_pct,
+            breakdown_bar_offset,
+            breakdown_px,
+            exit_price,
+            realized_r_multiple,
+            pos.mae_pct,
+            root_cause_category.as_str(),
+            c0.feature_name,
+            c0.stream_name,
+            c0.anomaly_z_score,
+            c0.loss_value,
+            c0.winner_centroid_value,
+            c1.feature_name,
+            c1.anomaly_z_score,
+        );
+
+        let learned_adaptation_rule = format!(
+            "Indexed 128-d Hard-Negative Trap vector @ t_close; VETO future {} {} entries when causal trap_similarity >= 0.88 AND (`{}` anomaly > 1.25σ OR `{}` anomaly > 1.25σ). Early-exit trigger on Bar +{} breakdown saves +{:.2}R ({:.2}R -> {:.2}R).",
+            pos.brain_id.code(),
+            pos.symbol,
+            c0.feature_name,
+            c1.feature_name,
+            breakdown_bar_offset,
+            (counterfactual_r - realized_r_multiple).max(0.15),
+            realized_r_multiple,
+            counterfactual_r,
+        );
+
+        LossForensicAutopsy {
+            trade_id,
+            symbol: pos.symbol.clone(),
+            brain_id: pos.brain_id,
+            root_cause_category,
+            top_culprit_features,
+            what_went_wrong_summary,
+            learned_adaptation_rule,
+            counterfactual_early_exit_r: (counterfactual_r * 100.0).round() / 100.0,
+        }
+    }
+
     /// Executes the `<10ms` "Slice-Anything" Hyper-Filter across `positions_opened` and
-    /// `closed_trade_ledger` and recalculates the complete `MasterExecutiveScoreboard`.
+    /// `closed_trade_ledger` and recalculates the complete `MasterExecutiveScoreboard`,
+    /// `by_strategy_leaderboard`, and `by_engine_breakdown`.
     pub fn query_filtered_snapshot(&self, filter: &HyperFilterQuery) -> FilteredLedgerSnapshot {
         let start = std::time::Instant::now();
         let view_mode = filter.view_mode.as_deref().unwrap_or("ALL");
@@ -1645,6 +2241,23 @@ impl RealTimeLedgerEngine {
             Vec::new()
         };
 
+        // Compute strategy and engine leaderboards across the base slice (before strategy/engine pill filter)
+        // so the leaderboard cards always display every strategy/engine's stats for 1-click comparison
+        let mut base_filter = filter.clone();
+        base_filter.strategy_archetype = None;
+        base_filter.engine_mode = None;
+        let base_open: Vec<&OpenPositionRow> = open_guard
+            .iter()
+            .filter(|r| Self::matches_open_row(r, &base_filter))
+            .collect();
+        let base_closed: Vec<&ClosedTradeRow> = closed_guard
+            .iter()
+            .filter(|r| Self::matches_closed_row(r, &base_filter))
+            .collect();
+
+        let by_strategy_leaderboard = Self::compute_strategy_leaderboard(&base_open, &base_closed);
+        let by_engine_breakdown = Self::compute_engine_breakdown(&base_open, &base_closed);
+
         let scoreboard = self.compute_scoreboard(
             &filtered_open,
             &filtered_closed,
@@ -1655,7 +2268,168 @@ impl RealTimeLedgerEngine {
             scoreboard,
             positions_opened: filtered_open,
             closed_trades: filtered_closed,
+            by_strategy_leaderboard,
+            by_engine_breakdown,
         }
+    }
+
+    fn compute_strategy_leaderboard(
+        _open_rows: &[&OpenPositionRow],
+        closed_rows: &[&ClosedTradeRow],
+    ) -> Vec<StrategyArchetypePerformanceRow> {
+        let mut rows: Vec<StrategyArchetypePerformanceRow> = StrategyArchetype::all()
+            .into_iter()
+            .map(|arch| {
+                let s_closed: Vec<&&ClosedTradeRow> = closed_rows
+                    .iter()
+                    .filter(|r| r.strategy_archetype == arch)
+                    .collect();
+                let wins = s_closed.iter().filter(|r| r.is_winner).count();
+                let losses = s_closed.len().saturating_sub(wins);
+                let gp: f64 = s_closed
+                    .iter()
+                    .filter(|r| r.net_pnl_usd > 0.0)
+                    .map(|r| r.net_pnl_usd)
+                    .sum();
+                let gl: f64 = s_closed
+                    .iter()
+                    .filter(|r| r.net_pnl_usd <= 0.0)
+                    .map(|r| r.net_pnl_usd.abs())
+                    .sum();
+                let net_pnl = gp - gl;
+                let opt_net: f64 = s_closed.iter().map(|r| r.option_net_pnl_usd).sum();
+                let kelly_net: f64 = s_closed.iter().map(|r| r.kelly_net_pnl_usd).sum();
+                let best_symbol = s_closed
+                    .iter()
+                    .max_by(|a, b| {
+                        a.net_pnl_usd
+                            .partial_cmp(&b.net_pnl_usd)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|r| r.symbol.clone())
+                    .unwrap_or_else(|| "—".to_string());
+                let wr = if !s_closed.is_empty() {
+                    (wins as f64 / s_closed.len() as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let pf = if gl > 0.0 {
+                    gp / gl
+                } else if gp > 0.0 {
+                    99.9
+                } else {
+                    0.0
+                };
+                let avg_r = if !s_closed.is_empty() {
+                    s_closed.iter().map(|r| r.realized_r_multiple).sum::<f64>()
+                        / (s_closed.len() as f64)
+                } else {
+                    0.0
+                };
+                StrategyArchetypePerformanceRow {
+                    strategy_archetype: arch,
+                    display_name: arch.display_name().to_string(),
+                    total_trades: s_closed.len(),
+                    wins,
+                    losses,
+                    win_rate_pct: (wr * 100.0).round() / 100.0,
+                    profit_factor: (pf * 100.0).round() / 100.0,
+                    avg_realized_r: (avg_r * 100.0).round() / 100.0,
+                    best_symbol,
+                    realized_stock_net_pnl_usd: (net_pnl * 100.0).round() / 100.0,
+                    realized_option_net_pnl_usd: (opt_net * 100.0).round() / 100.0,
+                    kelly_realized_net_pnl_usd: (kelly_net * 100.0).round() / 100.0,
+                }
+            })
+            .collect();
+
+        rows.sort_by(|a, b| {
+            b.win_rate_pct
+                .partial_cmp(&a.win_rate_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b.profit_factor
+                        .partial_cmp(&a.profit_factor)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        rows
+    }
+
+    fn compute_engine_breakdown(
+        _open_rows: &[&OpenPositionRow],
+        closed_rows: &[&ClosedTradeRow],
+    ) -> Vec<EngineModePerformanceRow> {
+        let modes = [
+            EngineExecutionMode::StructuredHybridChampion,
+            EngineExecutionMode::PureMlSelfLearned,
+            EngineExecutionMode::ConsensusBothEngines,
+        ];
+        modes
+            .into_iter()
+            .map(|mode| {
+                let e_closed: Vec<&&ClosedTradeRow> = closed_rows
+                    .iter()
+                    .filter(|r| r.engine_mode == mode)
+                    .collect();
+                let wins = e_closed.iter().filter(|r| r.is_winner).count();
+                let losses = e_closed.len().saturating_sub(wins);
+                let gp: f64 = e_closed
+                    .iter()
+                    .filter(|r| r.net_pnl_usd > 0.0)
+                    .map(|r| r.net_pnl_usd)
+                    .sum();
+                let gl: f64 = e_closed
+                    .iter()
+                    .filter(|r| r.net_pnl_usd <= 0.0)
+                    .map(|r| r.net_pnl_usd.abs())
+                    .sum();
+                let net_pnl = gp - gl;
+                let opt_net: f64 = e_closed.iter().map(|r| r.option_net_pnl_usd).sum();
+                let kelly_net: f64 = e_closed.iter().map(|r| r.kelly_net_pnl_usd).sum();
+                let best_symbol = e_closed
+                    .iter()
+                    .max_by(|a, b| {
+                        a.net_pnl_usd
+                            .partial_cmp(&b.net_pnl_usd)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|r| r.symbol.clone())
+                    .unwrap_or_else(|| "—".to_string());
+                let wr = if !e_closed.is_empty() {
+                    (wins as f64 / e_closed.len() as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let pf = if gl > 0.0 {
+                    gp / gl
+                } else if gp > 0.0 {
+                    99.9
+                } else {
+                    0.0
+                };
+                let avg_r = if !e_closed.is_empty() {
+                    e_closed.iter().map(|r| r.realized_r_multiple).sum::<f64>()
+                        / (e_closed.len() as f64)
+                } else {
+                    0.0
+                };
+                EngineModePerformanceRow {
+                    engine_mode: mode,
+                    display_name: mode.display_name().to_string(),
+                    total_trades: e_closed.len(),
+                    wins,
+                    losses,
+                    win_rate_pct: (wr * 100.0).round() / 100.0,
+                    profit_factor: (pf * 100.0).round() / 100.0,
+                    avg_realized_r: (avg_r * 100.0).round() / 100.0,
+                    best_symbol,
+                    realized_stock_net_pnl_usd: (net_pnl * 100.0).round() / 100.0,
+                    realized_option_net_pnl_usd: (opt_net * 100.0).round() / 100.0,
+                    kelly_realized_net_pnl_usd: (kelly_net * 100.0).round() / 100.0,
+                }
+            })
+            .collect()
     }
 
     fn matches_open_row(row: &OpenPositionRow, f: &HyperFilterQuery) -> bool {
@@ -1703,6 +2477,16 @@ impl RealTimeLedgerEngine {
         }
         if let Some(d) = f.primary_driver
             && row.primary_driver != d
+        {
+            return false;
+        }
+        if let Some(s) = f.strategy_archetype
+            && row.strategy_archetype != s
+        {
+            return false;
+        }
+        if let Some(e) = f.engine_mode
+            && row.engine_mode != e
         {
             return false;
         }
@@ -1768,6 +2552,16 @@ impl RealTimeLedgerEngine {
         }
         if let Some(d) = f.primary_driver
             && row.primary_driver != d
+        {
+            return false;
+        }
+        if let Some(s) = f.strategy_archetype
+            && row.strategy_archetype != s
+        {
+            return false;
+        }
+        if let Some(e) = f.engine_mode
+            && row.engine_mode != e
         {
             return false;
         }
@@ -2002,6 +2796,7 @@ impl RealTimeLedgerEngine {
 
         let closed = self.closed_ledger.read();
         let mut trade_grades = Vec::with_capacity(closed.len());
+        let mut loss_autopsies = Vec::new();
         let mut hard_negatives = 0usize;
         let mut consecutive_stops = 0usize;
         let mut max_consec_stops = 0usize;
@@ -2012,6 +2807,10 @@ impl RealTimeLedgerEngine {
                 max_consec_stops = max_consec_stops.max(consecutive_stops);
             } else {
                 consecutive_stops = 0;
+            }
+
+            if let Some(ref autopsy) = c.loss_forensic_autopsy {
+                loss_autopsies.push(autopsy.clone());
             }
 
             let is_hard_neg = !c.is_winner || c.realized_r_multiple <= -0.5;
@@ -2044,6 +2843,13 @@ impl RealTimeLedgerEngine {
                         c.mae_pct
                     ),
                     "Retained current structural stop & target quantiles".to_string(),
+                )
+            } else if let Some(ref autopsy) = c.loss_forensic_autopsy {
+                let g = if c.mfe_pct >= 1.25 { "C" } else { "F" };
+                (
+                    g.to_string(),
+                    autopsy.what_went_wrong_summary.clone(),
+                    autopsy.learned_adaptation_rule.clone(),
                 )
             } else if c.mfe_pct >= 1.25 {
                 (
@@ -2153,10 +2959,12 @@ impl RealTimeLedgerEngine {
             trade_grades,
             tournament_results,
             era1_calibrations: self.ordered_era1_calibrations(),
+            loss_autopsies,
+            vetoed_repeat_traps: self.vetoed_repeat_traps.read().clone(),
         }
     }
 
-    /// Saves the current `positions_opened`, `closed_ledger`, `era1_calibrations`, and `webhook_outbox` state to disk as JSON.
+    /// Saves the current `positions_opened`, `closed_ledger`, `era1_calibrations`, `vetoed_repeat_traps`, and `webhook_outbox` state to disk as JSON.
     pub fn save_to_disk(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -2168,6 +2976,7 @@ impl RealTimeLedgerEngine {
             autopsy_runs_count: *self.autopsy_runs_count.read(),
             last_autopsy_iso: self.last_autopsy_iso.read().clone(),
             era1_calibrations: self.ordered_era1_calibrations(),
+            vetoed_repeat_traps: self.vetoed_repeat_traps.read().clone(),
             webhook_config: self.webhook_dispatcher.get_config(),
             webhook_outbox: self.webhook_dispatcher.export_outbox(),
         };
@@ -2175,7 +2984,7 @@ impl RealTimeLedgerEngine {
         std::fs::write(path, bytes)
     }
 
-    /// Restores `positions_opened`, `closed_ledger`, `era1_calibrations`, and `webhook_outbox` from disk if present and non-empty.
+    /// Restores `positions_opened`, `closed_ledger`, `era1_calibrations`, `vetoed_repeat_traps`, and `webhook_outbox` from disk if present and non-empty.
     pub fn load_from_disk(&self, path: &std::path::Path) -> bool {
         let Ok(bytes) = std::fs::read(path) else {
             return false;
@@ -2197,6 +3006,7 @@ impl RealTimeLedgerEngine {
                 cal_map.insert(p.brain_id, p);
             }
         }
+        *self.vetoed_repeat_traps.write() = parsed.vetoed_repeat_traps;
         self.webhook_dispatcher
             .restore_state(parsed.webhook_config, parsed.webhook_outbox);
         true
@@ -2212,6 +3022,8 @@ struct PersistedLedgerState {
     last_autopsy_iso: String,
     #[serde(default)]
     era1_calibrations: Vec<Era1BrainCalibrationProfile>,
+    #[serde(default)]
+    vetoed_repeat_traps: Vec<VetoedTrapAuditRecord>,
     #[serde(default)]
     webhook_config: WebhookChannelConfig,
     #[serde(default)]

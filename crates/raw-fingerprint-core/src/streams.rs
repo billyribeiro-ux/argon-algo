@@ -40,6 +40,23 @@ impl BrainHorizonId {
     }
 
     #[inline]
+    pub const fn as_str(self) -> &'static str {
+        self.code()
+    }
+
+    #[inline]
+    pub fn from_str_code(s: &str) -> Option<Self> {
+        match s.trim() {
+            "BRAIN-01" | "Brain01PennyAnomaly" => Some(Self::Brain01PennyAnomaly),
+            "BRAIN-02" | "Brain02IntradayDayTrade" => Some(Self::Brain02IntradayDayTrade),
+            "BRAIN-03" | "Brain03ShortTermSwing" => Some(Self::Brain03ShortTermSwing),
+            "BRAIN-04" | "Brain04CoreSwing" => Some(Self::Brain04CoreSwing),
+            "BRAIN-05" | "Brain05LongTermWealth" => Some(Self::Brain05LongTermWealth),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Brain01PennyAnomaly => "Penny & Sub-Penny Anomaly Algo",

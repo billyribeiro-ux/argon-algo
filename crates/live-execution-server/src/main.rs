@@ -1,4 +1,4 @@
-//! Binary entry point for `live-execution-server` (`http://0.0.0.0:8080`).
+//! Binary entry point for `live-execution-server` (`http://0.0.0.0:8090`, configurable via `ARGON_PORT`).
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -111,7 +111,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let app = build_axum_router(state);
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let port: u16 = std::env::var("ARGON_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or(8090);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!(
         "Argon Quant Live Execution Server (Yahoo Finance Live Primary) listening on http://{addr}"
     );

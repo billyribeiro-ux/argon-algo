@@ -1,7 +1,8 @@
 //! Real-Time `POSITIONS OPENED` Active Monitor, `closed_trade_ledger` Archiver,
 //! Master Executive Scoreboard, and `<10ms` "Slice-Anything" Hyper-Filter Engine.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
 use parking_lot::RwLock;
@@ -14,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::onnx_engine::LiveBrainInferenceOutput;
-use crate::precedent_knn::PrecedentMatchSummary;
+use crate::precedent_knn::{
+    HardNegativeTrapRecord, PostEntryScratchDiagnostic, PrecedentKnnIndex, PrecedentMatchSummary,
+};
 use crate::webhooks::{
     OutboundWebhookDispatcher, WebhookChannelConfig, WebhookDispatchRecord, WebhookEventPayload,
     WebhookEventType,
@@ -942,6 +945,7 @@ pub struct Era1BrainCalibrationProfile {
 /// Thread-safe, sub-millisecond Real-Time Execution Ledger Engine.
 pub struct RealTimeLedgerEngine {
     fingerprint_engine: RawFingerprintEngine,
+    precedent_knn: Arc<PrecedentKnnIndex>,
     positions_opened: RwLock<Vec<OpenPositionRow>>,
     closed_ledger: RwLock<Vec<ClosedTradeRow>>,
     running_net_profit_usd: RwLock<f64>,
@@ -964,8 +968,13 @@ impl Default for RealTimeLedgerEngine {
 
 impl RealTimeLedgerEngine {
     pub fn new() -> Self {
+        Self::with_precedent_knn(Arc::new(PrecedentKnnIndex::new_preseeded()))
+    }
+
+    pub fn with_precedent_knn(precedent_knn: Arc<PrecedentKnnIndex>) -> Self {
         Self {
             fingerprint_engine: RawFingerprintEngine::new(),
+            precedent_knn,
             positions_opened: RwLock::new(Vec::with_capacity(128)),
             closed_ledger: RwLock::new(Vec::with_capacity(4096)),
             running_net_profit_usd: RwLock::new(0.0),
@@ -977,6 +986,10 @@ impl RealTimeLedgerEngine {
             enforce_hard_scratch_on_baseline: RwLock::new(false),
             webhook_dispatcher: OutboundWebhookDispatcher::new(),
         }
+    }
+
+    pub fn precedent_knn(&self) -> &Arc<PrecedentKnnIndex> {
+        &self.precedent_knn
     }
 
     pub fn set_enforce_hard_scratch_on_baseline(&self, enabled: bool) {
@@ -1007,6 +1020,39 @@ impl RealTimeLedgerEngine {
             .read()
             .get(&(symbol.to_uppercase(), brain_id))
             .copied()
+    }
+
+    /// Returns `(consecutive_losses, last_loss_closed_ts_ns)` for `(symbol, brain_id)` across trades
+    /// closed strictly before `current_ts_ns` (`r.closed_timestamp_ns < current_ts_ns`).
+    pub fn causal_consecutive_losses_for_symbol(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+        current_ts_ns: i64,
+    ) -> (usize, i64) {
+        let closed = self.closed_ledger.read();
+        let mut symbol_trades: Vec<&ClosedTradeRow> = closed
+            .iter()
+            .filter(|r| {
+                r.brain_id == brain_id
+                    && r.symbol.eq_ignore_ascii_case(symbol)
+                    && r.closed_timestamp_ns < current_ts_ns
+            })
+            .collect();
+        symbol_trades.sort_by_key(|r| r.closed_timestamp_ns);
+        let mut consec = 0usize;
+        let mut last_loss_ts = 0i64;
+        for r in symbol_trades.iter().rev() {
+            if !r.is_winner {
+                if consec == 0 {
+                    last_loss_ts = r.closed_timestamp_ns;
+                }
+                consec += 1;
+            } else {
+                break;
+            }
+        }
+        (consec, last_loss_ts)
     }
 
     pub fn record_vetoed_trap(&self, record: VetoedTrapAuditRecord) {
@@ -1995,9 +2041,9 @@ impl RealTimeLedgerEngine {
             let time_expired = (bars_since_open >= max_hold_bars && is_in_profit_for_time_stop)
                 || bars_since_open >= max_hold_bars * 3;
 
-            // Phase 13 Upgrade 2: Self-Learned Post-Entry Loss-Centroid Scratch Evaluation (Bar +1 .. Bar +3)
+            // Phase 14 Unified Post-Entry Loss-Centroid Scratch Evaluation (`Bar +1 / Bar +2`)
             let mut ai_scratch_exit = false;
-            if (1..=3).contains(&bars_since_open)
+            if (1..=2).contains(&bars_since_open)
                 && pos.current_r_multiple < -0.08
                 && !target_hit
                 && !stop_hit
@@ -2007,15 +2053,17 @@ impl RealTimeLedgerEngine {
                     .get_era1_brain_calibration(pos.brain_id)
                     .map(|c| c.era1_learned_scratch_posterior_threshold)
                     .unwrap_or(0.58);
-                if let Some((posterior_prob, _d_loss, _d_win)) = self
-                    .evaluate_causal_mahalanobis_loss_affinity(
+                if self
+                    .precedent_knn
+                    .evaluate_causal_post_entry_scratch(
                         pos.brain_id,
+                        &pos.symbol,
                         pos.direction,
                         pos.opened_timestamp_ns,
                         &live_x32,
-                        pos.current_r_multiple,
+                        era1_scratch_thresh,
                     )
-                    && posterior_prob >= era1_scratch_thresh
+                    .is_some()
                     && *self.enforce_hard_scratch_on_baseline.read()
                 {
                     ai_scratch_exit = true;
@@ -2153,8 +2201,18 @@ impl RealTimeLedgerEngine {
         let bar1_record = pos
             .entry_bars
             .get(entry_idx + 1)
-            .or_else(|| pos.entry_bars.get(entry_idx))
-            .copied();
+            .and_then(|b1| {
+                let b1_adverse = match pos.direction {
+                    TradeDirection::Long => b1.close < pos.entry_price,
+                    TradeDirection::Short => b1.close > pos.entry_price,
+                };
+                if b1_adverse {
+                    Some(*b1)
+                } else {
+                    pos.entry_bars.get(entry_idx + 2).copied().or(Some(*b1))
+                }
+            })
+            .or_else(|| pos.entry_bars.get(entry_idx).copied());
         let post_entry_bar1_features_32 = if let Some(ref b1) = bar1_record {
             Self::extract_post_entry_bar_features_32(&pos, b1)
         } else if pos.entry_embedding_128.len() >= 32 {
@@ -2257,6 +2315,7 @@ impl RealTimeLedgerEngine {
 
         self.populate_causal_adaptive_outcome_for_row(&mut row);
         self.closed_ledger.write().push(row.clone());
+        self.sync_closed_row_to_precedent_knn(&row);
 
         self.webhook_dispatcher
             .record_lifecycle_event(WebhookEventPayload {
@@ -2291,7 +2350,7 @@ impl RealTimeLedgerEngine {
         row
     }
 
-    /// Extracts the live 32-feature state vector $X_t$ on a post-entry bar (`Bar +1 .. Bar +3`),
+    /// Extracts the live 32-feature state vector $X_t$ on a post-entry bar (`Bar +1 .. Bar +2`),
     /// updating Stream-1 candle physics (`s1_log_ret_close`, `s1_log_open_gap`, `s1_log_hl_range`,
     /// `s1_body_conviction`, `s1_upper_wick_ratio`, `s1_lower_wick_ratio`, `s1_vol_surge_log`)
     /// relative to `pos.entry_price` and the causal pre-entry bar distribution.
@@ -2299,22 +2358,40 @@ impl RealTimeLedgerEngine {
         pos: &OpenPositionRow,
         bar: &RawBarRecord,
     ) -> Vec<f32> {
-        let mut x32 = if pos.entry_embedding_128.len() >= 32 {
-            pos.entry_embedding_128[0..32].to_vec()
+        Self::extract_post_entry_bar_features_from_parts(
+            &pos.entry_embedding_128,
+            pos.entry_price,
+            pos.direction,
+            &pos.entry_bars,
+            pos.entry_bar_idx,
+            bar,
+        )
+    }
+
+    pub fn extract_post_entry_bar_features_from_parts(
+        entry_embedding_128: &[f32],
+        entry_price: SubPennyPrice,
+        direction: TradeDirection,
+        entry_bars: &[RawBarRecord],
+        entry_bar_idx: usize,
+        bar: &RawBarRecord,
+    ) -> Vec<f32> {
+        let mut x32 = if entry_embedding_128.len() >= 32 {
+            entry_embedding_128[0..32].to_vec()
         } else {
             vec![0.10_f32; 32]
         };
-        let entry_px = pos.entry_price.to_f64().max(0.00001);
+        let entry_px = entry_price.to_f64().max(0.00001);
         let open_px = bar.open.to_f64().max(0.00001);
         let high_px = bar.high.to_f64().max(0.00001);
         let low_px = bar.low.to_f64().max(0.00001);
         let close_px = bar.close.to_f64().max(0.00001);
         let range = (high_px - low_px).max(entry_px * 0.0001);
-        let dir_sign = pos.direction.sign();
+        let dir_sign = direction.sign();
 
-        let entry_idx = pos.entry_bar_idx.min(pos.entry_bars.len().saturating_sub(1));
-        let pre_slice = if !pos.entry_bars.is_empty() {
-            &pos.entry_bars[0..=entry_idx]
+        let entry_idx = entry_bar_idx.min(entry_bars.len().saturating_sub(1));
+        let pre_slice = if !entry_bars.is_empty() {
+            &entry_bars[0..=entry_idx]
         } else {
             &[]
         };
@@ -2345,6 +2422,48 @@ impl RealTimeLedgerEngine {
         x32[5] = lower_wick_ratio as f32;
         x32[7] = vol_surge_log as f32;
         x32
+    }
+
+    /// Synchronizes an audited losing `ClosedTradeRow` into `PrecedentKnnIndex` at $T_{\text{loss\_closed}}$
+    /// so `evaluate_causal_post_entry_scratch` operates identically across live walk-forward and post-settlement reconciliation.
+    pub fn sync_closed_row_to_precedent_knn(&self, row: &ClosedTradeRow) {
+        if !row.is_winner && row.entry_embedding_128.len() >= 32 {
+            let (root_cat, culprit_indices, culprit_signs) =
+                if let Some(ref autopsy) = row.loss_forensic_autopsy {
+                    let mut idx_arr = [0usize; 3];
+                    let mut sign_arr = [1.0_f32; 3];
+                    for (k, c) in autopsy.top_culprit_features.iter().take(3).enumerate() {
+                        idx_arr[k] = c.feature_index.min(31);
+                        sign_arr[k] = if c.loss_value >= 0.0 { 1.0 } else { -1.0 };
+                    }
+                    (
+                        autopsy.root_cause_category.as_str().to_string(),
+                        idx_arr,
+                        sign_arr,
+                    )
+                } else {
+                    (
+                        "HTF_STRUCTURAL_HEADWIND".to_string(),
+                        [0, 1, 2],
+                        [1.0, 1.0, 1.0],
+                    )
+                };
+            self.precedent_knn
+                .insert_hard_negative_trap(HardNegativeTrapRecord {
+                    loss_trade_id: row.trade_id,
+                    brain_id: row.brain_id,
+                    symbol: row.symbol.clone(),
+                    closed_timestamp_ns: row.closed_timestamp_ns,
+                    direction: row.direction,
+                    root_cause_category: root_cat,
+                    embedding_128: row.entry_embedding_128.clone(),
+                    culprit_feature_indices: culprit_indices,
+                    culprit_feature_signs: culprit_signs,
+                    realized_loss_usd: row.net_pnl_usd.abs(),
+                    post_entry_bar1_features_32: row.post_entry_bar1_features_32.clone(),
+                    culprit_anomaly_weights_32: row.culprit_anomaly_weights_32.clone(),
+                });
+        }
     }
 
     /// Evaluates the Culprit-Weighted Mahalanobis / Cosine Loss-Affinity Score:
@@ -2876,63 +2995,113 @@ impl RealTimeLedgerEngine {
                 });
             }
         } else {
-            // Passed pre-entry gate (`sim < 0.880`), caught on Bar +1 / Bar +2 by Post-Entry Loss-Centroid Scratch Exit
-            let cf_r = row
-                .loss_forensic_autopsy
-                .as_ref()
-                .map(|a| a.counterfactual_early_exit_r)
-                .unwrap_or(-0.16)
-                .clamp(-0.24, -0.11);
-            let risk_u = (row.entry_price.scaled_units()
-                - row.initial_structural_stop.scaled_units())
-            .abs()
-            .max(1) as f64;
-            let scratch_offset_u = (risk_u * cf_r.abs()).round() as i64;
-            let scratch_exit_px = match row.direction {
-                TradeDirection::Long => SubPennyPrice::from_scaled_units(
-                    row.entry_price
-                        .scaled_units()
-                        .saturating_sub(scratch_offset_u)
-                        .max(1),
-                )
-                .unwrap_or(row.actual_exit_price),
-                TradeDirection::Short => SubPennyPrice::from_scaled_units(
-                    row.entry_price
-                        .scaled_units()
-                        .saturating_add(scratch_offset_u),
-                )
-                .unwrap_or(row.actual_exit_price),
-            };
+            // Passed pre-entry gate (`sim < 0.880`); evaluate actual causal Bar +1 / Bar +2 post-entry 32-feature
+            // tensor via unified `PrecedentKnnIndex::evaluate_causal_post_entry_scratch` against strictly prior
+            // closed losses (`loss.closed_timestamp_ns < row.opened_timestamp_ns`).
+            let era1_scratch_thresh = self
+                .get_era1_brain_calibration(row.brain_id)
+                .map(|c| c.era1_learned_scratch_posterior_threshold)
+                .unwrap_or(0.58);
+            let entry_idx = row.entry_bar_idx.min(row.entry_bars.len().saturating_sub(1));
+            let mut matched_scratch: Option<(usize, PostEntryScratchDiagnostic)> = None;
+            for offset in 1..=2 {
+                let candidate_x32 = if let Some(bar) = row.entry_bars.get(entry_idx + offset) {
+                    Self::extract_post_entry_bar_features_from_parts(
+                        &row.entry_embedding_128,
+                        row.entry_price,
+                        row.direction,
+                        &row.entry_bars,
+                        entry_idx,
+                        bar,
+                    )
+                } else if offset == 1 && row.post_entry_bar1_features_32.len() >= 32 {
+                    row.post_entry_bar1_features_32.clone()
+                } else {
+                    continue;
+                };
+                if let Some(diag) = self.precedent_knn.evaluate_causal_post_entry_scratch(
+                    row.brain_id,
+                    &row.symbol,
+                    row.direction,
+                    row.opened_timestamp_ns,
+                    &candidate_x32,
+                    era1_scratch_thresh,
+                ) {
+                    matched_scratch = Some((offset, diag));
+                    break;
+                }
+            }
 
-            let base_r_abs = row.realized_r_multiple.abs().max(0.35);
-            let loss_retain_fraction = (cf_r.abs() / base_r_abs).clamp(0.12, 0.28);
-            let scratched_net_pnl =
-                -((row.net_pnl_usd.abs() * loss_retain_fraction * 100.0).round() / 100.0);
-            let scratched_kelly_pnl =
-                -((row.kelly_net_pnl_usd.abs() * loss_retain_fraction * 100.0).round() / 100.0);
-            let saved_usd =
-                ((row.net_pnl_usd.abs() - scratched_net_pnl.abs()).max(0.0) * 100.0).round()
+            if let Some((scratch_offset, scratch_diag)) = matched_scratch {
+                let cf_r = row
+                    .loss_forensic_autopsy
+                    .as_ref()
+                    .map(|a| a.counterfactual_early_exit_r)
+                    .unwrap_or(-0.16)
+                    .clamp(-0.24, -0.11);
+                let risk_u = (row.entry_price.scaled_units()
+                    - row.initial_structural_stop.scaled_units())
+                .abs()
+                .max(1) as f64;
+                let scratch_offset_u = (risk_u * cf_r.abs()).round() as i64;
+                let scratch_exit_px = match row.direction {
+                    TradeDirection::Long => SubPennyPrice::from_scaled_units(
+                        row.entry_price
+                            .scaled_units()
+                            .saturating_sub(scratch_offset_u)
+                            .max(1),
+                    )
+                    .unwrap_or(row.actual_exit_price),
+                    TradeDirection::Short => SubPennyPrice::from_scaled_units(
+                        row.entry_price
+                            .scaled_units()
+                            .saturating_add(scratch_offset_u),
+                    )
+                    .unwrap_or(row.actual_exit_price),
+                };
+
+                let base_r_abs = row.realized_r_multiple.abs().max(0.35);
+                let loss_retain_fraction = (cf_r.abs() / base_r_abs).clamp(0.12, 0.28);
+                let scratched_net_pnl =
+                    -((row.net_pnl_usd.abs() * loss_retain_fraction * 100.0).round() / 100.0);
+                let scratched_kelly_pnl =
+                    -((row.kelly_net_pnl_usd.abs() * loss_retain_fraction * 100.0).round() / 100.0);
+                let saved_usd =
+                    ((row.net_pnl_usd.abs() - scratched_net_pnl.abs()).max(0.0) * 100.0).round()
+                        / 100.0;
+                let saved_kelly_usd = ((row.kelly_net_pnl_usd.abs() - scratched_kelly_pnl.abs())
+                    .max(0.0)
+                    * 100.0)
+                    .round()
                     / 100.0;
-            let saved_kelly_usd = ((row.kelly_net_pnl_usd.abs() - scratched_kelly_pnl.abs())
-                .max(0.0)
-                * 100.0)
-                .round()
-                / 100.0;
 
-            row.was_vetoed_by_loss_autopsy = false;
-            row.vetoed_by_loss_trade_id = Some(best_loss_id);
-            row.was_scratched_by_loss_autopsy = true;
-            row.scratch_bar_offset = 1;
-            row.adaptive_outcome_badge =
-                ClosedOutcomeBadge::AiLossAutopsyScratchExit.as_str().to_string();
-            row.adaptive_exit_price = scratch_exit_px;
-            row.adaptive_scratch_exit_r = (cf_r * 100.0).round() / 100.0;
-            row.adaptive_net_pnl_usd = scratched_net_pnl;
-            row.adaptive_kelly_net_pnl_usd = scratched_kelly_pnl;
-            row.adaptive_loss_saved_usd = saved_usd;
-            row.adaptive_kelly_loss_saved_usd = saved_kelly_usd;
-            row.loss_affinity_posterior_pct =
-                ((0.64 + 0.28 * best_sim) * 100.0).clamp(62.0, 94.5).round();
+                row.was_vetoed_by_loss_autopsy = false;
+                row.vetoed_by_loss_trade_id = Some(best_loss_id);
+                row.was_scratched_by_loss_autopsy = true;
+                row.scratch_bar_offset = scratch_offset;
+                row.adaptive_outcome_badge =
+                    ClosedOutcomeBadge::AiLossAutopsyScratchExit.as_str().to_string();
+                row.adaptive_exit_price = scratch_exit_px;
+                row.adaptive_scratch_exit_r = (cf_r * 100.0).round() / 100.0;
+                row.adaptive_net_pnl_usd = scratched_net_pnl;
+                row.adaptive_kelly_net_pnl_usd = scratched_kelly_pnl;
+                row.adaptive_loss_saved_usd = saved_usd;
+                row.adaptive_kelly_loss_saved_usd = saved_kelly_usd;
+                row.loss_affinity_posterior_pct = scratch_diag.loss_affinity_posterior_pct;
+            } else {
+                row.was_vetoed_by_loss_autopsy = false;
+                row.vetoed_by_loss_trade_id = None;
+                row.was_scratched_by_loss_autopsy = false;
+                row.scratch_bar_offset = 0;
+                row.adaptive_outcome_badge = row.outcome_badge.as_str().to_string();
+                row.adaptive_exit_price = row.actual_exit_price;
+                row.adaptive_scratch_exit_r = row.realized_r_multiple;
+                row.adaptive_net_pnl_usd = row.net_pnl_usd;
+                row.adaptive_kelly_net_pnl_usd = row.kelly_net_pnl_usd;
+                row.adaptive_loss_saved_usd = 0.0;
+                row.adaptive_kelly_loss_saved_usd = 0.0;
+                row.loss_affinity_posterior_pct = (era1_scratch_thresh * 100.0 - 6.0).clamp(40.0, 56.0);
+            }
         }
     }
 
@@ -2943,6 +3112,10 @@ impl RealTimeLedgerEngine {
         let mut closed = self.closed_ledger.write();
         self.vetoed_repeat_traps.write().clear();
         let snapshot = closed.clone();
+
+        for r in &snapshot {
+            self.sync_closed_row_to_precedent_knn(r);
+        }
 
         // Sort indices by opened_timestamp_ns for deterministic audit logging
         let mut indices: Vec<usize> = (0..closed.len()).collect();
@@ -4150,10 +4323,14 @@ impl RealTimeLedgerEngine {
         }
     }
 
-    /// Saves the current `positions_opened`, `closed_ledger`, `era1_calibrations`, `vetoed_repeat_traps`, and `webhook_outbox` state to disk as JSON.
+    /// Saves the current `positions_opened`, `closed_ledger`, `era1_calibrations`, `era1_symbol_median_stops`, `vetoed_repeat_traps`, and `webhook_outbox` state to disk as JSON.
     pub fn save_to_disk(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        let mut serialized_median_stops = BTreeMap::new();
+        for ((sym, brain), val) in self.era1_symbol_median_stops.read().iter() {
+            serialized_median_stops.insert(format!("{}::{}", sym.to_uppercase(), brain.as_str()), *val);
         }
         let payload = PersistedLedgerState {
             positions_opened: self.positions_opened.read().clone(),
@@ -4162,6 +4339,7 @@ impl RealTimeLedgerEngine {
             autopsy_runs_count: *self.autopsy_runs_count.read(),
             last_autopsy_iso: self.last_autopsy_iso.read().clone(),
             era1_calibrations: self.ordered_era1_calibrations(),
+            era1_symbol_median_stops: serialized_median_stops,
             vetoed_repeat_traps: self.vetoed_repeat_traps.read().clone(),
             webhook_config: self.webhook_dispatcher.get_config(),
             webhook_outbox: self.webhook_dispatcher.export_outbox(),
@@ -4170,7 +4348,7 @@ impl RealTimeLedgerEngine {
         std::fs::write(path, bytes)
     }
 
-    /// Restores `positions_opened`, `closed_ledger`, `era1_calibrations`, `vetoed_repeat_traps`, and `webhook_outbox` from disk if present and non-empty.
+    /// Restores `positions_opened`, `closed_ledger`, `era1_calibrations`, `era1_symbol_median_stops`, `vetoed_repeat_traps`, and `webhook_outbox` from disk if present and non-empty.
     pub fn load_from_disk(&self, path: &std::path::Path) -> bool {
         let Ok(bytes) = std::fs::read(path) else {
             return false;
@@ -4178,7 +4356,10 @@ impl RealTimeLedgerEngine {
         let Ok(parsed) = serde_json::from_slice::<PersistedLedgerState>(&bytes) else {
             return false;
         };
-        if parsed.positions_opened.is_empty() && parsed.closed_ledger.is_empty() {
+        if parsed.positions_opened.is_empty()
+            && parsed.closed_ledger.is_empty()
+            && parsed.era1_symbol_median_stops.is_empty()
+        {
             return false;
         }
         *self.positions_opened.write() = parsed.positions_opened;
@@ -4192,9 +4373,26 @@ impl RealTimeLedgerEngine {
                 cal_map.insert(p.brain_id, p);
             }
         }
+        if !parsed.era1_symbol_median_stops.is_empty() {
+            let mut stop_map = self.era1_symbol_median_stops.write();
+            stop_map.clear();
+            for (key, val) in parsed.era1_symbol_median_stops {
+                if let Some((sym, brain_str)) = key.split_once("::")
+                    && let Some(brain_id) = BrainHorizonId::from_str_code(brain_str)
+                {
+                    stop_map.insert((sym.to_uppercase(), brain_id), val);
+                }
+            }
+        }
         *self.vetoed_repeat_traps.write() = parsed.vetoed_repeat_traps;
         self.webhook_dispatcher
             .restore_state(parsed.webhook_config, parsed.webhook_outbox);
+        {
+            let closed_snap = self.closed_ledger.read().clone();
+            for r in &closed_snap {
+                self.sync_closed_row_to_precedent_knn(r);
+            }
+        }
         let needs_reconcile = self
             .closed_ledger
             .read()
@@ -4208,18 +4406,20 @@ impl RealTimeLedgerEngine {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedLedgerState {
-    positions_opened: Vec<OpenPositionRow>,
-    closed_ledger: Vec<ClosedTradeRow>,
-    running_net_profit_usd: f64,
-    autopsy_runs_count: u64,
-    last_autopsy_iso: String,
+pub struct PersistedLedgerState {
+    pub positions_opened: Vec<OpenPositionRow>,
+    pub closed_ledger: Vec<ClosedTradeRow>,
+    pub running_net_profit_usd: f64,
+    pub autopsy_runs_count: u64,
+    pub last_autopsy_iso: String,
     #[serde(default)]
-    era1_calibrations: Vec<Era1BrainCalibrationProfile>,
+    pub era1_calibrations: Vec<Era1BrainCalibrationProfile>,
     #[serde(default)]
-    vetoed_repeat_traps: Vec<VetoedTrapAuditRecord>,
+    pub era1_symbol_median_stops: BTreeMap<String, f64>,
     #[serde(default)]
-    webhook_config: WebhookChannelConfig,
+    pub vetoed_repeat_traps: Vec<VetoedTrapAuditRecord>,
     #[serde(default)]
-    webhook_outbox: Vec<WebhookDispatchRecord>,
+    pub webhook_config: WebhookChannelConfig,
+    #[serde(default)]
+    pub webhook_outbox: Vec<WebhookDispatchRecord>,
 }

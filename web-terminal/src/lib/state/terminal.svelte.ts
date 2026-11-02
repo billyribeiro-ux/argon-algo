@@ -1,8 +1,8 @@
 /**
  * Svelte 5 Runes Reactive Store for the ARGON-4 Multi-Brain Command Terminal.
  *
- * Connected 100% end-to-end to the Rust `live-execution-server` (`http://127.0.0.1:8080`)
- * and `ws://127.0.0.1:8080/ws/v1/stream` powered by `YahooFinanceLiveAdapter`.
+ * Connected 100% end-to-end to the Rust `live-execution-server` (`http://127.0.0.1:8090`)
+ * and `ws://127.0.0.1:8090/ws/v1/stream` powered by `YahooFinanceLiveAdapter`.
  * Zero synthetic default trades or charts.
  */
 
@@ -485,8 +485,8 @@ export interface WebhookStatusPayload {
   outboxRecords: WebhookDispatchRecordEntry[];
 }
 
-const API_BASE = 'http://127.0.0.1:8080';
-const WS_URL = 'ws://127.0.0.1:8080/ws/v1/stream';
+const API_BASE: string = import.meta.env.VITE_ARGON_API_BASE ?? 'http://127.0.0.1:8090';
+const WS_URL: string = import.meta.env.VITE_ARGON_WS_URL ?? 'ws://127.0.0.1:8090/ws/v1/stream';
 
 /**
  * Formats any asset price from `$0.00001` sub-penny up to `$10,000.00+` with exact tabular precision.
@@ -1003,7 +1003,15 @@ export class TerminalStore {
           : r.realizedStockPnlUsd;
       const effectiveR =
         useImmunity && r.wasScratchedByLossAutopsy ? r.adaptiveScratchExitR : r.realizedRMultiple;
-      const effectiveCombined = effectiveStockPnl + r.realizedOptionPnlUsd;
+      const optionScratchScale =
+        useImmunity && r.wasScratchedByLossAutopsy && Math.abs(r.realizedRMultiple) > 1e-6
+          ? Math.min(1, Math.abs(r.adaptiveScratchExitR) / Math.abs(r.realizedRMultiple))
+          : 1;
+      const effectiveOptionPnl =
+        useImmunity && r.wasVetoedByLossAutopsy
+          ? 0
+          : Math.round(r.realizedOptionPnlUsd * optionScratchScale * 100) / 100;
+      const effectiveCombined = effectiveStockPnl + effectiveOptionPnl;
 
       if (r.isWinner) {
         totalWins++;
@@ -1015,7 +1023,7 @@ export class TerminalStore {
       }
       sumR += effectiveR;
       stockPnl += effectiveStockPnl;
-      optionPnl += r.realizedOptionPnlUsd;
+      optionPnl += effectiveOptionPnl;
       combinedPnl += effectiveCombined;
       sumHoldMs += r.holdDurationMs;
 
@@ -1077,7 +1085,12 @@ export class TerminalStore {
           : r.realizedStockPnlUsd;
       const effectiveR =
         useImmunity && r.wasScratchedByLossAutopsy ? r.adaptiveScratchExitR : r.realizedRMultiple;
-      cumUsd += effectiveStockPnl + r.realizedOptionPnlUsd;
+      const optionScratchScale =
+        useImmunity && r.wasScratchedByLossAutopsy && Math.abs(r.realizedRMultiple) > 1e-6
+          ? Math.min(1, Math.abs(r.adaptiveScratchExitR) / Math.abs(r.realizedRMultiple))
+          : 1;
+      const effectiveOptionPnl = Math.round(r.realizedOptionPnlUsd * optionScratchScale * 100) / 100;
+      cumUsd += effectiveStockPnl + effectiveOptionPnl;
       cumR += effectiveR;
       return {
         step: idx + 1,

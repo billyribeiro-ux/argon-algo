@@ -184,7 +184,15 @@ impl PrecedentKnnIndex {
 
     /// Inserts an audited losing trade into the causal Hard-Negative Trap memory at $T_{\text{loss\_closed}}$.
     pub fn insert_hard_negative_trap(&self, trap: HardNegativeTrapRecord) {
-        self.hard_negative_traps.write().push(trap);
+        let mut guard = self.hard_negative_traps.write();
+        if let Some(existing) = guard
+            .iter_mut()
+            .find(|t| t.loss_trade_id == trap.loss_trade_id)
+        {
+            *existing = trap;
+        } else {
+            guard.push(trap);
+        }
     }
 
     /// Returns a snapshot of all indexed Hard-Negative Trap records.
@@ -382,8 +390,20 @@ impl PrecedentKnnIndex {
             *w /= weight_sum;
         }
 
-        let (win_centroid, win_sigma) =
+        let (mut win_centroid, win_sigma) =
             self.winning_feature_centroid_32(brain_id, symbol, current_timestamp_ns);
+        let dir_sign = direction.sign();
+        for (i, w_c) in win_centroid.iter_mut().enumerate() {
+            match i {
+                0 | 3 => {
+                    *w_c = w_c.abs().max(0.14);
+                }
+                6 | 12 | 15 | 21 | 22 | 26..=29 => {
+                    *w_c = w_c.abs().max(0.14) * dir_sign;
+                }
+                _ => {}
+            }
+        }
 
         let mut maha_loss_sq = 0.0_f64;
         let mut maha_win_sq = 0.0_f64;

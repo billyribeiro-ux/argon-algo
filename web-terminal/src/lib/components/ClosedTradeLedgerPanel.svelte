@@ -356,10 +356,22 @@
               : useImmunity && row.wasVetoedByLossAutopsy
                 ? 0
                 : row.realizedRMultiple}
+          {@const rowOptionScratchScale =
+            useImmunity && row.wasScratchedByLossAutopsy && Math.abs(row.realizedRMultiple) > 1e-6
+              ? Math.min(1, Math.abs(row.adaptiveScratchExitR) / Math.abs(row.realizedRMultiple))
+              : 1}
+          {@const rowEffectiveOptionPnl =
+            useImmunity && row.wasVetoedByLossAutopsy
+              ? 0
+              : Math.round(row.realizedOptionPnlUsd * rowOptionScratchScale * 100) / 100}
+          {@const rowEffectiveOptionPct =
+            useImmunity && row.wasVetoedByLossAutopsy
+              ? 0
+              : Math.round(row.realizedOptionPnlPct * rowOptionScratchScale * 100) / 100}
           {@const rowCombinedPnl =
             useImmunity && row.wasVetoedByLossAutopsy
               ? 0
-              : rowStockPnl + row.realizedOptionPnlUsd}
+              : rowStockPnl + rowEffectiveOptionPnl}
           <tr
             data-selected={terminalStore.activeReplayTrade?.tradeId === row.tradeId || terminalStore.selectedTicker === row.symbol}
             onclick={() => terminalStore.selectClosedTradeForReplay(row)}
@@ -444,9 +456,9 @@
                 N/A
               {/if}
             </td>
-            <td data-numeric="true" class={row.realizedOptionPnlUsd >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+            <td data-numeric="true" class={rowEffectiveOptionPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
               {#if row.optionContractsCount > 0}
-                {formatSignedUsd(row.realizedOptionPnlUsd)} ({formatSignedPct(row.realizedOptionPnlPct)})
+                {formatSignedUsd(rowEffectiveOptionPnl)} ({formatSignedPct(rowEffectiveOptionPct)})
               {:else}
                 $0.00
               {/if}

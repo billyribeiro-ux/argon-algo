@@ -288,6 +288,12 @@ mod tests {
             .run_real_yahoo_walk_forward_backfill()
             .await
             .expect("Real Yahoo walk-forward backfill succeeds");
+        if Path::new("../../data").exists() {
+            state
+                .ledger
+                .save_to_disk(Path::new("../../data/ledger_state.json"))
+                .expect("save updated Phase 14 ledger_state.json to disk");
+        }
 
         assert!(
             !snap.positions_opened.is_empty(),
@@ -612,5 +618,49 @@ mod tests {
             snap.scoreboard.adaptive_total_loss_saved_usd,
             snap.scoreboard.adaptive_kelly_total_loss_saved_usd,
         );
+    }
+
+    #[test]
+    fn test_persisted_ledger_state_preserves_era1_symbol_median_stops_bit_for_bit() {
+        let engine = RealTimeLedgerEngine::new();
+        let test_pairs = [
+            ("PLUG", BrainHorizonId::Brain01PennyAnomaly, 0.0184321987_f64),
+            ("CLOV", BrainHorizonId::Brain01PennyAnomaly, 0.0142510923_f64),
+            ("NVDA", BrainHorizonId::Brain02IntradayDayTrade, 0.0081245671_f64),
+            ("PLTR", BrainHorizonId::Brain03ShortTermSwing, 0.0285419283_f64),
+            ("MSTR", BrainHorizonId::Brain03ShortTermSwing, 0.0412893401_f64),
+            ("AAPL", BrainHorizonId::Brain04CoreSwing, 0.0361928374_f64),
+            ("SPY", BrainHorizonId::Brain05LongTermWealth, 0.0478912345_f64),
+        ];
+        for (sym, brain, val) in test_pairs {
+            engine.set_era1_symbol_median_stop_pct(sym, brain, val);
+        }
+
+        let tmp_path = std::env::temp_dir().join(format!(
+            "argon_phase14_median_stops_test_{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        engine
+            .save_to_disk(&tmp_path)
+            .expect("save PersistedLedgerState to temporary JSON");
+
+        let reloaded = RealTimeLedgerEngine::new();
+        assert!(
+            reloaded.load_from_disk(&tmp_path),
+            "load_from_disk should succeed for non-empty era1_symbol_median_stops"
+        );
+        let _ = std::fs::remove_file(&tmp_path);
+
+        for (sym, brain, expected) in test_pairs {
+            let actual = reloaded
+                .get_era1_symbol_median_stop_pct(sym, brain)
+                .expect("restored symbol median stop must exist");
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "Bit-for-bit mismatch for ({sym}, {}): got {actual}, expected {expected}",
+                brain.as_str()
+            );
+        }
     }
 }

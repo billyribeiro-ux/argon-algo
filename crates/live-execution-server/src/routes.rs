@@ -410,7 +410,10 @@ impl AppState {
         );
 
         let (ws_tx, _) = broadcast::channel(512);
-        let ledger = Arc::new(RealTimeLedgerEngine::new());
+        let precedent_knn = Arc::new(PrecedentKnnIndex::new_preseeded());
+        let ledger = Arc::new(RealTimeLedgerEngine::with_precedent_knn(
+            precedent_knn.clone(),
+        ));
 
         Self {
             data_bus,
@@ -418,7 +421,7 @@ impl AppState {
             scanner_funnel: Arc::new(TwoStageMarketFunnel::new()),
             scanner_candidates: Arc::new(RwLock::new(Vec::new())),
             onnx_engine: Arc::new(OnnxMultiBrainEngine::new(models_dir)),
-            precedent_knn: Arc::new(PrecedentKnnIndex::new_preseeded()),
+            precedent_knn,
             ledger,
             ws_tx,
         }
@@ -608,9 +611,9 @@ impl AppState {
         // 2. Fast Parallel Disk-Cache Hydration with Token-Bucket Pacing
         let mut prefetch_reqs: Vec<(String, Timeframe, usize)> = Vec::new();
         for (symbol, brain_id, tf, _) in walk_forward_plan {
-            prefetch_reqs.push((symbol.to_string(), tf, 900));
+            prefetch_reqs.push((symbol.to_string(), tf, 1500));
             if brain_id == BrainHorizonId::Brain01PennyAnomaly {
-                prefetch_reqs.push((symbol.to_string(), Timeframe::M15, 750));
+                prefetch_reqs.push((symbol.to_string(), Timeframe::M15, 1500));
             } else if brain_id == BrainHorizonId::Brain03ShortTermSwing {
                 prefetch_reqs.push((symbol.to_string(), Timeframe::D1, 750));
             }
@@ -723,7 +726,7 @@ impl AppState {
     ) -> Result<CustomBacktestSummaryResponse, String> {
         let fetched_bars = self
             .yahoo_adapter
-            .fetch_historical_bars(symbol, tf, 900)
+            .fetch_historical_bars(symbol, tf, 1500)
             .await
             .map_err(|e| e.to_string())?;
         if fetched_bars.len() < 32 {
@@ -735,17 +738,26 @@ impl AppState {
         }
 
         // Anchor historical window `[anchor_start..settled_total]` strictly to settled sessions
-        // prior to the latest UTC day so appending new intraday bars during open market hours
-        // (`09:30-16:00 EDT`) never shifts historical indices `0..settled_window_len` or `calibration_end`.
+        // prior to the canonical settled cutoff (`1_793_318_400_000_000_000`) or latest UTC day so
+        // appending new intraday bars during live Yahoo refreshes never shifts `0..settled_window_len`.
         let last_ts_ns = fetched_bars.last().map(|b| b.timestamp_ns).unwrap_or(0);
         let latest_utc_day_start_ns = (last_ts_ns / 86_400_000_000_000) * 86_400_000_000_000;
+        let canonical_settled_cutoff_ns = latest_utc_day_start_ns.min(1_793_318_400_000_000_000);
         let is_intraday_tf = matches!(tf, Timeframe::M5 | Timeframe::M15 | Timeframe::H1);
         let settled_total = if is_intraday_tf {
-            let c = fetched_bars
+            let c_canon = fetched_bars
                 .iter()
-                .take_while(|b| b.timestamp_ns < latest_utc_day_start_ns)
+                .take_while(|b| b.timestamp_ns < canonical_settled_cutoff_ns)
                 .count();
-            if c >= 64 { c } else { fetched_bars.len() }
+            if c_canon >= 750 {
+                c_canon
+            } else {
+                let c = fetched_bars
+                    .iter()
+                    .take_while(|b| b.timestamp_ns < latest_utc_day_start_ns)
+                    .count();
+                if c >= 64 { c } else { fetched_bars.len() }
+            }
         } else {
             fetched_bars.len()
         };
@@ -762,7 +774,7 @@ impl AppState {
         // Fix 2: Load real 15m higher-timeframe series for BRAIN-01 Penny Anomaly causal confluence
         let raw_m15_bars: Vec<RawBarRecord> = if brain_id == BrainHorizonId::Brain01PennyAnomaly {
             self.yahoo_adapter
-                .fetch_historical_bars(symbol, Timeframe::M15, 750)
+                .fetch_historical_bars(symbol, Timeframe::M15, 1500)
                 .await
                 .map(|bars| bars.iter().map(|b| b.to_raw_bar_record()).collect())
                 .unwrap_or_default()
@@ -1495,13 +1507,43 @@ impl AppState {
                         });
                     }
 
+                    // Phase 14 Fix 4: Causal Rolling Re-Calibration on consecutive symbol losses (`t > T_loss_closed`)
+                    let (consec_sym_losses, last_loss_ts_ns) = self
+                        .ledger
+                        .causal_consecutive_losses_for_symbol(
+                            symbol,
+                            brain_id,
+                            raw_bars[t].timestamp_ns,
+                        );
+                    let bars_since_last_loss = if last_loss_ts_ns > 0 {
+                        ((raw_bars[t].timestamp_ns - last_loss_ts_ns) / tf_step_ns.max(1)).max(0)
+                    } else {
+                        i64::MAX
+                    };
+                    let rolling_conf_penalty = if is_penny_brain
+                        && consec_sym_losses >= 2
+                        && bars_since_last_loss <= 76
+                    {
+                        let strict_htf_trend = match inference.signal.direction {
+                            raw_fingerprint_core::TradeDirection::Long => {
+                                anchor10_px >= anchor24_px && anchor24_px >= anchor64_px * 1.002
+                            }
+                            raw_fingerprint_core::TradeDirection::Short => {
+                                anchor10_px <= anchor24_px && anchor24_px <= anchor64_px * 0.998
+                            }
+                        };
+                        if strict_htf_trend { 2.5 } else { 6.5 }
+                    } else {
+                        0.0
+                    };
+
                     // Upgrade 2: Evaluate ENGINE-A (`STRUCTURED_HYBRID_CHAMPION`) and ENGINE-B (`PURE_ML_SELF_LEARNED`)
                     let engine_a_fires = causal_impulse_aligned
                         && causal_m15_confluence_ok
                         && causal_d1_swing_confluence_ok
                         && precedents.win_rate_pct >= cal_profile.min_precedent_win_rate_pct
                         && inference.signal.ai_confidence_pct
-                            >= cal_profile.calibrated_confidence_floor
+                            >= (cal_profile.calibrated_confidence_floor + rolling_conf_penalty)
                         && inference.signal.expected_r_multiple
                             >= cal_profile.min_expected_r_multiple;
 

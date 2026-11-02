@@ -37,6 +37,7 @@ export type ClosedOutcomeType =
   | 'TARGET HIT'
   | 'STOPPED OUT'
   | 'AI DYNAMIC EXIT'
+  | 'AI LOSS-AUTOPSY SCRATCH EXIT'
   | 'TRAILING STOP'
   | 'TIME EXPIRED';
 
@@ -62,6 +63,7 @@ export type StrategyArchetypeId =
   | 'PURE_ML_LATENT_ANOMALY';
 
 export type SizingModeId = 'FIXED_10K_BASELINE' | 'FRACTIONAL_KELLY';
+export type ImmunityModeId = 'BASELINE_ALL_TRADES' | 'ACTIVE_LOSS_IMMUNITY';
 
 export interface FeatureCulpritEntry {
   featureIndex: number;
@@ -107,6 +109,17 @@ export interface StrategyLeaderboardRow {
   realizedStockNetPnlUsd: number;
   realizedOptionNetPnlUsd: number;
   kellyRealizedNetPnlUsd: number;
+  kellyProfitFactor: number;
+  adaptiveTotalTrades: number;
+  adaptiveWins: number;
+  adaptiveLosses: number;
+  adaptiveVetoedLosses: number;
+  adaptiveScratchedLosses: number;
+  adaptiveWinRatePct: number;
+  adaptiveProfitFactor: number;
+  adaptiveRealizedNetPnlUsd: number;
+  adaptiveKellyNetPnlUsd: number;
+  adaptiveLossAvoidedUsd: number;
 }
 
 export interface EngineBreakdownRow {
@@ -122,6 +135,17 @@ export interface EngineBreakdownRow {
   realizedStockNetPnlUsd: number;
   realizedOptionNetPnlUsd: number;
   kellyRealizedNetPnlUsd: number;
+  kellyProfitFactor: number;
+  adaptiveTotalTrades: number;
+  adaptiveWins: number;
+  adaptiveLosses: number;
+  adaptiveVetoedLosses: number;
+  adaptiveScratchedLosses: number;
+  adaptiveWinRatePct: number;
+  adaptiveProfitFactor: number;
+  adaptiveRealizedNetPnlUsd: number;
+  adaptiveKellyNetPnlUsd: number;
+  adaptiveLossAvoidedUsd: number;
 }
 
 export type QuickFilterPillId =
@@ -311,6 +335,19 @@ export interface ClosedTradeLedgerItem {
   autopsyRootCauseCode: string;
   lossForensicAutopsy: LossForensicAutopsyEntry | null;
   entryBars: RawBarCandle[];
+  wasVetoedByLossAutopsy: boolean;
+  vetoedByLossTradeId: string | null;
+  entryTrapSimilarityScore: number;
+  wasScratchedByLossAutopsy: boolean;
+  scratchBarOffset: number;
+  adaptiveOutcomeBadge: string;
+  adaptiveExitPrice: number;
+  adaptiveScratchExitR: number;
+  adaptiveNetPnlUsd: number;
+  adaptiveKellyNetPnlUsd: number;
+  adaptiveLossSavedUsd: number;
+  adaptiveKellyLossSavedUsd: number;
+  lossAffinityPosteriorPct: number;
 }
 
 export interface ProviderStatusEntry {
@@ -364,6 +401,8 @@ export interface Era1BrainCalibrationEntry {
   era1CalibratedProfitFactor: number;
   era1LearnedMinDisplacementPct: number;
   era1LearnedMaxDisplacementPct: number;
+  era1MedianStopPct: number;
+  era1LearnedScratchPosteriorThreshold: number;
 }
 
 export interface BrainEvolutionStatusPayload {
@@ -555,6 +594,8 @@ function mapBackendTraceHealth(badge: string): TraceHealthBadge {
 function mapBackendOutcome(badge: string): ClosedOutcomeType {
   const b = String(badge).toUpperCase();
   if (b.includes('TARGET HIT')) return 'TARGET HIT';
+  if (b.includes('SCRATCH EXIT') || b.includes('LOSS-AUTOPSY SCRATCH'))
+    return 'AI LOSS-AUTOPSY SCRATCH EXIT';
   if (b.includes('DYNAMIC EXIT')) return 'AI DYNAMIC EXIT';
   if (b.includes('TRAILING STOP')) return 'TRAILING STOP';
   if (b.includes('STOPPED OUT')) return 'STOPPED OUT';
@@ -628,6 +669,7 @@ export class TerminalStore {
   evolutionStatus = $state<BrainEvolutionStatusPayload | null>(null);
   activeReplayTrade = $state<ClosedTradeLedgerItem | null>(null);
   sizingMode = $state<SizingModeId>('FIXED_10K_BASELINE');
+  immunityMode = $state<ImmunityModeId>('BASELINE_ALL_TRADES');
   byStrategyLeaderboard = $state<StrategyLeaderboardRow[]>([]);
   byEngineBreakdown = $state<EngineBreakdownRow[]>([]);
   webhookStatus = $state<WebhookStatusPayload>({
@@ -893,8 +935,9 @@ export class TerminalStore {
   scorecardKpis = $derived.by(() => {
     const rows = this.filteredLedger;
     const useKelly = this.sizingMode === 'FRACTIONAL_KELLY';
-    const totalClosed = rows.length;
-    if (totalClosed === 0) {
+    const useImmunity = this.immunityMode === 'ACTIVE_LOSS_IMMUNITY';
+    const rawCount = rows.length;
+    if (rawCount === 0) {
       return {
         totalClosed: 0,
         totalWins: 0,
@@ -908,7 +951,12 @@ export class TerminalStore {
         netRealizedOptionPnlUsd: 0,
         netCombinedPnlUsd: 0,
         maxDrawdownUsd: 0,
-        avgHoldDurationMs: 0
+        avgHoldDurationMs: 0,
+        vetoedLossesCount: 0,
+        scratchedLossesCount: 0,
+        totalLossAvoidedUsd: 0,
+        avgScratchExitR: 0,
+        avgLoserR: 0
       };
     }
 
@@ -917,10 +965,15 @@ export class TerminalStore {
     let grossProfit = 0;
     let grossLoss = 0;
     let sumR = 0;
+    let sumLoserR = 0;
     let stockPnl = 0;
     let optionPnl = 0;
     let combinedPnl = 0;
     let sumHoldMs = 0;
+    let vetoedLossesCount = 0;
+    let scratchedLossesCount = 0;
+    let totalLossAvoidedUsd = 0;
+    let sumScratchR = 0;
 
     let runningEquity = 0;
     let peakEquity = 0;
@@ -928,22 +981,45 @@ export class TerminalStore {
 
     const chronological = [...rows].sort((a, b) => a.closedTimestampMs - b.closedTimestampMs);
     for (const r of chronological) {
-      const effectiveStockPnl = useKelly ? r.kellyRealizedStockPnlUsd : r.realizedStockPnlUsd;
+      const savedUsd = useKelly ? r.adaptiveKellyLossSavedUsd : r.adaptiveLossSavedUsd;
+      if (r.wasVetoedByLossAutopsy) {
+        vetoedLossesCount++;
+        totalLossAvoidedUsd += Math.max(0, savedUsd);
+        if (useImmunity) {
+          continue;
+        }
+      } else if (r.wasScratchedByLossAutopsy) {
+        scratchedLossesCount++;
+        sumScratchR += r.adaptiveScratchExitR;
+        totalLossAvoidedUsd += Math.max(0, savedUsd);
+      }
+
+      const effectiveStockPnl = useImmunity
+        ? useKelly
+          ? r.adaptiveKellyNetPnlUsd
+          : r.adaptiveNetPnlUsd
+        : useKelly
+          ? r.kellyRealizedStockPnlUsd
+          : r.realizedStockPnlUsd;
+      const effectiveR =
+        useImmunity && r.wasScratchedByLossAutopsy ? r.adaptiveScratchExitR : r.realizedRMultiple;
       const effectiveCombined = effectiveStockPnl + r.realizedOptionPnlUsd;
+
       if (r.isWinner) {
         totalWins++;
-        grossProfit += Math.max(0, effectiveCombined);
+        grossProfit += Math.max(0, effectiveStockPnl);
       } else {
         totalLosses++;
-        grossLoss += Math.abs(Math.min(0, effectiveCombined));
+        grossLoss += Math.abs(Math.min(0, effectiveStockPnl));
+        sumLoserR += effectiveR;
       }
-      sumR += r.realizedRMultiple;
+      sumR += effectiveR;
       stockPnl += effectiveStockPnl;
       optionPnl += r.realizedOptionPnlUsd;
       combinedPnl += effectiveCombined;
       sumHoldMs += r.holdDurationMs;
 
-      runningEquity += effectiveCombined;
+      runningEquity += effectiveStockPnl;
       if (runningEquity > peakEquity) {
         peakEquity = runningEquity;
       }
@@ -953,8 +1029,10 @@ export class TerminalStore {
       }
     }
 
-    const winRatePct = (totalWins / totalClosed) * 100;
-    const lossRatePct = (totalLosses / totalClosed) * 100;
+    const totalClosed = Math.max(0, totalWins + totalLosses);
+    const denom = Math.max(1, totalClosed);
+    const winRatePct = totalClosed > 0 ? (totalWins / totalClosed) * 100 : 0;
+    const lossRatePct = totalClosed > 0 ? (totalLosses / totalClosed) * 100 : 0;
     const profitFactor =
       grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 99.99 : 0.0;
 
@@ -965,28 +1043,42 @@ export class TerminalStore {
       winRatePct,
       lossRatePct,
       profitFactor,
-      expectancyR: sumR / totalClosed,
-      expectancyUsd: combinedPnl / totalClosed,
+      expectancyR: sumR / denom,
+      expectancyUsd: combinedPnl / denom,
       netRealizedStockPnlUsd: stockPnl,
       netRealizedOptionPnlUsd: optionPnl,
       netCombinedPnlUsd: combinedPnl,
       maxDrawdownUsd,
-      avgHoldDurationMs: Math.round(sumHoldMs / totalClosed)
+      avgHoldDurationMs: Math.round(sumHoldMs / denom),
+      vetoedLossesCount,
+      scratchedLossesCount,
+      totalLossAvoidedUsd,
+      avgScratchExitR: scratchedLossesCount > 0 ? sumScratchR / scratchedLossesCount : 0,
+      avgLoserR: totalLosses > 0 ? sumLoserR / totalLosses : 0
     };
   });
 
   // Derived Cumulative Equity ($) & Cumulative R Curve
   equityCurve = $derived.by(() => {
     const useKelly = this.sizingMode === 'FRACTIONAL_KELLY';
-    const chronological = [...this.filteredLedger].sort(
-      (a, b) => a.closedTimestampMs - b.closedTimestampMs
-    );
+    const useImmunity = this.immunityMode === 'ACTIVE_LOSS_IMMUNITY';
+    const chronological = [...this.filteredLedger]
+      .filter((r) => !(useImmunity && r.wasVetoedByLossAutopsy))
+      .sort((a, b) => a.closedTimestampMs - b.closedTimestampMs);
     let cumUsd = 0;
     let cumR = 0;
     return chronological.map((r, idx) => {
-      const effectiveStockPnl = useKelly ? r.kellyRealizedStockPnlUsd : r.realizedStockPnlUsd;
+      const effectiveStockPnl = useImmunity
+        ? useKelly
+          ? r.adaptiveKellyNetPnlUsd
+          : r.adaptiveNetPnlUsd
+        : useKelly
+          ? r.kellyRealizedStockPnlUsd
+          : r.realizedStockPnlUsd;
+      const effectiveR =
+        useImmunity && r.wasScratchedByLossAutopsy ? r.adaptiveScratchExitR : r.realizedRMultiple;
       cumUsd += effectiveStockPnl + r.realizedOptionPnlUsd;
-      cumR += r.realizedRMultiple;
+      cumR += effectiveR;
       return {
         step: idx + 1,
         tradeId: r.tradeId,
@@ -1226,7 +1318,11 @@ export class TerminalStore {
             era1CalibratedWinRatePct: Number(c.era1_calibrated_win_rate_pct ?? 72.0),
             era1CalibratedProfitFactor: Number(c.era1_calibrated_profit_factor ?? 1.95),
             era1LearnedMinDisplacementPct: Number(c.era1_learned_min_displacement_pct ?? 0.15),
-            era1LearnedMaxDisplacementPct: Number(c.era1_learned_max_displacement_pct ?? 12.0)
+            era1LearnedMaxDisplacementPct: Number(c.era1_learned_max_displacement_pct ?? 12.0),
+            era1MedianStopPct: Number(c.era1_median_stop_pct ?? 0.015),
+            era1LearnedScratchPosteriorThreshold: Number(
+              c.era1_learned_scratch_posterior_threshold ?? 0.58
+            )
           };
         })
       : [];
@@ -1463,7 +1559,29 @@ export class TerminalStore {
           bestSymbol: String(s.best_symbol ?? ''),
           realizedStockNetPnlUsd: Number(s.realized_stock_net_pnl_usd ?? 0),
           realizedOptionNetPnlUsd: Number(s.realized_option_net_pnl_usd ?? 0),
-          kellyRealizedNetPnlUsd: Number(s.kelly_realized_net_pnl_usd ?? 0)
+          kellyRealizedNetPnlUsd: Number(s.kelly_realized_net_pnl_usd ?? 0),
+          kellyProfitFactor: Number(s.kelly_profit_factor ?? s.profit_factor ?? 0),
+          adaptiveTotalTrades: Number(s.adaptive_total_trades ?? s.total_trades ?? 0),
+          adaptiveWins: Number(s.adaptive_wins ?? s.wins ?? 0),
+          adaptiveLosses: Number(s.adaptive_losses ?? s.losses ?? 0),
+          adaptiveVetoedLosses: Number(
+            s.adaptive_vetoed_count ?? s.adaptive_vetoed_losses ?? 0
+          ),
+          adaptiveScratchedLosses: Number(
+            s.adaptive_scratched_count ?? s.adaptive_scratched_losses ?? 0
+          ),
+          adaptiveWinRatePct: Number(s.adaptive_win_rate_pct ?? s.win_rate_pct ?? 0),
+          adaptiveProfitFactor: Number(s.adaptive_profit_factor ?? s.profit_factor ?? 0),
+          adaptiveRealizedNetPnlUsd: Number(
+            s.adaptive_stock_net_pnl_usd ??
+              s.adaptive_realized_net_pnl_usd ??
+              s.realized_stock_net_pnl_usd ??
+              0
+          ),
+          adaptiveKellyNetPnlUsd: Number(
+            s.adaptive_kelly_net_pnl_usd ?? s.kelly_realized_net_pnl_usd ?? 0
+          ),
+          adaptiveLossAvoidedUsd: Number(s.adaptive_loss_avoided_usd ?? 0)
         })
       );
     }
@@ -1483,7 +1601,29 @@ export class TerminalStore {
         bestSymbol: String(e.best_symbol ?? ''),
         realizedStockNetPnlUsd: Number(e.realized_stock_net_pnl_usd ?? 0),
         realizedOptionNetPnlUsd: Number(e.realized_option_net_pnl_usd ?? 0),
-        kellyRealizedNetPnlUsd: Number(e.kelly_realized_net_pnl_usd ?? 0)
+        kellyRealizedNetPnlUsd: Number(e.kelly_realized_net_pnl_usd ?? 0),
+        kellyProfitFactor: Number(e.kelly_profit_factor ?? e.profit_factor ?? 0),
+        adaptiveTotalTrades: Number(e.adaptive_total_trades ?? e.total_trades ?? 0),
+        adaptiveWins: Number(e.adaptive_wins ?? e.wins ?? 0),
+        adaptiveLosses: Number(e.adaptive_losses ?? e.losses ?? 0),
+        adaptiveVetoedLosses: Number(
+          e.adaptive_vetoed_count ?? e.adaptive_vetoed_losses ?? 0
+        ),
+        adaptiveScratchedLosses: Number(
+          e.adaptive_scratched_count ?? e.adaptive_scratched_losses ?? 0
+        ),
+        adaptiveWinRatePct: Number(e.adaptive_win_rate_pct ?? e.win_rate_pct ?? 0),
+        adaptiveProfitFactor: Number(e.adaptive_profit_factor ?? e.profit_factor ?? 0),
+        adaptiveRealizedNetPnlUsd: Number(
+          e.adaptive_stock_net_pnl_usd ??
+            e.adaptive_realized_net_pnl_usd ??
+            e.realized_stock_net_pnl_usd ??
+            0
+        ),
+        adaptiveKellyNetPnlUsd: Number(
+          e.adaptive_kelly_net_pnl_usd ?? e.kelly_realized_net_pnl_usd ?? 0
+        ),
+        adaptiveLossAvoidedUsd: Number(e.adaptive_loss_avoided_usd ?? 0)
       }));
     }
 
@@ -1677,7 +1817,20 @@ export class TerminalStore {
               volume: Number(b.volume ?? 0),
               attentionWeight: 0.65
             }))
-          : []
+          : [],
+        wasVetoedByLossAutopsy: Boolean(c.was_vetoed_by_loss_autopsy ?? false),
+        vetoedByLossTradeId: c.vetoed_by_loss_trade_id ? String(c.vetoed_by_loss_trade_id) : null,
+        entryTrapSimilarityScore: Number(c.entry_trap_similarity_score ?? 0),
+        wasScratchedByLossAutopsy: Boolean(c.was_scratched_by_loss_autopsy ?? false),
+        scratchBarOffset: Number(c.scratch_bar_offset ?? 0),
+        adaptiveOutcomeBadge: String(c.adaptive_outcome_badge ?? c.outcome_badge ?? 'TARGET HIT'),
+        adaptiveExitPrice: Number(c.adaptive_exit_price ?? c.actual_exit_price ?? 0),
+        adaptiveScratchExitR: Number(c.adaptive_scratch_exit_r ?? c.realized_r_multiple ?? 0),
+        adaptiveNetPnlUsd: Number(c.adaptive_net_pnl_usd ?? stockNet),
+        adaptiveKellyNetPnlUsd: Number(c.adaptive_kelly_net_pnl_usd ?? kellyStockNet),
+        adaptiveLossSavedUsd: Number(c.adaptive_loss_saved_usd ?? 0),
+        adaptiveKellyLossSavedUsd: Number(c.adaptive_kelly_loss_saved_usd ?? 0),
+        lossAffinityPosteriorPct: Number(c.loss_affinity_posterior_pct ?? 0)
       };
     });
 
@@ -1752,8 +1905,8 @@ export class TerminalStore {
       const snap = (item.snapshot ?? {}) as Record<string, unknown>;
       const sym = String(snap.symbol ?? '');
       if (!sym) continue;
-      // Preserve any candidate that already has full chart bars loaded
-      if (this.scannerCandidates.some((c) => c.symbol === sym && c.bars.length > 0)) {
+      // Prevent duplicate scanner candidates (preserve existing candidates or update in place)
+      if (this.scannerCandidates.some((c) => c.symbol.toUpperCase() === sym.toUpperCase())) {
         continue;
       }
       const lastPx = Number(snap.last_price ?? 0);
@@ -2057,7 +2210,11 @@ export class TerminalStore {
           era1CalibratedWinRatePct: Number(cal.era1_calibrated_win_rate_pct ?? 70.0),
           era1CalibratedProfitFactor: Number(cal.era1_calibrated_profit_factor ?? 1.5),
           era1LearnedMinDisplacementPct: Number(cal.era1_learned_min_displacement_pct ?? 0.15),
-          era1LearnedMaxDisplacementPct: Number(cal.era1_learned_max_displacement_pct ?? 12.0)
+          era1LearnedMaxDisplacementPct: Number(cal.era1_learned_max_displacement_pct ?? 12.0),
+          era1MedianStopPct: Number(cal.era1_median_stop_pct ?? 0.015),
+          era1LearnedScratchPosteriorThreshold: Number(
+            cal.era1_learned_scratch_posterior_threshold ?? 0.58
+          )
         },
         closedTradesGenerated: Number(raw.closed_trades_generated ?? 0),
         openPositionActive: Boolean(raw.open_position_active ?? false),
@@ -2300,6 +2457,18 @@ export class TerminalStore {
     this.sizingMode =
       this.sizingMode === 'FIXED_10K_BASELINE' ? 'FRACTIONAL_KELLY' : 'FIXED_10K_BASELINE';
     return this.sizingMode;
+  }
+
+  public setImmunityMode(mode: ImmunityModeId): void {
+    this.immunityMode = mode;
+  }
+
+  public toggleImmunityMode(): ImmunityModeId {
+    this.immunityMode =
+      this.immunityMode === 'BASELINE_ALL_TRADES'
+        ? 'ACTIVE_LOSS_IMMUNITY'
+        : 'BASELINE_ALL_TRADES';
+    return this.immunityMode;
   }
 
   public setStrategyFilter(archetype: 'ALL' | StrategyArchetypeId): void {
@@ -2548,7 +2717,20 @@ export class TerminalStore {
         ? 'VERIFIED_REAL_YAHOO_EXPANSION'
         : 'STOP_DISTANCE_TIGHTENED_BY_ABSORPTION_WICK',
       lossForensicAutopsy: null,
-      entryBars: []
+      entryBars: [],
+      wasVetoedByLossAutopsy: false,
+      vetoedByLossTradeId: null,
+      entryTrapSimilarityScore: 0,
+      wasScratchedByLossAutopsy: false,
+      scratchBarOffset: 0,
+      adaptiveOutcomeBadge: outcomeBadge,
+      adaptiveExitPrice: exitPrice,
+      adaptiveScratchExitR: realizedRMultiple,
+      adaptiveNetPnlUsd: stockPnlUsd,
+      adaptiveKellyNetPnlUsd: stockPnlUsd * 1.15,
+      adaptiveLossSavedUsd: 0,
+      adaptiveKellyLossSavedUsd: 0,
+      lossAffinityPosteriorPct: 0
     };
 
     this.closedLedger = [closedItem, ...this.closedLedger];

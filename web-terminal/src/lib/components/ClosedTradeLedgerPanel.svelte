@@ -75,21 +75,21 @@
       </span>
     </div>
     <div class="kpi-card">
-      <span class="kpi-label">Expectancy (Per Trade)</span>
+      <span class="kpi-label">Expectancy / Avg Loser R</span>
       <span class="kpi-metric-value {kpis.expectancyR >= 0 ? 'pnl-positive' : 'pnl-negative'}">
-        {kpis.expectancyR >= 0 ? '+' : ''}{kpis.expectancyR.toFixed(2)}R ({formatSignedUsd(kpis.expectancyUsd)})
+        {kpis.expectancyR >= 0 ? '+' : ''}{kpis.expectancyR.toFixed(2)}R (Loser {kpis.avgLoserR.toFixed(2)}R)
       </span>
     </div>
     <div class="kpi-card">
-      <span class="kpi-label">Net Stock P&amp;L</span>
+      <span class="kpi-label">Net Stock P&amp;L ({terminalStore.sizingMode === 'FRACTIONAL_KELLY' ? 'Kelly' : 'Fixed $10K'})</span>
       <span class="kpi-metric-value {kpis.netRealizedStockPnlUsd >= 0 ? 'pnl-positive' : 'pnl-negative'}">
         {formatSignedUsd(kpis.netRealizedStockPnlUsd)}
       </span>
     </div>
     <div class="kpi-card">
-      <span class="kpi-label">Net Option P&amp;L</span>
-      <span class="kpi-metric-value {kpis.netRealizedOptionPnlUsd >= 0 ? 'pnl-positive' : 'pnl-negative'}">
-        {formatSignedUsd(kpis.netRealizedOptionPnlUsd)}
+      <span class="kpi-label">🛡️ Trap Immunity &amp; Bar+1 Scratch Saved</span>
+      <span class="kpi-metric-value pnl-positive">
+        {formatSignedUsd(kpis.totalLossAvoidedUsd)} ({kpis.vetoedLossesCount}V / {kpis.scratchedLossesCount}S)
       </span>
     </div>
     <div class="kpi-card">
@@ -102,6 +102,8 @@
 
   <!-- Interactive Strategy Archetype & Parallel Dual-Engine Win-Rate Leaderboard -->
   {#if strategyBoard.length > 0 || engineBoard.length > 0}
+    {@const useImmunity = terminalStore.immunityMode === 'ACTIVE_LOSS_IMMUNITY'}
+    {@const useKelly = terminalStore.sizingMode === 'FRACTIONAL_KELLY'}
     <div
       style="padding: 8px 12px; background: var(--surface-0); border-block-end: 1px solid var(--border-subtle); display: flex; flex-direction: column; gap: 8px;"
     >
@@ -111,6 +113,17 @@
             PARALLEL ENGINE LEADERBOARD (CLICK TO FILTER):
           </span>
           {#each engineBoard as eng (eng.engineMode)}
+            {@const wr = useImmunity ? eng.adaptiveWinRatePct : eng.winRatePct}
+            {@const w = useImmunity ? eng.adaptiveWins : eng.wins}
+            {@const l = useImmunity ? eng.adaptiveLosses : eng.losses}
+            {@const pf = useImmunity ? eng.adaptiveProfitFactor : useKelly ? eng.kellyProfitFactor : eng.profitFactor}
+            {@const pnl = useImmunity
+              ? useKelly
+                ? eng.adaptiveKellyNetPnlUsd
+                : eng.adaptiveRealizedNetPnlUsd
+              : useKelly
+                ? eng.kellyRealizedNetPnlUsd
+                : eng.realizedStockNetPnlUsd}
             <button
               type="button"
               class="filter-pill"
@@ -119,15 +132,16 @@
               style="padding: 3px 8px; font-size: 0.66rem; display: flex; align-items: center; gap: 6px;"
             >
               <strong>{eng.displayName}</strong>
-              <span class="tabular-num pnl-positive">{eng.winRatePct.toFixed(1)}% WR</span>
-              <span class="tabular-num">({eng.wins}W/{eng.losses}L | PF {eng.profitFactor.toFixed(2)})</span>
-              <span class="tabular-num {eng.realizedStockNetPnlUsd >= 0 ? 'pnl-positive' : 'pnl-negative'}">
-                {formatSignedUsd(
-                  terminalStore.sizingMode === 'FRACTIONAL_KELLY'
-                    ? eng.kellyRealizedNetPnlUsd
-                    : eng.realizedStockNetPnlUsd
-                )}
+              <span class="tabular-num pnl-positive">{wr.toFixed(1)}% WR</span>
+              <span class="tabular-num">({w}W/{l}L | PF {pf.toFixed(2)})</span>
+              <span class="tabular-num {pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">
+                {formatSignedUsd(pnl)}
               </span>
+              {#if useImmunity && (eng.adaptiveVetoedLosses > 0 || eng.adaptiveScratchedLosses > 0)}
+                <span class="badge badge-ai-core" style="font-size: 0.58rem;">
+                  🛡️ {eng.adaptiveVetoedLosses}V/{eng.adaptiveScratchedLosses}S
+                </span>
+              {/if}
             </button>
           {/each}
         </div>
@@ -139,6 +153,17 @@
             STRATEGY ARCHETYPE LEADERBOARD (CLICK TO FILTER):
           </span>
           {#each strategyBoard as strat (strat.strategyArchetype)}
+            {@const wr = useImmunity ? strat.adaptiveWinRatePct : strat.winRatePct}
+            {@const w = useImmunity ? strat.adaptiveWins : strat.wins}
+            {@const l = useImmunity ? strat.adaptiveLosses : strat.losses}
+            {@const pf = useImmunity ? strat.adaptiveProfitFactor : useKelly ? strat.kellyProfitFactor : strat.profitFactor}
+            {@const pnl = useImmunity
+              ? useKelly
+                ? strat.adaptiveKellyNetPnlUsd
+                : strat.adaptiveRealizedNetPnlUsd
+              : useKelly
+                ? strat.kellyRealizedNetPnlUsd
+                : strat.realizedStockNetPnlUsd}
             <button
               type="button"
               class="filter-pill"
@@ -147,8 +172,11 @@
               style="padding: 3px 8px; font-size: 0.66rem; display: flex; align-items: center; gap: 6px;"
             >
               <strong>{strat.displayName}</strong>
-              <span class="tabular-num pnl-positive">{strat.winRatePct.toFixed(1)}% WR</span>
-              <span class="tabular-num">({strat.wins}W/{strat.losses}L | PF {strat.profitFactor.toFixed(2)})</span>
+              <span class="tabular-num pnl-positive">{wr.toFixed(1)}% WR</span>
+              <span class="tabular-num">({w}W/{l}L | PF {pf.toFixed(2)})</span>
+              <span class="tabular-num {pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">
+                {formatSignedUsd(pnl)}
+              </span>
               <span class="tabular-num" style="opacity: 0.85;">Best: {strat.bestSymbol}</span>
             </button>
           {/each}
@@ -308,15 +336,34 @@
       </thead>
       <tbody>
         {#each rows as row (row.tradeId)}
-          {@const rowStockPnl =
-            terminalStore.sizingMode === 'FRACTIONAL_KELLY'
+          {@const useImmunity = terminalStore.immunityMode === 'ACTIVE_LOSS_IMMUNITY'}
+          {@const useKelly = terminalStore.sizingMode === 'FRACTIONAL_KELLY'}
+          {@const rowStockPnl = useImmunity
+            ? useKelly
+              ? row.adaptiveKellyNetPnlUsd
+              : row.adaptiveNetPnlUsd
+            : useKelly
               ? row.kellyRealizedStockPnlUsd
               : row.realizedStockPnlUsd}
-          {@const rowCombinedPnl = rowStockPnl + row.realizedOptionPnlUsd}
+          {@const rowSavedUsd = useKelly
+            ? row.adaptiveKellyLossSavedUsd
+            : row.adaptiveLossSavedUsd}
+          {@const rowEffectiveExitPx =
+            useImmunity && row.wasScratchedByLossAutopsy ? row.adaptiveExitPrice : row.exitPrice}
+          {@const rowEffectiveR =
+            useImmunity && row.wasScratchedByLossAutopsy
+              ? row.adaptiveScratchExitR
+              : useImmunity && row.wasVetoedByLossAutopsy
+                ? 0
+                : row.realizedRMultiple}
+          {@const rowCombinedPnl =
+            useImmunity && row.wasVetoedByLossAutopsy
+              ? 0
+              : rowStockPnl + row.realizedOptionPnlUsd}
           <tr
             data-selected={terminalStore.activeReplayTrade?.tradeId === row.tradeId || terminalStore.selectedTicker === row.symbol}
             onclick={() => terminalStore.selectClosedTradeForReplay(row)}
-            style="cursor: pointer;"
+            style="cursor: pointer; opacity: {useImmunity && row.wasVetoedByLossAutopsy ? 0.72 : 1};"
             title="Click to launch Full-Lifecycle Bar-by-Bar Trade Replay Scrubber for {row.symbol} ({row.tradeId})"
           >
             <td class="tabular-num">{row.tradeId}</td>
@@ -342,12 +389,27 @@
               </span>
             </td>
             <td>
-              <span class="badge {row.isWinner ? 'badge-long' : 'badge-short'}">
-                CLOSED - {row.outcomeBadge}
-              </span>
+              {#if useImmunity && row.wasVetoedByLossAutopsy}
+                <span class="badge badge-ai-core">
+                  🛡️ VETOED - HARD-NEGATIVE TRAP IMMUNITY
+                </span>
+              {:else if useImmunity && row.wasScratchedByLossAutopsy}
+                <span class="badge badge-gamma">
+                  ⚡ CLOSED - AI LOSS-AUTOPSY SCRATCH EXIT (Bar +{row.scratchBarOffset})
+                </span>
+              {:else}
+                <span class="badge {row.isWinner ? 'badge-long' : 'badge-short'}">
+                  CLOSED - {row.outcomeBadge}
+                </span>
+              {/if}
+              {#if rowSavedUsd > 0}
+                <span class="badge badge-long" style="margin-inline-start: 4px; font-size: 0.6rem;">
+                  Saved {formatSignedUsd(rowSavedUsd)}
+                </span>
+              {/if}
             </td>
             <td data-numeric="true">
-              {formatSubPennyPrice(row.entryPrice)} → <strong>{formatSubPennyPrice(row.exitPrice)}</strong>
+              {formatSubPennyPrice(row.entryPrice)} → <strong>{formatSubPennyPrice(rowEffectiveExitPx)}</strong>
             </td>
             <td data-numeric="true" style="font-size: 0.68rem; color: var(--text-secondary);">
               {formatSubPennyPrice(row.structuralStopAtEntry)} / {formatSubPennyPrice(row.target1AtEntry)} / {formatSubPennyPrice(row.target2AtEntry)}
@@ -396,8 +458,8 @@
             >
               {formatSignedUsd(rowCombinedPnl)}
             </td>
-            <td data-numeric="true" class={row.realizedRMultiple >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-              {row.realizedRMultiple >= 0 ? '+' : ''}{row.realizedRMultiple.toFixed(2)}R
+            <td data-numeric="true" class={rowEffectiveR >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+              {rowEffectiveR >= 0 ? '+' : ''}{rowEffectiveR.toFixed(2)}R
             </td>
             <td data-numeric="true">
               +{row.mfePct.toFixed(2)}% / -{row.maePct.toFixed(2)}%

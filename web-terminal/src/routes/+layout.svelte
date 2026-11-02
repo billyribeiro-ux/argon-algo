@@ -108,9 +108,37 @@
           data-selected={terminalStore.sizingMode === 'FRACTIONAL_KELLY'}
           onclick={() => terminalStore.setSizingMode('FRACTIONAL_KELLY')}
           style="padding: 2px 6px; font-size: 0.66rem; font-weight: 700;"
-          title="Phase 12 Causal Fractional-Kelly Risk Sizing (0.35x Kelly)"
+          title="Phase 13 Per-Symbol Era-1 Normalized Causal Fractional-Kelly Sizing"
         >
           Fractional-Kelly Sizing
+        </button>
+      </div>
+
+      <!-- Phase 13 Non-Destructive Adaptive Trap-Immunity & Bar+1 Scratch Comparison Mode Toggle -->
+      <div
+        style="display: flex; align-items: center; gap: 3px; padding: 2px 6px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
+        role="group"
+        aria-label="Adaptive Trap Immunity Mode"
+      >
+        <button
+          type="button"
+          class="filter-pill"
+          data-selected={terminalStore.immunityMode === 'BASELINE_ALL_TRADES'}
+          onclick={() => terminalStore.setImmunityMode('BASELINE_ALL_TRADES')}
+          style="padding: 2px 6px; font-size: 0.66rem; font-weight: 700;"
+          title="Non-Destructive 173-Trade Baseline (All Historical Trades Preserved)"
+        >
+          🔒 Baseline (All Trades)
+        </button>
+        <button
+          type="button"
+          class="filter-pill"
+          data-selected={terminalStore.immunityMode === 'ACTIVE_LOSS_IMMUNITY'}
+          onclick={() => terminalStore.setImmunityMode('ACTIVE_LOSS_IMMUNITY')}
+          style="padding: 2px 6px; font-size: 0.66rem; font-weight: 700;"
+          title="Causal Hard-Negative Trap Veto + Self-Learned Post-Entry Bar+1 Loss-Centroid Scratch Mode"
+        >
+          🛡️ Active Loss-Immunity &amp; Scratch Mode
         </button>
       </div>
 
@@ -261,11 +289,19 @@
         </strong>
       </span>
       <span class="tabular-num">
-        CLOSED REALIZED ({kpis.totalWins}W/{kpis.totalLosses}L):
-        <strong class={kpis.netCombinedPnlUsd >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-          {formatSignedUsd(kpis.netCombinedPnlUsd)}
+        CLOSED REALIZED ({kpis.totalWins}W/{kpis.totalLosses}L · PF {kpis.profitFactor.toFixed(2)}):
+        <strong class={kpis.netRealizedStockPnlUsd >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+          {formatSignedUsd(kpis.netRealizedStockPnlUsd)}
         </strong>
       </span>
+      {#if kpis.vetoedLossesCount > 0 || kpis.scratchedLossesCount > 0}
+        <span class="tabular-num" title="Causal Hard-Negative Traps Vetoed & Post-Entry Bar+1 Loss-Centroid Scratches">
+          🛡️ SAVED ({kpis.vetoedLossesCount} Vetoed / {kpis.scratchedLossesCount} Scratched):
+          <strong class="pnl-positive">
+            {formatSignedUsd(kpis.totalLossAvoidedUsd)}
+          </strong>
+        </span>
+      {/if}
       <a href="/macro-and-adapters" class="badge {terminalStore.backendConnected ? 'badge-long' : 'badge-squeeze'}">
         BUS: {primaryProvider.toUpperCase()} ({terminalStore.backendConnected ? 'LIVE WS' : 'RECONNECTING'})
       </a>

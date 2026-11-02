@@ -479,6 +479,19 @@ impl YahooSessionManager {
             return Ok(cached.bars);
         }
 
+        if let Some(disk_cached) =
+            Self::try_load_warm_ohlcv_disk_cache(&clean_sym, Timeframe::D1, 250, 86_400 * 30)
+        {
+            self.daily_ohlcv_cache.write().insert(
+                clean_sym,
+                CachedOhlcvEntry {
+                    bars: disk_cached.clone(),
+                    inserted_at: Instant::now(),
+                },
+            );
+            return Ok(disk_cached);
+        }
+
         // Source 1: Deep multi-year real exchange OHLCV from Nasdaq Historical API (up to 1,463 bars)
         let mut nasdaq_bars = self
             .fetch_nasdaq_historical_ohlcv(&clean_sym, 1500)
@@ -503,7 +516,8 @@ impl YahooSessionManager {
                 let yahoo_utc_day = last_yahoo.timestamp_sec.div_euclid(86_400);
                 let nasdaq_utc_day = last_nasdaq.timestamp_sec.div_euclid(86_400);
                 let canonical_close_sec = yahoo_utc_day * 86_400 + 20 * 3_600;
-                if yahoo_utc_day > nasdaq_utc_day
+                if nasdaq_bars.len() < 250
+                    && yahoo_utc_day > nasdaq_utc_day
                     && last_yahoo.timestamp_sec >= last_nasdaq.timestamp_sec + 86_400
                     && now_sec >= canonical_close_sec
                     && last_yahoo.high > last_yahoo.low

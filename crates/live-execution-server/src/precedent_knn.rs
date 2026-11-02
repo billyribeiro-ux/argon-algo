@@ -27,6 +27,25 @@ pub struct HardNegativeTrapRecord {
     pub culprit_feature_indices: [usize; 3],
     pub culprit_feature_signs: [f32; 3],
     pub realized_loss_usd: f64,
+    /// Post-entry `Bar +1` 32-feature state vector $X_{\text{loss\_bar1}}$ captured from the failing trade.
+    #[serde(default)]
+    pub post_entry_bar1_features_32: Vec<f32>,
+    /// Learned anomaly weights across the 32 raw features from `LossForensicAutopsy`.
+    #[serde(default)]
+    pub culprit_anomaly_weights_32: Vec<f32>,
+}
+
+/// Diagnostic returned when a live post-entry bar (`Bar +1 / Bar +2`) matches the causal
+/// Post-Entry Loss Autopsy Centroid $\bar{X}_{\text{loss\_bar1}}$ ($t > T_{\text{loss\_closed}}$)
+/// more closely than the Winning Centroid $\bar{X}_{\text{win}}$.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PostEntryScratchDiagnostic {
+    pub loss_affinity_posterior_pct: f64,
+    pub mahalanobis_loss_distance: f64,
+    pub mahalanobis_win_distance: f64,
+    pub cosine_loss_similarity: f64,
+    pub cosine_win_similarity: f64,
+    pub matched_prior_loss_count: usize,
 }
 
 /// Single historical trace record stored in `trace_embeddings` (`vector(128)`).
@@ -290,6 +309,130 @@ impl PrecedentKnnIndex {
         best_match
     }
 
+    /// Evaluates a live post-entry 32-feature state vector $X_t$ (`bars_since_open` in `1..=3`
+    /// and underwater `current_r_multiple < -0.08`) against the causal Post-Entry Loss Autopsy
+    /// Centroid $\bar{X}_{\text{loss\_bar1}}$ ($t > T_{\text{loss\_closed}}$) vs. the Winning Centroid
+    /// $\bar{X}_{\text{win}}$ using Culprit-Weighted Mahalanobis + Cosine Loss-Affinity scoring.
+    pub fn evaluate_causal_post_entry_scratch(
+        &self,
+        brain_id: BrainHorizonId,
+        symbol: &str,
+        direction: TradeDirection,
+        current_timestamp_ns: i64,
+        live_bar_features_32: &[f32],
+        learned_posterior_threshold: f64,
+    ) -> Option<PostEntryScratchDiagnostic> {
+        if live_bar_features_32.len() < 32 {
+            return None;
+        }
+        let traps = self.hard_negative_traps.read();
+        let causal_traps: Vec<&HardNegativeTrapRecord> = traps
+            .iter()
+            .filter(|t| {
+                t.brain_id == brain_id
+                    && t.direction == direction
+                    && t.closed_timestamp_ns < current_timestamp_ns
+            })
+            .collect();
+        if causal_traps.is_empty() {
+            return None;
+        }
+
+        let matched_prior_loss_count = causal_traps.len();
+        let n_loss = matched_prior_loss_count as f64;
+        let mut loss_centroid = [0.0_f64; 32];
+        let mut loss_var = [0.0025_f64; 32];
+        let mut culprit_weights = [0.01_f64; 32];
+
+        for trap in &causal_traps {
+            let src_feats = if trap.post_entry_bar1_features_32.len() >= 32 {
+                &trap.post_entry_bar1_features_32[0..32]
+            } else {
+                &trap.embedding_128[0..32.min(trap.embedding_128.len())]
+            };
+            for (i, &val) in src_feats.iter().enumerate() {
+                loss_centroid[i] += (val as f64) / n_loss;
+            }
+            if trap.culprit_anomaly_weights_32.len() >= 32 {
+                for (i, &w) in trap.culprit_anomaly_weights_32.iter().take(32).enumerate() {
+                    culprit_weights[i] += (w.max(0.05) as f64) / n_loss;
+                }
+            } else {
+                for &c_idx in &trap.culprit_feature_indices {
+                    culprit_weights[c_idx.min(31)] += 1.5 / n_loss;
+                }
+            }
+        }
+
+        for trap in &causal_traps {
+            let src_feats = if trap.post_entry_bar1_features_32.len() >= 32 {
+                &trap.post_entry_bar1_features_32[0..32]
+            } else {
+                &trap.embedding_128[0..32.min(trap.embedding_128.len())]
+            };
+            for (i, &val) in src_feats.iter().enumerate() {
+                let diff = (val as f64) - loss_centroid[i];
+                loss_var[i] += (diff * diff) / n_loss;
+            }
+        }
+        drop(traps);
+
+        let weight_sum: f64 = culprit_weights.iter().sum::<f64>().max(1e-6);
+        for w in &mut culprit_weights {
+            *w /= weight_sum;
+        }
+
+        let (win_centroid, win_sigma) =
+            self.winning_feature_centroid_32(brain_id, symbol, current_timestamp_ns);
+
+        let mut maha_loss_sq = 0.0_f64;
+        let mut maha_win_sq = 0.0_f64;
+        let mut dot_loss = 0.0_f64;
+        let mut dot_win = 0.0_f64;
+        let mut norm_x_sq = 0.0_f64;
+        let mut norm_loss_sq = 0.0_f64;
+        let mut norm_win_sq = 0.0_f64;
+
+        for i in 0..32 {
+            let x_i = live_bar_features_32[i] as f64;
+            let w_i = culprit_weights[i];
+            let l_var = loss_var[i].clamp(0.0016, 0.25);
+            let w_var = (win_sigma[i] * win_sigma[i]).clamp(0.0016, 0.25);
+
+            let dl = x_i - loss_centroid[i];
+            let dw = x_i - win_centroid[i];
+            maha_loss_sq += w_i * (dl * dl) / l_var;
+            maha_win_sq += w_i * (dw * dw) / w_var;
+
+            dot_loss += w_i * x_i * loss_centroid[i];
+            dot_win += w_i * x_i * win_centroid[i];
+            norm_x_sq += w_i * x_i * x_i;
+            norm_loss_sq += w_i * loss_centroid[i] * loss_centroid[i];
+            norm_win_sq += w_i * win_centroid[i] * win_centroid[i];
+        }
+
+        let maha_loss = maha_loss_sq.sqrt();
+        let maha_win = maha_win_sq.sqrt();
+        let cos_loss = (dot_loss / (norm_x_sq.sqrt() * norm_loss_sq.sqrt()).max(1e-6)).clamp(-1.0, 1.0);
+        let cos_win = (dot_win / (norm_x_sq.sqrt() * norm_win_sq.sqrt()).max(1e-6)).clamp(-1.0, 1.0);
+
+        let logit = 0.65 * (maha_win - maha_loss) + 2.40 * (cos_loss - cos_win) + 0.45;
+        let posterior = 1.0 / (1.0 + (-logit).exp());
+
+        if posterior >= learned_posterior_threshold {
+            Some(PostEntryScratchDiagnostic {
+                loss_affinity_posterior_pct: ((posterior * 100.0) * 100.0).round() / 100.0,
+                mahalanobis_loss_distance: (maha_loss * 1000.0).round() / 1000.0,
+                mahalanobis_win_distance: (maha_win * 1000.0).round() / 1000.0,
+                cosine_loss_similarity: (cos_loss * 1000.0).round() / 1000.0,
+                cosine_win_similarity: (cos_win * 1000.0).round() / 1000.0,
+                matched_prior_loss_count,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Inserts a newly completed trade or discovered historical Yahoo trace into the vector store.
     pub fn insert_trace(&self, record: HistoricalTraceRecord) {
         self.records.write().push(record);
@@ -470,6 +613,8 @@ mod tests {
             culprit_feature_indices: [12, 14, 18],
             culprit_feature_signs: [1.0, 1.0, 1.0],
             realized_loss_usd: 345.0,
+            post_entry_bar1_features_32: emb[0..32].to_vec(),
+            culprit_anomaly_weights_32: vec![1.0; 32],
         });
 
         // Before or at t_closed: MUST return None (zero lookahead)
@@ -484,17 +629,18 @@ mod tests {
             .is_none()
         );
         assert!(
-            knn.query_causal_trap_match(
+            knn.evaluate_causal_post_entry_scratch(
                 BrainHorizonId::Brain02IntradayDayTrade,
                 "NVDA",
                 TradeDirection::Long,
                 t_closed,
-                &emb,
+                &emb[0..32],
+                0.55,
             )
             .is_none()
         );
 
-        // Strictly after t_closed (t > T_loss_closed): MUST detect trap with similarity >= 0.88
+        // Strictly after t_closed (t > T_loss_closed): MUST detect trap and post-entry scratch affinity
         let matched = knn
             .query_causal_trap_match(
                 BrainHorizonId::Brain02IntradayDayTrade,
@@ -506,5 +652,17 @@ mod tests {
             .expect("Expected causal trap match after loss close timestamp");
         assert!(matched.0 >= 0.88);
         assert_eq!(matched.1.symbol, "NVDA");
+
+        let scratch_diag = knn
+            .evaluate_causal_post_entry_scratch(
+                BrainHorizonId::Brain02IntradayDayTrade,
+                "NVDA",
+                TradeDirection::Long,
+                t_closed + 300_000_000_000,
+                &emb[0..32],
+                0.55,
+            )
+            .expect("Expected post-entry loss-centroid scratch diagnostic after loss close");
+        assert!(scratch_diag.loss_affinity_posterior_pct >= 55.0);
     }
 }

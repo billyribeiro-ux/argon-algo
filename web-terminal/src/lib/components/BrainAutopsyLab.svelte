@@ -98,6 +98,8 @@
                   <th data-numeric="true">Era-1 Calibrated WR</th>
                   <th data-numeric="true">Era-1 Calibrated PF</th>
                   <th data-numeric="true">Learned Disp Envelope (p15..p90)</th>
+                  <th data-numeric="true">Era-1 Median Stop %</th>
+                  <th data-numeric="true">Learned Scratch Posterior</th>
                   <th data-numeric="true">Chart/Tape %</th>
                   <th data-numeric="true">Options/Gamma %</th>
                   <th data-numeric="true">Short/Float %</th>
@@ -128,6 +130,12 @@
                     </td>
                     <td data-numeric="true" class="tabular-num">
                       +{cal.era1LearnedMinDisplacementPct.toFixed(2)}% .. +{cal.era1LearnedMaxDisplacementPct.toFixed(2)}%
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      {(cal.era1MedianStopPct * 100).toFixed(2)}%
+                    </td>
+                    <td data-numeric="true" class="tabular-num pnl-positive">
+                      {(cal.era1LearnedScratchPosteriorThreshold * 100).toFixed(1)}%
                     </td>
                     <td data-numeric="true" class="tabular-num">
                       {(cal.chartTapePhysicsWeight * 100).toFixed(1)}%

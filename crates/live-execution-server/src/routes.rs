@@ -638,6 +638,7 @@ impl AppState {
                 .await;
         }
 
+        self.ledger.reconcile_causal_adaptive_immunity_ledger();
         let _ = self.ledger.run_autopsy_and_tournament(false);
         if !Path::new("../../Cargo.toml").exists() {
             let _ = self.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
@@ -696,6 +697,7 @@ impl AppState {
             )
             .await?;
 
+        self.ledger.reconcile_causal_adaptive_immunity_ledger();
         let _ = self.ledger.run_autopsy_and_tournament(false);
         if !Path::new("../../Cargo.toml").exists() {
             let _ = self.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
@@ -875,6 +877,7 @@ impl AppState {
         )> = Vec::new();
         // Era-1 Pure ML Ridge Training Samples (`ENGINE-B`: 32 direction-aligned raw features -> realized R)
         let mut era1_ml_samples: Vec<([f64; 32], f64)> = Vec::new();
+        let mut era1_stop_pcts: Vec<f64> = Vec::new();
         for idx in 20..calibration_end.saturating_sub(trace_horizon) {
             let cal_slice = &raw_bars[idx - 20..idx];
             let cal_outcome = &raw_bars[idx..idx + trace_horizon];
@@ -909,6 +912,10 @@ impl AppState {
             ) else {
                 continue;
             };
+            let entry_px_f64 = inf.signal.entry_price.to_f64().max(0.00001);
+            let stop_px_f64 = inf.signal.structural_stop_price.to_f64().max(0.00001);
+            let trace_stop_pct = ((entry_px_f64 - stop_px_f64).abs() / entry_px_f64).clamp(0.004, 0.25);
+            era1_stop_pcts.push(trace_stop_pct);
             let ref_px = cal_slice.last().unwrap().close.to_f64().max(0.00001);
             let anchor10_px = cal_slice[cal_slice.len().saturating_sub(10)]
                 .close
@@ -1082,6 +1089,20 @@ impl AppState {
             (0.10, 15.0)
         };
 
+        era1_stop_pcts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let era1_symbol_median_stop_pct = if !era1_stop_pcts.is_empty() {
+            era1_stop_pcts[era1_stop_pcts.len() / 2].clamp(0.005, 0.25)
+        } else {
+            0.032
+        };
+        self.ledger.set_era1_symbol_median_stop_pct(
+            symbol,
+            brain_id,
+            era1_symbol_median_stop_pct,
+        );
+        let era1_learned_scratch_posterior_threshold =
+            (0.52 + 0.12 * (best_wr / 100.0)).clamp(0.55, 0.68);
+
         let cal_profile = crate::ledger::Era1BrainCalibrationProfile {
             brain_id,
             calibrated_confidence_floor: if brain_id == BrainHorizonId::Brain01PennyAnomaly {
@@ -1102,6 +1123,8 @@ impl AppState {
             era1_calibrated_profit_factor: best_pf,
             era1_learned_min_displacement_pct: learned_min_disp_pct,
             era1_learned_max_displacement_pct: learned_max_disp_pct,
+            era1_median_stop_pct: era1_symbol_median_stop_pct,
+            era1_learned_scratch_posterior_threshold,
         };
         if accumulate_calibration {
             self.ledger
@@ -1231,6 +1254,12 @@ impl AppState {
                                 culprit_feature_indices: culprit_indices,
                                 culprit_feature_signs: culprit_signs,
                                 realized_loss_usd: closed_row.net_pnl_usd.abs(),
+                                post_entry_bar1_features_32: closed_row
+                                    .post_entry_bar1_features_32
+                                    .clone(),
+                                culprit_anomaly_weights_32: closed_row
+                                    .culprit_anomaly_weights_32
+                                    .clone(),
                             });
                     }
                 }

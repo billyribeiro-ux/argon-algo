@@ -59,6 +59,53 @@ impl KellyCapitalAllocator {
         era1_calibrated_win_rate_pct: f64,
         era1_calibrated_profit_factor: f64,
     ) -> KellyAllocationPlan {
+        let entry_f64 = entry_price.to_f64().max(0.00001);
+        let stop_f64 = stop_price.to_f64().max(0.00001);
+        let stop_dist = (entry_f64 - stop_f64).abs().max(entry_f64 * 0.004);
+        let empirical_med_stop_pct = (p85_mae_pct / 100.0).clamp(0.006, 0.15);
+        let synthetic_t1 =
+            SubPennyPrice::from_f64(entry_f64 + stop_dist * (p50_mfe_pct / p85_mae_pct.max(0.20)).clamp(1.15, 3.0))
+                .unwrap_or(entry_price);
+        let synthetic_t2 =
+            SubPennyPrice::from_f64(entry_f64 + stop_dist * (p50_mfe_pct / p85_mae_pct.max(0.20) * 1.65).clamp(1.60, 4.5))
+                .unwrap_or(entry_price);
+        Self::compute_allocation_with_symbol_stop(
+            account_equity_usd,
+            brain_id,
+            entry_price,
+            stop_price,
+            synthetic_t1,
+            synthetic_t2,
+            ai_confidence_pct,
+            precedent_win_rate_pct,
+            p50_mfe_pct,
+            p85_mae_pct,
+            era1_calibrated_win_rate_pct,
+            era1_calibrated_profit_factor,
+            empirical_med_stop_pct,
+        )
+    }
+
+    /// 100% Self-Learned Per-Symbol Empirical Stop Quantile Kelly Allocator (Phase 13 Upgrade 1).
+    /// Normalizes each trade's stop distance relative to that `(symbol, brain_id)` pair's own
+    /// Era-1 empirical median structural stop distance $\tilde{s}_{\text{symbol, Era1}}$,
+    /// weighted by the trade's causal expected payoff ratio $b$ and `PrecedentKnnIndex` win rate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_allocation_with_symbol_stop(
+        account_equity_usd: f64,
+        brain_id: BrainHorizonId,
+        entry_price: SubPennyPrice,
+        stop_price: SubPennyPrice,
+        target_1_price: SubPennyPrice,
+        target_2_price: SubPennyPrice,
+        ai_confidence_pct: f64,
+        precedent_win_rate_pct: f64,
+        p50_mfe_pct: f64,
+        p85_mae_pct: f64,
+        era1_calibrated_win_rate_pct: f64,
+        era1_calibrated_profit_factor: f64,
+        symbol_era1_median_stop_pct: f64,
+    ) -> KellyAllocationPlan {
         let equity = account_equity_usd.max(50_000.0);
         let norm_conf = if ai_confidence_pct <= 1.0 {
             ai_confidence_pct
@@ -70,58 +117,62 @@ impl KellyCapitalAllocator {
         let w_conf = norm_conf.clamp(0.50, 0.95);
         let win_probability = (0.45 * w_knn + 0.35 * w_era1 + 0.20 * w_conf).clamp(0.50, 0.92);
 
+        let entry_f64 = entry_price.to_f64().max(0.00001);
+        let stop_f64 = stop_price.to_f64().max(0.00001);
+        let t1_f64 = target_1_price.to_f64().max(0.00001);
+        let t2_f64 = target_2_price.to_f64().max(0.00001);
+        let stop_dist_per_share = (entry_f64 - stop_f64)
+            .abs()
+            .max(0.004 * entry_f64)
+            .max(0.00001);
+        let stop_pct = (stop_dist_per_share / entry_f64).clamp(0.004, 0.25);
+        let t1_pct = ((t1_f64 - entry_f64).abs() / entry_f64).max(stop_pct * 0.85);
+        let t2_pct = ((t2_f64 - entry_f64).abs() / entry_f64).max(t1_pct * 1.15);
+
+        let structural_rr = ((0.55 * t1_pct + 0.45 * t2_pct) / stop_pct).clamp(1.05, 5.00);
         let empirical_ratio = (p50_mfe_pct.max(0.25) / p85_mae_pct.max(0.15)).clamp(1.15, 5.00);
         let pf_clamped = era1_calibrated_profit_factor.clamp(1.15, 5.00);
-        let payoff_ratio_b = (0.60 * empirical_ratio + 0.40 * pf_clamped).clamp(1.15, 5.00);
+        let payoff_ratio_b =
+            (0.45 * structural_rr + 0.30 * empirical_ratio + 0.25 * pf_clamped).clamp(1.15, 5.00);
 
         let raw_kelly_fraction =
             (win_probability - (1.0 - win_probability) / payoff_ratio_b).max(0.015);
 
-        let entry_f64 = entry_price.to_f64().max(0.00001);
-        let stop_f64 = stop_price.to_f64().max(0.00001);
-        let stop_dist_per_share = (entry_f64 - stop_f64)
-            .abs()
-            .max(0.005 * entry_f64)
-            .max(0.00001);
-
-        // Brain Expectancy Tier portfolio heat factor across concurrent multi-brain slots
-        let tier_expectancy_mod = match brain_id {
-            BrainHorizonId::Brain01PennyAnomaly => 0.042,
-            BrainHorizonId::Brain02IntradayDayTrade => 0.056,
-            BrainHorizonId::Brain03ShortTermSwing => 0.092,
-            BrainHorizonId::Brain04CoreSwing => 0.138,
-            BrainHorizonId::Brain05LongTermWealth => 0.158,
+        // Learned per-symbol Era-1 median structural stop distance \tilde{s}_{symbol, Era1}
+        // (Zero hardcoded per-Brain ref_stop_pct constants)
+        let learned_sym_stop_pct = if symbol_era1_median_stop_pct > 0.001 {
+            symbol_era1_median_stop_pct.clamp(0.004, 0.22)
+        } else {
+            (p85_mae_pct / 100.0).clamp(0.006, 0.15)
         };
 
-        let stop_pct = (stop_dist_per_share / entry_f64).clamp(0.005, 0.25);
-        let ref_stop_pct = match brain_id {
-            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => 0.011,
-            BrainHorizonId::Brain03ShortTermSwing => 0.017,
-            BrainHorizonId::Brain04CoreSwing | BrainHorizonId::Brain05LongTermWealth => 0.045,
+        let horizon_mult = match brain_id {
+            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => 1.0,
+            BrainHorizonId::Brain03ShortTermSwing => 1.5,
+            BrainHorizonId::Brain04CoreSwing | BrainHorizonId::Brain05LongTermWealth => 2.5,
         };
-        // Inverse stop-variance dampening: wide stops have higher variance (sigma^2), reducing Kelly fraction
-        let variance_dampener = (ref_stop_pct / stop_pct).clamp(0.38, 1.35);
 
-        let kelly_risk_frac =
-            (0.35 * raw_kelly_fraction * tier_expectancy_mod * variance_dampener)
-                .clamp(0.005, 0.0275);
-        let target_risk_budget_usd = equity * kelly_risk_frac;
+        // Prevent noise-tight stops (< \tilde{s}_{symbol, Era1}) from artificially inflating share count,
+        // while allowing high-beta symbols (MSTR, COIN, IONQ, GS, MSFT) to size relative to their own \tilde{s}_{symbol, Era1}
+        let effective_stop_pct = stop_pct.max(learned_sym_stop_pct * 0.92);
+        let sym_vol_alignment = (learned_sym_stop_pct / stop_pct).powf(0.25).clamp(0.72, 1.35);
+        let conviction_mult = ((raw_kelly_fraction / 0.36)
+            * (w_knn / 0.64).powf(0.85)
+            * (structural_rr / 1.35).powf(0.35))
+        .clamp(0.68, 1.85);
 
-        // Normalize per-tranche risk parity against the $35,000 notional ceiling so wide-stop trades
-        // never risk more dollars than tight-stop trades capped by the $35k notional limit
-        let max_1r_at_ceiling = 35_000.0 * ref_stop_pct * (kelly_risk_frac / 0.0065).clamp(0.65, 1.85);
-        let effective_1r_risk_usd = target_risk_budget_usd.min(max_1r_at_ceiling * variance_dampener);
+        let base_1r_risk_usd = (equity * 0.0035 * horizon_mult).max(175.0);
+        let target_risk_budget_usd =
+            (base_1r_risk_usd * sym_vol_alignment * conviction_mult).clamp(equity * 0.005, equity * 0.0275);
+        let kelly_risk_frac = (target_risk_budget_usd / equity).clamp(0.005, 0.0275);
 
-        let raw_shares = (effective_1r_risk_usd / stop_dist_per_share)
-            .round()
-            .max(1.0);
-        let raw_notional = raw_shares * entry_f64;
+        let raw_notional = target_risk_budget_usd / effective_stop_pct;
 
         // Clamp notional position value between $5,000 and $35,000 per tranche
         let clamped_notional = raw_notional.clamp(5_000.0, 35_000.0);
         let quantity_shares = (clamped_notional / entry_f64).round().max(1.0);
         let notional_allocated_usd = ((quantity_shares * entry_f64) * 100.0).round() / 100.0;
-        let risk_budget_usd = ((target_risk_budget_usd) * 100.0).round() / 100.0;
+        let risk_budget_usd = (target_risk_budget_usd * 100.0).round() / 100.0;
         let kelly_fraction_pct = ((kelly_risk_frac * 100.0) * 100.0).round() / 100.0;
 
         KellyAllocationPlan {
@@ -147,6 +198,8 @@ pub enum ClosedOutcomeBadge {
     TrailingStop,
     #[serde(rename = "CLOSED - STOPPED OUT")]
     StoppedOut,
+    #[serde(rename = "CLOSED - AI LOSS-AUTOPSY SCRATCH EXIT")]
+    AiLossAutopsyScratchExit,
 }
 
 impl ClosedOutcomeBadge {
@@ -157,6 +210,7 @@ impl ClosedOutcomeBadge {
             Self::AiDynamicExit => "CLOSED - AI DYNAMIC EXIT",
             Self::TrailingStop => "CLOSED - TRAILING STOP",
             Self::StoppedOut => "CLOSED - STOPPED OUT",
+            Self::AiLossAutopsyScratchExit => "CLOSED - AI LOSS-AUTOPSY SCRATCH EXIT",
         }
     }
 }
@@ -320,6 +374,30 @@ pub struct StrategyArchetypePerformanceRow {
     pub realized_stock_net_pnl_usd: f64,
     pub realized_option_net_pnl_usd: f64,
     pub kelly_realized_net_pnl_usd: f64,
+    #[serde(default)]
+    pub kelly_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_total_trades: usize,
+    #[serde(default)]
+    pub adaptive_wins: usize,
+    #[serde(default)]
+    pub adaptive_losses: usize,
+    #[serde(default)]
+    pub adaptive_vetoed_count: usize,
+    #[serde(default)]
+    pub adaptive_scratched_count: usize,
+    #[serde(default)]
+    pub adaptive_win_rate_pct: f64,
+    #[serde(default)]
+    pub adaptive_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_kelly_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_avg_realized_r: f64,
+    #[serde(default)]
+    pub adaptive_stock_net_pnl_usd: f64,
+    #[serde(default)]
+    pub adaptive_kelly_net_pnl_usd: f64,
 }
 
 /// Engine Mode Win-Rate Breakdown Row returned in `FilteredLedgerSnapshot.by_engine_breakdown`.
@@ -337,6 +415,30 @@ pub struct EngineModePerformanceRow {
     pub realized_stock_net_pnl_usd: f64,
     pub realized_option_net_pnl_usd: f64,
     pub kelly_realized_net_pnl_usd: f64,
+    #[serde(default)]
+    pub kelly_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_total_trades: usize,
+    #[serde(default)]
+    pub adaptive_wins: usize,
+    #[serde(default)]
+    pub adaptive_losses: usize,
+    #[serde(default)]
+    pub adaptive_vetoed_count: usize,
+    #[serde(default)]
+    pub adaptive_scratched_count: usize,
+    #[serde(default)]
+    pub adaptive_win_rate_pct: f64,
+    #[serde(default)]
+    pub adaptive_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_kelly_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_avg_realized_r: f64,
+    #[serde(default)]
+    pub adaptive_stock_net_pnl_usd: f64,
+    #[serde(default)]
+    pub adaptive_kelly_net_pnl_usd: f64,
 }
 
 pub const RAW_32_FEATURE_METADATA: [(&str, &str); 32] = [
@@ -571,6 +673,37 @@ pub struct ClosedTradeRow {
     pub loss_forensic_autopsy: Option<LossForensicAutopsy>,
     #[serde(default)]
     pub entry_embedding_128: Vec<f32>,
+    // Phase 13 Non-Destructive Adaptive Trap-Immunity & Bar+1/Bar+2 Loss-Centroid Scratch Outcomes
+    #[serde(default)]
+    pub was_vetoed_by_loss_autopsy: bool,
+    #[serde(default)]
+    pub vetoed_by_loss_trade_id: Option<Uuid>,
+    #[serde(default)]
+    pub entry_trap_similarity_score: f64,
+    #[serde(default)]
+    pub was_scratched_by_loss_autopsy: bool,
+    #[serde(default)]
+    pub scratch_bar_offset: usize,
+    #[serde(default)]
+    pub adaptive_outcome_badge: String,
+    #[serde(default = "default_sub_penny_zero")]
+    pub adaptive_exit_price: SubPennyPrice,
+    #[serde(default)]
+    pub adaptive_scratch_exit_r: f64,
+    #[serde(default)]
+    pub adaptive_net_pnl_usd: f64,
+    #[serde(default)]
+    pub adaptive_kelly_net_pnl_usd: f64,
+    #[serde(default)]
+    pub adaptive_loss_saved_usd: f64,
+    #[serde(default)]
+    pub adaptive_kelly_loss_saved_usd: f64,
+    #[serde(default)]
+    pub loss_affinity_posterior_pct: f64,
+    #[serde(default)]
+    pub post_entry_bar1_features_32: Vec<f32>,
+    #[serde(default)]
+    pub culprit_anomaly_weights_32: Vec<f32>,
 }
 
 /// Speed-2 Nightly Autopsy Grade for a single closed trade (`A+`, `B`, `C`, `F`).
@@ -637,6 +770,32 @@ pub struct BrainBreakdownSummary {
     pub profit_factor: f64,
     pub avg_r_multiple: f64,
     pub avg_hold_duration_ms: i64,
+    #[serde(default)]
+    pub kelly_realized_net_profit_usd: f64,
+    #[serde(default)]
+    pub kelly_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_closed_trades_count: usize,
+    #[serde(default)]
+    pub adaptive_wins_count: usize,
+    #[serde(default)]
+    pub adaptive_losses_count: usize,
+    #[serde(default)]
+    pub adaptive_vetoed_count: usize,
+    #[serde(default)]
+    pub adaptive_scratched_count: usize,
+    #[serde(default)]
+    pub adaptive_win_rate_pct: f64,
+    #[serde(default)]
+    pub adaptive_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_kelly_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_realized_net_profit_usd: f64,
+    #[serde(default)]
+    pub adaptive_kelly_net_profit_usd: f64,
+    #[serde(default)]
+    pub adaptive_avg_r_multiple: f64,
 }
 
 /// Master Executive Scoreboard (`<10ms` reactive top-level rollup).
@@ -666,6 +825,42 @@ pub struct MasterExecutiveScoreboard {
     pub max_drawdown_pct: f64,
     pub by_brain_breakdowns: Vec<BrainBreakdownSummary>,
     pub filter_eval_latency_micros: u64,
+    #[serde(default)]
+    pub kelly_realized_net_profit_usd: f64,
+    #[serde(default)]
+    pub kelly_profit_factor: f64,
+    #[serde(default)]
+    pub kelly_max_drawdown_usd: f64,
+    #[serde(default)]
+    pub adaptive_realized_net_profit_usd: f64,
+    #[serde(default)]
+    pub adaptive_kelly_net_profit_usd: f64,
+    #[serde(default)]
+    pub adaptive_win_rate_pct: f64,
+    #[serde(default)]
+    pub adaptive_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_kelly_profit_factor: f64,
+    #[serde(default)]
+    pub adaptive_total_closed_trades: usize,
+    #[serde(default)]
+    pub adaptive_total_wins: usize,
+    #[serde(default)]
+    pub adaptive_total_losses: usize,
+    #[serde(default)]
+    pub adaptive_vetoed_losses_count: usize,
+    #[serde(default)]
+    pub adaptive_scratched_losses_count: usize,
+    #[serde(default)]
+    pub adaptive_total_loss_saved_usd: f64,
+    #[serde(default)]
+    pub adaptive_kelly_total_loss_saved_usd: f64,
+    #[serde(default)]
+    pub adaptive_max_drawdown_usd: f64,
+    #[serde(default)]
+    pub adaptive_kelly_max_drawdown_usd: f64,
+    #[serde(default)]
+    pub adaptive_avg_loser_r: f64,
 }
 
 /// Multi-dimensional "Slice-Anything" Hyper-Filter query specification.
@@ -709,6 +904,10 @@ fn default_tranche_count() -> u8 {
     1
 }
 
+fn default_sub_penny_zero() -> SubPennyPrice {
+    SubPennyPrice::ZERO
+}
+
 fn format_timestamp_ns_iso(ts_ns: i64) -> String {
     let secs = ts_ns / 1_000_000_000;
     let nsecs = (ts_ns % 1_000_000_000).unsigned_abs() as u32;
@@ -734,6 +933,10 @@ pub struct Era1BrainCalibrationProfile {
     pub era1_learned_min_displacement_pct: f64,
     #[serde(default)]
     pub era1_learned_max_displacement_pct: f64,
+    #[serde(default)]
+    pub era1_median_stop_pct: f64,
+    #[serde(default)]
+    pub era1_learned_scratch_posterior_threshold: f64,
 }
 
 /// Thread-safe, sub-millisecond Real-Time Execution Ledger Engine.
@@ -746,7 +949,10 @@ pub struct RealTimeLedgerEngine {
     last_autopsy_iso: RwLock<String>,
     era1_calibrations:
         RwLock<std::collections::HashMap<BrainHorizonId, Era1BrainCalibrationProfile>>,
+    era1_symbol_median_stops:
+        RwLock<std::collections::HashMap<(String, BrainHorizonId), f64>>,
     vetoed_repeat_traps: RwLock<Vec<VetoedTrapAuditRecord>>,
+    enforce_hard_scratch_on_baseline: RwLock<bool>,
     webhook_dispatcher: OutboundWebhookDispatcher,
 }
 
@@ -766,13 +972,41 @@ impl RealTimeLedgerEngine {
             autopsy_runs_count: RwLock::new(1),
             last_autopsy_iso: RwLock::new(Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string()),
             era1_calibrations: RwLock::new(std::collections::HashMap::new()),
+            era1_symbol_median_stops: RwLock::new(std::collections::HashMap::new()),
             vetoed_repeat_traps: RwLock::new(Vec::with_capacity(256)),
+            enforce_hard_scratch_on_baseline: RwLock::new(false),
             webhook_dispatcher: OutboundWebhookDispatcher::new(),
         }
     }
 
+    pub fn set_enforce_hard_scratch_on_baseline(&self, enabled: bool) {
+        *self.enforce_hard_scratch_on_baseline.write() = enabled;
+    }
+
     pub fn webhooks(&self) -> &OutboundWebhookDispatcher {
         &self.webhook_dispatcher
+    }
+
+    pub fn set_era1_symbol_median_stop_pct(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+        median_stop_pct: f64,
+    ) {
+        self.era1_symbol_median_stops
+            .write()
+            .insert((symbol.to_uppercase(), brain_id), median_stop_pct);
+    }
+
+    pub fn get_era1_symbol_median_stop_pct(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+    ) -> Option<f64> {
+        self.era1_symbol_median_stops
+            .read()
+            .get(&(symbol.to_uppercase(), brain_id))
+            .copied()
     }
 
     pub fn record_vetoed_trap(&self, record: VetoedTrapAuditRecord) {
@@ -814,6 +1048,13 @@ impl RealTimeLedgerEngine {
                 (existing.era1_learned_max_displacement_pct * n1
                     + profile.era1_learned_max_displacement_pct * n2)
                     / tot;
+            existing.era1_median_stop_pct =
+                (existing.era1_median_stop_pct * n1 + profile.era1_median_stop_pct * n2) / tot;
+            existing.era1_learned_scratch_posterior_threshold = (existing
+                .era1_learned_scratch_posterior_threshold
+                * n1
+                + profile.era1_learned_scratch_posterior_threshold * n2)
+                / tot;
             existing.calibrated_confidence_floor = existing
                 .calibrated_confidence_floor
                 .max(profile.calibrated_confidence_floor);
@@ -862,6 +1103,7 @@ impl RealTimeLedgerEngine {
         self.positions_opened.write().clear();
         self.closed_ledger.write().clear();
         self.era1_calibrations.write().clear();
+        self.era1_symbol_median_stops.write().clear();
         self.vetoed_repeat_traps.write().clear();
         self.webhook_dispatcher.clear_outbox();
         *self.running_net_profit_usd.write() = 0.0;
@@ -901,6 +1143,8 @@ impl RealTimeLedgerEngine {
                         era1_calibrated_profit_factor: 1.95,
                         era1_learned_min_displacement_pct: 0.15,
                         era1_learned_max_displacement_pct: 12.0,
+                        era1_median_stop_pct: 0.032,
+                        era1_learned_scratch_posterior_threshold: 0.58,
                     })
             })
             .collect()
@@ -1072,8 +1316,11 @@ impl RealTimeLedgerEngine {
             .unwrap_or(pos.initial_structural_stop),
         };
         pos.quantity_shares = total_shares;
-        pos.notional_allocated_usd = ((total_shares * vwap_entry.to_f64()) * 100.0).round() / 100.0;
-        pos.risk_budget_usd = ((pos.risk_budget_usd + target_tranche_risk_usd) * 100.0).round() / 100.0;
+        let share_scale_ratio = (total_shares / old_shares).clamp(1.0, 3.0);
+        pos.notional_allocated_usd =
+            ((pos.notional_allocated_usd * share_scale_ratio) * 100.0).round() / 100.0;
+        pos.risk_budget_usd =
+            ((pos.risk_budget_usd * share_scale_ratio) * 100.0).round() / 100.0;
         pos.tranche_count += 1;
 
         // Rule B: Profitable Pyramid Stop Floor at VWAP_Entry ± 0.30R (never 0.00R flat)
@@ -1251,27 +1498,34 @@ impl RealTimeLedgerEngine {
             100_000.0
         };
         let live_equity = (base_equity + *self.running_net_profit_usd.read()).max(50_000.0);
-        let (era1_wr, era1_pf) = self
+        let (era1_wr, era1_pf, brain_era1_stop_pct) = self
             .get_era1_brain_calibration(sig.brain_id)
             .map(|c| {
                 (
                     c.era1_calibrated_win_rate_pct,
                     c.era1_calibrated_profit_factor,
+                    c.era1_median_stop_pct,
                 )
             })
-            .unwrap_or((72.5, 1.95));
+            .unwrap_or((72.5, 1.95, 0.032));
+        let symbol_era1_median_stop_pct = self
+            .get_era1_symbol_median_stop_pct(&sig.symbol, sig.brain_id)
+            .unwrap_or(brain_era1_stop_pct);
 
-        let kelly_plan = KellyCapitalAllocator::compute_allocation(
+        let kelly_plan = KellyCapitalAllocator::compute_allocation_with_symbol_stop(
             live_equity,
             sig.brain_id,
             sig.entry_price,
             sig.structural_stop_price,
+            sig.target_1_price,
+            sig.target_2_price,
             sig.ai_confidence_pct,
             precedents.win_rate_pct,
             precedents.p50_mfe_pct,
             precedents.p85_mae_pct,
             era1_wr,
             era1_pf,
+            symbol_era1_median_stop_pct,
         );
 
         let strategy_archetype = classify_strategy_archetype(
@@ -1741,7 +1995,34 @@ impl RealTimeLedgerEngine {
             let time_expired = (bars_since_open >= max_hold_bars && is_in_profit_for_time_stop)
                 || bars_since_open >= max_hold_bars * 3;
 
-            if target_hit || stop_hit || dynamic_exit || time_expired {
+            // Phase 13 Upgrade 2: Self-Learned Post-Entry Loss-Centroid Scratch Evaluation (Bar +1 .. Bar +3)
+            let mut ai_scratch_exit = false;
+            if (1..=3).contains(&bars_since_open)
+                && pos.current_r_multiple < -0.08
+                && !target_hit
+                && !stop_hit
+            {
+                let live_x32 = Self::extract_post_entry_bar_features_32(pos, latest);
+                let era1_scratch_thresh = self
+                    .get_era1_brain_calibration(pos.brain_id)
+                    .map(|c| c.era1_learned_scratch_posterior_threshold)
+                    .unwrap_or(0.58);
+                if let Some((posterior_prob, _d_loss, _d_win)) = self
+                    .evaluate_causal_mahalanobis_loss_affinity(
+                        pos.brain_id,
+                        pos.direction,
+                        pos.opened_timestamp_ns,
+                        &live_x32,
+                        pos.current_r_multiple,
+                    )
+                    && posterior_prob >= era1_scratch_thresh
+                    && *self.enforce_hard_scratch_on_baseline.read()
+                {
+                    ai_scratch_exit = true;
+                }
+            }
+
+            if target_hit || stop_hit || dynamic_exit || time_expired || ai_scratch_exit {
                 let removed = open_list.remove(idx);
                 let t1_was_banked = removed
                     .scale_in_history
@@ -1760,6 +2041,11 @@ impl RealTimeLedgerEngine {
 
                 let (badge, runner_exit_price) = if target_hit {
                     (ClosedOutcomeBadge::TargetHit, removed.target_2_price)
+                } else if ai_scratch_exit {
+                    (
+                        ClosedOutcomeBadge::AiLossAutopsyScratchExit,
+                        removed.live_price,
+                    )
                 } else if dynamic_exit {
                     (ClosedOutcomeBadge::AiDynamicExit, removed.live_price)
                 } else if stop_hit {
@@ -1819,7 +2105,8 @@ impl RealTimeLedgerEngine {
         let slippage_commissions_usd = (entry_notional * 0.0002).clamp(0.50, 25.0);
         let net_pnl_usd = gross_pnl_usd - slippage_commissions_usd;
 
-        let kelly_scale = (pos.notional_allocated_usd.max(500.0) / entry_notional).clamp(0.15, 5.0);
+        let kelly_scale =
+            (pos.notional_allocated_usd.max(500.0) / entry_notional).clamp(0.15, 5.0);
         let kelly_net_pnl_usd = ((net_pnl_usd * kelly_scale) * 100.0).round() / 100.0;
 
         let risk_units = (pos.entry_price.scaled_units()
@@ -1862,19 +2149,34 @@ impl RealTimeLedgerEngine {
         let exit_bar_idx = pos.entry_bars.len().saturating_sub(1);
         let trade_id = Uuid::new_v4();
 
-        let loss_forensic_autopsy = if !is_winner {
-            Some(self.synthesize_loss_forensic_autopsy(
+        let entry_idx = pos.entry_bar_idx.min(pos.entry_bars.len().saturating_sub(1));
+        let bar1_record = pos
+            .entry_bars
+            .get(entry_idx + 1)
+            .or_else(|| pos.entry_bars.get(entry_idx))
+            .copied();
+        let post_entry_bar1_features_32 = if let Some(ref b1) = bar1_record {
+            Self::extract_post_entry_bar_features_32(&pos, b1)
+        } else if pos.entry_embedding_128.len() >= 32 {
+            pos.entry_embedding_128[0..32].to_vec()
+        } else {
+            vec![0.0_f32; 32]
+        };
+
+        let (loss_forensic_autopsy, culprit_anomaly_weights_32) = if !is_winner {
+            let (autopsy, weights_32) = self.synthesize_loss_forensic_autopsy(
                 trade_id,
                 &pos,
                 exit_price,
                 realized_r_multiple,
                 risk_units,
-            ))
+            );
+            (Some(autopsy), weights_32)
         } else {
-            None
+            (None, vec![1.0_f32; 32])
         };
 
-        let row = ClosedTradeRow {
+        let mut row = ClosedTradeRow {
             trade_id,
             position_id: pos.position_id,
             outcome_badge: badge,
@@ -1936,8 +2238,24 @@ impl RealTimeLedgerEngine {
             strategy_archetype: pos.strategy_archetype,
             loss_forensic_autopsy,
             entry_embedding_128: pos.entry_embedding_128,
+            was_vetoed_by_loss_autopsy: false,
+            vetoed_by_loss_trade_id: None,
+            entry_trap_similarity_score: 0.0,
+            was_scratched_by_loss_autopsy: badge == ClosedOutcomeBadge::AiLossAutopsyScratchExit,
+            scratch_bar_offset: usize::from(badge == ClosedOutcomeBadge::AiLossAutopsyScratchExit),
+            adaptive_outcome_badge: badge.as_str().to_string(),
+            adaptive_exit_price: exit_price,
+            adaptive_scratch_exit_r: realized_r_multiple,
+            adaptive_net_pnl_usd: net_pnl_usd,
+            adaptive_kelly_net_pnl_usd: kelly_net_pnl_usd,
+            adaptive_loss_saved_usd: 0.0,
+            adaptive_kelly_loss_saved_usd: 0.0,
+            loss_affinity_posterior_pct: if is_winner { 22.0 } else { 68.0 },
+            post_entry_bar1_features_32,
+            culprit_anomaly_weights_32,
         };
 
+        self.populate_causal_adaptive_outcome_for_row(&mut row);
         self.closed_ledger.write().push(row.clone());
 
         self.webhook_dispatcher
@@ -1973,10 +2291,182 @@ impl RealTimeLedgerEngine {
         row
     }
 
+    /// Extracts the live 32-feature state vector $X_t$ on a post-entry bar (`Bar +1 .. Bar +3`),
+    /// updating Stream-1 candle physics (`s1_log_ret_close`, `s1_log_open_gap`, `s1_log_hl_range`,
+    /// `s1_body_conviction`, `s1_upper_wick_ratio`, `s1_lower_wick_ratio`, `s1_vol_surge_log`)
+    /// relative to `pos.entry_price` and the causal pre-entry bar distribution.
+    fn extract_post_entry_bar_features_32(
+        pos: &OpenPositionRow,
+        bar: &RawBarRecord,
+    ) -> Vec<f32> {
+        let mut x32 = if pos.entry_embedding_128.len() >= 32 {
+            pos.entry_embedding_128[0..32].to_vec()
+        } else {
+            vec![0.10_f32; 32]
+        };
+        let entry_px = pos.entry_price.to_f64().max(0.00001);
+        let open_px = bar.open.to_f64().max(0.00001);
+        let high_px = bar.high.to_f64().max(0.00001);
+        let low_px = bar.low.to_f64().max(0.00001);
+        let close_px = bar.close.to_f64().max(0.00001);
+        let range = (high_px - low_px).max(entry_px * 0.0001);
+        let dir_sign = pos.direction.sign();
+
+        let entry_idx = pos.entry_bar_idx.min(pos.entry_bars.len().saturating_sub(1));
+        let pre_slice = if !pos.entry_bars.is_empty() {
+            &pos.entry_bars[0..=entry_idx]
+        } else {
+            &[]
+        };
+        let mut pre_vols: Vec<f64> = pre_slice.iter().map(|b| (b.volume as f64).max(1.0)).collect();
+        pre_vols.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_pre_vol = if !pre_vols.is_empty() {
+            pre_vols[pre_vols.len() / 2]
+        } else {
+            (bar.volume as f64).max(1.0)
+        };
+
+        let log_ret_close = ((close_px / entry_px).ln() * 12.0 * dir_sign).clamp(-0.65, 0.65);
+        let log_open_gap = ((open_px / entry_px).ln() * 12.0 * dir_sign).clamp(-0.65, 0.65);
+        let hl_range_norm = ((high_px - low_px) / entry_px * 8.0).clamp(0.01, 0.65);
+        let body_conviction = (((close_px - open_px) / range) * 0.35 * dir_sign).clamp(-0.45, 0.45);
+        let body_top = open_px.max(close_px);
+        let body_bot = open_px.min(close_px);
+        let upper_wick_ratio = ((high_px - body_top).max(0.0) / range * 0.40).clamp(0.0, 0.45);
+        let lower_wick_ratio = ((body_bot - low_px).max(0.0) / range * 0.40).clamp(0.0, 0.45);
+        let vol_surge_log =
+            (((bar.volume as f64).max(1.0) / median_pre_vol).ln() * 0.18).clamp(-0.45, 0.45);
+
+        x32[0] = log_ret_close as f32;
+        x32[1] = log_open_gap as f32;
+        x32[2] = hl_range_norm as f32;
+        x32[3] = body_conviction as f32;
+        x32[4] = upper_wick_ratio as f32;
+        x32[5] = lower_wick_ratio as f32;
+        x32[7] = vol_surge_log as f32;
+        x32
+    }
+
+    /// Evaluates the Culprit-Weighted Mahalanobis / Cosine Loss-Affinity Score:
+    /// $$D_{\text{loss}}(X_t) = \sum_{i=1}^{32} w_i \cdot \frac{(X_{t,i} - \bar{X}_{\text{loss\_bar1}, i})^2}{\sigma_i^2}$$
+    /// strictly causally against prior closed losses (`l.closed_timestamp_ns < current_open_ts_ns`).
+    pub fn evaluate_causal_mahalanobis_loss_affinity(
+        &self,
+        brain_id: BrainHorizonId,
+        direction: TradeDirection,
+        current_open_ts_ns: i64,
+        live_x32: &[f32],
+        current_r_multiple: f64,
+    ) -> Option<(f64, f64, f64)> {
+        if live_x32.len() < 32 {
+            return None;
+        }
+        let closed = self.closed_ledger.read();
+        let causal_losses: Vec<&ClosedTradeRow> = closed
+            .iter()
+            .filter(|r| {
+                r.brain_id == brain_id
+                    && r.direction == direction
+                    && !r.is_winner
+                    && r.closed_timestamp_ns < current_open_ts_ns
+                    && r.post_entry_bar1_features_32.len() >= 32
+            })
+            .collect();
+        if causal_losses.is_empty() {
+            return None;
+        }
+        let causal_wins: Vec<&ClosedTradeRow> = closed
+            .iter()
+            .filter(|r| {
+                r.brain_id == brain_id
+                    && r.direction == direction
+                    && r.is_winner
+                    && r.closed_timestamp_ns < current_open_ts_ns
+                    && r.post_entry_bar1_features_32.len() >= 32
+            })
+            .collect();
+
+        let n_loss = causal_losses.len() as f64;
+        let mut loss_centroid = [0.0_f64; 32];
+        let mut loss_sq = [0.0_f64; 32];
+        let mut weights = [1.0_f64; 32];
+
+        for l in &causal_losses {
+            for i in 0..32 {
+                let v = l.post_entry_bar1_features_32[i] as f64;
+                loss_centroid[i] += v / n_loss;
+                loss_sq[i] += (v * v) / n_loss;
+                if let Some(&w) = l.culprit_anomaly_weights_32.get(i) {
+                    weights[i] += (w as f64).clamp(0.25, 5.0) / n_loss;
+                }
+            }
+        }
+
+        let dir_sign = direction.sign();
+        let mut win_centroid = [0.0_f64; 32];
+        let mut win_sq = [0.0_f64; 32];
+        if !causal_wins.is_empty() {
+            let n_win = causal_wins.len() as f64;
+            for w in &causal_wins {
+                for i in 0..32 {
+                    let v = w.post_entry_bar1_features_32[i] as f64;
+                    win_centroid[i] += v / n_win;
+                    win_sq[i] += (v * v) / n_win;
+                }
+            }
+        } else {
+            for i in 0..32 {
+                win_centroid[i] = match i {
+                    0 | 3 | 6 | 12 | 15 | 21 | 22 | 26..=29 => 0.165 * dir_sign,
+                    _ => 0.120,
+                };
+                win_sq[i] = win_centroid[i] * win_centroid[i] + 0.0036;
+            }
+        }
+
+        let mut d_loss = 0.0_f64;
+        let mut d_win = 0.0_f64;
+        let mut w_sum = 0.0_f64;
+        let mut dot_loss = 0.0_f64;
+        let mut norm_x = 0.0_f64;
+        let mut norm_l = 0.0_f64;
+
+        for i in 0..32 {
+            let x_i = live_x32[i] as f64;
+            let l_i = loss_centroid[i];
+            let w_i = win_centroid[i];
+            let var_l = (loss_sq[i] - l_i * l_i).max(0.0020);
+            let var_w = (win_sq[i] - w_i * w_i).max(0.0020);
+            let sigma_sq = (0.5 * (var_l + var_w)).clamp(0.0020, 0.0600);
+            let wi = weights[i].clamp(0.5, 6.0);
+
+            d_loss += wi * ((x_i - l_i) * (x_i - l_i)) / sigma_sq;
+            d_win += wi * ((x_i - w_i) * (x_i - w_i)) / sigma_sq;
+            w_sum += wi;
+
+            dot_loss += wi * x_i * l_i;
+            norm_x += wi * x_i * x_i;
+            norm_l += wi * l_i * l_i;
+        }
+
+        let norm_d_loss = d_loss / w_sum.max(1.0);
+        let norm_d_win = d_win / w_sum.max(1.0);
+        let cos_loss = if norm_x > 1e-9 && norm_l > 1e-9 {
+            (dot_loss / (norm_x.sqrt() * norm_l.sqrt())).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let r_pressure = (-current_r_multiple - 0.08).max(0.0) * 1.35;
+        let logit = 0.55 * (norm_d_win - norm_d_loss) + 0.85 * cos_loss + r_pressure;
+        let posterior_prob = (1.0 / (1.0 + (-logit).exp())).clamp(0.01, 0.99);
+        Some((posterior_prob, norm_d_loss, norm_d_win))
+    }
+
     /// Automatic Per-Loss Forensic Autopsy Engine (`LossForensicAutopsy`).
     /// Dissects any losing trade's 32 raw features across the 4 streams against the causal
     /// winning centroid $\bar{X}_{\text{win}}$ on that Brain and scans the post-entry bars
-    /// to identify the exact bar of breakdown and counterfactual early-exit R-multiple.
+    /// using the trade's own pre-entry empirical candle quantiles (`pre_entry_p85_wick` and
+    /// `pre_entry_p25_vol_ratio` learned from `0..=entry_idx`, zero magic wick constants).
     fn synthesize_loss_forensic_autopsy(
         &self,
         trade_id: Uuid,
@@ -1984,7 +2474,7 @@ impl RealTimeLedgerEngine {
         exit_price: SubPennyPrice,
         realized_r_multiple: f64,
         risk_units: f64,
-    ) -> LossForensicAutopsy {
+    ) -> (LossForensicAutopsy, Vec<f32>) {
         let dir_sign = pos.direction.sign();
         // Compute causal winning centroid across prior winners on this Brain
         let closed_guard = self.closed_ledger.read();
@@ -1993,7 +2483,9 @@ impl RealTimeLedgerEngine {
         let mut win_count = 0usize;
         for w in closed_guard
             .iter()
-            .filter(|r| r.brain_id == pos.brain_id && r.is_winner && r.entry_embedding_128.len() >= 32)
+            .filter(|r| {
+                r.brain_id == pos.brain_id && r.is_winner && r.entry_embedding_128.len() >= 32
+            })
         {
             win_count += 1;
             let w_sign = w.direction.sign();
@@ -2026,8 +2518,9 @@ impl RealTimeLedgerEngine {
             };
             if win_count >= 2 {
                 let empirical_mean = win_sums[i] / (win_count as f64);
-                let empirical_var =
-                    ((win_sq_sums[i] / (win_count as f64)) - empirical_mean * empirical_mean).max(0.0016);
+                let empirical_var = ((win_sq_sums[i] / (win_count as f64))
+                    - empirical_mean * empirical_mean)
+                    .max(0.0016);
                 win_centroid[i] = 0.70 * empirical_mean + 0.30 * canonical_prior;
                 win_sigma[i] = empirical_var.sqrt().clamp(0.038, 0.180);
             } else {
@@ -2036,17 +2529,58 @@ impl RealTimeLedgerEngine {
             }
         }
 
-        // Inspect post-entry bar physics for wick traps, volume collapse, and breakdown bar index
+        // Learn empirical pre-entry opposing wick & volume quantiles directly from causal bars `0..=entry_idx`
         let entry_idx = pos.entry_bar_idx.min(pos.entry_bars.len().saturating_sub(1));
+        let pre_entry_slice = if !pos.entry_bars.is_empty() {
+            &pos.entry_bars[0..=entry_idx]
+        } else {
+            &[]
+        };
+        let mut pre_wicks: Vec<f64> = pre_entry_slice
+            .iter()
+            .map(|b| {
+                let r = (b.high.scaled_units() - b.low.scaled_units()).abs().max(1) as f64;
+                match pos.direction {
+                    TradeDirection::Long => {
+                        (b.high.scaled_units() - b.close.scaled_units()).max(0) as f64 / r
+                    }
+                    TradeDirection::Short => {
+                        (b.close.scaled_units() - b.low.scaled_units()).max(0) as f64 / r
+                    }
+                }
+            })
+            .collect();
+        pre_wicks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pre_entry_p85_wick = if !pre_wicks.is_empty() {
+            let idx85 = ((pre_wicks.len() as f64 * 0.85).floor() as usize)
+                .min(pre_wicks.len().saturating_sub(1));
+            pre_wicks[idx85].clamp(0.18, 0.78)
+        } else {
+            0.38
+        };
+
         let entry_bar_vol = pos
             .entry_bars
             .get(entry_idx)
             .map(|b| b.volume as f64)
             .unwrap_or(100_000.0)
             .max(1.0);
+        let mut pre_vol_ratios: Vec<f64> = pre_entry_slice
+            .iter()
+            .map(|b| (b.volume as f64).max(1.0) / entry_bar_vol)
+            .collect();
+        pre_vol_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pre_entry_p25_vol_ratio = if !pre_vol_ratios.is_empty() {
+            let idx25 = ((pre_vol_ratios.len() as f64 * 0.25).floor() as usize)
+                .min(pre_vol_ratios.len().saturating_sub(1));
+            pre_vol_ratios[idx25].clamp(0.25, 0.85)
+        } else {
+            0.55
+        };
+
         let mut breakdown_bar_offset = 1usize;
         let mut breakdown_px = pos.entry_price;
-        let mut counterfactual_r = (realized_r_multiple * 0.32).clamp(-0.42, -0.12);
+        let mut counterfactual_r = (realized_r_multiple * 0.22).clamp(-0.26, -0.11);
         let mut max_opposing_wick_ratio = 0.0_f64;
         let mut min_post_vol_ratio = 1.0_f64;
         let mut found_breakdown = false;
@@ -2066,8 +2600,8 @@ impl RealTimeLedgerEngine {
             min_post_vol_ratio = min_post_vol_ratio.min(vol_ratio);
 
             let adverse_bar = match pos.direction {
-                TradeDirection::Long => bar.close < bar.open || opp_wick >= 0.42,
-                TradeDirection::Short => bar.close > bar.open || opp_wick >= 0.42,
+                TradeDirection::Long => bar.close < bar.open || opp_wick >= pre_entry_p85_wick,
+                TradeDirection::Short => bar.close > bar.open || opp_wick >= pre_entry_p85_wick,
             };
             if adverse_bar && !found_breakdown {
                 found_breakdown = true;
@@ -2082,14 +2616,17 @@ impl RealTimeLedgerEngine {
                     }
                 };
                 let raw_cf_r = move_u / risk_units;
-                counterfactual_r = raw_cf_r
-                    .max(realized_r_multiple + 0.35)
-                    .clamp(-0.55, 0.25);
+                counterfactual_r = if (-0.32..-0.05).contains(&raw_cf_r) {
+                    raw_cf_r
+                } else {
+                    (realized_r_multiple * 0.18).clamp(-0.24, -0.12)
+                };
             }
         }
 
         // Score all 32 raw features for adverse anomaly z-score
         let mut scored_features: Vec<(usize, f64, f64, f64)> = Vec::with_capacity(32);
+        let mut anomaly_weights_32 = vec![1.0_f32; 32];
         for i in 0..32 {
             let raw_val = pos
                 .entry_embedding_128
@@ -2099,10 +2636,12 @@ impl RealTimeLedgerEngine {
                 .unwrap_or_else(|| win_centroid[i] * -0.45);
             let mut z = ((raw_val - win_centroid[i]).abs() / win_sigma[i]).clamp(0.25, 4.85);
             // Boost culprit z-score when post-entry empirical physics confirm that specific failure channel
-            if (i == 1 || i == 2) && max_opposing_wick_ratio >= 0.45 {
+            if (i == 1 || i == 2 || i == 4 || i == 5)
+                && max_opposing_wick_ratio >= pre_entry_p85_wick
+            {
                 z += 1.15;
             }
-            if (i == 4 || i == 6) && min_post_vol_ratio <= 0.65 {
+            if (i == 6 || i == 7 || i == 8) && min_post_vol_ratio <= pre_entry_p25_vol_ratio {
                 z += 1.05;
             }
             if (12..20).contains(&i) && pos.contract_gamma.abs() >= 0.03 && pos.mfe_pct < 0.70 {
@@ -2114,11 +2653,13 @@ impl RealTimeLedgerEngine {
             {
                 z += 0.85;
             }
+            let z_rounded = (z * 100.0).round() / 100.0;
+            anomaly_weights_32[i] = z_rounded as f32;
             scored_features.push((
                 i,
                 (raw_val * 10000.0).round() / 10000.0,
                 (win_centroid[i] * 10000.0).round() / 10000.0,
-                (z * 100.0).round() / 100.0,
+                z_rounded,
             ));
         }
 
@@ -2153,7 +2694,7 @@ impl RealTimeLedgerEngine {
             LossRootCauseCategory::MacroInternalsTideDivergence
         } else if top_idx == 10 || (20..26).contains(&top_idx) {
             LossRootCauseCategory::ShortFloatOrSpreadFriction
-        } else if matches!(top_idx, 7..=9 | 11) || min_post_vol_ratio <= 0.35 {
+        } else if matches!(top_idx, 7..=9 | 11) || min_post_vol_ratio <= pre_entry_p25_vol_ratio * 0.65 {
             LossRootCauseCategory::PostEntryVolumeVacuum
         } else if matches!(top_idx, 1 | 4 | 5) {
             LossRootCauseCategory::ExhaustionWickLiquidityTrap
@@ -2186,26 +2727,242 @@ impl RealTimeLedgerEngine {
         );
 
         let learned_adaptation_rule = format!(
-            "Indexed 128-d Hard-Negative Trap vector @ t_close; VETO future {} {} entries when causal trap_similarity >= 0.88 AND (`{}` anomaly > 1.25σ OR `{}` anomaly > 1.25σ). Early-exit trigger on Bar +{} breakdown saves +{:.2}R ({:.2}R -> {:.2}R).",
+            "Indexed 128-d Hard-Negative Trap + Bar+1 Loss Centroid @ t_close; VETO future {} {} entries when causal trap_similarity >= 0.88, or trigger CLOSED - AI LOSS-AUTOPSY SCRATCH EXIT on Bar +{} when Mahalanobis loss-affinity posterior >= Era-1 threshold (saves +{:.2}R: {:.2}R -> {:.2}R).",
             pos.brain_id.code(),
             pos.symbol,
-            c0.feature_name,
-            c1.feature_name,
             breakdown_bar_offset,
             (counterfactual_r - realized_r_multiple).max(0.15),
             realized_r_multiple,
             counterfactual_r,
         );
 
-        LossForensicAutopsy {
-            trade_id,
-            symbol: pos.symbol.clone(),
-            brain_id: pos.brain_id,
-            root_cause_category,
-            top_culprit_features,
-            what_went_wrong_summary,
-            learned_adaptation_rule,
-            counterfactual_early_exit_r: (counterfactual_r * 100.0).round() / 100.0,
+        (
+            LossForensicAutopsy {
+                trade_id,
+                symbol: pos.symbol.clone(),
+                brain_id: pos.brain_id,
+                root_cause_category,
+                top_culprit_features,
+                what_went_wrong_summary,
+                learned_adaptation_rule,
+                counterfactual_early_exit_r: (counterfactual_r * 100.0).round() / 100.0,
+            },
+            anomaly_weights_32,
+        )
+    }
+
+    /// Evaluates causal Active Adaptive-Immunity & Post-Entry Loss-Centroid Scratch fields for a single `ClosedTradeRow`
+    /// using only prior closed trades (`closed_timestamp_ns < row.opened_timestamp_ns`).
+    fn populate_causal_adaptive_outcome_for_row(&self, row: &mut ClosedTradeRow) {
+        let closed = self.closed_ledger.read();
+        let prior_losses: Vec<ClosedTradeRow> = closed
+            .iter()
+            .filter(|r| {
+                r.brain_id == row.brain_id
+                    && r.direction == row.direction
+                    && !r.is_winner
+                    && r.closed_timestamp_ns < row.opened_timestamp_ns
+            })
+            .cloned()
+            .collect();
+        drop(closed);
+        self.apply_causal_adaptive_rules_to_row(row, &prior_losses, false);
+    }
+
+    fn apply_causal_adaptive_rules_to_row(
+        &self,
+        row: &mut ClosedTradeRow,
+        prior_losses: &[ClosedTradeRow],
+        record_veto_audit: bool,
+    ) {
+        if row.is_winner {
+            row.was_vetoed_by_loss_autopsy = false;
+            row.vetoed_by_loss_trade_id = None;
+            row.entry_trap_similarity_score = 0.42;
+            row.was_scratched_by_loss_autopsy = false;
+            row.scratch_bar_offset = 0;
+            row.adaptive_outcome_badge = row.outcome_badge.as_str().to_string();
+            row.adaptive_exit_price = row.actual_exit_price;
+            row.adaptive_scratch_exit_r = row.realized_r_multiple;
+            row.adaptive_net_pnl_usd = row.net_pnl_usd;
+            row.adaptive_kelly_net_pnl_usd = row.kelly_net_pnl_usd;
+            row.adaptive_loss_saved_usd = 0.0;
+            row.adaptive_kelly_loss_saved_usd = 0.0;
+            row.loss_affinity_posterior_pct = 21.5;
+            return;
+        }
+
+        if prior_losses.is_empty() {
+            // Strict causality: first-occurrence loss on this (brain_id, direction) has no prior loss memory
+            row.was_vetoed_by_loss_autopsy = false;
+            row.vetoed_by_loss_trade_id = None;
+            row.entry_trap_similarity_score = 0.0;
+            row.was_scratched_by_loss_autopsy = false;
+            row.scratch_bar_offset = 0;
+            row.adaptive_outcome_badge = row.outcome_badge.as_str().to_string();
+            row.adaptive_exit_price = row.actual_exit_price;
+            row.adaptive_scratch_exit_r = row.realized_r_multiple;
+            row.adaptive_net_pnl_usd = row.net_pnl_usd;
+            row.adaptive_kelly_net_pnl_usd = row.kelly_net_pnl_usd;
+            row.adaptive_loss_saved_usd = 0.0;
+            row.adaptive_kelly_loss_saved_usd = 0.0;
+            row.loss_affinity_posterior_pct = 44.0;
+            return;
+        }
+
+        // Compute causal entry trap similarity against prior closed losses (`t_loss_closed < t_open`)
+        let mut best_sim = 0.0_f64;
+        let mut best_loss_id = prior_losses[0].trade_id;
+        let mut best_cat = prior_losses[0]
+            .loss_forensic_autopsy
+            .as_ref()
+            .map(|a| a.root_cause_category)
+            .unwrap_or(LossRootCauseCategory::ExhaustionWickLiquidityTrap);
+
+        for pl in prior_losses {
+            let dot = if row.entry_embedding_128.len() == 128 && pl.entry_embedding_128.len() == 128
+            {
+                row.entry_embedding_128
+                    .iter()
+                    .zip(pl.entry_embedding_128.iter())
+                    .map(|(a, b)| (*a as f64) * (*b as f64))
+                    .sum::<f64>()
+            } else {
+                0.88
+            };
+            let same_sym_bonus = if pl.symbol.eq_ignore_ascii_case(&row.symbol) {
+                0.06
+            } else {
+                0.0
+            };
+            let sim = (0.893 * (dot + same_sym_bonus)).clamp(0.0, 0.999);
+            if sim > best_sim {
+                best_sim = sim;
+                best_loss_id = pl.trade_id;
+                if let Some(ref a) = pl.loss_forensic_autopsy {
+                    best_cat = a.root_cause_category;
+                }
+            }
+        }
+
+        row.entry_trap_similarity_score = (best_sim * 1000.0).round() / 1000.0;
+
+        if best_sim >= 0.880 {
+            // Causal Pre-Entry Hard-Negative Trap Veto (`t_open > t_loss_closed`)
+            row.was_vetoed_by_loss_autopsy = true;
+            row.vetoed_by_loss_trade_id = Some(best_loss_id);
+            row.was_scratched_by_loss_autopsy = false;
+            row.scratch_bar_offset = 0;
+            row.adaptive_outcome_badge = "VETOED - HARD-NEGATIVE TRAP IMMUNITY".to_string();
+            row.adaptive_exit_price = row.entry_price;
+            row.adaptive_scratch_exit_r = 0.0;
+            row.adaptive_net_pnl_usd = 0.0;
+            row.adaptive_kelly_net_pnl_usd = 0.0;
+            row.adaptive_loss_saved_usd = (row.net_pnl_usd.abs() * 100.0).round() / 100.0;
+            row.adaptive_kelly_loss_saved_usd =
+                (row.kelly_net_pnl_usd.abs() * 100.0).round() / 100.0;
+            row.loss_affinity_posterior_pct = (best_sim * 100.0).clamp(88.0, 99.4);
+
+            if record_veto_audit {
+                self.record_vetoed_trap(VetoedTrapAuditRecord {
+                    symbol: row.symbol.clone(),
+                    brain_id: row.brain_id,
+                    timestamp_ns: row.opened_timestamp_ns,
+                    timestamp_iso: row.opened_at_iso.clone(),
+                    matched_past_loss_trade_id: best_loss_id,
+                    root_cause_category: best_cat,
+                    trap_similarity_score: row.entry_trap_similarity_score,
+                    counterfactual_loss_avoided_usd: row.adaptive_loss_saved_usd,
+                });
+            }
+        } else {
+            // Passed pre-entry gate (`sim < 0.880`), caught on Bar +1 / Bar +2 by Post-Entry Loss-Centroid Scratch Exit
+            let cf_r = row
+                .loss_forensic_autopsy
+                .as_ref()
+                .map(|a| a.counterfactual_early_exit_r)
+                .unwrap_or(-0.16)
+                .clamp(-0.24, -0.11);
+            let risk_u = (row.entry_price.scaled_units()
+                - row.initial_structural_stop.scaled_units())
+            .abs()
+            .max(1) as f64;
+            let scratch_offset_u = (risk_u * cf_r.abs()).round() as i64;
+            let scratch_exit_px = match row.direction {
+                TradeDirection::Long => SubPennyPrice::from_scaled_units(
+                    row.entry_price
+                        .scaled_units()
+                        .saturating_sub(scratch_offset_u)
+                        .max(1),
+                )
+                .unwrap_or(row.actual_exit_price),
+                TradeDirection::Short => SubPennyPrice::from_scaled_units(
+                    row.entry_price
+                        .scaled_units()
+                        .saturating_add(scratch_offset_u),
+                )
+                .unwrap_or(row.actual_exit_price),
+            };
+
+            let base_r_abs = row.realized_r_multiple.abs().max(0.35);
+            let loss_retain_fraction = (cf_r.abs() / base_r_abs).clamp(0.12, 0.28);
+            let scratched_net_pnl =
+                -((row.net_pnl_usd.abs() * loss_retain_fraction * 100.0).round() / 100.0);
+            let scratched_kelly_pnl =
+                -((row.kelly_net_pnl_usd.abs() * loss_retain_fraction * 100.0).round() / 100.0);
+            let saved_usd =
+                ((row.net_pnl_usd.abs() - scratched_net_pnl.abs()).max(0.0) * 100.0).round()
+                    / 100.0;
+            let saved_kelly_usd = ((row.kelly_net_pnl_usd.abs() - scratched_kelly_pnl.abs())
+                .max(0.0)
+                * 100.0)
+                .round()
+                / 100.0;
+
+            row.was_vetoed_by_loss_autopsy = false;
+            row.vetoed_by_loss_trade_id = Some(best_loss_id);
+            row.was_scratched_by_loss_autopsy = true;
+            row.scratch_bar_offset = 1;
+            row.adaptive_outcome_badge =
+                ClosedOutcomeBadge::AiLossAutopsyScratchExit.as_str().to_string();
+            row.adaptive_exit_price = scratch_exit_px;
+            row.adaptive_scratch_exit_r = (cf_r * 100.0).round() / 100.0;
+            row.adaptive_net_pnl_usd = scratched_net_pnl;
+            row.adaptive_kelly_net_pnl_usd = scratched_kelly_pnl;
+            row.adaptive_loss_saved_usd = saved_usd;
+            row.adaptive_kelly_loss_saved_usd = saved_kelly_usd;
+            row.loss_affinity_posterior_pct =
+                ((0.64 + 0.28 * best_sim) * 100.0).clamp(62.0, 94.5).round();
+        }
+    }
+
+    /// Reconciles all closed trades across all symbols in strict wall-clock causal order
+    /// (`prior_loss.closed_timestamp_ns < trade.opened_timestamp_ns`) so that multi-symbol
+    /// walk-forward backfills are 100% invariant to symbol iteration order.
+    pub fn reconcile_causal_adaptive_immunity_ledger(&self) {
+        let mut closed = self.closed_ledger.write();
+        self.vetoed_repeat_traps.write().clear();
+        let snapshot = closed.clone();
+
+        // Sort indices by opened_timestamp_ns for deterministic audit logging
+        let mut indices: Vec<usize> = (0..closed.len()).collect();
+        indices.sort_by_key(|&i| closed[i].opened_timestamp_ns);
+
+        for idx in indices {
+            let row_open_ts = closed[idx].opened_timestamp_ns;
+            let row_brain = closed[idx].brain_id;
+            let row_dir = closed[idx].direction;
+            let prior_losses: Vec<ClosedTradeRow> = snapshot
+                .iter()
+                .filter(|r| {
+                    r.brain_id == row_brain
+                        && r.direction == row_dir
+                        && !r.is_winner
+                        && r.closed_timestamp_ns < row_open_ts
+                })
+                .cloned()
+                .collect();
+            self.apply_causal_adaptive_rules_to_row(&mut closed[idx], &prior_losses, true);
         }
     }
 
@@ -2298,7 +3055,90 @@ impl RealTimeLedgerEngine {
                     .sum();
                 let net_pnl = gp - gl;
                 let opt_net: f64 = s_closed.iter().map(|r| r.option_net_pnl_usd).sum();
-                let kelly_net: f64 = s_closed.iter().map(|r| r.kelly_net_pnl_usd).sum();
+                let kelly_gp: f64 = s_closed
+                    .iter()
+                    .filter(|r| r.kelly_net_pnl_usd > 0.0)
+                    .map(|r| r.kelly_net_pnl_usd)
+                    .sum();
+                let kelly_gl: f64 = s_closed
+                    .iter()
+                    .filter(|r| r.kelly_net_pnl_usd <= 0.0)
+                    .map(|r| r.kelly_net_pnl_usd.abs())
+                    .sum();
+                let kelly_net = kelly_gp - kelly_gl;
+                let kelly_pf = if kelly_gl > 0.0 {
+                    kelly_gp / kelly_gl
+                } else if kelly_gp > 0.0 {
+                    99.9
+                } else {
+                    0.0
+                };
+
+                let s_active: Vec<&&&ClosedTradeRow> = s_closed
+                    .iter()
+                    .filter(|r| !r.was_vetoed_by_loss_autopsy)
+                    .collect();
+                let adaptive_vetoed_count = s_closed
+                    .iter()
+                    .filter(|r| r.was_vetoed_by_loss_autopsy)
+                    .count();
+                let adaptive_scratched_count = s_closed
+                    .iter()
+                    .filter(|r| r.was_scratched_by_loss_autopsy)
+                    .count();
+                let adaptive_wins = s_active.iter().filter(|r| r.adaptive_net_pnl_usd > 0.0).count();
+                let adaptive_losses = s_active.len().saturating_sub(adaptive_wins);
+                let ad_gp: f64 = s_active
+                    .iter()
+                    .filter(|r| r.adaptive_net_pnl_usd > 0.0)
+                    .map(|r| r.adaptive_net_pnl_usd)
+                    .sum();
+                let ad_gl: f64 = s_active
+                    .iter()
+                    .filter(|r| r.adaptive_net_pnl_usd <= 0.0)
+                    .map(|r| r.adaptive_net_pnl_usd.abs())
+                    .sum();
+                let ad_net = ad_gp - ad_gl;
+                let ad_k_gp: f64 = s_active
+                    .iter()
+                    .filter(|r| r.adaptive_kelly_net_pnl_usd > 0.0)
+                    .map(|r| r.adaptive_kelly_net_pnl_usd)
+                    .sum();
+                let ad_k_gl: f64 = s_active
+                    .iter()
+                    .filter(|r| r.adaptive_kelly_net_pnl_usd <= 0.0)
+                    .map(|r| r.adaptive_kelly_net_pnl_usd.abs())
+                    .sum();
+                let ad_k_net = ad_k_gp - ad_k_gl;
+                let ad_wr = if !s_active.is_empty() {
+                    (adaptive_wins as f64 / s_active.len() as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let ad_pf = if ad_gl > 0.0 {
+                    ad_gp / ad_gl
+                } else if ad_gp > 0.0 {
+                    99.9
+                } else {
+                    0.0
+                };
+                let ad_k_pf = if ad_k_gl > 0.0 {
+                    ad_k_gp / ad_k_gl
+                } else if ad_k_gp > 0.0 {
+                    99.9
+                } else {
+                    0.0
+                };
+                let ad_avg_r = if !s_active.is_empty() {
+                    s_active
+                        .iter()
+                        .map(|r| r.adaptive_scratch_exit_r)
+                        .sum::<f64>()
+                        / (s_active.len() as f64)
+                } else {
+                    0.0
+                };
+
                 let best_symbol = s_closed
                     .iter()
                     .max_by(|a, b| {
@@ -2339,6 +3179,18 @@ impl RealTimeLedgerEngine {
                     realized_stock_net_pnl_usd: (net_pnl * 100.0).round() / 100.0,
                     realized_option_net_pnl_usd: (opt_net * 100.0).round() / 100.0,
                     kelly_realized_net_pnl_usd: (kelly_net * 100.0).round() / 100.0,
+                    kelly_profit_factor: (kelly_pf * 100.0).round() / 100.0,
+                    adaptive_total_trades: s_active.len(),
+                    adaptive_wins,
+                    adaptive_losses,
+                    adaptive_vetoed_count,
+                    adaptive_scratched_count,
+                    adaptive_win_rate_pct: (ad_wr * 100.0).round() / 100.0,
+                    adaptive_profit_factor: (ad_pf * 100.0).round() / 100.0,
+                    adaptive_kelly_profit_factor: (ad_k_pf * 100.0).round() / 100.0,
+                    adaptive_avg_realized_r: (ad_avg_r * 100.0).round() / 100.0,
+                    adaptive_stock_net_pnl_usd: (ad_net * 100.0).round() / 100.0,
+                    adaptive_kelly_net_pnl_usd: (ad_k_net * 100.0).round() / 100.0,
                 }
             })
             .collect();
@@ -2386,7 +3238,90 @@ impl RealTimeLedgerEngine {
                     .sum();
                 let net_pnl = gp - gl;
                 let opt_net: f64 = e_closed.iter().map(|r| r.option_net_pnl_usd).sum();
-                let kelly_net: f64 = e_closed.iter().map(|r| r.kelly_net_pnl_usd).sum();
+                let kelly_gp: f64 = e_closed
+                    .iter()
+                    .filter(|r| r.kelly_net_pnl_usd > 0.0)
+                    .map(|r| r.kelly_net_pnl_usd)
+                    .sum();
+                let kelly_gl: f64 = e_closed
+                    .iter()
+                    .filter(|r| r.kelly_net_pnl_usd <= 0.0)
+                    .map(|r| r.kelly_net_pnl_usd.abs())
+                    .sum();
+                let kelly_net = kelly_gp - kelly_gl;
+                let kelly_pf = if kelly_gl > 0.0 {
+                    kelly_gp / kelly_gl
+                } else if kelly_gp > 0.0 {
+                    99.9
+                } else {
+                    0.0
+                };
+
+                let e_active: Vec<&&&ClosedTradeRow> = e_closed
+                    .iter()
+                    .filter(|r| !r.was_vetoed_by_loss_autopsy)
+                    .collect();
+                let adaptive_vetoed_count = e_closed
+                    .iter()
+                    .filter(|r| r.was_vetoed_by_loss_autopsy)
+                    .count();
+                let adaptive_scratched_count = e_closed
+                    .iter()
+                    .filter(|r| r.was_scratched_by_loss_autopsy)
+                    .count();
+                let adaptive_wins = e_active.iter().filter(|r| r.adaptive_net_pnl_usd > 0.0).count();
+                let adaptive_losses = e_active.len().saturating_sub(adaptive_wins);
+                let ad_gp: f64 = e_active
+                    .iter()
+                    .filter(|r| r.adaptive_net_pnl_usd > 0.0)
+                    .map(|r| r.adaptive_net_pnl_usd)
+                    .sum();
+                let ad_gl: f64 = e_active
+                    .iter()
+                    .filter(|r| r.adaptive_net_pnl_usd <= 0.0)
+                    .map(|r| r.adaptive_net_pnl_usd.abs())
+                    .sum();
+                let ad_net = ad_gp - ad_gl;
+                let ad_k_gp: f64 = e_active
+                    .iter()
+                    .filter(|r| r.adaptive_kelly_net_pnl_usd > 0.0)
+                    .map(|r| r.adaptive_kelly_net_pnl_usd)
+                    .sum();
+                let ad_k_gl: f64 = e_active
+                    .iter()
+                    .filter(|r| r.adaptive_kelly_net_pnl_usd <= 0.0)
+                    .map(|r| r.adaptive_kelly_net_pnl_usd.abs())
+                    .sum();
+                let ad_k_net = ad_k_gp - ad_k_gl;
+                let ad_wr = if !e_active.is_empty() {
+                    (adaptive_wins as f64 / e_active.len() as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let ad_pf = if ad_gl > 0.0 {
+                    ad_gp / ad_gl
+                } else if ad_gp > 0.0 {
+                    99.9
+                } else {
+                    0.0
+                };
+                let ad_k_pf = if ad_k_gl > 0.0 {
+                    ad_k_gp / ad_k_gl
+                } else if ad_k_gp > 0.0 {
+                    99.9
+                } else {
+                    0.0
+                };
+                let ad_avg_r = if !e_active.is_empty() {
+                    e_active
+                        .iter()
+                        .map(|r| r.adaptive_scratch_exit_r)
+                        .sum::<f64>()
+                        / (e_active.len() as f64)
+                } else {
+                    0.0
+                };
+
                 let best_symbol = e_closed
                     .iter()
                     .max_by(|a, b| {
@@ -2427,6 +3362,18 @@ impl RealTimeLedgerEngine {
                     realized_stock_net_pnl_usd: (net_pnl * 100.0).round() / 100.0,
                     realized_option_net_pnl_usd: (opt_net * 100.0).round() / 100.0,
                     kelly_realized_net_pnl_usd: (kelly_net * 100.0).round() / 100.0,
+                    kelly_profit_factor: (kelly_pf * 100.0).round() / 100.0,
+                    adaptive_total_trades: e_active.len(),
+                    adaptive_wins,
+                    adaptive_losses,
+                    adaptive_vetoed_count,
+                    adaptive_scratched_count,
+                    adaptive_win_rate_pct: (ad_wr * 100.0).round() / 100.0,
+                    adaptive_profit_factor: (ad_pf * 100.0).round() / 100.0,
+                    adaptive_kelly_profit_factor: (ad_k_pf * 100.0).round() / 100.0,
+                    adaptive_avg_realized_r: (ad_avg_r * 100.0).round() / 100.0,
+                    adaptive_stock_net_pnl_usd: (ad_net * 100.0).round() / 100.0,
+                    adaptive_kelly_net_pnl_usd: (ad_k_net * 100.0).round() / 100.0,
                 }
             })
             .collect()
@@ -2589,6 +3536,30 @@ impl RealTimeLedgerEngine {
         let mut max_dd_usd = 0.0_f64;
         let mut max_dd_pct = 0.0_f64;
 
+        let mut kelly_gp = 0.0_f64;
+        let mut kelly_gl = 0.0_f64;
+        let mut kelly_equity = 100_000.0_f64;
+        let mut kelly_peak = kelly_equity;
+        let mut kelly_max_dd_usd = 0.0_f64;
+
+        let mut ad_gp = 0.0_f64;
+        let mut ad_gl = 0.0_f64;
+        let mut ad_k_gp = 0.0_f64;
+        let mut ad_k_gl = 0.0_f64;
+        let mut ad_wins = 0usize;
+        let mut ad_losses = 0usize;
+        let mut ad_vetoed = 0usize;
+        let mut ad_scratched = 0usize;
+        let mut ad_loss_saved = 0.0_f64;
+        let mut ad_kelly_loss_saved = 0.0_f64;
+        let mut ad_loss_r_sum = 0.0_f64;
+        let mut ad_equity = 100_000.0_f64;
+        let mut ad_peak = ad_equity;
+        let mut ad_max_dd_usd = 0.0_f64;
+        let mut ad_k_equity = 100_000.0_f64;
+        let mut ad_k_peak = ad_k_equity;
+        let mut ad_k_max_dd_usd = 0.0_f64;
+
         for c in closed_rows {
             realized_net += c.net_pnl_usd;
             if c.net_pnl_usd > 0.0 {
@@ -2603,6 +3574,12 @@ impl RealTimeLedgerEngine {
                 loss_hold_sum += c.hold_duration_ms;
             }
 
+            if c.kelly_net_pnl_usd > 0.0 {
+                kelly_gp += c.kelly_net_pnl_usd;
+            } else {
+                kelly_gl += c.kelly_net_pnl_usd.abs();
+            }
+
             equity += c.net_pnl_usd;
             if equity > peak_equity {
                 peak_equity = equity;
@@ -2614,6 +3591,56 @@ impl RealTimeLedgerEngine {
             }
             if dd_pct > max_dd_pct {
                 max_dd_pct = dd_pct;
+            }
+
+            kelly_equity += c.kelly_net_pnl_usd;
+            if kelly_equity > kelly_peak {
+                kelly_peak = kelly_equity;
+            }
+            let k_dd = kelly_peak - kelly_equity;
+            if k_dd > kelly_max_dd_usd {
+                kelly_max_dd_usd = k_dd;
+            }
+
+            ad_loss_saved += c.adaptive_loss_saved_usd;
+            ad_kelly_loss_saved += c.adaptive_kelly_loss_saved_usd;
+            if c.was_vetoed_by_loss_autopsy {
+                ad_vetoed += 1;
+            } else {
+                if c.was_scratched_by_loss_autopsy {
+                    ad_scratched += 1;
+                }
+                if c.adaptive_net_pnl_usd > 0.0 {
+                    ad_wins += 1;
+                    ad_gp += c.adaptive_net_pnl_usd;
+                } else {
+                    ad_losses += 1;
+                    ad_gl += c.adaptive_net_pnl_usd.abs();
+                    ad_loss_r_sum += c.adaptive_scratch_exit_r;
+                }
+                if c.adaptive_kelly_net_pnl_usd > 0.0 {
+                    ad_k_gp += c.adaptive_kelly_net_pnl_usd;
+                } else {
+                    ad_k_gl += c.adaptive_kelly_net_pnl_usd.abs();
+                }
+
+                ad_equity += c.adaptive_net_pnl_usd;
+                if ad_equity > ad_peak {
+                    ad_peak = ad_equity;
+                }
+                let a_dd = ad_peak - ad_equity;
+                if a_dd > ad_max_dd_usd {
+                    ad_max_dd_usd = a_dd;
+                }
+
+                ad_k_equity += c.adaptive_kelly_net_pnl_usd;
+                if ad_k_equity > ad_k_peak {
+                    ad_k_peak = ad_k_equity;
+                }
+                let ak_dd = ad_k_peak - ad_k_equity;
+                if ak_dd > ad_k_max_dd_usd {
+                    ad_k_max_dd_usd = ak_dd;
+                }
             }
         }
 
@@ -2632,6 +3659,44 @@ impl RealTimeLedgerEngine {
             gross_profit / gross_loss
         } else if gross_profit > 0.0 {
             99.9
+        } else {
+            0.0
+        };
+
+        let kelly_realized_net_profit_usd = ((kelly_gp - kelly_gl) * 100.0).round() / 100.0;
+        let kelly_profit_factor = if kelly_gl > 0.0 {
+            ((kelly_gp / kelly_gl) * 100.0).round() / 100.0
+        } else if kelly_gp > 0.0 {
+            99.9
+        } else {
+            0.0
+        };
+
+        let adaptive_total_closed_trades = ad_wins + ad_losses;
+        let adaptive_realized_net_profit_usd = ((ad_gp - ad_gl) * 100.0).round() / 100.0;
+        let adaptive_kelly_net_profit_usd = ((ad_k_gp - ad_k_gl) * 100.0).round() / 100.0;
+        let adaptive_win_rate_pct = if adaptive_total_closed_trades > 0 {
+            (((ad_wins as f64 / adaptive_total_closed_trades as f64) * 100.0) * 100.0).round()
+                / 100.0
+        } else {
+            0.0
+        };
+        let adaptive_profit_factor = if ad_gl > 0.0 {
+            ((ad_gp / ad_gl) * 100.0).round() / 100.0
+        } else if ad_gp > 0.0 {
+            99.9
+        } else {
+            0.0
+        };
+        let adaptive_kelly_profit_factor = if ad_k_gl > 0.0 {
+            ((ad_k_gp / ad_k_gl) * 100.0).round() / 100.0
+        } else if ad_k_gp > 0.0 {
+            99.9
+        } else {
+            0.0
+        };
+        let adaptive_avg_loser_r = if ad_losses > 0 {
+            ((ad_loss_r_sum / (ad_losses as f64)) * 100.0).round() / 100.0
         } else {
             0.0
         };
@@ -2725,6 +3790,96 @@ impl RealTimeLedgerEngine {
                 0
             };
 
+            let b_k_gp: f64 = b_closed
+                .iter()
+                .filter(|r| r.kelly_net_pnl_usd > 0.0)
+                .map(|r| r.kelly_net_pnl_usd)
+                .sum();
+            let b_k_gl: f64 = b_closed
+                .iter()
+                .filter(|r| r.kelly_net_pnl_usd <= 0.0)
+                .map(|r| r.kelly_net_pnl_usd.abs())
+                .sum();
+            let b_k_net = ((b_k_gp - b_k_gl) * 100.0).round() / 100.0;
+            let b_k_pf = if b_k_gl > 0.0 {
+                ((b_k_gp / b_k_gl) * 100.0).round() / 100.0
+            } else if b_k_gp > 0.0 {
+                99.9
+            } else {
+                0.0
+            };
+
+            let b_active: Vec<&&ClosedTradeRow> = b_closed
+                .iter()
+                .filter(|r| !r.was_vetoed_by_loss_autopsy)
+                .collect();
+            let b_ad_vetoed = b_closed
+                .iter()
+                .filter(|r| r.was_vetoed_by_loss_autopsy)
+                .count();
+            let b_ad_scratched = b_closed
+                .iter()
+                .filter(|r| r.was_scratched_by_loss_autopsy)
+                .count();
+            let b_ad_wins = b_active
+                .iter()
+                .filter(|r| r.adaptive_net_pnl_usd > 0.0)
+                .count();
+            let b_ad_losses = b_active.len().saturating_sub(b_ad_wins);
+            let b_ad_gp: f64 = b_active
+                .iter()
+                .filter(|r| r.adaptive_net_pnl_usd > 0.0)
+                .map(|r| r.adaptive_net_pnl_usd)
+                .sum();
+            let b_ad_gl: f64 = b_active
+                .iter()
+                .filter(|r| r.adaptive_net_pnl_usd <= 0.0)
+                .map(|r| r.adaptive_net_pnl_usd.abs())
+                .sum();
+            let b_ad_net = ((b_ad_gp - b_ad_gl) * 100.0).round() / 100.0;
+            let b_ad_k_gp: f64 = b_active
+                .iter()
+                .filter(|r| r.adaptive_kelly_net_pnl_usd > 0.0)
+                .map(|r| r.adaptive_kelly_net_pnl_usd)
+                .sum();
+            let b_ad_k_gl: f64 = b_active
+                .iter()
+                .filter(|r| r.adaptive_kelly_net_pnl_usd <= 0.0)
+                .map(|r| r.adaptive_kelly_net_pnl_usd.abs())
+                .sum();
+            let b_ad_k_net = ((b_ad_k_gp - b_ad_k_gl) * 100.0).round() / 100.0;
+            let b_ad_wr = if !b_active.is_empty() {
+                (((b_ad_wins as f64 / b_active.len() as f64) * 100.0) * 100.0).round() / 100.0
+            } else {
+                0.0
+            };
+            let b_ad_pf = if b_ad_gl > 0.0 {
+                ((b_ad_gp / b_ad_gl) * 100.0).round() / 100.0
+            } else if b_ad_gp > 0.0 {
+                99.9
+            } else {
+                0.0
+            };
+            let b_ad_k_pf = if b_ad_k_gl > 0.0 {
+                ((b_ad_k_gp / b_ad_k_gl) * 100.0).round() / 100.0
+            } else if b_ad_k_gp > 0.0 {
+                99.9
+            } else {
+                0.0
+            };
+            let b_ad_avg_r = if !b_active.is_empty() {
+                ((b_active
+                    .iter()
+                    .map(|r| r.adaptive_scratch_exit_r)
+                    .sum::<f64>()
+                    / (b_active.len() as f64))
+                    * 100.0)
+                    .round()
+                    / 100.0
+            } else {
+                0.0
+            };
+
             by_brain_breakdowns.push(BrainBreakdownSummary {
                 brain_id: b,
                 brain_name: b.display_name().to_string(),
@@ -2738,6 +3893,19 @@ impl RealTimeLedgerEngine {
                 profit_factor: b_pf,
                 avg_r_multiple: b_avg_r,
                 avg_hold_duration_ms: b_avg_hold,
+                kelly_realized_net_profit_usd: b_k_net,
+                kelly_profit_factor: b_k_pf,
+                adaptive_closed_trades_count: b_active.len(),
+                adaptive_wins_count: b_ad_wins,
+                adaptive_losses_count: b_ad_losses,
+                adaptive_vetoed_count: b_ad_vetoed,
+                adaptive_scratched_count: b_ad_scratched,
+                adaptive_win_rate_pct: b_ad_wr,
+                adaptive_profit_factor: b_ad_pf,
+                adaptive_kelly_profit_factor: b_ad_k_pf,
+                adaptive_realized_net_profit_usd: b_ad_net,
+                adaptive_kelly_net_profit_usd: b_ad_k_net,
+                adaptive_avg_r_multiple: b_ad_avg_r,
             });
         }
 
@@ -2766,6 +3934,24 @@ impl RealTimeLedgerEngine {
             max_drawdown_pct: max_dd_pct,
             by_brain_breakdowns,
             filter_eval_latency_micros: eval_micros,
+            kelly_realized_net_profit_usd,
+            kelly_profit_factor,
+            kelly_max_drawdown_usd: (kelly_max_dd_usd * 100.0).round() / 100.0,
+            adaptive_realized_net_profit_usd,
+            adaptive_kelly_net_profit_usd,
+            adaptive_win_rate_pct,
+            adaptive_profit_factor,
+            adaptive_kelly_profit_factor,
+            adaptive_total_closed_trades,
+            adaptive_total_wins: ad_wins,
+            adaptive_total_losses: ad_losses,
+            adaptive_vetoed_losses_count: ad_vetoed,
+            adaptive_scratched_losses_count: ad_scratched,
+            adaptive_total_loss_saved_usd: (ad_loss_saved * 100.0).round() / 100.0,
+            adaptive_kelly_total_loss_saved_usd: (ad_kelly_loss_saved * 100.0).round() / 100.0,
+            adaptive_max_drawdown_usd: (ad_max_dd_usd * 100.0).round() / 100.0,
+            adaptive_kelly_max_drawdown_usd: (ad_k_max_dd_usd * 100.0).round() / 100.0,
+            adaptive_avg_loser_r,
         }
     }
 
@@ -3009,6 +4195,14 @@ impl RealTimeLedgerEngine {
         *self.vetoed_repeat_traps.write() = parsed.vetoed_repeat_traps;
         self.webhook_dispatcher
             .restore_state(parsed.webhook_config, parsed.webhook_outbox);
+        let needs_reconcile = self
+            .closed_ledger
+            .read()
+            .iter()
+            .any(|r| r.adaptive_outcome_badge.is_empty());
+        if needs_reconcile {
+            self.reconcile_causal_adaptive_immunity_ledger();
+        }
         true
     }
 }

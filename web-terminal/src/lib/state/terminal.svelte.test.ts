@@ -707,4 +707,166 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
     store.resetAllLedgerFilters();
     expect(store.filteredLedger.length).toBe(2);
   });
+
+  it('toggles Phase 13 Non-Destructive Adaptive Trap-Immunity & Post-Entry Bar+1 Loss-Centroid Scratch Mode', () => {
+    const store = new TerminalStore(false);
+    store.ingestBackendSnapshot({
+      positions_opened: [],
+      closed_trades: [
+        {
+          trade_id: 'TRD-P13-WIN',
+          opened_timestamp_ns: 1_730_300_000_000_000_000,
+          closed_timestamp_ns: 1_730_303_600_000_000_000,
+          hold_duration_ms: 3_600_000,
+          symbol: 'PLTR',
+          exchange_index: 'NYSE',
+          brain_id: 'BRAIN-03',
+          direction: 'LONG',
+          entry_price: 200.0,
+          actual_exit_price: 208.0,
+          quantity_shares: 50,
+          kelly_fraction_pct: 2.2,
+          risk_budget_usd: 220.0,
+          notional_allocated_usd: 22000.0,
+          kelly_net_pnl_usd: 880.0,
+          initial_structural_stop: 196.0,
+          target_1_price: 204.0,
+          target_2_price: 208.0,
+          outcome_badge: 'CLOSED - TARGET HIT',
+          is_winner: true,
+          net_pnl_usd: 400.0,
+          stock_return_pct: 4.0,
+          option_contracts_count: 0,
+          option_net_pnl_usd: 0.0,
+          realized_r_multiple: 2.0,
+          mfe_pct: 4.2,
+          mae_pct: 0.3,
+          ai_confidence_pct: 92.0,
+          primary_driver: 'GAMMA_SQUEEZE',
+          engine_mode: 'CONSENSUS_BOTH_ENGINES',
+          strategy_archetype: 'GAMMA_SQUEEZE_IGNITION',
+          was_vetoed_by_loss_autopsy: false,
+          was_scratched_by_loss_autopsy: false,
+          adaptive_net_pnl_usd: 400.0,
+          adaptive_kelly_net_pnl_usd: 880.0,
+          adaptive_loss_saved_usd: 0.0,
+          adaptive_kelly_loss_saved_usd: 0.0
+        },
+        {
+          trade_id: 'TRD-P13-VETOED',
+          opened_timestamp_ns: 1_730_310_000_000_000_000,
+          closed_timestamp_ns: 1_730_313_600_000_000_000,
+          hold_duration_ms: 3_600_000,
+          symbol: 'PLUG',
+          exchange_index: 'NASDAQ_CM',
+          brain_id: 'BRAIN-01',
+          direction: 'SHORT',
+          entry_price: 1.4,
+          actual_exit_price: 1.45,
+          quantity_shares: 7000,
+          kelly_fraction_pct: 1.2,
+          risk_budget_usd: 350.0,
+          notional_allocated_usd: 12000.0,
+          kelly_net_pnl_usd: -420.0,
+          initial_structural_stop: 1.45,
+          target_1_price: 1.34,
+          target_2_price: 1.28,
+          outcome_badge: 'CLOSED - STOPPED OUT',
+          is_winner: false,
+          net_pnl_usd: -350.0,
+          stock_return_pct: -3.57,
+          option_contracts_count: 0,
+          option_net_pnl_usd: 0.0,
+          realized_r_multiple: -1.0,
+          mfe_pct: 0.4,
+          mae_pct: 3.57,
+          ai_confidence_pct: 71.0,
+          primary_driver: 'SHORT_SQUEEZE',
+          engine_mode: 'STRUCTURED_HYBRID_CHAMPION',
+          strategy_archetype: 'SHORT_FLOAT_LIQUEFACTION',
+          was_vetoed_by_loss_autopsy: true,
+          vetoed_by_loss_trade_id: 'PRIOR-LOSS-01',
+          entry_trap_similarity_score: 0.912,
+          was_scratched_by_loss_autopsy: false,
+          adaptive_outcome_badge: 'VETOED - HARD-NEGATIVE TRAP IMMUNITY',
+          adaptive_exit_price: 1.4,
+          adaptive_scratch_exit_r: 0.0,
+          adaptive_net_pnl_usd: 0.0,
+          adaptive_kelly_net_pnl_usd: 0.0,
+          adaptive_loss_saved_usd: 350.0,
+          adaptive_kelly_loss_saved_usd: 420.0
+        },
+        {
+          trade_id: 'TRD-P13-SCRATCH',
+          opened_timestamp_ns: 1_730_320_000_000_000_000,
+          closed_timestamp_ns: 1_730_323_600_000_000_000,
+          hold_duration_ms: 3_600_000,
+          symbol: 'IONQ',
+          exchange_index: 'NYSE',
+          brain_id: 'BRAIN-03',
+          direction: 'LONG',
+          entry_price: 46.52,
+          actual_exit_price: 44.48,
+          quantity_shares: 215,
+          kelly_fraction_pct: 1.5,
+          risk_budget_usd: 527.0,
+          notional_allocated_usd: 15000.0,
+          kelly_net_pnl_usd: -790.0,
+          initial_structural_stop: 44.48,
+          target_1_price: 49.5,
+          target_2_price: 52.0,
+          outcome_badge: 'CLOSED - STOPPED OUT',
+          is_winner: false,
+          net_pnl_usd: -527.0,
+          stock_return_pct: -4.38,
+          option_contracts_count: 0,
+          option_net_pnl_usd: 0.0,
+          realized_r_multiple: -1.0,
+          mfe_pct: 0.3,
+          mae_pct: 4.38,
+          ai_confidence_pct: 74.0,
+          primary_driver: 'VOLUME_ABSORPTION',
+          engine_mode: 'STRUCTURED_HYBRID_CHAMPION',
+          strategy_archetype: 'POC_VOLUME_ABSORPTION',
+          was_vetoed_by_loss_autopsy: false,
+          was_scratched_by_loss_autopsy: true,
+          scratch_bar_offset: 1,
+          adaptive_outcome_badge: 'CLOSED - AI LOSS-AUTOPSY SCRATCH EXIT',
+          adaptive_exit_price: 46.15,
+          adaptive_scratch_exit_r: -0.18,
+          adaptive_net_pnl_usd: -95.0,
+          adaptive_kelly_net_pnl_usd: -142.5,
+          adaptive_loss_saved_usd: 432.0,
+          adaptive_kelly_loss_saved_usd: 647.5,
+          loss_affinity_posterior_pct: 78.4
+        }
+      ]
+    });
+
+    // 1. Baseline (All Trades) mode preserves all 3 trades ($400 - $350 - $527 = -$477)
+    expect(store.immunityMode).toBe('BASELINE_ALL_TRADES');
+    expect(store.scorecardKpis.totalClosed).toBe(3);
+    expect(store.scorecardKpis.totalWins).toBe(1);
+    expect(store.scorecardKpis.totalLosses).toBe(2);
+    expect(store.scorecardKpis.netRealizedStockPnlUsd).toBeCloseTo(-477.0, 2);
+    expect(store.scorecardKpis.vetoedLossesCount).toBe(1);
+    expect(store.scorecardKpis.scratchedLossesCount).toBe(1);
+    expect(store.scorecardKpis.totalLossAvoidedUsd).toBeCloseTo(782.0, 2);
+
+    // 2. Toggle to Active Loss-Immunity & Scratch Mode:
+    // Vetoed trade is excluded from active trade count (2 trades: 1W/1L), scratched trade loses -$95 instead of -$527 (Net = +$305)
+    store.toggleImmunityMode();
+    expect(store.immunityMode).toBe('ACTIVE_LOSS_IMMUNITY');
+    expect(store.scorecardKpis.totalClosed).toBe(2);
+    expect(store.scorecardKpis.totalWins).toBe(1);
+    expect(store.scorecardKpis.totalLosses).toBe(1);
+    expect(store.scorecardKpis.netRealizedStockPnlUsd).toBeCloseTo(305.0, 2);
+    expect(store.scorecardKpis.avgLoserR).toBeCloseTo(-0.18, 2);
+    expect(store.equityCurve.length).toBe(2);
+
+    // 3. Combine Active Immunity with Fractional-Kelly Sizing ($880 - $142.5 = +$737.5, Saved = $420 + $647.5 = $1,067.5)
+    store.setSizingMode('FRACTIONAL_KELLY');
+    expect(store.scorecardKpis.netRealizedStockPnlUsd).toBeCloseTo(737.5, 2);
+    expect(store.scorecardKpis.totalLossAvoidedUsd).toBeCloseTo(1067.5, 2);
+  });
 });

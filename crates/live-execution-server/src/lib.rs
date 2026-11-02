@@ -542,5 +542,75 @@ mod tests {
             "[PHASE-12 VERIFIED] Kelly Sizing Active | Replay Indices Verified | Webhook Outbox Records: {}",
             wh_status.total_outbox_records
         );
+
+        // 9. Verify Phase-13 Non-Destructive Self-Learned Maximization:
+        //    - Upgrade 1: Per-symbol Era-1 empirical stop quantile scaling ensures ALL 5 Brains (including BRAIN-03)
+        //                 achieve Fractional-Kelly Net P&L > Fixed $10K Net P&L
+        //    - Upgrade 2: Self-learned Bar+1/Bar+2 Loss-Centroid Scratch Exit (`CLOSED - AI LOSS-AUTOPSY SCRATCH EXIT`)
+        //    - Upgrade 3: Non-destructive Baseline (173 trades) vs Active Loss-Immunity & Scratch Mode
+        for b in &snap.scoreboard.by_brain_breakdowns {
+            println!(
+                "[PHASE-13 BRAIN KELLY & IMMUNITY] {} | Fixed $10K: ${:.2} (PF {:.2}) | Kelly: ${:.2} (PF {:.2}) | Active Immunity: ${:.2} / Kelly ${:.2} (WR {:.2}%, PF {:.2}, Vetoed {}, Scratched {})",
+                b.brain_id.code(),
+                b.realized_net_profit_usd,
+                b.profit_factor,
+                b.kelly_realized_net_profit_usd,
+                b.kelly_profit_factor,
+                b.adaptive_realized_net_profit_usd,
+                b.adaptive_kelly_net_profit_usd,
+                b.adaptive_win_rate_pct,
+                b.adaptive_profit_factor,
+                b.adaptive_vetoed_count,
+                b.adaptive_scratched_count,
+            );
+            assert!(
+                b.kelly_realized_net_profit_usd > b.realized_net_profit_usd,
+                "Expected {} Fractional-Kelly Net P&L (${:.2}) > Fixed $10K Net P&L (${:.2})",
+                b.brain_id.code(),
+                b.kelly_realized_net_profit_usd,
+                b.realized_net_profit_usd
+            );
+        }
+        assert!(
+            snap.scoreboard.kelly_realized_net_profit_usd > snap.scoreboard.realized_net_profit_usd,
+            "Expected Master Kelly Net P&L (${:.2}) > Fixed $10K Net P&L (${:.2})",
+            snap.scoreboard.kelly_realized_net_profit_usd,
+            snap.scoreboard.realized_net_profit_usd
+        );
+        assert!(
+            snap.scoreboard.adaptive_vetoed_losses_count > 0
+                && snap.scoreboard.adaptive_scratched_losses_count > 0,
+            "Expected both causal Hard-Negative Trap Vetoes ({}) and Bar+1/Bar+2 Loss-Centroid Scratches ({})",
+            snap.scoreboard.adaptive_vetoed_losses_count,
+            snap.scoreboard.adaptive_scratched_losses_count
+        );
+        assert!(
+            snap.scoreboard.adaptive_realized_net_profit_usd > snap.scoreboard.realized_net_profit_usd,
+            "Expected Active Immunity Net P&L (${:.2}) > Baseline Net P&L (${:.2})",
+            snap.scoreboard.adaptive_realized_net_profit_usd,
+            snap.scoreboard.realized_net_profit_usd
+        );
+        println!(
+            "[PHASE-13 MASTER SCOREBOARD] Baseline: {} trades ({}W/{}L, {:.2}% WR, {:.2} PF, Fixed ${:.2} / Kelly ${:.2}) | Active Immunity: {} trades ({}W/{}L, {:.2}% WR, {:.2} PF, Fixed ${:.2} / Kelly ${:.2}, Vetoed {}, Scratched {}, Avg Loser {:.2}R, Saved Fixed ${:.2} / Kelly ${:.2})",
+            snap.scoreboard.total_closed_trades,
+            snap.scoreboard.total_wins,
+            snap.scoreboard.total_losses,
+            snap.scoreboard.win_rate_pct,
+            snap.scoreboard.profit_factor,
+            snap.scoreboard.realized_net_profit_usd,
+            snap.scoreboard.kelly_realized_net_profit_usd,
+            snap.scoreboard.adaptive_total_closed_trades,
+            snap.scoreboard.adaptive_total_wins,
+            snap.scoreboard.adaptive_total_losses,
+            snap.scoreboard.adaptive_win_rate_pct,
+            snap.scoreboard.adaptive_profit_factor,
+            snap.scoreboard.adaptive_realized_net_profit_usd,
+            snap.scoreboard.adaptive_kelly_net_profit_usd,
+            snap.scoreboard.adaptive_vetoed_losses_count,
+            snap.scoreboard.adaptive_scratched_losses_count,
+            snap.scoreboard.adaptive_avg_loser_r,
+            snap.scoreboard.adaptive_total_loss_saved_usd,
+            snap.scoreboard.adaptive_kelly_total_loss_saved_usd,
+        );
     }
 }

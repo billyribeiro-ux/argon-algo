@@ -890,6 +890,7 @@ impl AppState {
         // Era-1 Pure ML Ridge Training Samples (`ENGINE-B`: 32 direction-aligned raw features -> realized R)
         let mut era1_ml_samples: Vec<([f64; 32], f64)> = Vec::new();
         let mut era1_stop_pcts: Vec<f64> = Vec::new();
+        let mut era1_win_hold_bars: Vec<usize> = Vec::new();
         for idx in 20..calibration_end.saturating_sub(trace_horizon) {
             let cal_slice = &raw_bars[idx - 20..idx];
             let cal_outcome = &raw_bars[idx..idx + trace_horizon];
@@ -953,6 +954,88 @@ impl AppState {
             } else {
                 -1.0
             };
+            if sim_r > 0.0 {
+                let mut peak_bar_offset = trace_horizon;
+                let mut best_excursion = 0.0_f64;
+                for (b_off, ob) in cal_outcome.iter().enumerate() {
+                    let exc = match inf.signal.direction {
+                        raw_fingerprint_core::TradeDirection::Long => ob.high.to_f64() - ref_px,
+                        raw_fingerprint_core::TradeDirection::Short => ref_px - ob.low.to_f64(),
+                    };
+                    if exc > best_excursion {
+                        best_excursion = exc;
+                        peak_bar_offset = (b_off + 1).max(1);
+                    }
+                }
+                era1_win_hold_bars.push(peak_bar_offset.max(trace_horizon));
+            } else if sim_r < -0.25
+                && idx % 6 == 0
+                && inf.signal.ai_confidence_pct >= 62.0
+                && inf.signal.latent_embedding_128.len() >= 32
+                && !cal_outcome.is_empty()
+            {
+                // Phase 15 Upgrade 1: Causal Era-1 Hard-Negative Trap & Post-Entry Loss-Centroid Seeding
+                // (`closed_timestamp_ns = cal_outcome.last().timestamp_ns < raw_bars[calibration_end].timestamp_ns`)
+                let bar1_post_x32 =
+                    crate::ledger::RealTimeLedgerEngine::extract_post_entry_bar_features_from_parts(
+                        &inf.signal.latent_embedding_128,
+                        inf.signal.entry_price,
+                        inf.signal.direction,
+                        cal_slice,
+                        cal_slice.len().saturating_sub(1),
+                        &cal_outcome[0],
+                    );
+                let mut culprit_weights_32 = vec![0.05_f32; 32];
+                let mut indexed_devs: Vec<(usize, f32)> = (0..32)
+                    .map(|f_i| {
+                        let v = *bar1_post_x32.get(f_i).unwrap_or(&0.0);
+                        let dev = match f_i {
+                            0 | 3 | 7 => (0.20 - v).max(0.05) * 2.2,
+                            4 | 5 => v.abs() * 2.4,
+                            _ => v.abs().max(0.05),
+                        };
+                        (f_i, dev)
+                    })
+                    .collect();
+                indexed_devs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (f_i, dev) in &indexed_devs {
+                    culprit_weights_32[*f_i] = (*dev).clamp(0.05, 3.5);
+                }
+                let culprit_indices = [
+                    indexed_devs[0].0,
+                    indexed_devs[1].0,
+                    indexed_devs[2].0,
+                ];
+                let culprit_signs = [
+                    if bar1_post_x32[culprit_indices[0]] >= 0.0 { 1.0 } else { -1.0 },
+                    if bar1_post_x32[culprit_indices[1]] >= 0.0 { 1.0 } else { -1.0 },
+                    if bar1_post_x32[culprit_indices[2]] >= 0.0 { 1.0 } else { -1.0 },
+                ];
+                let closed_ts_ns = cal_outcome.last().unwrap().timestamp_ns;
+                let mut id_bytes = [0u8; 16];
+                for (bi, bval) in symbol.as_bytes().iter().take(6).enumerate() {
+                    id_bytes[bi] = *bval;
+                }
+                id_bytes[6] = brain_id as u8;
+                id_bytes[7] = (idx & 0xFF) as u8;
+                id_bytes[8..16].copy_from_slice(&closed_ts_ns.to_be_bytes());
+                let era1_trap_id = Uuid::from_bytes(id_bytes);
+
+                self.precedent_knn.insert_hard_negative_trap(HardNegativeTrapRecord {
+                    loss_trade_id: era1_trap_id,
+                    brain_id,
+                    symbol: symbol.to_uppercase(),
+                    direction: inf.signal.direction,
+                    closed_timestamp_ns: closed_ts_ns,
+                    root_cause_category: "EXHAUSTION_WICK_LIQUIDITY_TRAP".to_string(),
+                    culprit_feature_indices: culprit_indices,
+                    culprit_feature_signs: culprit_signs,
+                    realized_loss_usd: 350.0,
+                    embedding_128: inf.signal.latent_embedding_128.clone(),
+                    post_entry_bar1_features_32: bar1_post_x32,
+                    culprit_anomaly_weights_32: culprit_weights_32,
+                });
+            }
             if inf.signal.latent_embedding_128.len() >= 32 {
                 let mut x_raw = [0.0_f64; 32];
                 for (k, slot) in x_raw.iter_mut().enumerate() {
@@ -1114,6 +1197,12 @@ impl AppState {
         );
         let era1_learned_scratch_posterior_threshold =
             (0.52 + 0.12 * (best_wr / 100.0)).clamp(0.55, 0.68);
+        era1_win_hold_bars.sort_unstable();
+        let era1_median_hold_bars = if !era1_win_hold_bars.is_empty() {
+            era1_win_hold_bars[era1_win_hold_bars.len() / 2].max(6)
+        } else {
+            trace_horizon.max(6)
+        };
 
         let cal_profile = crate::ledger::Era1BrainCalibrationProfile {
             brain_id,
@@ -1137,6 +1226,7 @@ impl AppState {
             era1_learned_max_displacement_pct: learned_max_disp_pct,
             era1_median_stop_pct: era1_symbol_median_stop_pct,
             era1_learned_scratch_posterior_threshold,
+            era1_median_hold_bars,
         };
         if accumulate_calibration {
             self.ledger
@@ -1507,35 +1597,24 @@ impl AppState {
                         });
                     }
 
-                    // Phase 14 Fix 4: Causal Rolling Re-Calibration on consecutive symbol losses (`t > T_loss_closed`)
-                    let (consec_sym_losses, last_loss_ts_ns) = self
-                        .ledger
-                        .causal_consecutive_losses_for_symbol(
+                    // Phase 15 Upgrade 3: Data-Driven Empirical Streak Confidence Adaptation (`t > T_loss_closed`)
+                    let strict_htf_trend = match inference.signal.direction {
+                        raw_fingerprint_core::TradeDirection::Long => {
+                            anchor10_px >= anchor24_px && anchor24_px >= anchor64_px * 1.002
+                        }
+                        raw_fingerprint_core::TradeDirection::Short => {
+                            anchor10_px <= anchor24_px && anchor24_px <= anchor64_px * 0.998
+                        }
+                    };
+                    let rolling_conf_penalty =
+                        self.ledger.compute_causal_streak_confidence_adjustment(
                             symbol,
                             brain_id,
                             raw_bars[t].timestamp_ns,
+                            tf_step_ns,
+                            cal_profile.calibrated_confidence_floor,
+                            strict_htf_trend,
                         );
-                    let bars_since_last_loss = if last_loss_ts_ns > 0 {
-                        ((raw_bars[t].timestamp_ns - last_loss_ts_ns) / tf_step_ns.max(1)).max(0)
-                    } else {
-                        i64::MAX
-                    };
-                    let rolling_conf_penalty = if is_penny_brain
-                        && consec_sym_losses >= 2
-                        && bars_since_last_loss <= 76
-                    {
-                        let strict_htf_trend = match inference.signal.direction {
-                            raw_fingerprint_core::TradeDirection::Long => {
-                                anchor10_px >= anchor24_px && anchor24_px >= anchor64_px * 1.002
-                            }
-                            raw_fingerprint_core::TradeDirection::Short => {
-                                anchor10_px <= anchor24_px && anchor24_px <= anchor64_px * 0.998
-                            }
-                        };
-                        if strict_htf_trend { 2.5 } else { 6.5 }
-                    } else {
-                        0.0
-                    };
 
                     // Upgrade 2: Evaluate ENGINE-A (`STRUCTURED_HYBRID_CHAMPION`) and ENGINE-B (`PURE_ML_SELF_LEARNED`)
                     let engine_a_fires = causal_impulse_aligned
@@ -1667,6 +1746,18 @@ impl AppState {
                 10_000.0,
                 live_window.to_vec(),
             );
+            if let Some(latest_bar) = live_raw_bars.last() {
+                let live_quote_px = snaps
+                    .iter()
+                    .find(|s| s.symbol.eq_ignore_ascii_case(symbol))
+                    .map(|s| s.last_price);
+                self.ledger.mark_open_position_to_market(
+                    symbol,
+                    Some(brain_id),
+                    latest_bar,
+                    live_quote_px,
+                );
+            }
         }
 
         let trades = self.ledger.trades_for_symbol_and_brain(symbol, brain_id);

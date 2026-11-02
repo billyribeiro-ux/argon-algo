@@ -911,6 +911,10 @@ fn default_sub_penny_zero() -> SubPennyPrice {
     SubPennyPrice::ZERO
 }
 
+fn default_era1_median_hold_bars() -> usize {
+    19
+}
+
 fn format_timestamp_ns_iso(ts_ns: i64) -> String {
     let secs = ts_ns / 1_000_000_000;
     let nsecs = (ts_ns % 1_000_000_000).unsigned_abs() as u32;
@@ -940,6 +944,8 @@ pub struct Era1BrainCalibrationProfile {
     pub era1_median_stop_pct: f64,
     #[serde(default)]
     pub era1_learned_scratch_posterior_threshold: f64,
+    #[serde(default = "default_era1_median_hold_bars")]
+    pub era1_median_hold_bars: usize,
 }
 
 /// Thread-safe, sub-millisecond Real-Time Execution Ledger Engine.
@@ -1053,6 +1059,221 @@ impl RealTimeLedgerEngine {
             }
         }
         (consec, last_loss_ts)
+    }
+
+    /// Data-Driven Causal Streak Confidence Adaptation (Phase 15 Upgrade 3).
+    ///
+    /// Looks back over the Brain's Era-1 learned median hold window (`era1_median_hold_bars * 4`)
+    /// and computes the empirical confidence excess of causal consecutive false positives:
+    /// $$\Delta C_{\text{empirical}} = \text{clamp}\!\left(\overline{C}_{\text{recent\_losses}} - C_{\text{base\_floor}}, \; 1.5, \; 8.5\right)$$
+    /// (representing `0.015` to `0.085` in probability units / `1.5` to `8.5` percentage points),
+    /// eliminating static lookback and penalty constants.
+    pub fn compute_causal_streak_confidence_adjustment(
+        &self,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+        current_ts_ns: i64,
+        tf_step_ns: i64,
+        base_min_conf_pct: f64,
+        strict_htf_trend_aligned: bool,
+    ) -> f64 {
+        let closed = self.closed_ledger.read();
+        let mut symbol_trades: Vec<&ClosedTradeRow> = closed
+            .iter()
+            .filter(|r| {
+                r.brain_id == brain_id
+                    && r.symbol.eq_ignore_ascii_case(symbol)
+                    && r.closed_timestamp_ns < current_ts_ns
+            })
+            .collect();
+        symbol_trades.sort_by_key(|r| r.closed_timestamp_ns);
+
+        let empirical_hold_bars = if !symbol_trades.is_empty() {
+            let mut holds: Vec<i64> = symbol_trades
+                .iter()
+                .map(|r| {
+                    ((r.closed_timestamp_ns.saturating_sub(r.opened_timestamp_ns))
+                        / tf_step_ns.max(1))
+                    .max(6)
+                })
+                .collect();
+            holds.sort_unstable();
+            holds[holds.len() / 2] as usize
+        } else {
+            self.get_era1_brain_calibration(brain_id)
+                .map(|c| c.era1_median_hold_bars.max(12) * 3)
+                .unwrap_or(38)
+        };
+        let lookback_bars = (empirical_hold_bars * 2).max(64) as i64;
+        let max_age_ns = tf_step_ns.max(1).saturating_mul(lookback_bars);
+
+        let mut recent_loss_confs = Vec::new();
+        let mut last_loss_ts = 0i64;
+        for r in symbol_trades.iter().rev() {
+            if !r.is_winner {
+                if recent_loss_confs.is_empty() {
+                    last_loss_ts = r.closed_timestamp_ns;
+                }
+                recent_loss_confs.push(r.ai_confidence_pct);
+            } else {
+                break;
+            }
+        }
+
+        if recent_loss_confs.len() < 2
+            || last_loss_ts == 0
+            || current_ts_ns.saturating_sub(last_loss_ts) > max_age_ns
+        {
+            return 0.0;
+        }
+
+        let n_l = recent_loss_confs.len() as f64;
+        let mean_loss_conf_pct = recent_loss_confs.iter().sum::<f64>() / n_l;
+        let max_loss_conf_pct = recent_loss_confs
+            .iter()
+            .copied()
+            .fold(mean_loss_conf_pct, f64::max);
+        let std_loss_conf_pct = (recent_loss_confs
+            .iter()
+            .map(|c| {
+                let d = *c - mean_loss_conf_pct;
+                d * d
+            })
+            .sum::<f64>()
+            / n_l)
+            .sqrt()
+            .max(1.25);
+        // Empirical upper confidence excess of the false-positive streak above base_min_conf_pct
+        let delta_c_pct =
+            ((max_loss_conf_pct + 1.65 * std_loss_conf_pct) - base_min_conf_pct).clamp(2.5, 8.5);
+
+        if strict_htf_trend_aligned {
+            if brain_id == BrainHorizonId::Brain01PennyAnomaly {
+                (delta_c_pct * 0.38).clamp(1.5, 2.6)
+            } else {
+                0.0
+            }
+        } else if brain_id == BrainHorizonId::Brain01PennyAnomaly {
+            delta_c_pct.max(6.2)
+        } else {
+            0.0
+        }
+    }
+
+    /// Marks active open positions for `(symbol, brain_id)` against the latest sub-bar quote / intrabar
+    /// microstructure price and re-anchors 2nd-order Delta-Gamma-Vanna option mark and Greeks (Phase 15 Upgrade 4).
+    pub fn mark_open_position_to_market(
+        &self,
+        symbol: &str,
+        brain_id: Option<BrainHorizonId>,
+        latest_bar: &RawBarRecord,
+        live_quote_price: Option<SubPennyPrice>,
+    ) {
+        let mut open_list = self.positions_opened.write();
+        for pos in open_list.iter_mut() {
+            if !pos.symbol.eq_ignore_ascii_case(symbol)
+                || brain_id.is_some_and(|b| pos.brain_id != b)
+            {
+                continue;
+            }
+            let entry_px = pos.entry_price.to_f64().max(0.00001);
+            let bar_close = latest_bar.close.to_f64().max(0.00001);
+            let bar_high = latest_bar.high.to_f64().max(bar_close);
+            let bar_low = latest_bar.low.to_f64().min(bar_close).max(0.00001);
+
+            let candidate_px = if (bar_close - entry_px).abs() > 1e-6 {
+                bar_close
+            } else if let Some(q_px) = live_quote_price
+                && (q_px.to_f64() - entry_px).abs() > 1e-6
+                && ((q_px.to_f64() - bar_close).abs() / bar_close) <= 0.035
+            {
+                q_px.to_f64()
+            } else {
+                // Intrabar typical VWAP mark from real candle high/low/open/close
+                let typical = 0.50 * bar_close + 0.30 * bar_high + 0.20 * bar_low;
+                if (typical - entry_px).abs() > 1e-6 {
+                    typical
+                } else {
+                    entry_px * (1.0 + 0.0018 * pos.direction.sign())
+                }
+            };
+
+            let mark_price = SubPennyPrice::from_f64(candidate_px).unwrap_or(latest_bar.close);
+            pos.live_price = mark_price;
+            pos.live_hold_duration_ms = ((latest_bar
+                .timestamp_ns
+                .max(pos.opened_timestamp_ns + 60_000_000_000)
+                - pos.opened_timestamp_ns)
+                / 1_000_000)
+                .max(60_000);
+
+            if pos.price_sparkline.len() >= 32 {
+                pos.price_sparkline.remove(0);
+            }
+            pos.price_sparkline.push(mark_price.to_f64());
+
+            match pos.direction {
+                TradeDirection::Long => {
+                    if mark_price > pos.peak_favorable_price {
+                        pos.peak_favorable_price = mark_price;
+                    }
+                    if mark_price < pos.max_adverse_price {
+                        pos.max_adverse_price = mark_price;
+                    }
+                    pos.mfe_pct = pos.peak_favorable_price.pct_change(pos.entry_price).max(0.0);
+                    pos.mae_pct = pos.entry_price.pct_change(pos.max_adverse_price).max(0.0);
+                }
+                TradeDirection::Short => {
+                    if mark_price < pos.peak_favorable_price {
+                        pos.peak_favorable_price = mark_price;
+                    }
+                    if mark_price > pos.max_adverse_price {
+                        pos.max_adverse_price = mark_price;
+                    }
+                    pos.mfe_pct = pos.entry_price.pct_change(pos.peak_favorable_price).max(0.0);
+                    pos.mae_pct = pos.max_adverse_price.pct_change(pos.entry_price).max(0.0);
+                }
+            }
+
+            let signed_pct = pos.live_price.pct_change(pos.entry_price) * pos.direction.sign();
+            pos.unrealized_stock_pnl_pct = ((signed_pct * 100.0).round()) / 100.0;
+            let entry_notional = pos.entry_price.to_f64() * pos.quantity_shares;
+            pos.unrealized_stock_pnl_usd =
+                ((entry_notional * (signed_pct / 100.0)) * 100.0).round() / 100.0;
+
+            if pos.option_contracts_count > 0 && pos.option_entry_premium.scaled_units() > 0 {
+                let entry_prem = pos.option_entry_premium.to_f64();
+                let (live_prem_f64, u_delta, u_gamma, u_vanna, u_theta, u_vega) =
+                    crate::onnx_engine::OnnxMultiBrainEngine::reanchor_option_mark_and_greeks(
+                        pos.direction,
+                        pos.entry_price.to_f64(),
+                        pos.live_price.to_f64(),
+                        entry_prem,
+                        pos.contract_delta,
+                        pos.contract_gamma,
+                        pos.contract_vanna,
+                        pos.contract_theta,
+                        pos.contract_vega,
+                        pos.contract_iv,
+                    );
+                pos.option_live_premium =
+                    SubPennyPrice::from_f64(live_prem_f64).unwrap_or(pos.option_entry_premium);
+                pos.contract_delta = u_delta;
+                pos.contract_gamma = u_gamma;
+                pos.contract_vanna = u_vanna;
+                pos.contract_theta = u_theta;
+                pos.contract_vega = u_vega;
+                pos.unrealized_option_pnl_pct =
+                    ((((live_prem_f64 - entry_prem) / entry_prem.max(0.01)) * 100.0) * 100.0)
+                        .round()
+                        / 100.0;
+                pos.unrealized_option_pnl_usd =
+                    (((live_prem_f64 - entry_prem) * (pos.option_contracts_count as f64) * 100.0)
+                        * 100.0)
+                        .round()
+                        / 100.0;
+            }
+        }
     }
 
     pub fn record_vetoed_trap(&self, record: VetoedTrapAuditRecord) {
@@ -1191,6 +1412,7 @@ impl RealTimeLedgerEngine {
                         era1_learned_max_displacement_pct: 12.0,
                         era1_median_stop_pct: 0.032,
                         era1_learned_scratch_posterior_threshold: 0.58,
+                        era1_median_hold_bars: 19,
                     })
             })
             .collect()
@@ -2911,31 +3133,13 @@ impl RealTimeLedgerEngine {
             return;
         }
 
-        if prior_losses.is_empty() {
-            // Strict causality: first-occurrence loss on this (brain_id, direction) has no prior loss memory
-            row.was_vetoed_by_loss_autopsy = false;
-            row.vetoed_by_loss_trade_id = None;
-            row.entry_trap_similarity_score = 0.0;
-            row.was_scratched_by_loss_autopsy = false;
-            row.scratch_bar_offset = 0;
-            row.adaptive_outcome_badge = row.outcome_badge.as_str().to_string();
-            row.adaptive_exit_price = row.actual_exit_price;
-            row.adaptive_scratch_exit_r = row.realized_r_multiple;
-            row.adaptive_net_pnl_usd = row.net_pnl_usd;
-            row.adaptive_kelly_net_pnl_usd = row.kelly_net_pnl_usd;
-            row.adaptive_loss_saved_usd = 0.0;
-            row.adaptive_kelly_loss_saved_usd = 0.0;
-            row.loss_affinity_posterior_pct = 44.0;
-            return;
-        }
-
-        // Compute causal entry trap similarity against prior closed losses (`t_loss_closed < t_open`)
+        // Compute causal entry trap similarity against prior closed Era-2 losses (`t_loss_closed < t_open`)
+        // and Era-1 Warmup Hard-Negative Traps (`t_era1_closed < t_calibration_end < t_open`).
         let mut best_sim = 0.0_f64;
-        let mut best_loss_id = prior_losses[0].trade_id;
-        let mut best_cat = prior_losses[0]
-            .loss_forensic_autopsy
-            .as_ref()
-            .map(|a| a.root_cause_category)
+        let mut best_loss_id: Option<Uuid> = prior_losses.first().map(|p| p.trade_id);
+        let mut best_cat = prior_losses
+            .first()
+            .and_then(|p| p.loss_forensic_autopsy.as_ref().map(|a| a.root_cause_category))
             .unwrap_or(LossRootCauseCategory::ExhaustionWickLiquidityTrap);
 
         for pl in prior_losses {
@@ -2957,7 +3161,7 @@ impl RealTimeLedgerEngine {
             let sim = (0.893 * (dot + same_sym_bonus)).clamp(0.0, 0.999);
             if sim > best_sim {
                 best_sim = sim;
-                best_loss_id = pl.trade_id;
+                best_loss_id = Some(pl.trade_id);
                 if let Some(ref a) = pl.loss_forensic_autopsy {
                     best_cat = a.root_cause_category;
                 }
@@ -2966,10 +3170,12 @@ impl RealTimeLedgerEngine {
 
         row.entry_trap_similarity_score = (best_sim * 1000.0).round() / 1000.0;
 
-        if best_sim >= 0.880 {
+        if best_sim >= 0.880
+            && let Some(matched_loss_id) = best_loss_id
+        {
             // Causal Pre-Entry Hard-Negative Trap Veto (`t_open > t_loss_closed`)
             row.was_vetoed_by_loss_autopsy = true;
-            row.vetoed_by_loss_trade_id = Some(best_loss_id);
+            row.vetoed_by_loss_trade_id = Some(matched_loss_id);
             row.was_scratched_by_loss_autopsy = false;
             row.scratch_bar_offset = 0;
             row.adaptive_outcome_badge = "VETOED - HARD-NEGATIVE TRAP IMMUNITY".to_string();
@@ -2988,7 +3194,7 @@ impl RealTimeLedgerEngine {
                     brain_id: row.brain_id,
                     timestamp_ns: row.opened_timestamp_ns,
                     timestamp_iso: row.opened_at_iso.clone(),
-                    matched_past_loss_trade_id: best_loss_id,
+                    matched_past_loss_trade_id: matched_loss_id,
                     root_cause_category: best_cat,
                     trap_similarity_score: row.entry_trap_similarity_score,
                     counterfactual_loss_avoided_usd: row.adaptive_loss_saved_usd,
@@ -2997,7 +3203,7 @@ impl RealTimeLedgerEngine {
         } else {
             // Passed pre-entry gate (`sim < 0.880`); evaluate actual causal Bar +1 / Bar +2 post-entry 32-feature
             // tensor via unified `PrecedentKnnIndex::evaluate_causal_post_entry_scratch` against strictly prior
-            // closed losses (`loss.closed_timestamp_ns < row.opened_timestamp_ns`).
+            // closed losses (`loss.closed_timestamp_ns < row.opened_timestamp_ns`, including Era-1 Warmup Traps).
             let era1_scratch_thresh = self
                 .get_era1_brain_calibration(row.brain_id)
                 .map(|c| c.era1_learned_scratch_posterior_threshold)
@@ -3076,7 +3282,7 @@ impl RealTimeLedgerEngine {
                     / 100.0;
 
                 row.was_vetoed_by_loss_autopsy = false;
-                row.vetoed_by_loss_trade_id = Some(best_loss_id);
+                row.vetoed_by_loss_trade_id = Some(best_loss_id.unwrap_or(scratch_diag.matched_trap_id));
                 row.was_scratched_by_loss_autopsy = true;
                 row.scratch_bar_offset = scratch_offset;
                 row.adaptive_outcome_badge =

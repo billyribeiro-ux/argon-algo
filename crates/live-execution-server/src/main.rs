@@ -98,6 +98,13 @@ async fn main() -> anyhow::Result<()> {
                                 &raw_bars,
                                 &raw_internals,
                             );
+                        } else if let Some(latest_bar) = raw_bars.last() {
+                            bg_state.ledger.mark_open_position_to_market(
+                                sym,
+                                Some(*brain_id),
+                                latest_bar,
+                                None,
+                            );
                         }
                     }
                 }

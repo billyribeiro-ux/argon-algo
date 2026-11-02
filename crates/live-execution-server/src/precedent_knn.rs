@@ -46,6 +46,10 @@ pub struct PostEntryScratchDiagnostic {
     pub cosine_loss_similarity: f64,
     pub cosine_win_similarity: f64,
     pub matched_prior_loss_count: usize,
+    #[serde(default)]
+    pub matched_trap_id: Uuid,
+    #[serde(default)]
+    pub ledoit_wolf_shrinkage_lambda: f64,
 }
 
 /// Single historical trace record stored in `trace_embeddings` (`vector(128)`).
@@ -317,10 +321,71 @@ impl PrecedentKnnIndex {
         best_match
     }
 
+    /// Solves the culprit-weighted quadratic form $\delta^T \Sigma_{\text{LW}}^{-1} \delta$ using
+    /// a Shrinkage-Regularized Ledoit-Wolf $32 \times 32$ Cross-Stream Covariance Matrix:
+    /// $$\Sigma_{\text{LW}} = (1 - \lambda)\hat{\Sigma} + \lambda \cdot \text{diag}(\hat{\Sigma}), \qquad \lambda = \text{clamp}\!\left(\frac{4.0}{N_{\text{causal}} + 4.0}, \; 0.15, \; 0.85\right)$$
+    /// factored via exact $32 \times 32$ Cholesky decomposition ($L L^T = \Sigma_{\text{LW}}$) and solved by
+    /// forward substitution ($L y = \delta$, where $\delta_i = \sqrt{w_i}(x_i - \bar{x}_i)$).
+    /// Returns `(mahalanobis_distance, shrinkage_lambda)`.
+    #[allow(clippy::needless_range_loop)]
+    pub fn solve_ledoit_wolf_cholesky_mahalanobis_32(
+        sample_cov: &[[f64; 32]; 32],
+        n_causal: usize,
+        culprit_weights: &[f64; 32],
+        diff: &[f64; 32],
+    ) -> (f64, f64) {
+        let lambda = (4.0 / ((n_causal as f64) + 4.0)).clamp(0.15, 0.85);
+        let mut sigma_lw = [[0.0_f64; 32]; 32];
+        for i in 0..32 {
+            let diag_ii = sample_cov[i][i].clamp(0.0016, 0.25);
+            sigma_lw[i][i] = diag_ii;
+            for j in 0..i {
+                let diag_jj = sample_cov[j][j].clamp(0.0016, 0.25);
+                let max_off = (diag_ii * diag_jj).sqrt() * 0.95;
+                let shrunk_cov = (1.0 - lambda) * sample_cov[i][j].clamp(-max_off, max_off);
+                sigma_lw[i][j] = shrunk_cov;
+                sigma_lw[j][i] = shrunk_cov;
+            }
+        }
+
+        // Exact 32x32 Cholesky factorization: L * L^T = Sigma_LW
+        let mut chol_l = [[0.0_f64; 32]; 32];
+        for i in 0..32 {
+            for j in 0..=i {
+                let mut sum = sigma_lw[i][j];
+                for p in 0..j {
+                    sum -= chol_l[i][p] * chol_l[j][p];
+                }
+                if i == j {
+                    chol_l[i][i] = sum.max(1e-6).sqrt();
+                } else {
+                    chol_l[i][j] = sum / chol_l[j][j].max(1e-6);
+                }
+            }
+        }
+
+        // Forward substitution: solve L * y = delta, where delta_i = sqrt(w_i) * diff_i
+        let mut y = [0.0_f64; 32];
+        let mut maha_sq = 0.0_f64;
+        for i in 0..32 {
+            let delta_i = culprit_weights[i].max(0.0).sqrt() * diff[i];
+            let mut sum = delta_i;
+            for j in 0..i {
+                sum -= chol_l[i][j] * y[j];
+            }
+            let y_i = sum / chol_l[i][i].max(1e-6);
+            y[i] = y_i;
+            maha_sq += y_i * y_i;
+        }
+
+        (maha_sq.max(0.0).sqrt(), lambda)
+    }
+
     /// Evaluates a live post-entry 32-feature state vector $X_t$ (`bars_since_open` in `1..=3`
     /// and underwater `current_r_multiple < -0.08`) against the causal Post-Entry Loss Autopsy
     /// Centroid $\bar{X}_{\text{loss\_bar1}}$ ($t > T_{\text{loss\_closed}}$) vs. the Winning Centroid
-    /// $\bar{X}_{\text{win}}$ using Culprit-Weighted Mahalanobis + Cosine Loss-Affinity scoring.
+    /// $\bar{X}_{\text{win}}$ using Ledoit-Wolf $32 \times 32$ Cross-Stream Covariance Mahalanobis + Cosine scoring.
+    #[allow(clippy::needless_range_loop)]
     pub fn evaluate_causal_post_entry_scratch(
         &self,
         brain_id: BrainHorizonId,
@@ -349,8 +414,9 @@ impl PrecedentKnnIndex {
         let matched_prior_loss_count = causal_traps.len();
         let n_loss = matched_prior_loss_count as f64;
         let mut loss_centroid = [0.0_f64; 32];
-        let mut loss_var = [0.0025_f64; 32];
         let mut culprit_weights = [0.01_f64; 32];
+        let mut best_trap_id = causal_traps[0].loss_trade_id;
+        let mut best_trap_dist_sq = f64::MAX;
 
         for trap in &causal_traps {
             let src_feats = if trap.post_entry_bar1_features_32.len() >= 32 {
@@ -358,8 +424,19 @@ impl PrecedentKnnIndex {
             } else {
                 &trap.embedding_128[0..32.min(trap.embedding_128.len())]
             };
+            let mut d_sq = 0.0_f64;
             for (i, &val) in src_feats.iter().enumerate() {
-                loss_centroid[i] += (val as f64) / n_loss;
+                let v = val as f64;
+                loss_centroid[i] += v / n_loss;
+                let dl = (live_bar_features_32[i] as f64) - v;
+                d_sq += dl * dl;
+            }
+            if trap.symbol.eq_ignore_ascii_case(symbol) {
+                d_sq *= 0.75;
+            }
+            if d_sq < best_trap_dist_sq {
+                best_trap_dist_sq = d_sq;
+                best_trap_id = trap.loss_trade_id;
             }
             if trap.culprit_anomaly_weights_32.len() >= 32 {
                 for (i, &w) in trap.culprit_anomaly_weights_32.iter().take(32).enumerate() {
@@ -372,15 +449,29 @@ impl PrecedentKnnIndex {
             }
         }
 
+        // Empirical 32x32 cross-stream sample covariance matrix \hat{\Sigma}_loss
+        let mut loss_sample_cov = [[0.0_f64; 32]; 32];
+        for i in 0..32 {
+            loss_sample_cov[i][i] = 0.0025;
+        }
         for trap in &causal_traps {
             let src_feats = if trap.post_entry_bar1_features_32.len() >= 32 {
                 &trap.post_entry_bar1_features_32[0..32]
             } else {
                 &trap.embedding_128[0..32.min(trap.embedding_128.len())]
             };
-            for (i, &val) in src_feats.iter().enumerate() {
-                let diff = (val as f64) - loss_centroid[i];
-                loss_var[i] += (diff * diff) / n_loss;
+            for i in 0..32 {
+                let di = (src_feats[i] as f64) - loss_centroid[i];
+                for j in 0..=i {
+                    let dj = (src_feats[j] as f64) - loss_centroid[j];
+                    let cov_ij = (di * dj) / n_loss;
+                    loss_sample_cov[i][j] += cov_ij;
+                }
+            }
+        }
+        for i in 0..32 {
+            for j in 0..i {
+                loss_sample_cov[j][i] = loss_sample_cov[i][j];
             }
         }
         drop(traps);
@@ -405,8 +496,13 @@ impl PrecedentKnnIndex {
             }
         }
 
-        let mut maha_loss_sq = 0.0_f64;
-        let mut maha_win_sq = 0.0_f64;
+        let mut win_sample_cov = [[0.0_f64; 32]; 32];
+        for i in 0..32 {
+            win_sample_cov[i][i] = (win_sigma[i] * win_sigma[i]).clamp(0.0016, 0.25);
+        }
+
+        let mut diff_loss = [0.0_f64; 32];
+        let mut diff_win = [0.0_f64; 32];
         let mut dot_loss = 0.0_f64;
         let mut dot_win = 0.0_f64;
         let mut norm_x_sq = 0.0_f64;
@@ -416,13 +512,8 @@ impl PrecedentKnnIndex {
         for i in 0..32 {
             let x_i = live_bar_features_32[i] as f64;
             let w_i = culprit_weights[i];
-            let l_var = loss_var[i].clamp(0.0016, 0.25);
-            let w_var = (win_sigma[i] * win_sigma[i]).clamp(0.0016, 0.25);
-
-            let dl = x_i - loss_centroid[i];
-            let dw = x_i - win_centroid[i];
-            maha_loss_sq += w_i * (dl * dl) / l_var;
-            maha_win_sq += w_i * (dw * dw) / w_var;
+            diff_loss[i] = x_i - loss_centroid[i];
+            diff_win[i] = x_i - win_centroid[i];
 
             dot_loss += w_i * x_i * loss_centroid[i];
             dot_win += w_i * x_i * win_centroid[i];
@@ -431,8 +522,18 @@ impl PrecedentKnnIndex {
             norm_win_sq += w_i * win_centroid[i] * win_centroid[i];
         }
 
-        let maha_loss = maha_loss_sq.sqrt();
-        let maha_win = maha_win_sq.sqrt();
+        let (maha_loss, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+            &loss_sample_cov,
+            matched_prior_loss_count,
+            &culprit_weights,
+            &diff_loss,
+        );
+        let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+            &win_sample_cov,
+            matched_prior_loss_count.max(8),
+            &culprit_weights,
+            &diff_win,
+        );
         let cos_loss = (dot_loss / (norm_x_sq.sqrt() * norm_loss_sq.sqrt()).max(1e-6)).clamp(-1.0, 1.0);
         let cos_win = (dot_win / (norm_x_sq.sqrt() * norm_win_sq.sqrt()).max(1e-6)).clamp(-1.0, 1.0);
 
@@ -447,6 +548,8 @@ impl PrecedentKnnIndex {
                 cosine_loss_similarity: (cos_loss * 1000.0).round() / 1000.0,
                 cosine_win_similarity: (cos_win * 1000.0).round() / 1000.0,
                 matched_prior_loss_count,
+                matched_trap_id: best_trap_id,
+                ledoit_wolf_shrinkage_lambda: (lw_lambda * 10000.0).round() / 10000.0,
             })
         } else {
             None
@@ -684,5 +787,51 @@ mod tests {
             )
             .expect("Expected post-entry loss-centroid scratch diagnostic after loss close");
         assert!(scratch_diag.loss_affinity_posterior_pct >= 55.0);
+        assert!(
+            (scratch_diag.ledoit_wolf_shrinkage_lambda - 0.80).abs() < 1e-3,
+            "Expected Ledoit-Wolf shrinkage lambda=0.80 for N=1, got {}",
+            scratch_diag.ledoit_wolf_shrinkage_lambda
+        );
+    }
+
+    #[test]
+    fn test_ledoit_wolf_32x32_cholesky_cross_stream_covariance() {
+        let mut cov = [[0.0_f64; 32]; 32];
+        for (i, row) in cov.iter_mut().enumerate() {
+            row[i] = 0.01;
+        }
+        // Strong cross-stream correlation between Stream 1 (idx 7: vol_surge) and Stream 2 (idx 8: gamma_wall)
+        cov[7][8] = 0.008;
+        cov[8][7] = 0.008;
+        let weights = [1.0 / 32.0; 32];
+        let mut diff_aligned = [0.0_f64; 32];
+        diff_aligned[7] = 0.10;
+        diff_aligned[8] = 0.10;
+        let mut diff_anti = [0.0_f64; 32];
+        diff_anti[7] = 0.10;
+        diff_anti[8] = -0.10;
+
+        let (maha_aligned, lambda_16) =
+            PrecedentKnnIndex::solve_ledoit_wolf_cholesky_mahalanobis_32(
+                &cov,
+                16,
+                &weights,
+                &diff_aligned,
+            );
+        let (maha_anti, _) = PrecedentKnnIndex::solve_ledoit_wolf_cholesky_mahalanobis_32(
+            &cov,
+            16,
+            &weights,
+            &diff_anti,
+        );
+        assert!(
+            (lambda_16 - 0.20).abs() < 1e-6,
+            "Expected lambda = 4/(16+4) = 0.20, got {lambda_16}"
+        );
+        // Under positive covariance, a point aligned along the principal eigenvector has smaller Mahalanobis distance
+        assert!(
+            maha_aligned < maha_anti,
+            "Expected cross-stream correlated vector to have smaller Mahalanobis distance ({maha_aligned} < {maha_anti})"
+        );
     }
 }

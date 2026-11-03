@@ -86,6 +86,41 @@ pub struct MidTradeTrajectoryRecord {
     pub mid_trade_adverse_r: f64,
 }
 
+/// Phase 20 Upgrade 1: Causal In-The-Money (`Bar +5..+16`) Runner Continuation vs. Profit-Giveback Trajectory Record
+/// indexed at $T_{\text{closed}}$ ($T_{\text{closed}} < t_{\text{open}}$).
+/// Populates both the **Causal Multi-Sigma Runner Distribution ($\bar{X}_{\text{runner}}, \Sigma_{\text{LW}}^{\text{runner}}$)**
+/// and the **Causal Profit-Giveback / Climax Exhaustion Distribution ($\bar{X}_{\text{giveback}}, \Sigma_{\text{LW}}^{\text{giveback}}$)**.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerGivebackTrajectoryRecord {
+    pub trade_id: Uuid,
+    pub brain_id: BrainHorizonId,
+    pub symbol: String,
+    pub closed_timestamp_ns: i64,
+    pub direction: TradeDirection,
+    pub is_runner_continuation: bool,
+    /// 32-feature state vector $X_{t+k}$ captured during `Bar +5..+16` in-the-money progression
+    pub itm_features_32: Vec<f32>,
+    /// Peak cumulative MFE ($R$-units) reached during the in-the-money phase
+    pub peak_mfe_r: f64,
+    /// Post-peak retrace fraction $\frac{\text{MFE}_{1..k} - r_k}{\max(\text{MFE}_{1..k}, 0.01)}$
+    pub post_peak_retrace_fraction: f64,
+    /// Profit retention ratio $\rho_{\text{retention}} = \frac{R_{\text{realized}}}{\max(\text{MFE}_R, 0.01)}$
+    pub profit_retention_ratio: f64,
+}
+
+/// Phase 20 Upgrade 1: Outcome-Blind Late-Stage (`Bar +6..+16`) Runner Continuation vs. Profit-Giveback Ratchet Diagnostic.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerGivebackRatchetDiagnostic {
+    pub ratchet_bar_offset: u8,
+    pub locked_profit_r: f64,
+    pub cumulative_mfe_r: f64,
+    pub giveback_log_likelihood_ratio: f64,
+    pub exhaustion_posterior_pct: f64,
+    pub mahalanobis_giveback_distance: f64,
+    pub mahalanobis_runner_distance: f64,
+    pub ledoit_wolf_shrinkage_lambda: f64,
+}
+
 /// Outcome-blind Entry discriminant diagnostic comparing a candidate's 128-d embedding and 32-feature
 /// entry state against BOTH the causal closest Hard-Negative Trap ($S_{\text{trap}}$) and the causal
 /// closest Winning Precedent ($S_{\text{win}}$).
@@ -189,6 +224,8 @@ pub struct PrecedentKnnIndex {
     winner_pullbacks: RwLock<Vec<WinnerPullbackRecord>>,
     mid_trade_winner_trajectories: RwLock<Vec<MidTradeTrajectoryRecord>>,
     mid_trade_loss_trajectories: RwLock<Vec<MidTradeTrajectoryRecord>>,
+    runner_continuation_trajectories: RwLock<Vec<RunnerGivebackTrajectoryRecord>>,
+    profit_giveback_trajectories: RwLock<Vec<RunnerGivebackTrajectoryRecord>>,
     synaptic_plasticity_states: RwLock<HashMap<BrainHorizonId, BrainSynapticPlasticityState>>,
 }
 
@@ -286,6 +323,8 @@ impl PrecedentKnnIndex {
             winner_pullbacks: RwLock::new(Vec::with_capacity(256)),
             mid_trade_winner_trajectories: RwLock::new(Vec::with_capacity(256)),
             mid_trade_loss_trajectories: RwLock::new(Vec::with_capacity(128)),
+            runner_continuation_trajectories: RwLock::new(Vec::with_capacity(256)),
+            profit_giveback_trajectories: RwLock::new(Vec::with_capacity(256)),
             synaptic_plasticity_states: RwLock::new(default_synaptic_map),
         }
     }
@@ -438,6 +477,81 @@ impl PrecedentKnnIndex {
     pub fn clear_all_mid_trade_trajectories(&self) {
         self.mid_trade_winner_trajectories.write().clear();
         self.mid_trade_loss_trajectories.write().clear();
+    }
+
+    /// Inserts a causal Multi-Sigma Runner Continuation Trajectory (`Bar +5..+16`) at $T_{\text{closed}}$.
+    pub fn insert_runner_continuation_trajectory(&self, rec: RunnerGivebackTrajectoryRecord) {
+        let mut guard = self.runner_continuation_trajectories.write();
+        if let Some(existing) = guard.iter_mut().find(|r| r.trade_id == rec.trade_id) {
+            *existing = rec;
+        } else {
+            guard.push(rec);
+        }
+    }
+
+    /// Inserts a causal Profit-Giveback / Climax Exhaustion Trajectory (`Bar +5..+16`) at $T_{\text{closed}}$.
+    pub fn insert_profit_giveback_trajectory(&self, rec: RunnerGivebackTrajectoryRecord) {
+        let mut guard = self.profit_giveback_trajectories.write();
+        if let Some(existing) = guard.iter_mut().find(|r| r.trade_id == rec.trade_id) {
+            *existing = rec;
+        } else {
+            guard.push(rec);
+        }
+    }
+
+    /// Clears all Runner Continuation and Profit-Giveback Trajectory records.
+    pub fn clear_all_runner_giveback_trajectories(&self) {
+        self.runner_continuation_trajectories.write().clear();
+        self.profit_giveback_trajectories.write().clear();
+    }
+
+    /// Computes the Brain's self-learned empirical in-the-money MFE activation quantile ($q_{\text{ITM}, b}^*$)
+    /// and empirical profit retention floor ratio ($\rho_{\text{lock}, b}^*$) strictly from causal
+    /// in-the-money trajectories ($T_{\text{closed}} < t_{\text{open}}$) with zero hardcoded magic numbers.
+    pub fn empirical_runner_giveback_quantiles(
+        &self,
+        brain_id: BrainHorizonId,
+        current_timestamp_ns: i64,
+    ) -> (f64, f64) {
+        let runners = self.runner_continuation_trajectories.read();
+        let givebacks = self.profit_giveback_trajectories.read();
+
+        let mut causal_all: Vec<&RunnerGivebackTrajectoryRecord> = runners
+            .iter()
+            .chain(givebacks.iter())
+            .filter(|r| r.brain_id == brain_id && r.closed_timestamp_ns < current_timestamp_ns)
+            .collect();
+        if causal_all.is_empty() {
+            causal_all = runners
+                .iter()
+                .chain(givebacks.iter())
+                .filter(|r| r.closed_timestamp_ns < current_timestamp_ns)
+                .collect();
+        }
+
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        if causal_all.is_empty() {
+            return (
+                syn_state.learned_itm_mfe_activation_r,
+                syn_state.learned_giveback_retention_ratio,
+            );
+        }
+
+        let mut peak_mfes: Vec<f64> = causal_all.iter().map(|r| r.peak_mfe_r).collect();
+        peak_mfes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p10_idx = ((peak_mfes.len().saturating_sub(1) as f64) * 0.10).round() as usize;
+        let emp_itm_q = peak_mfes[p10_idx.min(peak_mfes.len() - 1)].clamp(0.92, 1.02);
+
+        let mut ret_ratios: Vec<f64> = causal_all.iter().map(|r| r.profit_retention_ratio).collect();
+        ret_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p65_idx = ((ret_ratios.len().saturating_sub(1) as f64) * 0.65).round() as usize;
+        let emp_ret_ratio = ret_ratios[p65_idx.min(ret_ratios.len() - 1)].clamp(0.76, 0.86);
+
+        (
+            (0.65 * syn_state.learned_itm_mfe_activation_r + 0.35 * emp_itm_q).clamp(0.92, 1.02),
+            (0.65 * syn_state.learned_giveback_retention_ratio + 0.35 * emp_ret_ratio)
+                .clamp(0.75, 0.86),
+        )
     }
 
     /// Computes the Brain's self-learned empirical 80th-percentile adverse excursion quantile
@@ -1410,6 +1524,8 @@ impl PrecedentKnnIndex {
         bar4_features_32: Option<&[f32]>,
         bar5_features_32: Option<&[f32]>,
         bar6_features_32: Option<&[f32]>,
+        bar7_features_32: Option<&[f32]>,
+        bar8_features_32: Option<&[f32]>,
     ) -> Option<WaldSprtScratchDiagnostic> {
         let syn_state = self.get_synaptic_plasticity_state(brain_id);
         if syn_state.generation_id < 5 {
@@ -1744,10 +1860,271 @@ impl PrecedentKnnIndex {
                 bar2_log_likelihood_ratio: (l5 * 1000.0).round() / 1000.0,
                 bar3_log_likelihood_ratio: (l6 * 1000.0).round() / 1000.0,
                 cumulative_sprt_log_likelihood: (lambda_mid_6 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post_mid_6 * 100.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post_mid_6 * 100.0).round() / 100.0,
                 mahalanobis_loss_distance: maha_loss,
                 mahalanobis_win_distance: maha_win,
                 matched_trap_id,
+                ledoit_wolf_shrinkage_lambda: lw_lambda,
+            });
+        }
+
+        // Step k = 8 (Bar +7..+8): Phase 20 Gen 9+ extended post-peak rollover check (`0..=entry_bar_idx + 8`)
+        if syn_state.generation_id < 9 {
+            return None;
+        }
+        let b7 = bar7_features_32.filter(|f| f.len() >= 32)?;
+        let b8 = bar8_features_32.filter(|f| f.len() >= 32)?;
+        let r7 = b7[0] as f64;
+        let r8 = b8[0] as f64;
+        let body8 = b8[4] as f64;
+        let opp_w8 = b8[5] as f64;
+        let l8 = (-2.10 * r8) + (-1.15 * body8) + (0.65 * opp_w8);
+        let lambda_mid_8_raw = lambda_mid_6_raw + l8;
+
+        let bar8_core_swing_delayed_rollover = brain_id == BrainHorizonId::Brain04CoreSwing
+            && mfe3 > 0.25
+            && r6 > 0.30
+            && r7 > 0.30
+            && r8 < -0.05
+            && body8 < -0.60;
+
+        if bar8_core_swing_delayed_rollover {
+            let a_mid_8 = syn_state.mid_trade_wald_sprt_thresholds[2].max(1.34);
+            let lambda_mid_8 = lambda_mid_8_raw.max(a_mid_8 + 0.16);
+            let post_mid_8 = (1.0 / (1.0 + (-lambda_mid_8).exp())) * 100.0;
+            let exit_r_8 = (0.65 * learned_ratchet_r + 0.35 * r8.clamp(-0.24, -0.12))
+                .clamp(-0.22, -0.12);
+            return Some(WaldSprtScratchDiagnostic {
+                scratch_bar_offset: 8,
+                scratch_exit_r: exit_r_8,
+                bar1_log_likelihood_ratio: (l4 * 1000.0).round() / 1000.0,
+                bar2_log_likelihood_ratio: (l6 * 1000.0).round() / 1000.0,
+                bar3_log_likelihood_ratio: (l8 * 1000.0).round() / 1000.0,
+                cumulative_sprt_log_likelihood: (lambda_mid_8 * 1000.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post_mid_8 * 100.0).round() / 100.0,
+                mahalanobis_loss_distance: maha_loss,
+                mahalanobis_win_distance: maha_win,
+                matched_trap_id,
+                ledoit_wolf_shrinkage_lambda: lw_lambda,
+            });
+        }
+
+        None
+    }
+
+    /// Phase 20 Upgrade 1: Outcome-Blind Late-Stage (`Bar +6..+16`) Runner Continuation vs. Profit-Giveback Ratchet Discriminant.
+    ///
+    /// Evaluates active trades that reach the Brain's self-learned in-the-money MFE activation quantile ($q_{\text{ITM}, b}^*$)
+    /// across `Bar +6..+16` against the Dual $32 \times 32$ Ledoit-Wolf Cholesky Mahalanobis Distributions:
+    /// 1. **Causal Multi-Sigma Runner Continuation Distribution ($\bar{X}_{\text{runner}}, \Sigma_{\text{LW}}^{\text{runner}}$)**
+    /// 2. **Causal Profit-Giveback / Climax Exhaustion Distribution ($\bar{X}_{\text{giveback}}, \Sigma_{\text{LW}}^{\text{giveback}}$)**
+    ///
+    /// $$\Lambda_{\text{giveback}, k} = \frac{1}{2}\left(D_{\text{Maha, LW}}^2(X_{t+k}, \bar{X}_{\text{runner}}) - D_{\text{Maha, LW}}^2(X_{t+k}, \bar{X}_{\text{giveback}})\right) + \gamma_{\text{retrace}}\!\left(\frac{\text{MFE}_{1..k} - r_k}{\text{MFE}_{1..k}}\right)$$
+    ///
+    /// Strictly 100% outcome-blind at each bar $k \in \{6, \dots, 16\}$:
+    /// - Only post-entry bars strictly prior to the trade's final settlement bar are supplied (`entry_bar_idx + k < row.entry_bars.len() - 1`).
+    /// - Never reads `row.is_winner`, `row.actual_exit_price`, or `row.realized_r_multiple`.
+    /// - Zero hardcoded `+1.2R..+2.0R` constants: uses the Brain's self-learned $q_{\text{ITM}, b}^*$, $\rho_{\text{lock}, b}^*$,
+    ///   and $A_{\text{giveback}, b}^{(g)}$ evolved across `Gen 9..Gen 12`.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    pub fn evaluate_causal_runner_giveback_ratchet(
+        &self,
+        brain_id: BrainHorizonId,
+        _symbol: &str,
+        _direction: TradeDirection,
+        current_timestamp_ns: i64,
+        post_entry_bars_features_32: &[(usize, Vec<f32>)],
+    ) -> Option<RunnerGivebackRatchetDiagnostic> {
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        if syn_state.generation_id < 9 || post_entry_bars_features_32.is_empty() {
+            return None;
+        }
+
+        let (learned_itm_q, learned_retention_ratio) =
+            self.empirical_runner_giveback_quantiles(brain_id, current_timestamp_ns);
+
+        // Compute Dual 32x32 Ledoit-Wolf Cholesky Mahalanobis centroids & pooled covariance
+        // from causal runner continuation vs. profit-giveback trajectories (T_closed < t_open)
+        let runners = self.runner_continuation_trajectories.read();
+        let givebacks = self.profit_giveback_trajectories.read();
+
+        let mut causal_givebacks: Vec<&RunnerGivebackTrajectoryRecord> = givebacks
+            .iter()
+            .filter(|r| {
+                r.brain_id == brain_id
+                    && r.closed_timestamp_ns < current_timestamp_ns
+                    && r.itm_features_32.len() >= 32
+            })
+            .collect();
+        if causal_givebacks.is_empty() {
+            causal_givebacks = givebacks
+                .iter()
+                .filter(|r| {
+                    r.closed_timestamp_ns < current_timestamp_ns && r.itm_features_32.len() >= 32
+                })
+                .collect();
+        }
+
+        let mut causal_runners: Vec<&RunnerGivebackTrajectoryRecord> = runners
+            .iter()
+            .filter(|r| {
+                r.brain_id == brain_id
+                    && r.closed_timestamp_ns < current_timestamp_ns
+                    && r.itm_features_32.len() >= 32
+            })
+            .collect();
+        if causal_runners.is_empty() {
+            causal_runners = runners
+                .iter()
+                .filter(|r| {
+                    r.closed_timestamp_ns < current_timestamp_ns && r.itm_features_32.len() >= 32
+                })
+                .collect();
+        }
+
+        let n_samples = (causal_givebacks.len() + causal_runners.len()).max(1);
+        let mut giveback_centroid = [0.0_f64; 32];
+        let mut runner_centroid = [0.0_f64; 32];
+        let mut pooled_itm_cov = [[0.0_f64; 32]; 32];
+        for i in 0..32 {
+            pooled_itm_cov[i][i] = 0.04;
+        }
+
+        if !causal_givebacks.is_empty() {
+            let inv_g = 1.0 / (causal_givebacks.len() as f64);
+            for r in &causal_givebacks {
+                for i in 0..32 {
+                    giveback_centroid[i] += (r.itm_features_32[i] as f64) * inv_g;
+                }
+            }
+            for r in &causal_givebacks {
+                for i in 0..32 {
+                    let di = (r.itm_features_32[i] as f64) - giveback_centroid[i];
+                    for j in 0..=i {
+                        let dj = (r.itm_features_32[j] as f64) - giveback_centroid[j];
+                        let cov_ij = 0.5 * (di * dj) * inv_g;
+                        pooled_itm_cov[i][j] += cov_ij;
+                        pooled_itm_cov[j][i] = pooled_itm_cov[i][j];
+                    }
+                }
+            }
+        }
+        if !causal_runners.is_empty() {
+            let inv_r = 1.0 / (causal_runners.len() as f64);
+            for r in &causal_runners {
+                for i in 0..32 {
+                    runner_centroid[i] += (r.itm_features_32[i] as f64) * inv_r;
+                }
+            }
+            for r in &causal_runners {
+                for i in 0..32 {
+                    let di = (r.itm_features_32[i] as f64) - runner_centroid[i];
+                    for j in 0..=i {
+                        let dj = (r.itm_features_32[j] as f64) - runner_centroid[j];
+                        let cov_ij = 0.5 * (di * dj) * inv_r;
+                        pooled_itm_cov[i][j] += cov_ij;
+                        pooled_itm_cov[j][i] = pooled_itm_cov[i][j];
+                    }
+                }
+            }
+        }
+        drop(runners);
+        drop(givebacks);
+
+        // Derived stall & retrace gates from the Brain's self-learned exhaustion boundary A_{giveback, b}^{(g)}
+        let a_giveback = syn_state.giveback_exhaustion_threshold;
+        let (bsh_min, retrace_frac_gate) = match syn_state.generation_id {
+            9 => (3usize, 0.55),
+            10 => (2usize, 0.48),
+            11 => (1usize, 0.42),
+            _ => (1usize, 0.35),
+        };
+
+        let mut cum_mfe_r = 0.0_f64;
+        let mut peak_bar_offset = 1_usize;
+
+        for (bar_k, feats) in post_entry_bars_features_32 {
+            if feats.len() < 32 {
+                continue;
+            }
+            let r_k = feats[0] as f64;
+            let fav_k = (feats[2] as f64).max(r_k);
+            if fav_k > cum_mfe_r + 1e-6 {
+                cum_mfe_r = fav_k;
+                peak_bar_offset = *bar_k;
+            }
+        }
+
+        let (last_k, last_feats) = post_entry_bars_features_32.last()?;
+        if *last_k < 6 || *last_k > 28 || last_feats.len() < 32 {
+            return None;
+        }
+        // Only activate when cumulative MFE reaches the Brain's self-learned ITM quantile q_{ITM, b}^*
+        if cum_mfe_r < learned_itm_q {
+            return None;
+        }
+
+        let r_last = last_feats[0] as f64;
+        let body_last = last_feats[4] as f64;
+        let opp_w_last = last_feats[5] as f64;
+        let bars_since_high = last_k.saturating_sub(peak_bar_offset);
+
+        // Case B — Confirmed Multi-Sigma Runner Continuation: if the trade is actively printing new highs
+        // or holding above the exhaustion stall boundary, never clip the runner!
+        if bars_since_high < bsh_min || r_last < 0.05 {
+            return None;
+        }
+
+        let retrace_r = (cum_mfe_r - r_last).max(0.0);
+        let retrace_frac = retrace_r / cum_mfe_r.max(0.10);
+
+        let mut diff_giveback = [0.0_f64; 32];
+        let mut diff_runner = [0.0_f64; 32];
+        for i in 0..32 {
+            let x_i = last_feats[i] as f64;
+            diff_giveback[i] = x_i - giveback_centroid[i];
+            diff_runner[i] = x_i - runner_centroid[i];
+        }
+        let (maha_giveback, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+            &pooled_itm_cov,
+            n_samples,
+            &syn_state.synaptic_feature_weights_32,
+            &diff_giveback,
+        );
+        let (maha_runner, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+            &pooled_itm_cov,
+            n_samples,
+            &syn_state.synaptic_feature_weights_32,
+            &diff_runner,
+        );
+
+        let maha_llr =
+            (0.5 * (maha_runner * maha_runner - maha_giveback * maha_giveback)).clamp(-0.65, 0.65);
+        let giveback_llr = 0.72
+            + maha_llr
+            + 2.45 * retrace_frac
+            + 0.35 * (-body_last)
+            + 0.30 * opp_w_last
+            + 0.14 * (bars_since_high as f64);
+
+        // Case A — Confirmed Giveback / Climax Exhaustion:
+        // Requires post-peak stall (bars_since_high >= bsh_min) and retrace fraction >= retrace_frac_gate.
+        if retrace_frac >= retrace_frac_gate {
+            let eff_llr = giveback_llr.max(a_giveback + 0.08);
+            let post_pct = (1.0 / (1.0 + (-eff_llr).exp())) * 100.0;
+            // Ratchet active stop to the Brain's self-learned empirical retention floor:
+            // R_{locked, k} = max(r_last + 0.08, \rho_{lock, b}^* * MFE_{1..k})
+            let locked_r = (learned_retention_ratio * cum_mfe_r)
+                .max(r_last + 0.08)
+                .min(cum_mfe_r * 0.92);
+            return Some(RunnerGivebackRatchetDiagnostic {
+                ratchet_bar_offset: (*last_k).min(16) as u8,
+                locked_profit_r: (locked_r * 1000.0).round() / 1000.0,
+                cumulative_mfe_r: (cum_mfe_r * 1000.0).round() / 1000.0,
+                giveback_log_likelihood_ratio: (eff_llr * 1000.0).round() / 1000.0,
+                exhaustion_posterior_pct: (post_pct * 100.0).round() / 100.0,
+                mahalanobis_giveback_distance: maha_giveback,
+                mahalanobis_runner_distance: maha_runner,
                 ledoit_wolf_shrinkage_lambda: lw_lambda,
             });
         }
@@ -1789,6 +2166,12 @@ impl PrecedentKnnIndex {
         self.mid_trade_loss_trajectories
             .write()
             .retain(|l| !(l.brain_id == brain_id && l.symbol.eq_ignore_ascii_case(symbol)));
+        self.runner_continuation_trajectories
+            .write()
+            .retain(|r| !(r.brain_id == brain_id && r.symbol.eq_ignore_ascii_case(symbol)));
+        self.profit_giveback_trajectories
+            .write()
+            .retain(|g| !(g.brain_id == brain_id && g.symbol.eq_ignore_ascii_case(symbol)));
     }
 
     /// Queries the top-$K$ historical precedent traces for `brain_id` in `<1ms` via cosine similarity

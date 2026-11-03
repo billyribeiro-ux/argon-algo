@@ -701,6 +701,7 @@ mod tests {
 
         let mut verified_vetoes = 0usize;
         let mut verified_scratches = 0usize;
+        let mut verified_giveback_saves = 0usize;
 
         for original_row in &snap.closed_trades {
             // Evaluate on the original row
@@ -747,6 +748,22 @@ mod tests {
                 original_row.brain_id.code()
             );
             assert_eq!(
+                row_truth.was_protected_from_giveback,
+                row_mutated.was_protected_from_giveback,
+                "OUTCOME LEAK DETECTED on trade {} ({} {}): was_protected_from_giveback changed when row.is_winner/actual_exit_price/realized_r_multiple were mutated!",
+                original_row.trade_id,
+                original_row.symbol,
+                original_row.brain_id.code()
+            );
+            assert_eq!(
+                row_truth.giveback_ratchet_bar_offset,
+                row_mutated.giveback_ratchet_bar_offset,
+                "OUTCOME LEAK DETECTED on trade {} ({} {}): giveback_ratchet_bar_offset changed under outcome mutation!",
+                original_row.trade_id,
+                original_row.symbol,
+                original_row.brain_id.code()
+            );
+            assert_eq!(
                 row_truth.entry_trap_similarity_score.to_bits(),
                 row_mutated.entry_trap_similarity_score.to_bits(),
                 "OUTCOME LEAK DETECTED: entry_trap_similarity_score changed under outcome mutation!"
@@ -756,11 +773,11 @@ mod tests {
                 row_mutated.loss_affinity_posterior_pct.to_bits(),
                 "OUTCOME LEAK DETECTED: loss_affinity_posterior_pct changed under outcome mutation!"
             );
-            if row_truth.was_scratched_by_loss_autopsy {
+            if row_truth.was_scratched_by_loss_autopsy || row_truth.was_protected_from_giveback {
                 assert_eq!(
                     row_truth.adaptive_exit_price,
                     row_mutated.adaptive_exit_price,
-                    "OUTCOME LEAK DETECTED: scratched adaptive_exit_price depended on actual_exit_price!"
+                    "OUTCOME LEAK DETECTED: adaptive_exit_price depended on actual_exit_price!"
                 );
                 assert_eq!(
                     row_truth.adaptive_scratch_exit_r.to_bits(),
@@ -770,7 +787,12 @@ mod tests {
                 assert_eq!(
                     row_truth.adaptive_net_pnl_usd.to_bits(),
                     row_mutated.adaptive_net_pnl_usd.to_bits(),
-                    "OUTCOME LEAK DETECTED: scratched adaptive_net_pnl_usd depended on realized outcome!"
+                    "OUTCOME LEAK DETECTED: adaptive_net_pnl_usd depended on realized outcome!"
+                );
+                assert_eq!(
+                    row_truth.giveback_r_saved.to_bits(),
+                    row_mutated.giveback_r_saved.to_bits(),
+                    "OUTCOME LEAK DETECTED: giveback_r_saved depended on realized outcome!"
                 );
             }
 
@@ -780,11 +802,14 @@ mod tests {
             if row_truth.was_scratched_by_loss_autopsy {
                 verified_scratches += 1;
             }
+            if row_truth.was_protected_from_giveback {
+                verified_giveback_saves += 1;
+            }
         }
 
         assert!(
-            verified_vetoes > 0 && verified_scratches > 0,
-            "Expected both vetoes ({verified_vetoes}) and scratches ({verified_scratches}) to be verified outcome-blind"
+            verified_vetoes > 0 && verified_scratches > 0 && verified_giveback_saves > 0,
+            "Expected vetoes ({verified_vetoes}), scratches ({verified_scratches}), and giveback saves ({verified_giveback_saves}) to be verified outcome-blind"
         );
         assert!(
             snap.scoreboard.remaining_unscratched_losses > 0,
@@ -792,14 +817,17 @@ mod tests {
             snap.scoreboard.remaining_unscratched_losses
         );
         println!(
-            "[OUTCOME-BLIND PROOF VERIFIED] Tested all {} trades: 0 outcome leaks across {} vetoes and {} scratches | TP Veto: {}, FP Veto: {}, TP Scratch: {}, FP Scratch: {}, Remaining Unscratched Stops: {}",
+            "[OUTCOME-BLIND PROOF VERIFIED] Tested all {} trades: 0 outcome leaks across {} vetoes, {} scratches, and {} giveback saves | TP Veto: {}, FP Veto: {}, TP Scratch: {}, FP Scratch: {}, Giveback Saves: {} (+{:.2}R), Remaining Unscratched Stops: {}",
             snap.closed_trades.len(),
             verified_vetoes,
             verified_scratches,
+            verified_giveback_saves,
             snap.scoreboard.true_positive_losses_vetoed,
             snap.scoreboard.false_positive_winners_vetoed,
             snap.scoreboard.true_positive_losses_scratched,
             snap.scoreboard.false_positive_winners_scratched,
+            snap.scoreboard.giveback_saves_count,
+            snap.scoreboard.total_giveback_r_recovered,
             snap.scoreboard.remaining_unscratched_losses
         );
     }
@@ -973,17 +1001,17 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen8();
+        let evo = engine.run_multi_generation_evolution_to_gen12();
         assert_eq!(
             evo.generations_history.len(),
-            9,
-            "Expected Gen 0..Gen 8 (9 generation records)"
+            13,
+            "Expected Gen 0..Gen 12 (13 generation records)"
         );
-        assert_eq!(evo.current_champion_generation, 8);
+        assert_eq!(evo.current_champion_generation, 12);
 
         for g in &evo.generations_history {
             println!(
-                "[PHASE 19 EVOLUTION GEN-{}] Status: {} | Active: {} ({}W/{}L, WR {:.2}%) | TP Veto: {} / FP Veto: {} (Prec {:.2}%) | TP Scratch: {} (Early B1..3: {}, Mid B4..6: {}) / FP Scratch: {} (Prec {:.2}%) | Rem Stops: {} | PF: {:.2} (Kelly PF: {:.2}) | Fixed P&L: ${:.2} | Kelly P&L: ${:.2} | MaxDD: ${:.2} | Fitness: {:.2}",
+                "[PHASE 20 EVOLUTION GEN-{}] Status: {} | Active: {} ({}W/{}L, WR {:.2}%) | TP Veto: {} / FP Veto: {} (Prec {:.2}%) | TP Scratch: {} (Early B1..3: {}, Mid B4..8: {}) / FP Scratch: {} (Prec {:.2}%) | Giveback Saves: {} (+{:.2}R, Avg Win: +{:.2}R) | Rem Stops: {} | PF: {:.2} (Kelly PF: {:.2}) | Fixed P&L: ${:.2} | Kelly P&L: ${:.2} | MaxDD: ${:.2} | Fitness: {:.2}",
                 g.generation_id,
                 g.status_label,
                 g.active_trades,
@@ -998,6 +1026,9 @@ mod tests {
                 g.mid_trade_stall_saves_bar4_to_6,
                 g.fp_winners_scratched,
                 g.scratch_precision_pct,
+                g.giveback_saves_count,
+                g.total_giveback_r_recovered,
+                g.avg_winner_r,
                 g.remaining_unscratched_losses,
                 g.profit_factor,
                 g.kelly_profit_factor,
@@ -1008,7 +1039,7 @@ mod tests {
             );
         }
 
-        // Verify strict monotonic progression from Gen 0 -> Gen 8
+        // Verify strict monotonic progression from Gen 0 -> Gen 12
         for idx in 1..evo.generations_history.len() {
             let prev = &evo.generations_history[idx - 1];
             let curr = &evo.generations_history[idx];
@@ -1054,10 +1085,19 @@ mod tests {
                 prev.generation_id,
                 prev.remaining_unscratched_losses
             );
+            assert!(
+                curr.giveback_saves_count >= prev.giveback_saves_count,
+                "Gen {} giveback_saves_count ({}) must be >= Gen {} ({})",
+                curr.generation_id,
+                curr.giveback_saves_count,
+                prev.generation_id,
+                prev.giveback_saves_count
+            );
         }
 
         let gen4 = &evo.generations_history[4];
-        let gen8 = evo.generations_history.last().unwrap();
+        let gen8 = &evo.generations_history[8];
+        let gen12 = evo.generations_history.last().unwrap();
         assert!(
             gen8.mid_trade_stall_saves_bar4_to_6 > gen4.mid_trade_stall_saves_bar4_to_6,
             "Expected Gen 8 mid_trade_stall_saves_bar4_to_6 ({}) > Gen 4 ({})",
@@ -1065,18 +1105,27 @@ mod tests {
             gen4.mid_trade_stall_saves_bar4_to_6
         );
         assert!(
-            gen8.remaining_unscratched_losses < gen4.remaining_unscratched_losses,
-            "Expected Gen 8 remaining_unscratched_losses ({}) < Gen 4 ({})",
-            gen8.remaining_unscratched_losses,
-            gen4.remaining_unscratched_losses
+            gen12.giveback_saves_count > gen8.giveback_saves_count
+                && gen12.total_giveback_r_recovered > gen8.total_giveback_r_recovered,
+            "Expected Gen 12 giveback_saves_count ({}) & total_giveback_r_recovered ({}) > Gen 8 ({}, {})",
+            gen12.giveback_saves_count,
+            gen12.total_giveback_r_recovered,
+            gen8.giveback_saves_count,
+            gen8.total_giveback_r_recovered
         );
         assert!(
-            gen8.remaining_unscratched_losses > 0,
-            "Honest outcome-blind Gen 8 must still have remaining_unscratched_losses > 0, got {}",
+            gen12.remaining_unscratched_losses < gen8.remaining_unscratched_losses,
+            "Expected Gen 12 remaining_unscratched_losses ({}) < Gen 8 ({})",
+            gen12.remaining_unscratched_losses,
             gen8.remaining_unscratched_losses
         );
+        assert!(
+            gen12.remaining_unscratched_losses > 0,
+            "Honest outcome-blind Gen 12 must still have remaining_unscratched_losses > 0, got {}",
+            gen12.remaining_unscratched_losses
+        );
 
-        // Verify per-Brain Empirical-Bayes specialization: each Brain has distinct specialized weights
+        // Verify per-Brain Empirical-Bayes specialization & Phase 20 Runner/Giveback parameters
         assert_eq!(evo.synaptic_plasticity_states.len(), 5);
         for b_state in &evo.synaptic_plasticity_states {
             assert!(
@@ -1086,12 +1135,23 @@ mod tests {
                 b_state.brain_id.as_str(),
                 b_state.empirical_bayes_shrinkage_lambda
             );
+            assert!(
+                b_state.learned_itm_mfe_activation_r >= 0.85
+                    && b_state.learned_giveback_retention_ratio >= 0.72,
+                "Brain {} learned ITM activation ({}) & retention ratio ({}) must be self-calibrated",
+                b_state.brain_id.as_str(),
+                b_state.learned_itm_mfe_activation_r,
+                b_state.learned_giveback_retention_ratio
+            );
             println!(
-                "[EMPIRICAL-BAYES BRAIN SPECIALIZATION] {} | lambda_b={:.4} | Mid-Trade SPRT={:?} | Stop Ratchet={:.4}R | Top Boosted: {} ({:.3}x)",
+                "[EMPIRICAL-BAYES BRAIN SPECIALIZATION] {} | lambda_b={:.4} | Mid-Trade SPRT={:?} | Stop Ratchet={:.4}R | ITM Activation={:.3}R | Giveback A={:.3} / Retention={:.3} | Top Boosted: {} ({:.3}x)",
                 b_state.brain_id.as_str(),
                 b_state.empirical_bayes_shrinkage_lambda,
                 b_state.mid_trade_wald_sprt_thresholds,
                 b_state.learned_mid_trade_stop_ratchet_r,
+                b_state.learned_itm_mfe_activation_r,
+                b_state.giveback_exhaustion_threshold,
+                b_state.learned_giveback_retention_ratio,
                 b_state
                     .top_boosted_warning_features
                     .first()
@@ -1110,8 +1170,32 @@ mod tests {
             "BRAIN-01 and BRAIN-05 must specialize into distinct 32-feature synaptic weight vectors under Empirical-Bayes shrinkage"
         );
 
-        // Verify 100% Outcome-Blind Invariance at Gen 8 across all 173 trades
+        // Verify Open-Position Live Sequential LLR & Next-Bar Ratchet Telemetry across all 5 open positions
         let snap = engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        assert_eq!(snap.positions_opened.len(), 5);
+        for op in &snap.positions_opened {
+            assert!(
+                op.bars_held_count >= 1
+                    && !op.active_sequential_stage.is_empty()
+                    && op.champion_llr_threshold > 0.0
+                    && op.next_bar_ratchet_stop_preview > 0.0,
+                "Open position {} must have live sequential LLR & next-bar ratchet telemetry populated",
+                op.symbol
+            );
+            println!(
+                "[OPEN POSITION LIVE SEQUENTIAL TELEMETRY] {} ({}) | Bar +{} | Stage: {} | LLR: {:.3} / Thresh: {:.3} | Safety Margin: {:.1}% | Next-Bar Ratchet Preview: ${:.2}",
+                op.symbol,
+                op.brain_id.code(),
+                op.bars_held_count,
+                op.active_sequential_stage,
+                op.live_sequential_llr,
+                op.champion_llr_threshold,
+                op.sequential_safety_margin_pct,
+                op.next_bar_ratchet_stop_preview
+            );
+        }
+
+        // Verify 100% Outcome-Blind Invariance at Gen 12 across all 173 trades
         for original_row in &snap.closed_trades {
             let mut row_truth = original_row.clone();
             engine.apply_causal_adaptive_rules_to_row(&mut row_truth, &[], false);
@@ -1128,21 +1212,35 @@ mod tests {
             assert_eq!(
                 row_truth.was_vetoed_by_loss_autopsy,
                 row_mutated.was_vetoed_by_loss_autopsy,
-                "GEN-8 OUTCOME LEAK on trade {} ({})",
+                "GEN-12 OUTCOME LEAK on trade {} ({})",
                 original_row.trade_id,
                 original_row.symbol
             );
             assert_eq!(
                 row_truth.was_scratched_by_loss_autopsy,
                 row_mutated.was_scratched_by_loss_autopsy,
-                "GEN-8 OUTCOME LEAK on trade {} ({})",
+                "GEN-12 OUTCOME LEAK on trade {} ({})",
                 original_row.trade_id,
                 original_row.symbol
             );
             assert_eq!(
                 row_truth.scratch_bar_offset,
                 row_mutated.scratch_bar_offset,
-                "GEN-8 OUTCOME LEAK on scratch_bar_offset for trade {} ({})",
+                "GEN-12 OUTCOME LEAK on scratch_bar_offset for trade {} ({})",
+                original_row.trade_id,
+                original_row.symbol
+            );
+            assert_eq!(
+                row_truth.was_protected_from_giveback,
+                row_mutated.was_protected_from_giveback,
+                "GEN-12 OUTCOME LEAK on was_protected_from_giveback for trade {} ({})",
+                original_row.trade_id,
+                original_row.symbol
+            );
+            assert_eq!(
+                row_truth.giveback_ratchet_bar_offset,
+                row_mutated.giveback_ratchet_bar_offset,
+                "GEN-12 OUTCOME LEAK on giveback_ratchet_bar_offset for trade {} ({})",
                 original_row.trade_id,
                 original_row.symbol
             );

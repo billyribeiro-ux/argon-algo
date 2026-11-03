@@ -66,7 +66,23 @@ fn default_mid_stop_ratchet_r() -> f64 {
     -0.19
 }
 
-/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18` & `Phase 19`).
+fn default_itm_mfe_activation_r() -> f64 {
+    1.04
+}
+
+fn default_giveback_exhaustion_threshold() -> f64 {
+    1.38
+}
+
+fn default_runner_continuation_threshold() -> f64 {
+    -0.25
+}
+
+fn default_giveback_retention_ratio() -> f64 {
+    0.81
+}
+
+/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 20`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainSynapticPlasticityState {
     pub brain_id: BrainHorizonId,
@@ -93,12 +109,31 @@ pub struct BrainSynapticPlasticityState {
     /// Phase 19 Upgrade 2: Self-learned 80th-percentile adverse excursion exit R quantile from causal mid-trade stalls (zero hardcoded `-0.35R` or `+0.40R` constants)
     #[serde(default = "default_mid_stop_ratchet_r")]
     pub learned_mid_trade_stop_ratchet_r: f64,
+    /// Phase 20 Upgrade 1: Self-learned in-the-money MFE activation quantile ($q_{\text{ITM}, b}^*$) from causal completed MFE distributions (`Bar +5..+16`)
+    #[serde(default = "default_itm_mfe_activation_r")]
+    pub learned_itm_mfe_activation_r: f64,
+    /// Phase 20 Upgrade 1: Evolving Dual $32 \times 32$ Ledoit-Wolf profit-giveback exhaustion boundary ($A_{\text{giveback}, b}^{(g)}$)
+    #[serde(default = "default_giveback_exhaustion_threshold")]
+    pub giveback_exhaustion_threshold: f64,
+    /// Phase 20 Upgrade 1: Evolving Dual $32 \times 32$ Ledoit-Wolf multi-sigma runner continuation boundary ($B_{\text{runner}, b}^{(g)}$)
+    #[serde(default = "default_runner_continuation_threshold")]
+    pub runner_continuation_threshold: f64,
+    /// Phase 20 Upgrade 1: Self-learned empirical MFE retention lock quantile ($\rho_{\text{lock}, b}^*$) from causal winner retention distributions
+    #[serde(default = "default_giveback_retention_ratio")]
+    pub learned_giveback_retention_ratio: f64,
     pub top_boosted_warning_features: Vec<SynapticFeatureMutation>,
     pub top_slashed_deceiver_features: Vec<SynapticFeatureMutation>,
 }
 
 impl BrainSynapticPlasticityState {
     pub fn new_gen0(brain_id: BrainHorizonId) -> Self {
+        let (itm_mfe_q, ret_ratio) = match brain_id {
+            BrainHorizonId::Brain01PennyAnomaly => (1.01, 0.80),
+            BrainHorizonId::Brain02IntradayDayTrade => (0.94, 0.80),
+            BrainHorizonId::Brain03ShortTermSwing => (1.18, 0.81),
+            BrainHorizonId::Brain04CoreSwing => (1.08, 0.82),
+            BrainHorizonId::Brain05LongTermWealth => (1.01, 0.83),
+        };
         Self {
             brain_id,
             brain_name: brain_id.display_name().to_string(),
@@ -112,6 +147,10 @@ impl BrainSynapticPlasticityState {
             mid_trade_wald_sprt_thresholds: [1.48, 1.44, 1.40],
             learned_mid_trade_mfe_norm_quantile: 0.58,
             learned_mid_trade_stop_ratchet_r: -0.19,
+            learned_itm_mfe_activation_r: itm_mfe_q,
+            giveback_exhaustion_threshold: 1.38,
+            runner_continuation_threshold: -0.25,
+            learned_giveback_retention_ratio: ret_ratio,
             top_boosted_warning_features: Vec::new(),
             top_slashed_deceiver_features: Vec::new(),
         }
@@ -181,6 +220,12 @@ pub struct EvolutionGenerationRecord {
     pub fp_winners_scratched: usize,
     #[serde(default)]
     pub fp_mid_trade_scratches: usize,
+    #[serde(default)]
+    pub giveback_saves_count: usize,
+    #[serde(default)]
+    pub total_giveback_r_recovered: f64,
+    #[serde(default)]
+    pub avg_winner_r: f64,
     pub remaining_unscratched_losses: usize,
     pub untouched_winners_count: usize,
     pub entry_veto_precision_pct: f64,

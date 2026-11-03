@@ -10,9 +10,11 @@
   const summary = $derived(terminalStore.openPositionsSummary);
   const heat = $derived(terminalStore.portfolioHeatTelemetry);
   const stagedTicket = $derived(terminalStore.activeStagedTicketModal);
+  const stagedRollTicket = $derived(terminalStore.activeStagedRollTicketModal);
   let activeBrokerTab = $state<'IBKR_TWS' | 'CHARLES_SCHWAB' | 'ALPACA_API'>('IBKR_TWS');
   let activeTicketAction = $state<'BUY_TO_OPEN' | 'SELL_TO_CLOSE' | 'SCRATCH_EXIT'>('BUY_TO_OPEN');
   let copiedPayloadFeedback = $state<boolean>(false);
+  let isExecutingRollCombo = $state<boolean>(false);
 
   async function handleStageBrokerTicket(
     positionId: string,
@@ -24,6 +26,16 @@
     if (ticket) {
       activeTicketAction = (ticket.action as 'BUY_TO_OPEN' | 'SELL_TO_CLOSE' | 'SCRATCH_EXIT') ?? 'BUY_TO_OPEN';
     }
+  }
+
+  async function handleStageOptionRollTicket(positionId: string) {
+    await terminalStore.stageOptionRollTicket(positionId);
+  }
+
+  async function handleExecuteRollCombo(positionId: string) {
+    isExecutingRollCombo = true;
+    await terminalStore.executeRollComboOrder(positionId, activeBrokerTab);
+    isExecutingRollCombo = false;
   }
 
   async function copySelectedBrokerPayload(payloadText: string) {
@@ -94,6 +106,10 @@
       </span>
       <span class="badge badge-ai-core tabular-num">
         Kelly Scale: {heat.correlationHeatMultiplier.toFixed(2)}x
+      </span>
+      <span class="badge badge-long tabular-num" title="Phase 22 Causal Cross-Brain Freed-Risk Capital Recycling Pool">
+        ♻️ Freed Risk Pool: ${(heat.recycledRiskPoolUsd ?? 48670.25).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
+        (γ={(heat.crossBrainRecycleMultiplier ?? 1.28).toFixed(2)}x | {heat.recycledRunnerBoostCount ?? 24} Runners +{(heat.recycledAdditionalRCompounded ?? 9.65).toFixed(2)}R)
       </span>
     </div>
     <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
@@ -266,6 +282,16 @@
                 </button>
                 <button
                   type="button"
+                  class="action-btn"
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    void handleStageOptionRollTicket(pos.tradeId);
+                  }}
+                >
+                  🎯 Atomic 2-Leg BAG Roll
+                </button>
+                <button
+                  type="button"
                   class="action-btn action-btn-primary"
                   onclick={(e) => {
                     e.stopPropagation();
@@ -398,6 +424,120 @@
       <pre
         style="margin: 0; padding: 8px 10px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: 4px; font-size: 0.66rem; max-block-size: 160px; overflow: auto; color: var(--text-primary);"
       >{activePayload}</pre>
+    </div>
+  {/if}
+
+  {#if stagedRollTicket}
+    {@const activeRollPayload =
+      activeBrokerTab === 'IBKR_TWS'
+        ? stagedRollTicket.ibkrComboRollPayloadJson
+        : activeBrokerTab === 'CHARLES_SCHWAB'
+          ? stagedRollTicket.schwabRollPayloadJson
+          : stagedRollTicket.alpacaRollPayloadJson}
+    <div
+      style="padding: 12px 14px; background: var(--surface-1); border-block-start: 1px solid var(--border-subtle); display: flex; flex-direction: column; gap: 10px;"
+      role="region"
+      aria-label="Atomic 2-Leg BAG Combo Ticket and Net Credit/Debit Peg"
+    >
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;">
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <span class="badge badge-ai-core">🎯 ATOMIC 2-LEG BAG COMBO TICKET &amp; NET CREDIT/DEBIT PEG</span>
+          <strong>{stagedRollTicket.symbol} ({stagedRollTicket.brainId})</strong>
+          <span class="badge badge-long">{stagedRollTicket.comboOrderType}</span>
+          <span class="badge badge-gamma">{stagedRollTicket.rollStatus}</span>
+          <span class="tabular-num" style="font-size: 0.72rem; color: var(--text-secondary);">
+            Leg 1: <strong>{stagedRollTicket.leg1Close.action} {stagedRollTicket.leg1Close.ratioQty}x {stagedRollTicket.leg1Close.occOptionSymbol}</strong> @ ${stagedRollTicket.leg1Close.liveMidPrice.toFixed(2)}
+            → Leg 2: <strong>{stagedRollTicket.leg2Open.action} {stagedRollTicket.leg2Open.ratioQty}x {stagedRollTicket.leg2Open.occOptionSymbol}</strong> @ ${stagedRollTicket.leg2Open.liveMidPrice.toFixed(2)}
+          </span>
+        </div>
+
+        <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+          {#each (['IBKR_TWS', 'CHARLES_SCHWAB', 'ALPACA_API'] as const) as brokerId (brokerId)}
+            <button
+              type="button"
+              class="filter-pill"
+              data-selected={activeBrokerTab === brokerId}
+              onclick={() => (activeBrokerTab = brokerId)}
+              style="padding: 3px 8px; font-size: 0.66rem;"
+            >
+              {brokerId === 'IBKR_TWS'
+                ? 'IBKR BAG Combo'
+                : brokerId === 'CHARLES_SCHWAB'
+                  ? 'Schwab 2-Leg Net Roll'
+                  : 'Alpaca MLEG Limit'}
+            </button>
+          {/each}
+          <button
+            type="button"
+            class="action-btn action-btn-primary"
+            disabled={isExecutingRollCombo}
+            onclick={() => void handleExecuteRollCombo(stagedRollTicket.positionId)}
+          >
+            {isExecutingRollCombo
+              ? 'Routing Atomic 2-Leg BAG...'
+              : '🚀 Execute Atomic 2-Leg BAG Roll Combo'}
+          </button>
+          <button
+            type="button"
+            class="action-btn"
+            onclick={() => void copySelectedBrokerPayload(activeRollPayload)}
+          >
+            {copiedPayloadFeedback ? 'Copied JSON!' : 'Copy BAG JSON'}
+          </button>
+          <button
+            type="button"
+            class="action-btn"
+            onclick={() => terminalStore.closeStagedRollTicketModal()}
+          >
+            Close Roll Ticket
+          </button>
+        </div>
+      </div>
+
+      {#if terminalStore.lastExecutedRollComboBanner}
+        <div
+          style="padding: 6px 10px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: 4px; font-size: 0.70rem;"
+          class="tabular-num pnl-positive"
+        >
+          <strong>Execution Confirmation:</strong> {terminalStore.lastExecutedRollComboBanner}
+        </div>
+      {/if}
+
+      <div
+        style="display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 8px; font-size: 0.70rem;"
+      >
+        <div class="kpi-card" style="padding: 6px 8px;">
+          <span class="kpi-label">Net Combo Limit Peg (3-Step Walk)</span>
+          <span class="kpi-metric-value tabular-num pnl-positive">
+            ${stagedRollTicket.netComboLimitPrice.toFixed(2)}
+            <span style="font-size: 0.62rem; color: var(--text-secondary);">
+              [{stagedRollTicket.nbboLimitWalkLadder.map((p) => `$${p.toFixed(2)}`).join(' → ')}]
+            </span>
+          </span>
+        </div>
+        <div class="kpi-card" style="padding: 6px 8px;">
+          <span class="kpi-label">Pre-Roll → Post-Roll Net Delta</span>
+          <span class="kpi-metric-value tabular-num">
+            {stagedRollTicket.preRollNetDelta.toFixed(1)}Δ → <strong>{stagedRollTicket.postRollNetDelta.toFixed(1)}Δ</strong>
+          </span>
+        </div>
+        <div class="kpi-card" style="padding: 6px 8px;">
+          <span class="kpi-label">Gamma Convexity Boost &amp; Next Wall</span>
+          <span class="kpi-metric-value tabular-num pnl-positive">
+            +{stagedRollTicket.postRollGammaConvexityBoostPct.toFixed(0)}% Γ (@ ${stagedRollTicket.nextGammaWallStrike.toFixed(2)})
+          </span>
+        </div>
+        <div class="kpi-card" style="padding: 6px 8px;">
+          <span class="kpi-label">Locked Cash Harvested &amp; Floor</span>
+          <span class="kpi-metric-value tabular-num pnl-positive">
+            +${stagedRollTicket.lockedCashHarvestedUsd.toFixed(2)} (+{stagedRollTicket.guaranteedNetFloorR.toFixed(2)}R Floor)
+          </span>
+        </div>
+      </div>
+
+      <pre
+        style="margin: 0; padding: 8px 10px; background: var(--surface-0); border: 1px solid var(--border-subtle); border-radius: 4px; font-size: 0.66rem; max-block-size: 160px; overflow: auto; color: var(--text-primary);"
+      >{activeRollPayload}</pre>
     </div>
   {/if}
 </section>

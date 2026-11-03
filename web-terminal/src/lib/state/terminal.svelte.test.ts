@@ -1591,4 +1591,182 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
     expect(sp16.learned_house_money_reinvestment_fraction).toBeCloseTo(0.524, 3);
     expect(sp16.late_blowoff_scratch_threshold).toBeCloseTo(1.28, 2);
   });
+
+  it('hydrates Phase 22 Gen 20 Shakeout Rescue (116/116 Winners, 0 FP), Freed-Risk Capital Recycler, & Atomic 2-Leg BAG Combo Router', async () => {
+    const store = new TerminalStore(false);
+    store.ingestBackendSnapshot({
+      positions_opened: [
+        {
+          position_id: 'OPEN-P22-AMD',
+          opened_timestamp_ns: 1_793_739_300_000_000_000,
+          symbol: 'AMD',
+          exchange_index: 'SP_500',
+          brain_id: 'BRAIN-04',
+          direction: 'LONG',
+          entry_price: 566.42,
+          live_price: 567.854,
+          quantity_shares: 18,
+          kelly_fraction_pct: 1.9,
+          risk_budget_usd: 972.39,
+          notional_allocated_usd: 10195.56,
+          tranche_count: 2,
+          structural_stop_price: 512.39848,
+          target_1_price: 651.48057,
+          target_2_price: 692.39653,
+          unrealized_stock_pnl_usd: 25.81,
+          unrealized_stock_pnl_pct: 0.25,
+          option_structure: 'DIAGONAL_SPREAD',
+          matched_option_contract: 'AMD 2026-12-18 $565.00C',
+          option_entry_premium: 42.5,
+          option_live_premium: 157.7,
+          option_contracts_count: 5,
+          unrealized_option_pnl_usd: 57600.0,
+          unrealized_option_pnl_pct: 271.06,
+          contract_delta: 0.6222,
+          contract_gamma: 0.018,
+          contract_vanna: 0.011,
+          contract_theta: -0.14,
+          contract_vega: 0.35,
+          contract_iv: 0.48,
+          current_r_multiple: 0.68,
+          mfe_pct: 4.5,
+          mae_pct: 0.2,
+          ai_confidence_pct: 77.7,
+          bars_held_count: 5,
+          active_sequential_stage: 'STAGE_3_GIVEBACK_RATCHET & HOUSE_MONEY_PYRAMID',
+          live_sequential_llr: -0.64,
+          champion_llr_threshold: -0.52,
+          sequential_safety_margin_pct: 84.2,
+          next_bar_ratchet_stop_preview: 598.4,
+          house_money_scale_eligible: true,
+          learned_house_money_phi: 0.524,
+          locked_profit_r: 0.587,
+          guaranteed_net_floor_r: 0.279,
+          next_gamma_wall_strike: 655.0,
+          next_gamma_wall_contract: 'AMD 2026-12-18 $655.00C',
+          banked_option_gain_usd: 12141.44,
+          rolled_option_budget_usd: 9129.0
+        }
+      ],
+      closed_trades: [],
+      portfolio_heat_telemetry: {
+        account_equity_usd: 205128.62,
+        open_positions_count: 5,
+        aggregate_open_risk_usd: 2810.0,
+        aggregate_open_risk_pct: 1.37,
+        portfolio_heat_cap_pct: 8.5,
+        gross_portfolio_notional_usd: 52000.0,
+        net_portfolio_beta_delta_usd: 14200.0,
+        net_portfolio_gamma_1pct_usd: 1850.0,
+        net_portfolio_vanna_1pct_usd: 640.0,
+        mean_pairwise_correlation: 0.18,
+        max_pairwise_correlation: 0.34,
+        correlation_heat_multiplier: 1.0,
+        heat_regime_badge: 'LOW HEAT — FULL 1.00x KELLY CAPACITY',
+        position_labels: ['AMD (BRAIN-04)'],
+        cross_position_correlation_matrix: [[1.0]],
+        pairwise_correlations: [],
+        overlapping_clusters_summary: 'Independent multi-horizon exposure',
+        recycled_risk_pool_usd: 48670.25,
+        recycled_runner_boost_count: 24,
+        recycled_additional_r_compounded: 9.65,
+        cross_brain_recycle_multiplier: 1.33
+      },
+      evolution_generations_history: [
+        {
+          generation_id: 20,
+          status_label: 'GEN-20 PROMOTED CHAMPION',
+          is_current_champion: true,
+          timestamp_iso: '2026-11-03T17:00:00Z',
+          active_trades: 153,
+          wins: 116,
+          losses: 37,
+          win_rate_pct: 75.82,
+          tp_losses_vetoed: 20,
+          fp_winners_vetoed: 0,
+          entry_veto_precision_pct: 100.0,
+          tp_losses_scratched: 37,
+          fp_winners_scratched: 0,
+          scratch_precision_pct: 100.0,
+          early_scratches_bar1_to_3: 19,
+          mid_trade_stall_saves_bar4_to_6: 18,
+          giveback_saves_count: 19,
+          total_giveback_r_recovered: 13.09,
+          house_money_scaled_runners_count: 24,
+          total_house_money_r_gained: 27.77,
+          recycled_risk_pool_usd: 48670.25,
+          recycled_runner_boost_count: 24,
+          recycled_additional_r_compounded: 9.65,
+          avg_winner_r: 1.15,
+          tp_losses_caught_total: 57,
+          fp_winners_clipped_total: 0,
+          remaining_unscratched_losses: 0,
+          profit_factor: 22.87,
+          kelly_profit_factor: 22.4,
+          fixed_net_pnl_usd: 76615.42,
+          kelly_net_pnl_usd: 120660.5,
+          max_drawdown_usd: 282.48,
+          composite_fitness_score: 153494.0,
+          mutations_applied_summary: [
+            'Gen 20: 116/116 Winners Preserved (0 FP Scratches), 24 Recycled House-Money Runners (+27.77R total, +9.65R recycled)'
+          ]
+        }
+      ],
+      synaptic_plasticity_states: [
+        {
+          brain_id: 'BRAIN-04',
+          generation_id: 20,
+          synaptic_feature_weights_32: Array(32).fill(1.22),
+          stream_prior_multipliers: [1.18, 1.12, 1.15, 1.31],
+          wald_sprt_thresholds: [1.46, 1.38, 1.44],
+          entry_veto_margin_delta: 0.015,
+          trap_conviction_weights: {},
+          empirical_bayes_shrinkage_lambda: 0.8344,
+          mid_trade_wald_sprt_thresholds: [1.42, 1.38, 1.35],
+          learned_mid_trade_mfe_norm_quantile: 0.55,
+          learned_mid_trade_stop_ratchet_r: -0.121,
+          learned_itm_mfe_activation_r: 1.024,
+          giveback_exhaustion_threshold: 1.36,
+          runner_continuation_threshold: -0.52,
+          learned_giveback_retention_ratio: 0.807,
+          learned_profit_lock_activation_r: 0.416,
+          learned_house_money_reinvestment_fraction: 0.524,
+          late_blowoff_scratch_threshold: 1.28,
+          learned_shakeout_absorption_quantile: 0.68,
+          learned_cross_brain_recycle_multiplier: 1.33,
+          top_boosted_warning_features: [],
+          top_slashed_deceiver_features: [],
+          cumulative_tp_vetoes: 6,
+          cumulative_fp_vetoes: 0,
+          cumulative_tp_scratches: 6,
+          cumulative_fp_scratches: 0,
+          remaining_unscratched_losses: 0,
+          last_mutation_summary: 'Gen 20 promoted champion'
+        }
+      ]
+    });
+
+    const gen20 = store.evolutionGenerationsHistory[0]!;
+    expect(gen20.generation_id).toBe(20);
+    expect(gen20.winners_preserved_count).toBe(116);
+    expect(gen20.fp_winners_scratched).toBe(0);
+    expect(gen20.scratch_precision_pct).toBeCloseTo(100.0, 2);
+    expect(gen20.recycled_risk_pool_usd).toBeCloseTo(48670.25, 2);
+    expect(gen20.recycled_runner_boost_count).toBe(24);
+    expect(gen20.recycled_additional_r_compounded).toBeCloseTo(9.65, 2);
+
+    expect(store.portfolioHeatTelemetry.recycledRiskPoolUsd).toBeCloseTo(48670.25, 2);
+    expect(store.portfolioHeatTelemetry.crossBrainRecycleMultiplier).toBeCloseTo(1.33, 2);
+
+    const rollTicket = await store.stageOptionRollTicket('OPEN-P22-AMD');
+    expect(rollTicket).not.toBeNull();
+    expect(rollTicket?.comboOrderType).toBe('IBKR_BAG_VERTICAL_ROLL_COMBO');
+    expect(rollTicket?.leg1Close.action).toBe('SELL_TO_CLOSE');
+    expect(rollTicket?.leg2Open.action).toBe('BUY_TO_OPEN');
+    expect(rollTicket?.nbboLimitWalkLadder.length).toBe(3);
+
+    const executed = await store.executeRollComboOrder('OPEN-P22-AMD', 'IBKR_TWS');
+    expect(executed).toBe(true);
+    expect(store.activeStagedRollTicketModal?.rollStatus).toBe('ATOMIC_2LEG_BAG_EXECUTED_FILLED');
+  });
 });

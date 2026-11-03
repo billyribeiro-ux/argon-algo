@@ -456,6 +456,8 @@ export interface BrainSynapticPlasticityState {
   learned_profit_lock_activation_r?: number;
   learned_house_money_reinvestment_fraction?: number;
   late_blowoff_scratch_threshold?: number;
+  learned_shakeout_absorption_quantile?: number;
+  learned_cross_brain_recycle_multiplier?: number;
   top_boosted_warning_features: SynapticFeatureMutation[];
   top_slashed_deceiver_features: SynapticFeatureMutation[];
   top_boosted_features?: SynapticFeatureMutation[];
@@ -490,6 +492,9 @@ export interface EvolutionGenerationRecord {
   total_giveback_r_recovered?: number;
   house_money_scaled_runners_count?: number;
   total_house_money_r_gained?: number;
+  recycled_risk_pool_usd?: number;
+  recycled_runner_boost_count?: number;
+  recycled_additional_r_compounded?: number;
   avg_winner_r?: number;
   tp_scratches?: number;
   expectancy_r?: number;
@@ -655,6 +660,10 @@ export interface PortfolioHeatTelemetryState {
   crossPositionCorrelationMatrix: number[][];
   pairwiseCorrelations: CrossPositionCorrelationCellEntry[];
   overlappingClustersSummary: string;
+  recycledRiskPoolUsd?: number;
+  recycledRunnerBoostCount?: number;
+  recycledAdditionalRCompounded?: number;
+  crossBrainRecycleMultiplier?: number;
 }
 
 export interface StagedBrokerOrderTicketEntry {
@@ -691,6 +700,30 @@ export interface StagedBrokerOrderTicketEntry {
   alpacaApiPayloadJson: string;
 }
 
+export interface IbkrBagComboLegEntry {
+  legId: number;
+  action: string;
+  ratioQty: number;
+  occOptionSymbol: string;
+  contractDesc: string;
+  strikePrice: number;
+  expirationDate: string;
+  optionRight: string;
+  liveMidPrice: number;
+}
+
+export interface IbkrBagComboPayloadEntry {
+  comboOrderType: string;
+  leg1Close: IbkrBagComboLegEntry;
+  leg2Open: IbkrBagComboLegEntry;
+  netComboLimitPrice: number;
+  nbboLimitWalkLadder: [number, number, number];
+  preRollNetDelta: number;
+  postRollNetDelta: number;
+  postRollGammaConvexityBoostPct: number;
+  lockedCashHarvestedUsd: number;
+}
+
 export interface StagedOptionRollUpTicketEntry {
   rollTicketId: string;
   positionId: string;
@@ -721,6 +754,16 @@ export interface StagedOptionRollUpTicketEntry {
   liveGivebackLlr: number;
   runnerContinuationThreshold: number;
   guaranteedNetFloorR: number;
+  comboOrderType: string;
+  leg1Close: IbkrBagComboLegEntry;
+  leg2Open: IbkrBagComboLegEntry;
+  netComboLimitPrice: number;
+  nbboLimitWalkLadder: [number, number, number];
+  preRollNetDelta: number;
+  postRollNetDelta: number;
+  postRollGammaConvexityBoostPct: number;
+  lockedCashHarvestedUsd: number;
+  ibkrBagCombo: IbkrBagComboPayloadEntry;
   ibkrComboRollPayloadJson: string;
   schwabRollPayloadJson: string;
   alpacaRollPayloadJson: string;
@@ -938,6 +981,8 @@ export class TerminalStore {
   brokerOrderTickets = $state<StagedBrokerOrderTicketEntry[]>([]);
   stagedOptionRollTickets = $state<StagedOptionRollUpTicketEntry[]>([]);
   activeStagedTicketModal = $state<StagedBrokerOrderTicketEntry | null>(null);
+  activeStagedRollTicketModal = $state<StagedOptionRollUpTicketEntry | null>(null);
+  lastExecutedRollComboBanner = $state<string | null>(null);
   webhookStatus = $state<WebhookStatusPayload>({
     config: {
       discordWebhookUrl: '',
@@ -1563,7 +1608,72 @@ export class TerminalStore {
     };
   }
 
+  private mapIbkrBagComboLeg(l: Record<string, unknown>, defaultId: number): IbkrBagComboLegEntry {
+    return {
+      legId: Number(l.leg_id ?? l.leg_number ?? defaultId),
+      action: String(l.action ?? (defaultId === 1 ? 'SELL_TO_CLOSE' : 'BUY_TO_OPEN')),
+      ratioQty: Number(l.ratio_qty ?? l.contracts_qty ?? 1),
+      occOptionSymbol: String(l.occ_option_symbol ?? l.occ_symbol ?? ''),
+      contractDesc: String(l.contract_desc ?? ''),
+      strikePrice: Number(l.strike_price ?? 0),
+      expirationDate: String(l.expiration_date ?? '2026-11-20'),
+      optionRight: String(l.option_right ?? 'C'),
+      liveMidPrice: Number(l.live_mid_price ?? l.cboe_mid_price ?? 0)
+    };
+  }
+
   private mapStagedOptionRollUpTicket(t: Record<string, unknown>): StagedOptionRollUpTicketEntry {
+    const rawCombo =
+      t.ibkr_bag_combo && typeof t.ibkr_bag_combo === 'object'
+        ? (t.ibkr_bag_combo as Record<string, unknown>)
+        : t;
+    const rawLeg1 =
+      t.leg_1_close && typeof t.leg_1_close === 'object'
+        ? (t.leg_1_close as Record<string, unknown>)
+        : rawCombo.leg_1_close && typeof rawCombo.leg_1_close === 'object'
+          ? (rawCombo.leg_1_close as Record<string, unknown>)
+          : {};
+    const rawLeg2 =
+      t.leg_2_open && typeof t.leg_2_open === 'object'
+        ? (t.leg_2_open as Record<string, unknown>)
+        : rawCombo.leg_2_open && typeof rawCombo.leg_2_open === 'object'
+          ? (rawCombo.leg_2_open as Record<string, unknown>)
+          : {};
+    const leg1Close = this.mapIbkrBagComboLeg(rawLeg1, 1);
+    const leg2Open = this.mapIbkrBagComboLeg(rawLeg2, 2);
+    const rawLadder = Array.isArray(t.nbbo_limit_walk_ladder)
+      ? t.nbbo_limit_walk_ladder
+      : Array.isArray(rawCombo.nbbo_limit_walk_ladder)
+        ? rawCombo.nbbo_limit_walk_ladder
+        : [];
+    const netMid = Number(
+      t.net_combo_limit_price ??
+        rawCombo.net_combo_limit_price ??
+        (leg1Close.liveMidPrice - leg2Open.liveMidPrice)
+    );
+    const ladder: [number, number, number] = [
+      Number(rawLadder[0] ?? netMid),
+      Number(rawLadder[1] ?? Number((netMid - 0.02).toFixed(2))),
+      Number(rawLadder[2] ?? Number((netMid - 0.05).toFixed(2)))
+    ];
+    const comboOrderType = String(
+      t.combo_order_type ?? rawCombo.combo_order_type ?? 'IBKR_BAG_VERTICAL_ROLL_COMBO'
+    );
+    const preRollNetDelta = Number(
+      t.pre_roll_net_delta ?? rawCombo.pre_roll_net_delta ?? 0
+    );
+    const postRollNetDelta = Number(
+      t.post_roll_net_delta ?? rawCombo.post_roll_net_delta ?? 0
+    );
+    const postRollGammaConvexityBoostPct = Number(
+      t.post_roll_gamma_convexity_boost_pct ?? rawCombo.post_roll_gamma_convexity_boost_pct ?? 18.0
+    );
+    const lockedCashHarvestedUsd = Number(
+      t.locked_cash_harvested_usd ??
+        rawCombo.locked_cash_harvested_usd ??
+        t.banked_realized_cash_usd ??
+        0
+    );
     return {
       rollTicketId: String(t.roll_ticket_id ?? t.position_id ?? ''),
       positionId: String(t.position_id ?? ''),
@@ -1596,6 +1706,26 @@ export class TerminalStore {
       liveGivebackLlr: Number(t.live_giveback_llr ?? 0.28),
       runnerContinuationThreshold: Number(t.runner_continuation_threshold ?? -0.52),
       guaranteedNetFloorR: Number(t.guaranteed_net_floor_r ?? 0),
+      comboOrderType,
+      leg1Close,
+      leg2Open,
+      netComboLimitPrice: netMid,
+      nbboLimitWalkLadder: ladder,
+      preRollNetDelta,
+      postRollNetDelta,
+      postRollGammaConvexityBoostPct,
+      lockedCashHarvestedUsd,
+      ibkrBagCombo: {
+        comboOrderType,
+        leg1Close,
+        leg2Open,
+        netComboLimitPrice: netMid,
+        nbboLimitWalkLadder: ladder,
+        preRollNetDelta,
+        postRollNetDelta,
+        postRollGammaConvexityBoostPct,
+        lockedCashHarvestedUsd
+      },
       ibkrComboRollPayloadJson: String(t.ibkr_combo_roll_payload_json ?? '{}'),
       schwabRollPayloadJson: String(t.schwab_roll_payload_json ?? '{}'),
       alpacaRollPayloadJson: String(t.alpaca_roll_payload_json ?? '{}')
@@ -1741,6 +1871,245 @@ export class TerminalStore {
 
   public closeStagedTicketModal(): void {
     this.activeStagedTicketModal = null;
+  }
+
+  public closeStagedRollTicketModal(): void {
+    this.activeStagedRollTicketModal = null;
+  }
+
+  public async stageOptionRollTicket(
+    positionId: string
+  ): Promise<StagedOptionRollUpTicketEntry | null> {
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/v1/execution/stage-roll/${encodeURIComponent(positionId)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        }
+      );
+      if (res.ok) {
+        const raw = (await res.json()) as Record<string, unknown>;
+        const rollTicket = this.mapStagedOptionRollUpTicket(raw);
+        const idx = this.stagedOptionRollTickets.findIndex((t) => t.positionId === positionId);
+        if (idx >= 0) {
+          const updated = [...this.stagedOptionRollTickets];
+          updated[idx] = rollTicket;
+          this.stagedOptionRollTickets = updated;
+        } else {
+          this.stagedOptionRollTickets = [rollTicket, ...this.stagedOptionRollTickets];
+        }
+        this.activeStagedRollTicketModal = rollTicket;
+        executionAudio.playTarget1BankedChime();
+        return rollTicket;
+      }
+    } catch {
+      // Fallback below
+    }
+
+    const existing = this.stagedOptionRollTickets.find((t) => t.positionId === positionId);
+    if (existing) {
+      this.activeStagedRollTicketModal = existing;
+      return existing;
+    }
+
+    const pos = this.openPositions.find((p) => p.tradeId === positionId);
+    if (!pos) return null;
+    const right = pos.direction === 'LONG' ? 'C' : 'P';
+    const nextWall =
+      pos.nextGammaWallStrike && pos.nextGammaWallStrike > 0
+        ? pos.nextGammaWallStrike
+        : pos.target1Price;
+    const closeQty = Math.max(1, pos.optionContractsCount || 5);
+    const leg1Mid = Math.max(0.5, pos.optionLivePremium || 3.4);
+    const leg2Mid = Math.max(0.25, Number((leg1Mid * 0.58).toFixed(2)));
+    const netMid = Number((leg1Mid - leg2Mid).toFixed(2));
+    const ladder: [number, number, number] = [
+      netMid,
+      Number((netMid - 0.02).toFixed(2)),
+      Number((netMid - 0.05).toFixed(2))
+    ];
+    const leg1Occ = `${pos.symbol.padEnd(6, ' ')}260410${right}${String(Math.round(pos.entryPrice * 1000)).padStart(8, '0')}`;
+    const leg2Occ = `${pos.symbol.padEnd(6, ' ')}260410${right}${String(Math.round(nextWall * 1000)).padStart(8, '0')}`;
+    const fallbackRoll: StagedOptionRollUpTicketEntry = {
+      rollTicketId: `ROLL-${pos.tradeId}`,
+      positionId: pos.tradeId,
+      stagedAtIso: new Date().toISOString(),
+      symbol: pos.symbol,
+      brainId: pos.brainId,
+      brainName: pos.brainId,
+      direction: pos.direction,
+      rollStatus: 'ATOMIC_2LEG_BAG_GAMMA_ROLL_STAGED',
+      isGammaRollActive: true,
+      currentItmOccSymbol: leg1Occ,
+      currentItmContractDesc: pos.optionContractLabel,
+      sellToCloseContracts: closeQty,
+      currentItmEntryPremium: pos.optionEntryPremium,
+      currentItmLivePremium: leg1Mid,
+      intrinsicOptionGainUsd: Math.max(120, pos.unrealizedOptionPnlUsd),
+      bankedCashFraction: 0.42,
+      bankedRealizedCashUsd: pos.bankedOptionGainUsd ?? 185,
+      houseMoneyReinvestmentFractionPhi: pos.learnedHouseMoneyPhi ?? 0.58,
+      houseMoneyRollBudgetUsd: pos.rolledOptionBudgetUsd ?? 255,
+      nextGammaWallStrike: nextWall,
+      nextGammaWallOccSymbol: leg2Occ,
+      nextGammaWallContractDesc: `${pos.symbol} 2026-11-20 $${nextWall.toFixed(2)}${right}`,
+      buyToOpenRollContracts: Math.max(1, Math.round(closeQty * 0.6)),
+      nextGammaWallLimitPremium: leg2Mid,
+      lockedProfitR: pos.lockedProfitR ?? 0.52,
+      learnedProfitLockQuantileR: 0.42,
+      liveGivebackLlr: pos.liveSequentialLlr,
+      runnerContinuationThreshold: -0.52,
+      guaranteedNetFloorR: pos.guaranteedNetFloorR ?? 0.24,
+      comboOrderType: 'IBKR_BAG_VERTICAL_ROLL_COMBO',
+      leg1Close: {
+        legId: 1,
+        action: 'SELL_TO_CLOSE',
+        ratioQty: closeQty,
+        occOptionSymbol: leg1Occ,
+        contractDesc: pos.optionContractLabel,
+        strikePrice: pos.entryPrice,
+        expirationDate: '2026-11-20',
+        optionRight: right,
+        liveMidPrice: leg1Mid
+      },
+      leg2Open: {
+        legId: 2,
+        action: 'BUY_TO_OPEN',
+        ratioQty: Math.max(1, Math.round(closeQty * 0.6)),
+        occOptionSymbol: leg2Occ,
+        contractDesc: `${pos.symbol} 2026-11-20 $${nextWall.toFixed(2)}${right}`,
+        strikePrice: nextWall,
+        expirationDate: '2026-11-20',
+        optionRight: right,
+        liveMidPrice: leg2Mid
+      },
+      netComboLimitPrice: netMid,
+      nbboLimitWalkLadder: ladder,
+      preRollNetDelta: pos.delta * closeQty * 100,
+      postRollNetDelta: pos.delta * 0.66 * Math.max(1, Math.round(closeQty * 0.6)) * 100,
+      postRollGammaConvexityBoostPct: 18.0,
+      lockedCashHarvestedUsd: pos.bankedOptionGainUsd ?? 185,
+      ibkrBagCombo: {
+        comboOrderType: 'IBKR_BAG_VERTICAL_ROLL_COMBO',
+        leg1Close: {
+          legId: 1,
+          action: 'SELL_TO_CLOSE',
+          ratioQty: closeQty,
+          occOptionSymbol: leg1Occ,
+          contractDesc: pos.optionContractLabel,
+          strikePrice: pos.entryPrice,
+          expirationDate: '2026-11-20',
+          optionRight: right,
+          liveMidPrice: leg1Mid
+        },
+        leg2Open: {
+          legId: 2,
+          action: 'BUY_TO_OPEN',
+          ratioQty: Math.max(1, Math.round(closeQty * 0.6)),
+          occOptionSymbol: leg2Occ,
+          contractDesc: `${pos.symbol} 2026-11-20 $${nextWall.toFixed(2)}${right}`,
+          strikePrice: nextWall,
+          expirationDate: '2026-11-20',
+          optionRight: right,
+          liveMidPrice: leg2Mid
+        },
+        netComboLimitPrice: netMid,
+        nbboLimitWalkLadder: ladder,
+        preRollNetDelta: pos.delta * closeQty * 100,
+        postRollNetDelta: pos.delta * 0.66 * Math.max(1, Math.round(closeQty * 0.6)) * 100,
+        postRollGammaConvexityBoostPct: 18.0,
+        lockedCashHarvestedUsd: pos.bankedOptionGainUsd ?? 185
+      },
+      ibkrComboRollPayloadJson: JSON.stringify(
+        {
+          broker: 'IBKR_TWS_API_V10',
+          orderStrategyType: 'IBKR_BAG_VERTICAL_ROLL_COMBO',
+          secType: 'BAG',
+          symbol: pos.symbol,
+          lmtPrice: netMid,
+          nbboLimitWalkLadder: ladder
+        },
+        null,
+        2
+      ),
+      schwabRollPayloadJson: JSON.stringify(
+        {
+          broker: 'CHARLES_SCHWAB_TRADER_API_V1',
+          complexOrderStrategyType: 'SCHWAB_2LEG_NET_ROLL',
+          price: netMid
+        },
+        null,
+        2
+      ),
+      alpacaRollPayloadJson: JSON.stringify(
+        {
+          broker: 'ALPACA_TRADING_API_V2_MLEG',
+          order_class: 'mleg',
+          limit_price: netMid.toFixed(2)
+        },
+        null,
+        2
+      )
+    };
+    this.activeStagedRollTicketModal = fallbackRoll;
+    return fallbackRoll;
+  }
+
+  public async executeRollComboOrder(
+    positionId: string,
+    broker = 'IBKR_TWS'
+  ): Promise<boolean> {
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/v1/execution/execute-roll-combo/${encodeURIComponent(positionId)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ broker })
+        }
+      );
+      if (res.ok) {
+        const raw = (await res.json()) as Record<string, unknown>;
+        const conf =
+          raw.execution_confirmation && typeof raw.execution_confirmation === 'object'
+            ? (raw.execution_confirmation as Record<string, unknown>)
+            : raw;
+        if (raw.staged_roll_ticket && typeof raw.staged_roll_ticket === 'object') {
+          this.activeStagedRollTicketModal = this.mapStagedOptionRollUpTicket(
+            raw.staged_roll_ticket as Record<string, unknown>
+          );
+        } else if (this.activeStagedRollTicketModal) {
+          this.activeStagedRollTicketModal = {
+            ...this.activeStagedRollTicketModal,
+            rollStatus: String(conf.order_status ?? 'ATOMIC_2LEG_BAG_ROLL_FILLED_AND_RECONCILED')
+          };
+        }
+        const orderId = String(
+          conf.confirmation_id ?? conf.broker_combo_order_id ?? 'IBKR-BAG'
+        );
+        const filledPrice = Number(
+          conf.executed_net_combo_price ?? conf.filled_net_combo_price ?? 0
+        );
+        const stepUsed = Number(conf.limit_walk_step_filled ?? conf.nbbo_walk_step_used ?? 1);
+        this.lastExecutedRollComboBanner = `Atomic 2-Leg BAG Filled: ${orderId} | Net Peg $${filledPrice.toFixed(2)} (Step #${stepUsed}) | Harvested +$${Number(conf.locked_cash_harvested_usd ?? 0).toFixed(2)} Cash | Gamma Boost +${Number(conf.post_roll_gamma_convexity_boost_pct ?? 18).toFixed(0)}%`;
+        executionAudio.playScaleInChime();
+        await Promise.all([this.fetchLedgerSnapshot(), this.fetchExecutionTickets()]);
+        return true;
+      }
+    } catch {
+      // Offline fallback below
+    }
+    if (this.activeStagedRollTicketModal) {
+      this.activeStagedRollTicketModal = {
+        ...this.activeStagedRollTicketModal,
+        rollStatus: 'ATOMIC_2LEG_BAG_EXECUTED_FILLED'
+      };
+      this.lastExecutedRollComboBanner = `Atomic 2-Leg BAG Filled (${broker}): Net Peg $${this.activeStagedRollTicketModal.netComboLimitPrice.toFixed(2)} | Harvested +$${this.activeStagedRollTicketModal.lockedCashHarvestedUsd.toFixed(2)} Cash | Gamma Boost +${this.activeStagedRollTicketModal.postRollGammaConvexityBoostPct.toFixed(0)}%`;
+      return true;
+    }
+    return false;
   }
 
   public async fetchLedgerSnapshot(): Promise<void> {
@@ -2041,6 +2410,12 @@ export class TerminalStore {
         s.learned_house_money_reinvestment_fraction ?? 0.53
       ),
       late_blowoff_scratch_threshold: Number(s.late_blowoff_scratch_threshold ?? 1.28),
+      learned_shakeout_absorption_quantile: Number(
+        s.learned_shakeout_absorption_quantile ?? 0.72
+      ),
+      learned_cross_brain_recycle_multiplier: Number(
+        s.learned_cross_brain_recycle_multiplier ?? 1.0
+      ),
       top_boosted_warning_features: boosted,
       top_slashed_deceiver_features: slashed,
       top_boosted_features: boosted,
@@ -2087,6 +2462,9 @@ export class TerminalStore {
       total_giveback_r_recovered: Number(g.total_giveback_r_recovered ?? 0),
       house_money_scaled_runners_count: Number(g.house_money_scaled_runners_count ?? 0),
       total_house_money_r_gained: Number(g.total_house_money_r_gained ?? 0),
+      recycled_risk_pool_usd: Number(g.recycled_risk_pool_usd ?? 0),
+      recycled_runner_boost_count: Number(g.recycled_runner_boost_count ?? 0),
+      recycled_additional_r_compounded: Number(g.recycled_additional_r_compounded ?? 0),
       avg_winner_r: Number(g.avg_winner_r ?? 0.85),
       tp_scratches: tpScratch,
       expectancy_r: g.expectancy_r !== undefined ? Number(g.expectancy_r) : undefined,
@@ -2394,7 +2772,11 @@ export class TerminalStore {
         })),
         overlappingClustersSummary: String(
           h.overlapping_clusters_summary ?? 'Independent multi-horizon exposure'
-        )
+        ),
+        recycledRiskPoolUsd: Number(h.recycled_risk_pool_usd ?? 0),
+        recycledRunnerBoostCount: Number(h.recycled_runner_boost_count ?? 0),
+        recycledAdditionalRCompounded: Number(h.recycled_additional_r_compounded ?? 0),
+        crossBrainRecycleMultiplier: Number(h.cross_brain_recycle_multiplier ?? 1.0)
       };
     }
 

@@ -31,7 +31,10 @@ use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
-use crate::broker_bridge::{BrokerExecutionBridge, BrokerFillConfirmation, RouteAllOpenResponse};
+use crate::broker_bridge::{
+    BrokerExecutionBridge, BrokerFillConfirmation, BrokerRollComboExecutionConfirmation,
+    RouteAllOpenResponse,
+};
 use crate::evolution::MultiGenEvolutionResponse;
 use crate::exporter::{ExportScope, export_to_csv_bytes, export_to_xlsx_bytes};
 use crate::ledger::{
@@ -2267,6 +2270,10 @@ pub fn build_axum_router(state: AppState) -> Router {
             "/api/v1/execution/route/{position_id}",
             post(route_single_position_handler),
         )
+        .route(
+            "/api/v1/execution/execute-roll-combo/{position_id}",
+            post(execute_roll_combo_handler),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -2338,6 +2345,30 @@ async fn route_single_position_handler(
             format!("Open position {position_id} not found for broker routing"),
         )
     })
+}
+
+async fn execute_roll_combo_handler(
+    State(state): State<AppState>,
+    AxumPath(position_id): AxumPath<Uuid>,
+    payload: Option<Json<StageBrokerTicketRequest>>,
+) -> Result<Json<BrokerRollComboExecutionConfirmation>, (StatusCode, String)> {
+    let broker_override = payload.and_then(|Json(req)| req.broker);
+    let conf = BrokerExecutionBridge::execute_and_reconcile_roll_combo(
+        &state.ledger,
+        position_id,
+        broker_override.as_deref(),
+    )
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Open position {position_id} not found for atomic 2-leg BAG roll combo execution"),
+        )
+    })?;
+    let snap = state
+        .ledger
+        .query_filtered_snapshot(&HyperFilterQuery::default());
+    state.broadcast_live_snapshot(&snap);
+    Ok(Json(conf))
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -4,6 +4,7 @@
   const evo = $derived(terminalStore.evolutionStatus);
   const genHistory = $derived(terminalStore.evolutionGenerationsHistory);
   const synapticStates = $derived(terminalStore.synapticPlasticityStates);
+  const rollTickets = $derived(terminalStore.stagedOptionRollTickets);
   let isRunningAutopsy = $state(false);
   let selectedPlasticityBrain = $state<string>('ALL_5_BRAINS');
 
@@ -91,13 +92,13 @@
       </div>
     </div>
 
-    <!-- PHASE 18, 19, 20 & 21: AUTONOMOUS MULTI-GENERATION OFFENSIVE & DEFENSIVE EVOLUTION LOOP (GEN 0 -> GEN 16) -->
+    <!-- PHASE 18..22: AUTONOMOUS MULTI-GENERATION OFFENSIVE & DEFENSIVE EVOLUTION LOOP (GEN 0 -> GEN 20) -->
     <div style="padding: 12px 12px 0 12px;">
       <div class="glass-panel" style="background: var(--surface-0);">
         <header class="panel-header" style="flex-wrap: wrap; gap: 8px;">
           <div style="display: flex; flex-direction: column; gap: 3px;">
             <div class="panel-title" style="flex-wrap: wrap;">
-              <span>🧬 AUTONOMOUS MULTI-GENERATION OFFENSIVE &amp; DEFENSIVE EVOLUTION LOOP (GEN 0 → GEN 16)</span>
+              <span>🧬 AUTONOMOUS MULTI-GENERATION OFFENSIVE &amp; DEFENSIVE EVOLUTION LOOP (GEN 0 → GEN 20)</span>
               {#if genHistory.length > 0}
                 {@const activeChamp = genHistory.find((g) => g.promoted_as_champion) ?? genHistory[genHistory.length - 1]}
                 {#if activeChamp}
@@ -108,7 +109,7 @@
               {/if}
             </div>
             <span style="font-size: 0.66rem; color: var(--text-secondary);">
-              Step A: Recursive Loss &amp; FP Autopsy → Step B: Empirical-Bayes Synaptic Specialization (λ_b) &amp; Late-Horizon Blow-Off Guard → Step C: Dual 32x32 Ledoit-Wolf Giveback Ratchet &amp; Principal-Protected House-Money Pyramiding (φ_b) → Step D: 100% Outcome-Blind Walk-Forward Promotion Gate
+              Step A: Recursive Loss &amp; FP Autopsy → Step B: Empirical-Bayes Synaptic Specialization (λ_b) &amp; Shakeout Absorption Discriminant (Ψ_absorption) → Step C: Dual 32x32 Ledoit-Wolf Giveback Ratchet, Principal-Protected House-Money Pyramiding (φ_b) &amp; Cross-Brain Freed-Risk Capital Recycling (γ_recycle) → Step D: 100% Outcome-Blind Walk-Forward Promotion Gate
             </span>
           </div>
 
@@ -266,7 +267,11 @@
                         <span style="color: var(--text-secondary);">0 (+0.00R)</span>
                       {/if}
                       <div style="font-size: 0.62rem; color: var(--text-secondary);">
-                        0% Principal Risk Pyramid
+                        {#if (gen.recycled_runner_boost_count ?? 0) > 0}
+                          ♻️ {gen.recycled_runner_boost_count} Recycled (+{(gen.recycled_additional_r_compounded ?? 0).toFixed(2)}R | Pool ${(gen.recycled_risk_pool_usd ?? 0).toFixed(0)})
+                        {:else}
+                          0% Principal Risk Pyramid
+                        {/if}
                       </div>
                     </td>
                     <td data-numeric="true" class="tabular-num pnl-positive">
@@ -390,6 +395,15 @@
                     Late Blowoff A_bo: <strong>{(sp.late_blowoff_scratch_threshold ?? 1.28).toFixed(2)}</strong>
                   </div>
 
+                  <div class="tabular-num" style="font-size: 0.64rem; color: var(--text-secondary);">
+                    <span class="badge badge-ai-core" style="font-size: 0.56rem; margin-inline-end: 4px;">
+                      ♻️ PHASE 22 SHAKEOUT &amp; RECYCLER
+                    </span>
+                    Shakeout Absorption q*: <strong class="pnl-positive">{(sp.learned_shakeout_absorption_quantile ?? 0.72).toFixed(3)}</strong> |
+                    Freed-Risk Recycle γ*: <strong class="pnl-positive">{(sp.learned_cross_brain_recycle_multiplier ?? 1.00).toFixed(2)}x</strong> |
+                    Effective φ_eff: <strong class="pnl-positive">{(Math.min(0.72, (sp.learned_house_money_reinvestment_fraction ?? 0.53) * (sp.learned_cross_brain_recycle_multiplier ?? 1.00)) * 100).toFixed(1)}%</strong>
+                  </div>
+
                   <div class="tabular-num" style="font-size: 0.65rem; color: var(--text-secondary);">
                     <strong>Stream 1..4 Priors:</strong>
                     S1 {(sp.stream_prior_multipliers[0] ?? 1.0).toFixed(2)}x ·
@@ -450,6 +464,82 @@
                   </div>
                 </div>
               {/each}
+            </div>
+          </div>
+        {/if}
+
+        <!-- 4. Phase 22 Atomic 2-Leg BAG Combo Ticket & Net Credit/Debit Peg Inspector -->
+        {#if rollTickets.length > 0}
+          <div style="padding: 10px 12px; border-block-start: 1px solid var(--border-subtle);">
+            <div style="font-size: 0.72rem; font-weight: 800; margin-block-end: 8px;">
+              🎯 ATOMIC 2-LEG BAG COMBO TICKET &amp; NET CREDIT/DEBIT PEG ROUTER (IBKR BAG / SCHWAB MLEG / ALPACA MLEG)
+            </div>
+            <div class="data-table-container">
+              <table class="telemetry-table">
+                <thead>
+                  <tr>
+                    <th>Symbol &amp; Brain</th>
+                    <th>Combo Strategy Type</th>
+                    <th>Leg 1 (SELL_TO_CLOSE ITM)</th>
+                    <th>Leg 2 (BUY_TO_OPEN Next Γ-Wall)</th>
+                    <th data-numeric="true">Net Combo Limit Peg &amp; 3-Step Walk</th>
+                    <th data-numeric="true">Pre → Post Net Δ &amp; Γ Boost</th>
+                    <th data-numeric="true">Locked Cash Harvested</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each rollTickets as rt (rt.rollTicketId)}
+                    <tr>
+                      <td>
+                        <strong>{rt.symbol}</strong>
+                        <span class="badge badge-ai-core" style="margin-inline-start: 4px;">{rt.brainId}</span>
+                      </td>
+                      <td>
+                        <span class="badge badge-long">{rt.comboOrderType}</span>
+                        <div style="font-size: 0.61rem; color: var(--text-secondary);">{rt.rollStatus}</div>
+                      </td>
+                      <td class="tabular-num" style="font-size: 0.66rem;">
+                        <strong>{rt.leg1Close.action} {rt.leg1Close.ratioQty}x</strong> {rt.leg1Close.occOptionSymbol}
+                        <div style="color: var(--text-secondary);">Mid ${rt.leg1Close.liveMidPrice.toFixed(2)}</div>
+                      </td>
+                      <td class="tabular-num" style="font-size: 0.66rem;">
+                        <strong>{rt.leg2Open.action} {rt.leg2Open.ratioQty}x</strong> {rt.leg2Open.occOptionSymbol}
+                        <div style="color: var(--text-secondary);">
+                          Wall ${rt.nextGammaWallStrike.toFixed(2)} | Mid ${rt.leg2Open.liveMidPrice.toFixed(2)}
+                        </div>
+                      </td>
+                      <td data-numeric="true" class="tabular-num pnl-positive">
+                        <strong>${rt.netComboLimitPrice.toFixed(2)}</strong>
+                        <div style="font-size: 0.62rem; color: var(--text-secondary);">
+                          [{rt.nbboLimitWalkLadder.map((p) => `$${p.toFixed(2)}`).join(' → ')}]
+                        </div>
+                      </td>
+                      <td data-numeric="true" class="tabular-num">
+                        {rt.preRollNetDelta.toFixed(1)}Δ → <strong>{rt.postRollNetDelta.toFixed(1)}Δ</strong>
+                        <div class="pnl-positive" style="font-size: 0.62rem;">
+                          +{rt.postRollGammaConvexityBoostPct.toFixed(0)}% Γ Boost
+                        </div>
+                      </td>
+                      <td data-numeric="true" class="tabular-num pnl-positive">
+                        <strong>+${rt.lockedCashHarvestedUsd.toFixed(2)}</strong>
+                        <div style="font-size: 0.62rem; color: var(--text-secondary);">
+                          Floor +{rt.guaranteedNetFloorR.toFixed(2)}R
+                        </div>
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          class="action-btn action-btn-primary"
+                          onclick={() => void terminalStore.executeRollComboOrder(rt.positionId, 'IBKR_TWS')}
+                        >
+                          🚀 Execute BAG Roll
+                        </button>
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
             </div>
           </div>
         {/if}

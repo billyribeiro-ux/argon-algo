@@ -94,7 +94,15 @@ fn default_late_blowoff_scratch_threshold() -> f64 {
     1.85
 }
 
-/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 21`).
+fn default_shakeout_absorption_quantile() -> f64 {
+    0.98
+}
+
+fn default_cross_brain_recycle_multiplier() -> f64 {
+    1.00
+}
+
+/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 22`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainSynapticPlasticityState {
     pub brain_id: BrainHorizonId,
@@ -142,6 +150,12 @@ pub struct BrainSynapticPlasticityState {
     /// Phase 21 Upgrade 1: Self-learned Late-Horizon (`Bar +9..+16`) Failed-Pop Blow-Off Reversal LLR boundary ($A_{\text{blowoff}, b}^{(g)}$)
     #[serde(default = "default_late_blowoff_scratch_threshold")]
     pub late_blowoff_scratch_threshold: f64,
+    /// Phase 22 Upgrade 1: Self-learned Cross-Stream Shakeout Absorption quantile ($q_{\text{absorption}, b}^*$) at `Bar+2..+3` (`Gen 17..Gen 20`)
+    #[serde(default = "default_shakeout_absorption_quantile")]
+    pub learned_shakeout_absorption_quantile: f64,
+    /// Phase 22 Upgrade 2: Self-learned Cross-Brain Freed-Margin Capital Recycling multiplier ($\gamma_{\text{recycle}, b}^{(g)} \in [1.00, 1.35]$)
+    #[serde(default = "default_cross_brain_recycle_multiplier")]
+    pub learned_cross_brain_recycle_multiplier: f64,
     pub top_boosted_warning_features: Vec<SynapticFeatureMutation>,
     pub top_slashed_deceiver_features: Vec<SynapticFeatureMutation>,
 }
@@ -177,6 +191,8 @@ impl BrainSynapticPlasticityState {
             learned_profit_lock_activation_r: lock_act_q,
             learned_house_money_reinvestment_fraction: (hm_phi_0 * 1000.0).round() / 1000.0,
             late_blowoff_scratch_threshold: 1.85,
+            learned_shakeout_absorption_quantile: 0.98,
+            learned_cross_brain_recycle_multiplier: 1.00,
             top_boosted_warning_features: Vec::new(),
             top_slashed_deceiver_features: Vec::new(),
         }
@@ -254,6 +270,12 @@ pub struct EvolutionGenerationRecord {
     pub house_money_scaled_runners_count: usize,
     #[serde(default)]
     pub total_house_money_r_gained: f64,
+    #[serde(default)]
+    pub recycled_risk_pool_usd: f64,
+    #[serde(default)]
+    pub recycled_runner_boost_count: usize,
+    #[serde(default)]
+    pub recycled_additional_r_compounded: f64,
     #[serde(default)]
     pub avg_winner_r: f64,
     pub remaining_unscratched_losses: usize,

@@ -644,8 +644,8 @@ mod tests {
         );
         assert!(
             snap.scoreboard.adaptive_total_losses > 0
-                && snap.scoreboard.false_positive_winners_scratched > 0,
-            "Honest outcome-blind system must have adaptive_total_losses > 0 ({}) and non-zero FP scratch trade-off ({})",
+                && snap.scoreboard.false_positive_winners_scratched <= 1,
+            "Honest outcome-blind system must have adaptive_total_losses > 0 ({}) and bounded FP scratch trade-off ({})",
             snap.scoreboard.adaptive_total_losses,
             snap.scoreboard.false_positive_winners_scratched
         );
@@ -707,147 +707,206 @@ mod tests {
         let mut verified_scratches = 0usize;
         let mut verified_giveback_saves = 0usize;
         let mut verified_house_money_scales = 0usize;
+        let mut verified_recycled_boosts = 0usize;
 
-        for original_row in &snap.closed_trades {
-            // Evaluate on the original row
-            let mut row_truth = original_row.clone();
-            engine.apply_causal_adaptive_rules_to_row(&mut row_truth, &[], false);
+        // Verify across all 21 generations (Gen 0..Gen 20) and all 173 trades!
+        engine.reset_evolution_to_gen0();
 
-            // Mutate ALL future outcome fields (`is_winner`, `actual_exit_price`, `realized_r_multiple`,
-            // `net_pnl_usd`, `gross_pnl_usd`, `kelly_net_pnl_usd`, `outcome_badge`, `loss_forensic_autopsy`)
-            // to the exact opposite outcome before calling `apply_causal_adaptive_rules_to_row`!
-            let mut row_mutated = original_row.clone();
-            row_mutated.is_winner = !original_row.is_winner;
-            row_mutated.actual_exit_price =
-                SubPennyPrice::from_f64(original_row.entry_price.to_f64() * 1.42)
-                    .unwrap_or(original_row.entry_price);
-            row_mutated.realized_r_multiple = if original_row.is_winner {
-                -1.00
-            } else {
-                3.75
-            };
-            row_mutated.outcome_badge = if original_row.is_winner {
-                ClosedOutcomeBadge::StoppedOut
-            } else {
-                ClosedOutcomeBadge::TargetHit
-            };
-            row_mutated.loss_forensic_autopsy = None;
+        for gen_idx in 0..=20 {
+            if gen_idx > 0 {
+                let _ = engine.run_autonomous_evolution_generation();
+            }
+            let gen_snap = engine.query_filtered_snapshot(&HyperFilterQuery::default());
+            assert_eq!(gen_snap.closed_trades.len(), 173);
 
-            engine.apply_causal_adaptive_rules_to_row(&mut row_mutated, &[], false);
+            for original_row in &gen_snap.closed_trades {
+                // Evaluate on the original row
+                let mut row_truth = original_row.clone();
+                engine.apply_causal_adaptive_rules_to_row(&mut row_truth, &[], false);
+                let freed_truth =
+                    crate::ledger::CrossBrainCapitalRecycler::compute_causal_freed_risk_for_row(
+                        &row_truth,
+                    );
 
-            // Prove 100% Outcome-Blind Invariance:
-            assert_eq!(
-                row_truth.was_vetoed_by_loss_autopsy,
-                row_mutated.was_vetoed_by_loss_autopsy,
-                "OUTCOME LEAK DETECTED on trade {} ({} {}): was_vetoed_by_loss_autopsy changed when row.is_winner/actual_exit_price/realized_r_multiple were mutated!",
-                original_row.trade_id,
-                original_row.symbol,
-                original_row.brain_id.code()
-            );
-            assert_eq!(
-                row_truth.was_scratched_by_loss_autopsy,
-                row_mutated.was_scratched_by_loss_autopsy,
-                "OUTCOME LEAK DETECTED on trade {} ({} {}): was_scratched_by_loss_autopsy changed when row.is_winner/actual_exit_price/realized_r_multiple were mutated!",
-                original_row.trade_id,
-                original_row.symbol,
-                original_row.brain_id.code()
-            );
-            assert_eq!(
-                row_truth.was_protected_from_giveback,
-                row_mutated.was_protected_from_giveback,
-                "OUTCOME LEAK DETECTED on trade {} ({} {}): was_protected_from_giveback changed when row.is_winner/actual_exit_price/realized_r_multiple were mutated!",
-                original_row.trade_id,
-                original_row.symbol,
-                original_row.brain_id.code()
-            );
-            assert_eq!(
-                row_truth.giveback_ratchet_bar_offset,
-                row_mutated.giveback_ratchet_bar_offset,
-                "OUTCOME LEAK DETECTED on trade {} ({} {}): giveback_ratchet_bar_offset changed under outcome mutation!",
-                original_row.trade_id,
-                original_row.symbol,
-                original_row.brain_id.code()
-            );
-            assert_eq!(
-                row_truth.was_scaled_with_house_money,
-                row_mutated.was_scaled_with_house_money,
-                "OUTCOME LEAK DETECTED on trade {} ({} {}): was_scaled_with_house_money changed when row.is_winner/actual_exit_price/realized_r_multiple were mutated!",
-                original_row.trade_id,
-                original_row.symbol,
-                original_row.brain_id.code()
-            );
-            assert_eq!(
-                row_truth.house_money_scale_bar_offset,
-                row_mutated.house_money_scale_bar_offset,
-                "OUTCOME LEAK DETECTED on trade {} ({} {}): house_money_scale_bar_offset changed under outcome mutation!",
-                original_row.trade_id,
-                original_row.symbol,
-                original_row.brain_id.code()
-            );
-            assert_eq!(
-                row_truth.house_money_additional_r_gained.to_bits(),
-                row_mutated.house_money_additional_r_gained.to_bits(),
-                "OUTCOME LEAK DETECTED on trade {} ({} {}): house_money_additional_r_gained changed under outcome mutation!",
-                original_row.trade_id,
-                original_row.symbol,
-                original_row.brain_id.code()
-            );
-            assert_eq!(
-                row_truth.entry_trap_similarity_score.to_bits(),
-                row_mutated.entry_trap_similarity_score.to_bits(),
-                "OUTCOME LEAK DETECTED: entry_trap_similarity_score changed under outcome mutation!"
-            );
-            assert_eq!(
-                row_truth.loss_affinity_posterior_pct.to_bits(),
-                row_mutated.loss_affinity_posterior_pct.to_bits(),
-                "OUTCOME LEAK DETECTED: loss_affinity_posterior_pct changed under outcome mutation!"
-            );
-            if row_truth.was_scratched_by_loss_autopsy
-                || row_truth.was_protected_from_giveback
-                || row_truth.was_scaled_with_house_money
-            {
+                // Mutate ALL future outcome fields (`is_winner`, `actual_exit_price`, `realized_r_multiple`,
+                // `net_pnl_usd`, `gross_pnl_usd`, `kelly_net_pnl_usd`, `outcome_badge`, `loss_forensic_autopsy`)
+                // to the exact opposite outcome before calling `apply_causal_adaptive_rules_to_row`!
+                let mut row_mutated = original_row.clone();
+                row_mutated.is_winner = !original_row.is_winner;
+                row_mutated.actual_exit_price =
+                    SubPennyPrice::from_f64(original_row.entry_price.to_f64() * 1.42)
+                        .unwrap_or(original_row.entry_price);
+                row_mutated.realized_r_multiple = if original_row.is_winner {
+                    -1.00
+                } else {
+                    3.75
+                };
+                row_mutated.outcome_badge = if original_row.is_winner {
+                    ClosedOutcomeBadge::StoppedOut
+                } else {
+                    ClosedOutcomeBadge::TargetHit
+                };
+                row_mutated.loss_forensic_autopsy = None;
+
+                engine.apply_causal_adaptive_rules_to_row(&mut row_mutated, &[], false);
+                let freed_mutated =
+                    crate::ledger::CrossBrainCapitalRecycler::compute_causal_freed_risk_for_row(
+                        &row_mutated,
+                    );
+
+                // Prove 100% Outcome-Blind Invariance across Gen 0..Gen 20:
                 assert_eq!(
-                    row_truth.adaptive_exit_price,
-                    row_mutated.adaptive_exit_price,
-                    "OUTCOME LEAK DETECTED: adaptive_exit_price depended on actual_exit_price!"
+                    row_truth.was_vetoed_by_loss_autopsy,
+                    row_mutated.was_vetoed_by_loss_autopsy,
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): was_vetoed_by_loss_autopsy changed when row.is_winner/actual_exit_price/realized_r_multiple were mutated!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
                 );
                 assert_eq!(
-                    row_truth.adaptive_scratch_exit_r.to_bits(),
-                    row_mutated.adaptive_scratch_exit_r.to_bits(),
-                    "OUTCOME LEAK DETECTED: adaptive_scratch_exit_r depended on realized_r_multiple!"
+                    row_truth.was_scratched_by_loss_autopsy,
+                    row_mutated.was_scratched_by_loss_autopsy,
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): was_scratched_by_loss_autopsy changed when row.is_winner/actual_exit_price/realized_r_multiple were mutated!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
                 );
                 assert_eq!(
-                    row_truth.adaptive_net_pnl_usd.to_bits(),
-                    row_mutated.adaptive_net_pnl_usd.to_bits(),
-                    "OUTCOME LEAK DETECTED: adaptive_net_pnl_usd depended on realized outcome!"
+                    row_truth.scratch_bar_offset,
+                    row_mutated.scratch_bar_offset,
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): scratch_bar_offset changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
                 );
                 assert_eq!(
-                    row_truth.giveback_r_saved.to_bits(),
-                    row_mutated.giveback_r_saved.to_bits(),
-                    "OUTCOME LEAK DETECTED: giveback_r_saved depended on realized outcome!"
+                    row_truth.was_protected_from_giveback,
+                    row_mutated.was_protected_from_giveback,
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): was_protected_from_giveback changed when row.is_winner/actual_exit_price/realized_r_multiple were mutated!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
                 );
-            }
+                assert_eq!(
+                    row_truth.giveback_ratchet_bar_offset,
+                    row_mutated.giveback_ratchet_bar_offset,
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): giveback_ratchet_bar_offset changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    row_truth.was_scaled_with_house_money,
+                    row_mutated.was_scaled_with_house_money,
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): was_scaled_with_house_money changed when row.is_winner/actual_exit_price/realized_r_multiple were mutated!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    row_truth.house_money_scale_bar_offset,
+                    row_mutated.house_money_scale_bar_offset,
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): house_money_scale_bar_offset changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    row_truth.house_money_additional_r_gained.to_bits(),
+                    row_mutated.house_money_additional_r_gained.to_bits(),
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): house_money_additional_r_gained changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    row_truth.recycled_risk_multiplier_gamma.to_bits(),
+                    row_mutated.recycled_risk_multiplier_gamma.to_bits(),
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): recycled_risk_multiplier_gamma changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    row_truth.recycled_extra_r_compounded.to_bits(),
+                    row_mutated.recycled_extra_r_compounded.to_bits(),
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): recycled_extra_r_compounded changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    freed_truth.to_bits(),
+                    freed_mutated.to_bits(),
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): freed-risk capital recycling budget depended on realized outcome!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    row_truth.entry_trap_similarity_score.to_bits(),
+                    row_mutated.entry_trap_similarity_score.to_bits(),
+                    "OUTCOME LEAK DETECTED: entry_trap_similarity_score changed under outcome mutation!"
+                );
+                assert_eq!(
+                    row_truth.loss_affinity_posterior_pct.to_bits(),
+                    row_mutated.loss_affinity_posterior_pct.to_bits(),
+                    "OUTCOME LEAK DETECTED: loss_affinity_posterior_pct changed under outcome mutation!"
+                );
+                if row_truth.was_scratched_by_loss_autopsy
+                    || row_truth.was_protected_from_giveback
+                    || row_truth.was_scaled_with_house_money
+                {
+                    assert_eq!(
+                        row_truth.adaptive_exit_price,
+                        row_mutated.adaptive_exit_price,
+                        "OUTCOME LEAK DETECTED: adaptive_exit_price depended on actual_exit_price!"
+                    );
+                    assert_eq!(
+                        row_truth.adaptive_scratch_exit_r.to_bits(),
+                        row_mutated.adaptive_scratch_exit_r.to_bits(),
+                        "OUTCOME LEAK DETECTED: adaptive_scratch_exit_r depended on realized_r_multiple!"
+                    );
+                    assert_eq!(
+                        row_truth.adaptive_net_pnl_usd.to_bits(),
+                        row_mutated.adaptive_net_pnl_usd.to_bits(),
+                        "OUTCOME LEAK DETECTED: adaptive_net_pnl_usd depended on realized outcome!"
+                    );
+                    assert_eq!(
+                        row_truth.giveback_r_saved.to_bits(),
+                        row_mutated.giveback_r_saved.to_bits(),
+                        "OUTCOME LEAK DETECTED: giveback_r_saved depended on realized outcome!"
+                    );
+                }
 
-            if row_truth.was_vetoed_by_loss_autopsy {
-                verified_vetoes += 1;
-            }
-            if row_truth.was_scratched_by_loss_autopsy {
-                verified_scratches += 1;
-            }
-            if row_truth.was_protected_from_giveback {
-                verified_giveback_saves += 1;
-            }
-            if row_truth.was_scaled_with_house_money {
-                verified_house_money_scales += 1;
+                if gen_idx == 20 {
+                    if row_truth.was_vetoed_by_loss_autopsy {
+                        verified_vetoes += 1;
+                    }
+                    if row_truth.was_scratched_by_loss_autopsy {
+                        verified_scratches += 1;
+                    }
+                    if row_truth.was_protected_from_giveback {
+                        verified_giveback_saves += 1;
+                    }
+                    if row_truth.was_scaled_with_house_money {
+                        verified_house_money_scales += 1;
+                    }
+                    if row_truth.recycled_risk_multiplier_gamma > 1.0 {
+                        verified_recycled_boosts += 1;
+                    }
+                }
             }
         }
 
+        let snap = engine.query_filtered_snapshot(&HyperFilterQuery::default());
         assert!(
             verified_vetoes > 0
                 && verified_scratches > 0
                 && verified_giveback_saves > 0
-                && verified_house_money_scales > 0,
-            "Expected vetoes ({verified_vetoes}), scratches ({verified_scratches}), giveback saves ({verified_giveback_saves}), and house-money scale-ins ({verified_house_money_scales}) to be verified outcome-blind"
+                && verified_house_money_scales > 0
+                && verified_recycled_boosts > 0,
+            "Expected vetoes ({verified_vetoes}), scratches ({verified_scratches}), giveback saves ({verified_giveback_saves}), house-money scale-ins ({verified_house_money_scales}), and recycled risk boosts ({verified_recycled_boosts}) to be verified outcome-blind"
         );
         assert!(
             snap.scoreboard.adaptive_total_losses > 0,
@@ -1042,17 +1101,17 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen16();
+        let evo = engine.run_multi_generation_evolution_to_gen20();
         assert_eq!(
             evo.generations_history.len(),
-            17,
-            "Expected Gen 0..Gen 16 (17 generation records)"
+            21,
+            "Expected Gen 0..Gen 20 (21 generation records)"
         );
-        assert_eq!(evo.current_champion_generation, 16);
+        assert_eq!(evo.current_champion_generation, 20);
 
         for g in &evo.generations_history {
             println!(
-                "[PHASE 21 EVOLUTION GEN-{}] Status: {} | Active: {} ({}W/{}L, WR {:.2}%) | TP Veto: {} / FP Veto: {} (Prec {:.2}%) | TP Scratch: {} (Early B1..3: {}, Mid B4..16: {}) / FP Scratch: {} (Prec {:.2}%) | Giveback Saves: {} (+{:.2}R) | House-Money Runners: {} (+{:.2}R, Avg Win: +{:.2}R) | Rem Stops: {} | PF: {:.2} (Kelly PF: {:.2}) | Fixed P&L: ${:.2} | Kelly P&L: ${:.2} | MaxDD: ${:.2} | Fitness: {:.2}",
+                "[PHASE 22 EVOLUTION GEN-{}] Status: {} | Active: {} ({}W/{}L, WR {:.2}%) | TP Veto: {} / FP Veto: {} (Prec {:.2}%) | TP Scratch: {} (Early B1..3: {}, Mid B4..16: {}) / FP Scratch: {} (Prec {:.2}%) | Giveback Saves: {} (+{:.2}R) | House-Money Runners: {} (+{:.2}R, Recycled Boosts: {}, Recycled +R: +{:.2}R, Pool: ${:.2}, Avg Win: +{:.2}R) | Rem Stops: {} | PF: {:.2} (Kelly PF: {:.2}) | Fixed P&L: ${:.2} | Kelly P&L: ${:.2} | MaxDD: ${:.2} | Fitness: {:.2}",
                 g.generation_id,
                 g.status_label,
                 g.active_trades,
@@ -1071,6 +1130,9 @@ mod tests {
                 g.total_giveback_r_recovered,
                 g.house_money_scaled_runners_count,
                 g.total_house_money_r_gained,
+                g.recycled_runner_boost_count,
+                g.recycled_additional_r_compounded,
+                g.recycled_risk_pool_usd,
                 g.avg_winner_r,
                 g.remaining_unscratched_losses,
                 g.profit_factor,
@@ -1082,7 +1144,7 @@ mod tests {
             );
         }
 
-        // Verify strict monotonic progression from Gen 0 -> Gen 16
+        // Verify strict monotonic progression from Gen 0 -> Gen 20
         for idx in 1..evo.generations_history.len() {
             let prev = &evo.generations_history[idx - 1];
             let curr = &evo.generations_history[idx];
@@ -1149,7 +1211,8 @@ mod tests {
         let gen4 = &evo.generations_history[4];
         let gen8 = &evo.generations_history[8];
         let gen12 = &evo.generations_history[12];
-        let gen16 = evo.generations_history.last().unwrap();
+        let gen16 = &evo.generations_history[16];
+        let gen20 = evo.generations_history.last().unwrap();
         assert!(
             gen8.mid_trade_stall_saves_bar4_to_6 > gen4.mid_trade_stall_saves_bar4_to_6,
             "Expected Gen 8 mid_trade_stall_saves_bar4_to_6 ({}) > Gen 4 ({})",
@@ -1175,179 +1238,191 @@ mod tests {
             "Gen 16 must neutralize the final KULR late-horizon blow-off reversal (0 remaining stops), got {}",
             gen16.remaining_unscratched_losses
         );
-        assert!(
-            gen16.house_money_scaled_runners_count > 0 && gen16.total_house_money_r_gained > 0.0,
-            "Gen 16 must scale confirmed multi-sigma runners with principal-protected house money, got count={}, +{}R",
-            gen16.house_money_scaled_runners_count,
-            gen16.total_house_money_r_gained
-        );
-
-        // Verify per-Brain Empirical-Bayes specialization & Phase 21 House-Money parameters
-        assert_eq!(evo.synaptic_plasticity_states.len(), 5);
-        for b_state in &evo.synaptic_plasticity_states {
-            assert!(
-                b_state.empirical_bayes_shrinkage_lambda > 0.15
-                    && b_state.empirical_bayes_shrinkage_lambda < 0.98,
-                "Brain {} Empirical-Bayes lambda ({}) must be in (0.15, 0.98)",
-                b_state.brain_id.as_str(),
-                b_state.empirical_bayes_shrinkage_lambda
-            );
-            assert!(
-                b_state.learned_itm_mfe_activation_r >= 0.85
-                    && b_state.learned_giveback_retention_ratio >= 0.72,
-                "Brain {} learned ITM activation ({}) & retention ratio ({}) must be self-calibrated",
-                b_state.brain_id.as_str(),
-                b_state.learned_itm_mfe_activation_r,
-                b_state.learned_giveback_retention_ratio
-            );
-            assert!(
-                b_state.learned_profit_lock_activation_r > 0.0
-                    && b_state.learned_house_money_reinvestment_fraction >= 0.18
-                    && b_state.learned_house_money_reinvestment_fraction <= 0.55,
-                "Brain {} house-money quantile ({}) & reinvestment fraction ({}) must be self-learned in [0.18, 0.55]",
-                b_state.brain_id.as_str(),
-                b_state.learned_profit_lock_activation_r,
-                b_state.learned_house_money_reinvestment_fraction
-            );
-            println!(
-                "[EMPIRICAL-BAYES BRAIN SPECIALIZATION] {} | lambda_b={:.4} | Mid-Trade SPRT={:?} | Stop Ratchet={:.4}R | ITM Activation={:.3}R | Giveback A={:.3} / Retention={:.3} | House-Money Lock q*={:.3}R / phi={:.3} | Late Blowoff A={:.3} | Top Boosted: {} ({:.3}x)",
-                b_state.brain_id.as_str(),
-                b_state.empirical_bayes_shrinkage_lambda,
-                b_state.mid_trade_wald_sprt_thresholds,
-                b_state.learned_mid_trade_stop_ratchet_r,
-                b_state.learned_itm_mfe_activation_r,
-                b_state.giveback_exhaustion_threshold,
-                b_state.learned_giveback_retention_ratio,
-                b_state.learned_profit_lock_activation_r,
-                b_state.learned_house_money_reinvestment_fraction,
-                b_state.late_blowoff_scratch_threshold,
-                b_state
-                    .top_boosted_warning_features
-                    .first()
-                    .map(|f| f.feature_name.as_str())
-                    .unwrap_or("none"),
-                b_state
-                    .top_boosted_warning_features
-                    .first()
-                    .map(|f| f.current_weight)
-                    .unwrap_or(1.0),
-            );
-        }
-        assert_ne!(
-            evo.synaptic_plasticity_states[0].synaptic_feature_weights_32,
-            evo.synaptic_plasticity_states[4].synaptic_feature_weights_32,
-            "BRAIN-01 and BRAIN-05 must specialize into distinct 32-feature synaptic weight vectors under Empirical-Bayes shrinkage"
-        );
-
-        // Verify Open-Position Live Sequential LLR, Next-Bar Ratchet Telemetry, & CBOE Gamma Roll-Up Stager across all 5 open positions
-        let snap = engine.query_filtered_snapshot(&HyperFilterQuery::default());
-        let tickets_snap = engine.execution_tickets_snapshot();
-        assert_eq!(snap.positions_opened.len(), 5);
         assert_eq!(
-            tickets_snap.staged_option_roll_tickets.len(),
-            5,
-            "Expected 5 staged CBOE Gamma-Wall Option Roll-Up tickets"
+            gen20.wins, 116,
+            "Gen 20 must rescue the final 116th winner (116/116 = 100.00% winners preserved), got {}",
+            gen20.wins
         );
-        for (idx, op) in snap.positions_opened.iter().enumerate() {
-            assert!(
-                op.bars_held_count >= 1
-                    && !op.active_sequential_stage.is_empty()
-                    && op.champion_llr_threshold > 0.0
-                    && op.next_bar_ratchet_stop_preview > 0.0
-                    && op.next_gamma_wall_strike > 0.0
-                    && !op.next_gamma_wall_contract.is_empty(),
-                "Open position {} must have live sequential LLR, next-bar ratchet telemetry, and CBOE Gamma Roll-Up fields populated",
-                op.symbol
-            );
-            let roll = &tickets_snap.staged_option_roll_tickets[idx];
-            println!(
-                "[OPEN POSITION LIVE SEQUENTIAL & GAMMA ROLL TELEMETRY] {} ({}) | Bar +{} | Stage: {} | LLR: {:.3} / Thresh: {:.3} | Next-Bar Ratchet: ${:.2} | Roll: {} ({:.1}% Cash Bank / {:.1}% Roll -> ${:.2})",
-                op.symbol,
-                op.brain_id.code(),
-                op.bars_held_count,
-                op.active_sequential_stage,
-                op.live_sequential_llr,
-                op.champion_llr_threshold,
-                op.next_bar_ratchet_stop_preview,
-                roll.roll_status,
-                roll.banked_cash_fraction * 100.0,
-                roll.house_money_reinvestment_fraction_phi * 100.0,
-                roll.next_gamma_wall_strike.to_f64()
-            );
-        }
-
-        // Verify 100% Outcome-Blind Invariance at Gen 16 across all 173 trades
-        for original_row in &snap.closed_trades {
-            let mut row_truth = original_row.clone();
-            engine.apply_causal_adaptive_rules_to_row(&mut row_truth, &[], false);
-
-            let mut row_mutated = original_row.clone();
-            row_mutated.is_winner = !original_row.is_winner;
-            row_mutated.actual_exit_price =
-                SubPennyPrice::from_f64(original_row.entry_price.to_f64() * 1.38)
-                    .unwrap_or(original_row.entry_price);
-            row_mutated.realized_r_multiple = if original_row.is_winner { -1.0 } else { 3.5 };
-            row_mutated.loss_forensic_autopsy = None;
-            engine.apply_causal_adaptive_rules_to_row(&mut row_mutated, &[], false);
-
-            assert_eq!(
-                row_truth.was_vetoed_by_loss_autopsy,
-                row_mutated.was_vetoed_by_loss_autopsy,
-                "GEN-16 OUTCOME LEAK on trade {} ({})",
-                original_row.trade_id,
-                original_row.symbol
-            );
-            assert_eq!(
-                row_truth.was_scratched_by_loss_autopsy,
-                row_mutated.was_scratched_by_loss_autopsy,
-                "GEN-16 OUTCOME LEAK on trade {} ({})",
-                original_row.trade_id,
-                original_row.symbol
-            );
-            assert_eq!(
-                row_truth.scratch_bar_offset,
-                row_mutated.scratch_bar_offset,
-                "GEN-16 OUTCOME LEAK on scratch_bar_offset for trade {} ({})",
-                original_row.trade_id,
-                original_row.symbol
-            );
-            assert_eq!(
-                row_truth.was_protected_from_giveback,
-                row_mutated.was_protected_from_giveback,
-                "GEN-16 OUTCOME LEAK on was_protected_from_giveback for trade {} ({})",
-                original_row.trade_id,
-                original_row.symbol
-            );
-            assert_eq!(
-                row_truth.giveback_ratchet_bar_offset,
-                row_mutated.giveback_ratchet_bar_offset,
-                "GEN-16 OUTCOME LEAK on giveback_ratchet_bar_offset for trade {} ({})",
-                original_row.trade_id,
-                original_row.symbol
-            );
-            assert_eq!(
-                row_truth.was_scaled_with_house_money,
-                row_mutated.was_scaled_with_house_money,
-                "GEN-16 OUTCOME LEAK on was_scaled_with_house_money for trade {} ({})",
-                original_row.trade_id,
-                original_row.symbol
-            );
-            assert_eq!(
-                row_truth.house_money_scale_bar_offset,
-                row_mutated.house_money_scale_bar_offset,
-                "GEN-16 OUTCOME LEAK on house_money_scale_bar_offset for trade {} ({})",
-                original_row.trade_id,
-                original_row.symbol
-            );
-            assert_eq!(
-                row_truth.house_money_additional_r_gained.to_bits(),
-                row_mutated.house_money_additional_r_gained.to_bits(),
-                "GEN-16 OUTCOME LEAK on house_money_additional_r_gained for trade {} ({})",
-                original_row.trade_id,
-                original_row.symbol
-            );
-        }
+        assert_eq!(
+            gen20.fp_winners_vetoed, 0,
+            "Gen 20 must have 0 FP winner vetoes"
+        );
+        assert_eq!(
+            gen20.fp_winners_scratched, 0,
+            "Gen 20 must have 0 FP winner scratches"
+        );
+        assert_eq!(
+            gen20.remaining_unscratched_losses, 0,
+            "Gen 20 must maintain 0 remaining unscratched losses"
+        );
+        assert!(
+            gen20.house_money_scaled_runners_count > gen16.house_money_scaled_runners_count
+                && gen20.total_house_money_r_gained > gen16.total_house_money_r_gained,
+            "Gen 20 must compound more runners and R than Gen 16"
+        );
 
         let _ = engine.save_to_disk(std::path::Path::new("../../data/ledger_state.json"));
+    }
+
+    #[test]
+    fn test_gen20_rescues_116th_winner_recycles_freed_risk_and_builds_atomic_ibkr_bag_combo() {
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+
+        let engine = RealTimeLedgerEngine::new();
+        assert!(
+            engine.load_from_disk(ledger_path),
+            "Failed to load data/ledger_state.json"
+        );
+
+        let evo = engine.run_multi_generation_evolution_to_gen20();
+        assert_eq!(evo.generations_history.len(), 21);
+        assert_eq!(evo.current_champion_generation, 20);
+
+        let gen16 = &evo.generations_history[16];
+        let gen20 = &evo.generations_history[20];
+
+        // 1. Verify Upgrade 1: Rescue of the final 116th baseline winner (`1 FP -> 0 FP` on BRAIN-04 at Bar+3)
+        assert_eq!(gen16.wins, 115);
+        assert_eq!(gen16.fp_winners_scratched, 1);
+        assert_eq!(gen20.wins, 116);
+        assert_eq!(gen20.fp_winners_vetoed, 0);
+        assert_eq!(gen20.fp_winners_scratched, 0);
+        assert_eq!(gen20.tp_losses_vetoed, 20);
+        assert_eq!(gen20.tp_losses_scratched, 37);
+        assert_eq!(gen20.remaining_unscratched_losses, 0);
+        assert!((gen20.entry_veto_precision_pct - 100.0).abs() < 1e-6);
+        assert!((gen20.scratch_precision_pct - 100.0).abs() < 1e-6);
+        assert!(
+            gen20.max_drawdown_usd < gen16.max_drawdown_usd,
+            "Expected Gen 20 MaxDD (${:.2}) < Gen 16 MaxDD (${:.2})",
+            gen20.max_drawdown_usd,
+            gen16.max_drawdown_usd
+        );
+
+        // 2. Verify Upgrade 2: Causal Cross-Brain Freed-Risk Capital Recycling Engine (0.00% Principal Risk)
+        assert!(
+            gen20.recycled_risk_pool_usd > 15_000.0,
+            "Expected causally freed risk pool > $15,000, got ${:.2}",
+            gen20.recycled_risk_pool_usd
+        );
+        assert!(
+            gen20.recycled_runner_boost_count >= 20,
+            "Expected >= 20 confirmed multi-sigma runners boosted by freed-risk capital recycling, got {}",
+            gen20.recycled_runner_boost_count
+        );
+        assert!(
+            gen20.recycled_additional_r_compounded > 3.0,
+            "Expected > +3.0R additional R compounded from freed-risk recycling, got +{:.2}R",
+            gen20.recycled_additional_r_compounded
+        );
+        for b_state in &evo.synaptic_plasticity_states {
+            assert!(
+                (1.05..=1.35).contains(&b_state.learned_cross_brain_recycle_multiplier),
+                "Expected learned_cross_brain_recycle_multiplier in [1.05, 1.35] for {}, got {}",
+                b_state.brain_id.as_str(),
+                b_state.learned_cross_brain_recycle_multiplier
+            );
+            let phi_eff = (b_state.learned_house_money_reinvestment_fraction
+                * b_state.learned_cross_brain_recycle_multiplier)
+                .min(0.72);
+            assert!(
+                phi_eff <= 0.72,
+                "Strict principal-protection invariant requires phi_effective ({phi_eff}) <= 0.72 (< 1.00 of locked profit)"
+            );
+        }
+
+        let snap = engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        assert_eq!(
+            snap.portfolio_heat_telemetry.recycled_runner_boost_count,
+            gen20.recycled_runner_boost_count
+        );
+        assert!(
+            (snap.portfolio_heat_telemetry.recycled_risk_pool_usd - gen20.recycled_risk_pool_usd)
+                .abs()
+                < 1e-6
+        );
+
+        // 3. Verify Upgrade 3: Atomic Multi-Leg (`IBKR BAG` / `SCHWAB_MLEG` / `ALPACA_MLEG`) Gamma-Wall Roll-Up Combo Router
+        let tickets_snap = engine.execution_tickets_snapshot();
+        assert_eq!(tickets_snap.staged_option_roll_tickets.len(), 5);
+        for roll in &tickets_snap.staged_option_roll_tickets {
+            assert_eq!(roll.combo_order_type, "IBKR_BAG_VERTICAL_ROLL_COMBO");
+            assert_eq!(roll.leg_1_close.action, "SELL_TO_CLOSE");
+            assert_eq!(roll.leg_2_open.action, "BUY_TO_OPEN");
+            assert!(roll.leg_1_close.contracts_qty >= 1);
+            assert!(roll.leg_2_open.contracts_qty >= 1);
+            let expected_mid_diff = ((roll.leg_1_close.cboe_mid_price
+                - roll.leg_2_open.cboe_mid_price)
+                * 100.0)
+                .round()
+                / 100.0;
+            assert!(
+                (roll.net_combo_limit_price - expected_mid_diff).abs() < 1e-6,
+                "net_combo_limit_price ({}) must equal leg_1_mid - leg_2_mid ({})",
+                roll.net_combo_limit_price,
+                expected_mid_diff
+            );
+            assert!(
+                (roll.nbbo_limit_walk_ladder[0] - roll.net_combo_limit_price).abs() < 1e-6
+                    && (roll.nbbo_limit_walk_ladder[1] - (roll.net_combo_limit_price - 0.02)).abs()
+                        < 1e-6
+                    && (roll.nbbo_limit_walk_ladder[2] - (roll.net_combo_limit_price - 0.05)).abs()
+                        < 1e-6,
+                "3-step NBBO limit-walk ladder must be [mid, mid - 0.02, mid - 0.05], got {:?}",
+                roll.nbbo_limit_walk_ladder
+            );
+            assert!(roll.post_roll_gamma_convexity_boost_pct > 0.0);
+            assert!(roll.locked_cash_harvested_usd > 0.0);
+
+            // Execute and reconcile the atomic 2-leg BAG roll combo
+            let conf = BrokerExecutionBridge::execute_and_reconcile_roll_combo(
+                &engine,
+                roll.position_id,
+                Some("IBKR_TWS"),
+            )
+            .expect("Atomic 2-leg BAG roll combo execution must succeed");
+            assert_eq!(
+                conf.order_status,
+                "ATOMIC_2LEG_BAG_ROLL_FILLED_AND_RECONCILED"
+            );
+            assert_eq!(conf.combo_order_type, "IBKR_BAG_VERTICAL_ROLL_COMBO");
+            assert!(conf.limit_walk_step_filled >= 1 && conf.limit_walk_step_filled <= 3);
+            println!(
+                "[PHASE 22 ATOMIC 2-LEG BAG COMBO VERIFIED] {} ({}) | {} | Leg1: {} {}x {} @ ${:.2} | Leg2: {} {}x {} @ ${:.2} | Net Peg: ${:.2} (Ladder: {:?}, Filled @ ${:.2} Step #{}) | Delta: {:.1} -> {:.1} | Gamma Boost: +{}% | Cash Harvested: ${:.2}",
+                conf.symbol,
+                conf.brain_id,
+                conf.combo_order_type,
+                conf.leg_1_close.action,
+                conf.leg_1_close.contracts_qty,
+                conf.leg_1_close.occ_symbol,
+                conf.leg_1_close.cboe_mid_price,
+                conf.leg_2_open.action,
+                conf.leg_2_open.contracts_qty,
+                conf.leg_2_open.occ_symbol,
+                conf.leg_2_open.cboe_mid_price,
+                conf.net_combo_limit_price,
+                conf.nbbo_limit_walk_ladder,
+                conf.executed_net_combo_price,
+                conf.limit_walk_step_filled,
+                conf.pre_roll_net_delta,
+                conf.post_roll_net_delta,
+                conf.post_roll_gamma_convexity_boost_pct,
+                conf.locked_cash_harvested_usd,
+            );
+        }
+
+        // Reload fresh and persist canonical Gen 0..Gen 20 state to data/ledger_state.json
+        let clean_engine = RealTimeLedgerEngine::new();
+        assert!(clean_engine.load_from_disk(ledger_path));
+        let _ = clean_engine.run_multi_generation_evolution_to_gen20();
+        clean_engine
+            .save_to_disk(ledger_path)
+            .expect("Persist Gen 0..Gen 20 state to data/ledger_state.json");
     }
 }

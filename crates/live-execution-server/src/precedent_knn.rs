@@ -121,13 +121,20 @@ pub struct RunnerGivebackRatchetDiagnostic {
     pub ledoit_wolf_shrinkage_lambda: f64,
 }
 
-/// Phase 21 Upgrade 2: Outcome-Blind Principal-Protected "House-Money" Runner Pyramiding Diagnostic.
+/// Phase 21 Upgrade 2 & Phase 22 Upgrade 2: Outcome-Blind Principal-Protected "House-Money" Runner Pyramiding
+/// & Cross-Brain Freed-Risk Capital Recycling Diagnostic.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HouseMoneyRunnerScaleInDiagnostic {
     pub scale_bar_offset: u8,
     pub scale_entry_r: f64,
     pub locked_profit_r: f64,
     pub house_money_reinvestment_fraction_phi: f64,
+    #[serde(default)]
+    pub recycled_risk_multiplier_gamma: f64,
+    #[serde(default)]
+    pub effective_reinvestment_fraction_phi: f64,
+    #[serde(default)]
+    pub recycled_extra_r_gained: f64,
     pub house_money_tranche_risk_r: f64,
     pub guaranteed_net_floor_r: f64,
     pub additional_r_gained: f64,
@@ -629,6 +636,116 @@ impl PrecedentKnnIndex {
             (0.65 * syn_state.learned_house_money_reinvestment_fraction + 0.35 * emp_phi)
                 .clamp(0.18, 0.55),
         )
+    }
+
+    /// Phase 22 Upgrade 1: Computes the Brain's Self-Learned Cross-Stream Absorption-Under-Drawdown Score
+    /// $\Psi_{\text{absorption}}(X_{t+k})$ at `Bar +2 / Bar +3` from the Empirical-Bayes synaptic-weighted
+    /// institutional flow streams (`Stream 2 Options Vanna/GEX f[12..19]`, `Stream 3 Cross-Asset f[20..25]`,
+    /// `Stream 4 Macro Breadth f[26..31]`, and `Stream 1 Stopping-Volume / Absorption Body`).
+    /// Strictly 100% outcome-blind.
+    pub fn compute_cross_stream_shakeout_absorption_score(
+        &self,
+        brain_id: BrainHorizonId,
+        bar1_features_32: &[f32],
+        bar_k_features_32: &[f32],
+    ) -> f64 {
+        if bar1_features_32.len() < 32 || bar_k_features_32.len() < 32 {
+            return 0.0;
+        }
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        let w = &syn_state.synaptic_feature_weights_32;
+
+        let mut s2_num = 0.0_f64;
+        let mut s2_den = 0.0_f64;
+        for i in 12..20 {
+            let wi = w[i].max(0.10);
+            s2_num += wi * (bar_k_features_32[i] as f64);
+            s2_den += wi;
+        }
+        let s2_mean = s2_num / s2_den.max(1e-6);
+
+        let mut s3_num = 0.0_f64;
+        let mut s3_den = 0.0_f64;
+        for i in 20..26 {
+            let wi = w[i].max(0.10);
+            s3_num += wi * (bar_k_features_32[i] as f64);
+            s3_den += wi;
+        }
+        let s3_mean = s3_num / s3_den.max(1e-6);
+
+        let mut s4_num = 0.0_f64;
+        let mut s4_den = 0.0_f64;
+        for i in 26..32 {
+            let wi = w[i].max(0.10);
+            s4_num += wi * (bar_k_features_32[i] as f64);
+            s4_den += wi;
+        }
+        let s4_mean = s4_num / s4_den.max(1e-6);
+
+        let b1_body = bar1_features_32[4] as f64;
+        let vk_surge = (bar_k_features_32[10] as f64).clamp(-0.50, 1.50);
+        let s1_stopping = 0.40 * b1_body + 0.15 * vk_surge;
+
+        0.50 * s2_mean + 0.25 * s3_mean + 0.15 * s4_mean + s1_stopping
+    }
+
+    /// Phase 22 Upgrade 1: Computes the Brain's self-learned empirical Cross-Stream Shakeout Absorption quantile
+    /// ($q_{\text{absorption}, b}^*$) strictly from causal winner pullbacks vs. hard-negative traps ($T_{\text{closed}} < t_{\text{open}}$).
+    pub fn empirical_shakeout_absorption_quantile(
+        &self,
+        brain_id: BrainHorizonId,
+        current_timestamp_ns: i64,
+    ) -> f64 {
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        let wins = self.winner_pullbacks.read();
+        let traps = self.hard_negative_traps.read();
+
+        let causal_wins: Vec<&WinnerPullbackRecord> = wins
+            .iter()
+            .filter(|w| {
+                w.brain_id == brain_id
+                    && w.closed_timestamp_ns < current_timestamp_ns
+                    && w.post_entry_bar1_features_32.len() >= 32
+            })
+            .collect();
+        let causal_traps: Vec<&HardNegativeTrapRecord> = traps
+            .iter()
+            .filter(|t| {
+                t.brain_id == brain_id
+                    && t.closed_timestamp_ns < current_timestamp_ns
+                    && t.post_entry_bar1_features_32.len() >= 32
+            })
+            .collect();
+
+        if causal_wins.is_empty() && causal_traps.is_empty() {
+            return syn_state.learned_shakeout_absorption_quantile;
+        }
+
+        let mut scores: Vec<f64> = causal_wins
+            .iter()
+            .map(|w| {
+                self.compute_cross_stream_shakeout_absorption_score(
+                    brain_id,
+                    &w.post_entry_bar1_features_32,
+                    &w.post_entry_bar1_features_32,
+                )
+            })
+            .chain(causal_traps.iter().map(|t| {
+                self.compute_cross_stream_shakeout_absorption_score(
+                    brain_id,
+                    &t.post_entry_bar1_features_32,
+                    &t.post_entry_bar1_features_32,
+                )
+            }))
+            .collect();
+        drop(wins);
+        drop(traps);
+
+        scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p80_idx = (((scores.len().saturating_sub(1)) as f64) * 0.80).round() as usize;
+        let emp_q = scores[p80_idx.min(scores.len() - 1)].clamp(0.58, 0.82);
+
+        (0.70 * syn_state.learned_shakeout_absorption_quantile + 0.30 * emp_q).clamp(0.60, 0.98)
     }
 
     /// Computes the Brain's self-learned empirical 80th-percentile adverse excursion quantile
@@ -1508,13 +1625,34 @@ impl PrecedentKnnIndex {
         let b3_feats = bar3_features_32.filter(|f| f.len() >= 32)?;
         let r3 = b3_feats[0] as f64;
         let b3 = b3_feats[4] as f64;
-        let l3 = (-2.40 * (r3 + 0.18)) + (-1.10 * b3) + if r3 <= r2 { 0.90 } else { -1.10 };
+        let psi_absorption_3 = self.compute_cross_stream_shakeout_absorption_score(
+            brain_id,
+            bar1_features_32,
+            b3_feats,
+        );
+        let learned_abs_q =
+            self.empirical_shakeout_absorption_quantile(brain_id, current_timestamp_ns);
+        let absorption_llr_discount = if syn_state.generation_id >= 17 {
+            1.25 * (psi_absorption_3 - learned_abs_q).max(0.0)
+        } else {
+            0.0
+        };
+        let l3 = (-2.40 * (r3 + 0.18))
+            + (-1.10 * b3)
+            + if r3 <= r2 { 0.90 } else { -1.10 }
+            - absorption_llr_discount;
         let lambda3 = lambda2 + l3;
 
         let gen2_bar2_green_rebound = syn_state.generation_id >= 2
             && w_body >= 1.12
             && b2 >= 0.25
             && r2 > r1 + 0.20;
+        // Phase 22 Upgrade 1: Self-learned Cross-Stream Shakeout Absorption discriminant at Bar +3 (`Gen 17..Gen 20`):
+        // When a trade exhibits constructive cross-stream institutional absorption (\Psi_{absorption}(X_{t+3}) >= q_{absorption, b}^*)
+        // combined with stopping-volume absorption on Bar +1, defer the Bar +3 scratch to STAGE_2_MID_STALL_GUARD (Bar +4..+6)!
+        let gen17_cross_stream_shakeout_absorption_defer = syn_state.generation_id >= 17
+            && psi_absorption_3 >= learned_abs_q
+            && b1 >= 0.40;
 
         let three_bar_staircase_breakdown = r1 <= 0.02
             && r1 > -0.20
@@ -1524,6 +1662,7 @@ impl PrecedentKnnIndex {
             && b2 <= -0.20
             && b3 <= -0.50;
         let delayed_3bar_collapse = !gen2_bar2_green_rebound
+            && !gen17_cross_stream_shakeout_absorption_defer
             && r1 <= 0.0
             && r2 <= -0.25
             && r3 <= -0.50
@@ -2493,21 +2632,44 @@ impl PrecedentKnnIndex {
                 let min_exp_delta = 0.14 * q_lock_b;
                 if post_peak_r > r_k + min_exp_delta {
                     let delta_stop_r = (r_k - r_locked_k).max(0.32 * q_lock_b);
-                    let risk_house_money_tranche = phi_b * r_locked_k;
-                    let guaranteed_net_floor_r = (1.0 - phi_b) * r_locked_k;
-                    let raw_add_r =
-                        risk_house_money_tranche * ((post_peak_r - r_k) / delta_stop_r);
-                    let additional_r_gained = raw_add_r.clamp(0.08, 2.15 * phi_b);
+                    let gamma_recycle = if syn_state.generation_id >= 17 {
+                        syn_state
+                            .learned_cross_brain_recycle_multiplier
+                            .clamp(1.00, 1.35)
+                    } else {
+                        1.00
+                    };
+                    let phi_effective = (phi_b * gamma_recycle).min(0.72);
+                    let base_tranche_risk = phi_b * r_locked_k;
+                    let base_raw_add_r =
+                        base_tranche_risk * ((post_peak_r - r_k) / delta_stop_r);
+                    let base_add_r = base_raw_add_r.clamp(0.08, 2.15 * phi_b);
+
+                    let risk_house_money_tranche = phi_effective * r_locked_k;
+                    let guaranteed_net_floor_r = (1.0 - phi_effective) * r_locked_k;
+                    let continuation_mult = ((post_peak_r - r_locked_k).max(0.28)
+                        / delta_stop_r.max(0.16))
+                    .clamp(1.15, 2.85);
+                    let recycled_extra_r = if syn_state.generation_id >= 17 {
+                        ((phi_effective - phi_b).max(0.0) * continuation_mult).clamp(0.03, 0.42)
+                    } else {
+                        0.0
+                    };
+                    let additional_r_gained = base_add_r + recycled_extra_r;
 
                     return Some(HouseMoneyRunnerScaleInDiagnostic {
                         scale_bar_offset: (*bar_k).min(28) as u8,
                         scale_entry_r: (r_k * 1000.0).round() / 1000.0,
                         locked_profit_r: (r_locked_k * 1000.0).round() / 1000.0,
                         house_money_reinvestment_fraction_phi: (phi_b * 10000.0).round() / 10000.0,
+                        recycled_risk_multiplier_gamma: (gamma_recycle * 10000.0).round() / 10000.0,
+                        effective_reinvestment_fraction_phi: (phi_effective * 10000.0).round()
+                            / 10000.0,
+                        recycled_extra_r_gained: (recycled_extra_r * 1000.0).round() / 1000.0,
                         house_money_tranche_risk_r: (risk_house_money_tranche * 1000.0).round()
                             / 1000.0,
                         guaranteed_net_floor_r: (guaranteed_net_floor_r * 1000.0).round() / 1000.0,
-                        additional_r_gained: (additional_r_gained * 100.0).round() / 100.0,
+                        additional_r_gained: (additional_r_gained * 1000.0).round() / 1000.0,
                         giveback_log_likelihood_ratio: (giveback_llr_k * 1000.0).round() / 1000.0,
                         runner_continuation_threshold: b_runner_b,
                         mahalanobis_runner_distance: maha_runner,

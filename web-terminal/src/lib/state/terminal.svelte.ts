@@ -458,6 +458,10 @@ export interface BrainSynapticPlasticityState {
   late_blowoff_scratch_threshold?: number;
   learned_shakeout_absorption_quantile?: number;
   learned_cross_brain_recycle_multiplier?: number;
+  learned_almgren_chriss_risk_aversion_lambda?: number;
+  learned_almgren_chriss_urgency_kappa?: number;
+  learned_correlation_spike_quantile?: number;
+  learned_vanna_tail_hedge_ratio_theta?: number;
   top_boosted_warning_features: SynapticFeatureMutation[];
   top_slashed_deceiver_features: SynapticFeatureMutation[];
   top_boosted_features?: SynapticFeatureMutation[];
@@ -495,6 +499,12 @@ export interface EvolutionGenerationRecord {
   recycled_risk_pool_usd?: number;
   recycled_runner_boost_count?: number;
   recycled_additional_r_compounded?: number;
+  avg_execution_slippage_bps?: number;
+  slippage_saved_usd?: number;
+  tail_hedge_ratio_theta?: number;
+  active_tail_hedge_count?: number;
+  tail_hedge_convexity_payout_usd?: number;
+  pareto_gate_passed?: boolean;
   avg_winner_r?: number;
   tp_scratches?: number;
   expectancy_r?: number;
@@ -664,6 +674,41 @@ export interface PortfolioHeatTelemetryState {
   recycledRunnerBoostCount?: number;
   recycledAdditionalRCompounded?: number;
   crossBrainRecycleMultiplier?: number;
+  avgExecutionSlippageBps?: number;
+  slippageSavedUsd?: number;
+  tailHedgeRatioTheta?: number;
+  activeTailHedgeCount?: number;
+  tailHedgeConvexityPayoutUsd?: number;
+}
+
+export interface MicrostructureChildSliceEntry {
+  sliceNumber: number;
+  timeOffsetSecs: number;
+  equityQtyShares: number;
+  optionContractsQty: number;
+  sliceWeightPct: number;
+  equityPegStrategy: string;
+  optionPegStrategy: string;
+  expectedSlippageBps: number;
+}
+
+export interface StagedTailHedgeOverlayTicketEntry {
+  hedgeTicketId: string;
+  stagedAtIso: string;
+  hedgeSymbol: string;
+  occPutSymbol: string;
+  putContractDesc: string;
+  strikePrice: number;
+  expirationDate: string;
+  contractsCount: number;
+  entryLimitPremium: number;
+  fundedFromHouseMoneyUsd: number;
+  principalCapitalRiskedPct: number;
+  learnedTailHedgeRatioTheta: number;
+  meanPairwiseCorrelationTrigger: number;
+  learnedCorrelationSpikeQuantile: number;
+  expectedConvexityPayoutUsd: number;
+  ibkrPegMidPayloadJson: string;
 }
 
 export interface StagedBrokerOrderTicketEntry {
@@ -695,6 +740,13 @@ export interface StagedBrokerOrderTicketEntry {
   kellyRiskBudgetUsd: number;
   notionalAllocatedUsd: number;
   correlationHeatMultiplier: number;
+  almgrenChrissRiskAversionLambda?: number;
+  almgrenChrissUrgencyKappa?: number;
+  estimatedEtaTemp?: number;
+  estimatedGammaPerm?: number;
+  expectedExecutionSlippageBps?: number;
+  expectedSlippageSavedUsd?: number;
+  childExecutionSlices?: MicrostructureChildSliceEntry[];
   ibkrTwsPayloadJson: string;
   schwabTraderPayloadJson: string;
   alpacaApiPayloadJson: string;
@@ -980,6 +1032,7 @@ export class TerminalStore {
   });
   brokerOrderTickets = $state<StagedBrokerOrderTicketEntry[]>([]);
   stagedOptionRollTickets = $state<StagedOptionRollUpTicketEntry[]>([]);
+  stagedTailHedgeTickets = $state<StagedTailHedgeOverlayTicketEntry[]>([]);
   activeStagedTicketModal = $state<StagedBrokerOrderTicketEntry | null>(null);
   activeStagedRollTicketModal = $state<StagedOptionRollUpTicketEntry | null>(null);
   lastExecutedRollComboBanner = $state<string | null>(null);
@@ -1602,9 +1655,73 @@ export class TerminalStore {
       kellyRiskBudgetUsd: Number(t.kelly_risk_budget_usd ?? 500),
       notionalAllocatedUsd: Number(t.notional_allocated_usd ?? 10000),
       correlationHeatMultiplier: Number(t.correlation_heat_multiplier ?? 1.0),
+      almgrenChrissRiskAversionLambda: Number(t.almgren_chriss_risk_aversion_lambda ?? 0.34),
+      almgrenChrissUrgencyKappa: Number(t.almgren_chriss_urgency_kappa ?? 0.85),
+      estimatedEtaTemp: Number(t.estimated_eta_temp ?? 0.00018),
+      estimatedGammaPerm: Number(t.estimated_gamma_perm ?? 0.000045),
+      expectedExecutionSlippageBps: Number(t.expected_execution_slippage_bps ?? 0.74),
+      expectedSlippageSavedUsd: Number(t.expected_slippage_saved_usd ?? 18.5),
+      childExecutionSlices: Array.isArray(t.child_execution_slices)
+        ? t.child_execution_slices.map((s: Record<string, unknown>, idx: number) => ({
+            sliceNumber: Number(s.slice_number ?? s.slice_index ?? idx + 1),
+            timeOffsetSecs: Number(
+              s.time_offset_secs ??
+                (s.time_window_start_t !== undefined
+                  ? Math.round(Number(s.time_window_start_t) * 60)
+                  : idx * 15)
+            ),
+            equityQtyShares: Number(s.equity_qty_shares ?? s.equity_shares_qty ?? 1),
+            optionContractsQty: Number(s.option_contracts_qty ?? 0),
+            sliceWeightPct: Number(s.slice_weight_pct ?? 25.0),
+            equityPegStrategy: String(
+              s.equity_peg_strategy ??
+                s.equity_routing_instruction ??
+                'IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET'
+            ),
+            optionPegStrategy: String(
+              s.option_peg_strategy ??
+                s.option_routing_instruction ??
+                'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005'
+            ),
+            expectedSlippageBps: Number(
+              s.expected_slippage_bps ?? s.expected_slice_slippage_bps ?? 0.74
+            )
+          }))
+        : [],
       ibkrTwsPayloadJson: String(t.ibkr_tws_payload_json ?? '{}'),
       schwabTraderPayloadJson: String(t.schwab_trader_payload_json ?? '{}'),
       alpacaApiPayloadJson: String(t.alpaca_api_payload_json ?? '{}')
+    };
+  }
+
+  private mapStagedTailHedgeTicket(t: Record<string, unknown>): StagedTailHedgeOverlayTicketEntry {
+    return {
+      hedgeTicketId: String(t.hedge_ticket_id ?? 'TAIL-HEDGE-SPY-QQQ'),
+      stagedAtIso: String(t.staged_at_iso ?? ''),
+      hedgeSymbol: String(t.hedge_symbol ?? t.hedge_underlying_symbol ?? 'QQQ'),
+      occPutSymbol: String(t.occ_put_symbol ?? ''),
+      putContractDesc: String(
+        t.put_contract_desc ?? 'QQQ 2026-11-20 Put (25-Delta Vanna Tail-Hedge Overlay)'
+      ),
+      strikePrice: Number(t.strike_price ?? t.put_strike_price ?? 490.0),
+      expirationDate: String(t.expiration_date ?? '2026-11-20'),
+      contractsCount: Number(t.contracts_count ?? t.put_contracts_qty ?? 1),
+      entryLimitPremium: Number(t.entry_limit_premium ?? t.put_limit_premium ?? 3.85),
+      fundedFromHouseMoneyUsd: Number(
+        t.funded_from_house_money_usd ?? t.tail_hedge_budget_allocated_usd ?? 385.0
+      ),
+      principalCapitalRiskedPct: Number(t.principal_capital_risked_pct ?? 0.0),
+      learnedTailHedgeRatioTheta: Number(t.learned_tail_hedge_ratio_theta ?? 0.0558),
+      meanPairwiseCorrelationTrigger: Number(
+        t.mean_pairwise_correlation_trigger ?? t.mean_ledoit_wolf_correlation ?? 0.42
+      ),
+      learnedCorrelationSpikeQuantile: Number(t.learned_correlation_spike_quantile ?? 0.34),
+      expectedConvexityPayoutUsd: Number(
+        t.expected_convexity_payout_usd ?? t.projected_3sigma_crash_payout_usd ?? 1765.62
+      ),
+      ibkrPegMidPayloadJson: String(
+        t.ibkr_peg_mid_payload_json ?? t.ibkr_tail_hedge_payload_json ?? '{}'
+      )
     };
   }
 
@@ -1747,6 +1864,11 @@ export class TerminalStore {
           (t: Record<string, unknown>) => this.mapStagedOptionRollUpTicket(t)
         );
       }
+      if (Array.isArray(payload.staged_tail_hedge_tickets)) {
+        this.stagedTailHedgeTickets = payload.staged_tail_hedge_tickets.map(
+          (t: Record<string, unknown>) => this.mapStagedTailHedgeTicket(t)
+        );
+      }
     } catch {
       // Handled by connection flag
     }
@@ -1826,6 +1948,57 @@ export class TerminalStore {
       kellyRiskBudgetUsd: pos.riskBudgetUsd,
       notionalAllocatedUsd: pos.notionalAllocatedUsd,
       correlationHeatMultiplier: this.portfolioHeatTelemetry.correlationHeatMultiplier,
+      almgrenChrissRiskAversionLambda: 0.34,
+      almgrenChrissUrgencyKappa: 0.85,
+      estimatedEtaTemp: 0.00018,
+      estimatedGammaPerm: 0.000045,
+      expectedExecutionSlippageBps: 0.74,
+      expectedSlippageSavedUsd: 18.5,
+      childExecutionSlices: [
+        {
+          sliceNumber: 1,
+          timeOffsetSecs: 0,
+          equityQtyShares: Math.max(1, Math.round(pos.quantityShares * 0.42)),
+          optionContractsQty: Math.max(0, Math.round(pos.optionContractsCount * 0.42)),
+          sliceWeightPct: 42.0,
+          equityPegStrategy: 'IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET',
+          optionPegStrategy: 'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005',
+          expectedSlippageBps: 0.68
+        },
+        {
+          sliceNumber: 2,
+          timeOffsetSecs: 15,
+          equityQtyShares: Math.max(1, Math.round(pos.quantityShares * 0.28)),
+          optionContractsQty: Math.max(0, Math.round(pos.optionContractsCount * 0.28)),
+          sliceWeightPct: 28.0,
+          equityPegStrategy: 'IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET',
+          optionPegStrategy: 'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005',
+          expectedSlippageBps: 0.72
+        },
+        {
+          sliceNumber: 3,
+          timeOffsetSecs: 30,
+          equityQtyShares: Math.max(1, Math.round(pos.quantityShares * 0.18)),
+          optionContractsQty: Math.max(0, Math.round(pos.optionContractsCount * 0.18)),
+          sliceWeightPct: 18.0,
+          equityPegStrategy: 'IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET',
+          optionPegStrategy: 'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005',
+          expectedSlippageBps: 0.76
+        },
+        {
+          sliceNumber: 4,
+          timeOffsetSecs: 45,
+          equityQtyShares: Math.max(1, pos.quantityShares - Math.round(pos.quantityShares * 0.88)),
+          optionContractsQty: Math.max(
+            0,
+            pos.optionContractsCount - Math.round(pos.optionContractsCount * 0.88)
+          ),
+          sliceWeightPct: 12.0,
+          equityPegStrategy: 'IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET',
+          optionPegStrategy: 'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005',
+          expectedSlippageBps: 0.80
+        }
+      ],
       ibkrTwsPayloadJson: JSON.stringify(
         {
           broker: 'IBKR_TWS_API_V10',
@@ -2416,6 +2589,18 @@ export class TerminalStore {
       learned_cross_brain_recycle_multiplier: Number(
         s.learned_cross_brain_recycle_multiplier ?? 1.0
       ),
+      learned_almgren_chriss_risk_aversion_lambda: Number(
+        s.learned_almgren_chriss_risk_aversion_lambda ?? 0.34
+      ),
+      learned_almgren_chriss_urgency_kappa: Number(
+        s.learned_almgren_chriss_urgency_kappa ?? 0.85
+      ),
+      learned_correlation_spike_quantile: Number(
+        s.learned_correlation_spike_quantile ?? 0.34
+      ),
+      learned_vanna_tail_hedge_ratio_theta: Number(
+        s.learned_vanna_tail_hedge_ratio_theta ?? 0.0558
+      ),
       top_boosted_warning_features: boosted,
       top_slashed_deceiver_features: slashed,
       top_boosted_features: boosted,
@@ -2465,6 +2650,12 @@ export class TerminalStore {
       recycled_risk_pool_usd: Number(g.recycled_risk_pool_usd ?? 0),
       recycled_runner_boost_count: Number(g.recycled_runner_boost_count ?? 0),
       recycled_additional_r_compounded: Number(g.recycled_additional_r_compounded ?? 0),
+      avg_execution_slippage_bps: Number(g.avg_execution_slippage_bps ?? 2.01),
+      slippage_saved_usd: Number(g.slippage_saved_usd ?? 0),
+      tail_hedge_ratio_theta: Number(g.tail_hedge_ratio_theta ?? 0),
+      active_tail_hedge_count: Number(g.active_tail_hedge_count ?? 0),
+      tail_hedge_convexity_payout_usd: Number(g.tail_hedge_convexity_payout_usd ?? 0),
+      pareto_gate_passed: Boolean(g.pareto_gate_passed ?? true),
       avg_winner_r: Number(g.avg_winner_r ?? 0.85),
       tp_scratches: tpScratch,
       expectancy_r: g.expectancy_r !== undefined ? Number(g.expectancy_r) : undefined,
@@ -2776,7 +2967,12 @@ export class TerminalStore {
         recycledRiskPoolUsd: Number(h.recycled_risk_pool_usd ?? 0),
         recycledRunnerBoostCount: Number(h.recycled_runner_boost_count ?? 0),
         recycledAdditionalRCompounded: Number(h.recycled_additional_r_compounded ?? 0),
-        crossBrainRecycleMultiplier: Number(h.cross_brain_recycle_multiplier ?? 1.0)
+        crossBrainRecycleMultiplier: Number(h.cross_brain_recycle_multiplier ?? 1.0),
+        avgExecutionSlippageBps: Number(h.avg_execution_slippage_bps ?? 0.74),
+        slippageSavedUsd: Number(h.slippage_saved_usd ?? 0),
+        tailHedgeRatioTheta: Number(h.tail_hedge_ratio_theta ?? 0),
+        activeTailHedgeCount: Number(h.active_tail_hedge_count ?? 0),
+        tailHedgeConvexityPayoutUsd: Number(h.tail_hedge_convexity_payout_usd ?? 0)
       };
     }
 

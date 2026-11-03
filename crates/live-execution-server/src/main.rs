@@ -92,12 +92,17 @@ async fn main() -> anyhow::Result<()> {
                             .last()
                             .is_some_and(|b| b.timestamp_ns > *opened_ts_ns)
                         {
-                            let _ = bg_state.ledger.process_live_bar_for_symbol_and_brain(
+                            let settled = bg_state.ledger.process_live_bar_for_symbol_and_brain(
                                 sym,
                                 *brain_id,
                                 &raw_bars,
                                 &raw_internals,
                             );
+                            for closed_row in &settled {
+                                let _ = bg_state
+                                    .ledger
+                                    .on_live_trade_settled_continual_plasticity(closed_row);
+                            }
                         } else if let Some(latest_bar) = raw_bars.last() {
                             bg_state.ledger.mark_open_position_to_market(
                                 sym,

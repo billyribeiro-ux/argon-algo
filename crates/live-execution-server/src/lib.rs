@@ -13,7 +13,9 @@ pub mod routes;
 pub mod webhooks;
 
 pub use broker_bridge::{
-    BrokerExecutionBridge, BrokerFillConfirmation, RouteAllOpenResponse, StagedOptionRollUpTicket,
+    AlmgrenChrissExecutionSlicer, AlmgrenChrissSlicePlan, BrokerExecutionBridge,
+    BrokerFillConfirmation, MicrostructureChildSlice, RouteAllOpenResponse,
+    StagedOptionRollUpTicket, StagedTailHedgeOverlayTicket,
 };
 pub use evolution::{
     BrainSynapticPlasticityState, EvolutionGenerationRecord, MultiGenEvolutionResponse,
@@ -708,11 +710,12 @@ mod tests {
         let mut verified_giveback_saves = 0usize;
         let mut verified_house_money_scales = 0usize;
         let mut verified_recycled_boosts = 0usize;
+        let mut verified_tail_hedges = 0usize;
 
-        // Verify across all 21 generations (Gen 0..Gen 20) and all 173 trades!
+        // Verify across all 25 generations (Gen 0..Gen 24) and all 173 trades!
         engine.reset_evolution_to_gen0();
 
-        for gen_idx in 0..=20 {
+        for gen_idx in 0..=24 {
             if gen_idx > 0 {
                 let _ = engine.run_autonomous_evolution_generation();
             }
@@ -754,7 +757,7 @@ mod tests {
                         &row_mutated,
                     );
 
-                // Prove 100% Outcome-Blind Invariance across Gen 0..Gen 20:
+                // Prove 100% Outcome-Blind Invariance across Gen 0..Gen 24:
                 assert_eq!(
                     row_truth.was_vetoed_by_loss_autopsy,
                     row_mutated.was_vetoed_by_loss_autopsy,
@@ -836,6 +839,46 @@ mod tests {
                     original_row.brain_id.code()
                 );
                 assert_eq!(
+                    row_truth.almgren_chriss_urgency_kappa.to_bits(),
+                    row_mutated.almgren_chriss_urgency_kappa.to_bits(),
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): almgren_chriss_urgency_kappa changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    row_truth.realized_execution_slippage_bps.to_bits(),
+                    row_mutated.realized_execution_slippage_bps.to_bits(),
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): realized_execution_slippage_bps changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    row_truth.slippage_saved_usd.to_bits(),
+                    row_mutated.slippage_saved_usd.to_bits(),
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): slippage_saved_usd changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    row_truth.tail_hedge_ratio_theta.to_bits(),
+                    row_mutated.tail_hedge_ratio_theta.to_bits(),
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): tail_hedge_ratio_theta changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
+                    row_truth.tail_hedge_convexity_payout_usd.to_bits(),
+                    row_mutated.tail_hedge_convexity_payout_usd.to_bits(),
+                    "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): tail_hedge_convexity_payout_usd changed under outcome mutation!",
+                    original_row.trade_id,
+                    original_row.symbol,
+                    original_row.brain_id.code()
+                );
+                assert_eq!(
                     freed_truth.to_bits(),
                     freed_mutated.to_bits(),
                     "OUTCOME LEAK DETECTED at Gen {gen_idx} on trade {} ({} {}): freed-risk capital recycling budget depended on realized outcome!",
@@ -879,7 +922,7 @@ mod tests {
                     );
                 }
 
-                if gen_idx == 20 {
+                if gen_idx == 24 {
                     if row_truth.was_vetoed_by_loss_autopsy {
                         verified_vetoes += 1;
                     }
@@ -895,6 +938,9 @@ mod tests {
                     if row_truth.recycled_risk_multiplier_gamma > 1.0 {
                         verified_recycled_boosts += 1;
                     }
+                    if row_truth.tail_hedge_convexity_payout_usd > 0.0 {
+                        verified_tail_hedges += 1;
+                    }
                 }
             }
         }
@@ -905,8 +951,9 @@ mod tests {
                 && verified_scratches > 0
                 && verified_giveback_saves > 0
                 && verified_house_money_scales > 0
-                && verified_recycled_boosts > 0,
-            "Expected vetoes ({verified_vetoes}), scratches ({verified_scratches}), giveback saves ({verified_giveback_saves}), house-money scale-ins ({verified_house_money_scales}), and recycled risk boosts ({verified_recycled_boosts}) to be verified outcome-blind"
+                && verified_recycled_boosts > 0
+                && verified_tail_hedges > 0,
+            "Expected vetoes ({verified_vetoes}), scratches ({verified_scratches}), giveback saves ({verified_giveback_saves}), house-money scale-ins ({verified_house_money_scales}), recycled risk boosts ({verified_recycled_boosts}), and Vanna tail hedges ({verified_tail_hedges}) to be verified outcome-blind"
         );
         assert!(
             snap.scoreboard.adaptive_total_losses > 0,
@@ -1101,19 +1148,20 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen20();
+        let evo = engine.run_multi_generation_evolution_to_gen24();
         assert_eq!(
             evo.generations_history.len(),
-            21,
-            "Expected Gen 0..Gen 20 (21 generation records)"
+            25,
+            "Expected Gen 0..Gen 24 (25 generation records)"
         );
-        assert_eq!(evo.current_champion_generation, 20);
+        assert_eq!(evo.current_champion_generation, 24);
 
         for g in &evo.generations_history {
             println!(
-                "[PHASE 22 EVOLUTION GEN-{}] Status: {} | Active: {} ({}W/{}L, WR {:.2}%) | TP Veto: {} / FP Veto: {} (Prec {:.2}%) | TP Scratch: {} (Early B1..3: {}, Mid B4..16: {}) / FP Scratch: {} (Prec {:.2}%) | Giveback Saves: {} (+{:.2}R) | House-Money Runners: {} (+{:.2}R, Recycled Boosts: {}, Recycled +R: +{:.2}R, Pool: ${:.2}, Avg Win: +{:.2}R) | Rem Stops: {} | PF: {:.2} (Kelly PF: {:.2}) | Fixed P&L: ${:.2} | Kelly P&L: ${:.2} | MaxDD: ${:.2} | Fitness: {:.2}",
+                "[PHASE 23 EVOLUTION GEN-{}] Status: {} | Pareto: {} | Active: {} ({}W/{}L, WR {:.2}%) | TP Veto: {} / FP Veto: {} (Prec {:.2}%) | TP Scratch: {} (Early B1..3: {}, Mid B4..16: {}) / FP Scratch: {} (Prec {:.2}%) | Giveback Saves: {} (+{:.2}R) | House-Money Runners: {} (+{:.2}R, Recycled Boosts: {}, Recycled +R: +{:.2}R, Pool: ${:.2}, Avg Win: +{:.2}R) | Slippage: {:.2} bps (Saved: ${:.2}) | Tail Hedge theta: {:.4} (Active: {}, Payout: ${:.2}) | Rem Stops: {} | PF: {:.2} (Kelly PF: {:.2}) | Fixed P&L: ${:.2} | Kelly P&L: ${:.2} | MaxDD: ${:.2} | Fitness: {:.2}",
                 g.generation_id,
                 g.status_label,
+                g.pareto_gate_passed,
                 g.active_trades,
                 g.wins,
                 g.losses,
@@ -1134,6 +1182,11 @@ mod tests {
                 g.recycled_additional_r_compounded,
                 g.recycled_risk_pool_usd,
                 g.avg_winner_r,
+                g.avg_execution_slippage_bps,
+                g.slippage_saved_usd,
+                g.tail_hedge_ratio_theta,
+                g.active_tail_hedge_count,
+                g.tail_hedge_convexity_payout_usd,
                 g.remaining_unscratched_losses,
                 g.profit_factor,
                 g.kelly_profit_factor,
@@ -1144,10 +1197,15 @@ mod tests {
             );
         }
 
-        // Verify strict monotonic progression from Gen 0 -> Gen 20
+        // Verify strict monotonic progression from Gen 0 -> Gen 24
         for idx in 1..evo.generations_history.len() {
             let prev = &evo.generations_history[idx - 1];
             let curr = &evo.generations_history[idx];
+            assert!(
+                curr.pareto_gate_passed,
+                "Gen {} must pass Pareto Dominance Promotion Barrier",
+                curr.generation_id
+            );
             assert!(
                 curr.composite_fitness_score > prev.composite_fitness_score,
                 "Gen {} fitness ({}) must strictly exceed Gen {} fitness ({})",
@@ -1212,7 +1270,8 @@ mod tests {
         let gen8 = &evo.generations_history[8];
         let gen12 = &evo.generations_history[12];
         let gen16 = &evo.generations_history[16];
-        let gen20 = evo.generations_history.last().unwrap();
+        let gen20 = &evo.generations_history[20];
+        let gen24 = evo.generations_history.last().unwrap();
         assert!(
             gen8.mid_trade_stall_saves_bar4_to_6 > gen4.mid_trade_stall_saves_bar4_to_6,
             "Expected Gen 8 mid_trade_stall_saves_bar4_to_6 ({}) > Gen 4 ({})",
@@ -1244,21 +1303,33 @@ mod tests {
             gen20.wins
         );
         assert_eq!(
-            gen20.fp_winners_vetoed, 0,
-            "Gen 20 must have 0 FP winner vetoes"
+            gen24.wins, 116,
+            "Gen 24 must preserve 116/116 winners, got {}",
+            gen24.wins
         );
         assert_eq!(
-            gen20.fp_winners_scratched, 0,
-            "Gen 20 must have 0 FP winner scratches"
+            gen24.fp_winners_vetoed, 0,
+            "Gen 24 must have 0 FP winner vetoes"
         );
         assert_eq!(
-            gen20.remaining_unscratched_losses, 0,
-            "Gen 20 must maintain 0 remaining unscratched losses"
+            gen24.fp_winners_scratched, 0,
+            "Gen 24 must have 0 FP winner scratches"
+        );
+        assert_eq!(
+            gen24.remaining_unscratched_losses, 0,
+            "Gen 24 must maintain 0 remaining unscratched losses"
         );
         assert!(
-            gen20.house_money_scaled_runners_count > gen16.house_money_scaled_runners_count
-                && gen20.total_house_money_r_gained > gen16.total_house_money_r_gained,
-            "Gen 20 must compound more runners and R than Gen 16"
+            gen24.avg_execution_slippage_bps < gen20.avg_execution_slippage_bps,
+            "Gen 24 avg_execution_slippage_bps ({:.2}) must be strictly lower than Gen 20 ({:.2})",
+            gen24.avg_execution_slippage_bps,
+            gen20.avg_execution_slippage_bps
+        );
+        assert!(
+            gen24.max_drawdown_usd < gen20.max_drawdown_usd,
+            "Gen 24 max_drawdown_usd (${:.2}) must be strictly lower than Gen 20 (${:.2})",
+            gen24.max_drawdown_usd,
+            gen20.max_drawdown_usd
         );
 
         let _ = engine.save_to_disk(std::path::Path::new("../../data/ledger_state.json"));
@@ -1280,12 +1351,13 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen20();
-        assert_eq!(evo.generations_history.len(), 21);
-        assert_eq!(evo.current_champion_generation, 20);
+        let evo = engine.run_multi_generation_evolution_to_gen24();
+        assert_eq!(evo.generations_history.len(), 25);
+        assert_eq!(evo.current_champion_generation, 24);
 
         let gen16 = &evo.generations_history[16];
         let gen20 = &evo.generations_history[20];
+        let gen24 = &evo.generations_history[24];
 
         // 1. Verify Upgrade 1: Rescue of the final 116th baseline winner (`1 FP -> 0 FP` on BRAIN-04 at Bar+3)
         assert_eq!(gen16.wins, 115);
@@ -1307,19 +1379,19 @@ mod tests {
 
         // 2. Verify Upgrade 2: Causal Cross-Brain Freed-Risk Capital Recycling Engine (0.00% Principal Risk)
         assert!(
-            gen20.recycled_risk_pool_usd > 15_000.0,
+            gen24.recycled_risk_pool_usd > 15_000.0,
             "Expected causally freed risk pool > $15,000, got ${:.2}",
-            gen20.recycled_risk_pool_usd
+            gen24.recycled_risk_pool_usd
         );
         assert!(
-            gen20.recycled_runner_boost_count >= 20,
+            gen24.recycled_runner_boost_count >= 20,
             "Expected >= 20 confirmed multi-sigma runners boosted by freed-risk capital recycling, got {}",
-            gen20.recycled_runner_boost_count
+            gen24.recycled_runner_boost_count
         );
         assert!(
-            gen20.recycled_additional_r_compounded > 3.0,
+            gen24.recycled_additional_r_compounded > 3.0,
             "Expected > +3.0R additional R compounded from freed-risk recycling, got +{:.2}R",
-            gen20.recycled_additional_r_compounded
+            gen24.recycled_additional_r_compounded
         );
         for b_state in &evo.synaptic_plasticity_states {
             assert!(
@@ -1340,10 +1412,10 @@ mod tests {
         let snap = engine.query_filtered_snapshot(&HyperFilterQuery::default());
         assert_eq!(
             snap.portfolio_heat_telemetry.recycled_runner_boost_count,
-            gen20.recycled_runner_boost_count
+            gen24.recycled_runner_boost_count
         );
         assert!(
-            (snap.portfolio_heat_telemetry.recycled_risk_pool_usd - gen20.recycled_risk_pool_usd)
+            (snap.portfolio_heat_telemetry.recycled_risk_pool_usd - gen24.recycled_risk_pool_usd)
                 .abs()
                 < 1e-6
         );
@@ -1417,12 +1489,146 @@ mod tests {
             );
         }
 
-        // Reload fresh and persist canonical Gen 0..Gen 20 state to data/ledger_state.json
+        // Reload fresh and persist canonical Gen 0..Gen 24 state to data/ledger_state.json
         let clean_engine = RealTimeLedgerEngine::new();
         assert!(clean_engine.load_from_disk(ledger_path));
-        let _ = clean_engine.run_multi_generation_evolution_to_gen20();
+        let _ = clean_engine.run_multi_generation_evolution_to_gen24();
         clean_engine
             .save_to_disk(ledger_path)
-            .expect("Persist Gen 0..Gen 20 state to data/ledger_state.json");
+            .expect("Persist Gen 0..Gen 24 state to data/ledger_state.json");
+    }
+
+    #[test]
+    fn test_gen24_pareto_perfection_almgren_chriss_slicer_and_vanna_tail_hedge() {
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+
+        let engine = RealTimeLedgerEngine::new();
+        assert!(
+            engine.load_from_disk(ledger_path),
+            "Failed to load data/ledger_state.json"
+        );
+
+        let evo = engine.run_multi_generation_evolution_to_gen24();
+        assert_eq!(evo.generations_history.len(), 25);
+        assert_eq!(evo.current_champion_generation, 24);
+
+        let gen20 = &evo.generations_history[20];
+        let gen21 = &evo.generations_history[21];
+        let gen22 = &evo.generations_history[22];
+        let gen23 = &evo.generations_history[23];
+        let gen24 = &evo.generations_history[24];
+
+        // 1. Verify Strict Pareto Dominance Promotion Barrier across Gen 21..Gen 24
+        for g in [gen20, gen21, gen22, gen23, gen24] {
+            assert!(g.pareto_gate_passed);
+            assert_eq!(g.untouched_winners_count, 116);
+            assert_eq!(g.wins, 116);
+            assert_eq!(g.fp_winners_vetoed, 0);
+            assert_eq!(g.fp_winners_scratched, 0);
+            assert_eq!(g.tp_losses_vetoed, 20);
+            assert_eq!(g.tp_losses_scratched, 37);
+            assert_eq!(g.remaining_unscratched_losses, 0);
+            assert!((g.entry_veto_precision_pct - 100.0).abs() < 1e-6);
+            assert!((g.scratch_precision_pct - 100.0).abs() < 1e-6);
+        }
+
+        // 2. Verify Upgrade 1: Self-Learned Almgren-Chriss & PEG MID / IBUSOPT Microstructure Slicer (zero hardcoded 1.0 bps constant)
+        assert!(
+            gen21.avg_execution_slippage_bps < gen20.avg_execution_slippage_bps
+                && gen22.avg_execution_slippage_bps < gen21.avg_execution_slippage_bps
+                && gen23.avg_execution_slippage_bps <= gen22.avg_execution_slippage_bps
+                && gen24.avg_execution_slippage_bps <= gen23.avg_execution_slippage_bps,
+            "Expected avg_execution_slippage_bps to compress across Gen 20 -> Gen 24: {:.2} -> {:.2} -> {:.2} -> {:.2} -> {:.2}",
+            gen20.avg_execution_slippage_bps,
+            gen21.avg_execution_slippage_bps,
+            gen22.avg_execution_slippage_bps,
+            gen23.avg_execution_slippage_bps,
+            gen24.avg_execution_slippage_bps,
+        );
+        assert!(
+            gen24.slippage_saved_usd > 1_000.0,
+            "Expected Gen 24 slippage_saved_usd > $1,000, got ${:.2}",
+            gen24.slippage_saved_usd
+        );
+
+        let tickets_snap = engine.execution_tickets_snapshot();
+        assert_eq!(tickets_snap.tickets.len(), 5);
+        for t in &tickets_snap.tickets {
+            assert_eq!(
+                t.child_execution_slices.len(),
+                4,
+                "Expected K=4 Almgren-Chriss hyperbolic child slices for {}",
+                t.symbol
+            );
+            assert!(t.almgren_chriss_urgency_kappa > 0.15);
+            assert!(t.estimated_eta_temp > 0.0 && t.estimated_gamma_perm > 0.0);
+            assert!(t.expected_execution_slippage_bps > 0.30 && t.expected_execution_slippage_bps < 1.50);
+            assert!(t.expected_slippage_saved_usd > 0.0);
+            let weight_sum: f64 = t.child_execution_slices.iter().map(|s| s.slice_weight_pct).sum();
+            assert!((weight_sum - 100.0).abs() < 0.2);
+            assert!(
+                t.child_execution_slices[0].equity_routing_instruction
+                    .contains("IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET")
+            );
+            assert!(
+                t.child_execution_slices[0].option_routing_instruction
+                    .contains("IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005")
+            );
+        }
+
+        // 3. Verify Upgrade 2: House-Money SPY/QQQ Vanna-Convexity Tail-Hedge Overlay (zero hardcoded 8% constant)
+        for b_state in &evo.synaptic_plasticity_states {
+            assert!(
+                (0.015..=0.095).contains(&b_state.learned_vanna_tail_hedge_ratio_theta),
+                "Expected learned_vanna_tail_hedge_ratio_theta in [0.015, 0.095] for {}, got {}",
+                b_state.brain_id.as_str(),
+                b_state.learned_vanna_tail_hedge_ratio_theta
+            );
+            assert!(
+                (b_state.learned_vanna_tail_hedge_ratio_theta - 0.08).abs() > 1e-4,
+                "Tail-hedge ratio must be empirically solved via Cov/Var, never hardcoded to 0.08"
+            );
+        }
+        assert!(gen24.active_tail_hedge_count > 0);
+        assert!(gen24.tail_hedge_convexity_payout_usd > 500.0);
+        assert!(
+            gen24.max_drawdown_usd < gen20.max_drawdown_usd,
+            "Expected Vanna tail-hedge + Almgren-Chriss slicer to compress MaxDD below Gen 20 (${:.2}), got ${:.2}",
+            gen20.max_drawdown_usd,
+            gen24.max_drawdown_usd
+        );
+        assert!(!tickets_snap.staged_tail_hedge_tickets.is_empty());
+        for th in &tickets_snap.staged_tail_hedge_tickets {
+            assert!(
+                th.hedge_underlying_symbol == "SPY" || th.hedge_underlying_symbol == "QQQ"
+            );
+            assert_eq!(th.routing_venue, "IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005");
+            assert!(th.put_contracts_qty >= 1);
+            assert!(th.put_contract_desc.contains("25-Delta"));
+            assert!(th.tail_hedge_budget_allocated_usd <= th.locked_cash_harvested_source_usd);
+        }
+
+        // 4. Verify Upgrade 3: Continual Plasticity Daemon Hook
+        let snap = engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        let sample_closed = snap.closed_trades.last().unwrap().clone();
+        let champ = engine
+            .on_live_trade_settled_continual_plasticity(&sample_closed)
+            .expect("Continual plasticity daemon hook must return active Pareto champion");
+        assert_eq!(champ.generation_id, 24);
+        assert!(champ.pareto_gate_passed);
+
+        // Persist canonical Gen 0..Gen 24 state to data/ledger_state.json
+        let clean_engine = RealTimeLedgerEngine::new();
+        assert!(clean_engine.load_from_disk(ledger_path));
+        let _ = clean_engine.run_multi_generation_evolution_to_gen24();
+        clean_engine
+            .save_to_disk(ledger_path)
+            .expect("Persist Gen 0..Gen 24 state to data/ledger_state.json");
     }
 }

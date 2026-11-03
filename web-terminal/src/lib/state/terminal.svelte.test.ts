@@ -1769,4 +1769,163 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
     expect(executed).toBe(true);
     expect(store.activeStagedRollTicketModal?.rollStatus).toBe('ATOMIC_2LEG_BAG_EXECUTED_FILLED');
   });
+
+  it('hydrates Phase 23 Gen-24 Pareto Dominance Champion, Almgren-Chriss Child Execution Schedule, and SPY/QQQ Vanna Tail-Hedge Overlay', async () => {
+    const store = new TerminalStore(false);
+    store.ingestBackendSnapshot({
+      positions_opened: [
+        {
+          position_id: 'OPEN-P23-NVDA',
+          opened_timestamp_ns: 1_793_739_300_000_000_000,
+          symbol: 'NVDA',
+          exchange_index: 'NASDAQ_100',
+          brain_id: 'BRAIN-02',
+          direction: 'LONG',
+          entry_price: 210.0,
+          live_price: 218.5,
+          quantity_shares: 120,
+          kelly_fraction_pct: 2.15,
+          risk_budget_usd: 1120.0,
+          notional_allocated_usd: 25200.0,
+          tranche_count: 2,
+          structural_stop_price: 204.5,
+          target_1_price: 222.0,
+          target_2_price: 235.0,
+          unrealized_stock_pnl_usd: 1020.0,
+          unrealized_stock_pnl_pct: 4.05,
+          option_structure: 'LONG_CALL_GAMMA',
+          matched_option_contract: 'NVDA 2026-11-20 $210.00C',
+          option_entry_premium: 6.4,
+          option_live_premium: 11.8,
+          option_contracts_count: 6,
+          unrealized_option_pnl_usd: 3240.0,
+          unrealized_option_pnl_pct: 84.38
+        }
+      ],
+      closed_trades: [],
+      portfolio_heat_telemetry: {
+        account_equity_usd: 227406.09,
+        open_positions_count: 5,
+        aggregate_open_risk_usd: 2740.0,
+        aggregate_open_risk_pct: 1.2,
+        portfolio_heat_cap_pct: 8.5,
+        gross_portfolio_notional_usd: 54000.0,
+        net_portfolio_beta_delta_usd: 14800.0,
+        net_portfolio_gamma_1pct_usd: 1920.0,
+        net_portfolio_vanna_1pct_usd: 680.0,
+        mean_pairwise_correlation: 0.18,
+        max_pairwise_correlation: 0.34,
+        correlation_heat_multiplier: 1.0,
+        heat_regime_badge: 'LOW HEAT — FULL 1.00x KELLY CAPACITY',
+        position_labels: ['NVDA (BRAIN-02)'],
+        cross_position_correlation_matrix: [[1.0]],
+        pairwise_correlations: [],
+        overlapping_clusters_summary: 'Independent multi-horizon exposure',
+        recycled_risk_pool_usd: 50507.68,
+        recycled_runner_boost_count: 24,
+        recycled_additional_r_compounded: 10.63,
+        cross_brain_recycle_multiplier: 1.33,
+        avg_execution_slippage_bps: 0.74,
+        slippage_saved_usd: 2701.91,
+        tail_hedge_ratio_theta: 0.0558,
+        active_tail_hedge_count: 44,
+        tail_hedge_convexity_payout_usd: 1765.62
+      },
+      evolution_generations_history: [
+        {
+          generation_id: 24,
+          status_label: 'GEN-24 PROMOTED CHAMPION',
+          is_current_champion: true,
+          timestamp_iso: '2026-11-03T18:30:00Z',
+          active_trades: 153,
+          wins: 116,
+          losses: 37,
+          win_rate_pct: 75.82,
+          tp_losses_vetoed: 20,
+          fp_winners_vetoed: 0,
+          entry_veto_precision_pct: 100.0,
+          tp_losses_scratched: 37,
+          fp_winners_scratched: 0,
+          scratch_precision_pct: 100.0,
+          early_scratches_bar1_to_3: 19,
+          mid_trade_stall_saves_bar4_to_6: 18,
+          giveback_saves_count: 19,
+          total_giveback_r_recovered: 13.09,
+          house_money_scaled_runners_count: 24,
+          total_house_money_r_gained: 27.77,
+          recycled_risk_pool_usd: 50507.68,
+          recycled_runner_boost_count: 24,
+          recycled_additional_r_compounded: 10.63,
+          avg_execution_slippage_bps: 0.74,
+          slippage_saved_usd: 2701.91,
+          tail_hedge_ratio_theta: 0.0558,
+          active_tail_hedge_count: 44,
+          tail_hedge_convexity_payout_usd: 1765.62,
+          pareto_gate_passed: true,
+          avg_winner_r: 1.15,
+          tp_losses_caught_total: 57,
+          fp_winners_clipped_total: 0,
+          remaining_unscratched_losses: 0,
+          profit_factor: 29.36,
+          kelly_profit_factor: 28.05,
+          fixed_net_pnl_usd: 79464.72,
+          kelly_net_pnl_usd: 127406.09,
+          max_drawdown_usd: 234.0,
+          composite_fitness_score: 168817.43,
+          mutations_applied_summary: [
+            'Gen 24: Pareto Gate Passed (116/116 Winners, 57/57 Full Stops Eliminated), Almgren-Chriss Slippage 0.74 bps (+$2,701.91 saved), Vanna Tail-Hedge θ*=5.58% (+$1,765.62 convexity)'
+          ]
+        }
+      ],
+      synaptic_plasticity_states: [
+        {
+          brain_id: 'BRAIN-02',
+          generation_id: 24,
+          synaptic_feature_weights_32: Array(32).fill(1.24),
+          stream_prior_multipliers: [1.2, 1.15, 1.12, 1.28],
+          wald_sprt_thresholds: [1.44, 1.36, 1.42],
+          entry_veto_margin_delta: 0.015,
+          trap_conviction_weights: {},
+          empirical_bayes_shrinkage_lambda: 0.892,
+          learned_almgren_chriss_risk_aversion_lambda: 0.42,
+          learned_almgren_chriss_urgency_kappa: 0.94,
+          learned_correlation_spike_quantile: 0.34,
+          learned_vanna_tail_hedge_ratio_theta: 0.0558,
+          top_boosted_warning_features: [],
+          top_slashed_deceiver_features: [],
+          cumulative_tp_vetoes: 4,
+          cumulative_fp_vetoes: 0,
+          cumulative_tp_scratches: 9,
+          cumulative_fp_scratches: 0,
+          remaining_unscratched_losses: 0,
+          last_mutation_summary: 'Gen 24 promoted champion'
+        }
+      ]
+    });
+
+    const gen24 = store.evolutionGenerationsHistory[0]!;
+    expect(gen24.generation_id).toBe(24);
+    expect(gen24.winners_preserved_count).toBe(116);
+    expect(gen24.remaining_full_stops).toBe(0);
+    expect(gen24.pareto_gate_passed).toBe(true);
+    expect(gen24.avg_execution_slippage_bps).toBeCloseTo(0.74, 2);
+    expect(gen24.slippage_saved_usd).toBeCloseTo(2701.91, 2);
+    expect(gen24.tail_hedge_ratio_theta).toBeCloseTo(0.0558, 4);
+    expect(gen24.active_tail_hedge_count).toBe(44);
+    expect(gen24.tail_hedge_convexity_payout_usd).toBeCloseTo(1765.62, 2);
+
+    expect(store.portfolioHeatTelemetry.avgExecutionSlippageBps).toBeCloseTo(0.74, 2);
+    expect(store.portfolioHeatTelemetry.slippageSavedUsd).toBeCloseTo(2701.91, 2);
+    expect(store.portfolioHeatTelemetry.tailHedgeRatioTheta).toBeCloseTo(0.0558, 4);
+
+    const ticket = await store.stageBrokerOrderTicket('OPEN-P23-NVDA', 'IBKR_TWS');
+    expect(ticket).not.toBeNull();
+    expect(ticket?.childExecutionSlices?.length).toBe(4);
+    expect(ticket?.childExecutionSlices?.[0]?.equityPegStrategy).toBe(
+      'IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET'
+    );
+    expect(ticket?.childExecutionSlices?.[0]?.optionPegStrategy).toBe(
+      'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005'
+    );
+  });
 });

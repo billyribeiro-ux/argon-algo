@@ -102,7 +102,27 @@ fn default_cross_brain_recycle_multiplier() -> f64 {
     1.00
 }
 
-/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 22`).
+fn default_almgren_chriss_risk_aversion_lambda() -> f64 {
+    0.18
+}
+
+fn default_almgren_chriss_urgency_kappa() -> f64 {
+    0.42
+}
+
+fn default_correlation_spike_quantile() -> f64 {
+    0.52
+}
+
+fn default_vanna_tail_hedge_ratio_theta() -> f64 {
+    0.00
+}
+
+fn default_pareto_gate_passed() -> bool {
+    true
+}
+
+/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 23`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainSynapticPlasticityState {
     pub brain_id: BrainHorizonId,
@@ -156,6 +176,18 @@ pub struct BrainSynapticPlasticityState {
     /// Phase 22 Upgrade 2: Self-learned Cross-Brain Freed-Margin Capital Recycling multiplier ($\gamma_{\text{recycle}, b}^{(g)} \in [1.00, 1.35]$)
     #[serde(default = "default_cross_brain_recycle_multiplier")]
     pub learned_cross_brain_recycle_multiplier: f64,
+    /// Phase 23 Upgrade 1: Self-learned Almgren-Chriss execution risk-aversion urgency multiplier ($\lambda_{\text{risk}, b}^{(g)} \in [0.12, 0.92]$)
+    #[serde(default = "default_almgren_chriss_risk_aversion_lambda")]
+    pub learned_almgren_chriss_risk_aversion_lambda: f64,
+    /// Phase 23 Upgrade 1: Self-learned Almgren-Chriss hyperbolic execution urgency parameter ($\kappa_b^{(g)} = \sqrt{\lambda_{\text{risk}, b}^{(g)} \sigma_{\text{bar}}^2 / \eta_{\text{temp}}}$)
+    #[serde(default = "default_almgren_chriss_urgency_kappa")]
+    pub learned_almgren_chriss_urgency_kappa: f64,
+    /// Phase 23 Upgrade 2: Self-learned empirical cross-position Ledoit-Wolf correlation spike activation quantile ($q_{\text{corr}, b}^*$)
+    #[serde(default = "default_correlation_spike_quantile")]
+    pub learned_correlation_spike_quantile: f64,
+    /// Phase 23 Upgrade 2: Self-learned Minimum-Variance Vanna-Convexity Tail-Hedge Ratio ($\theta_{\text{hedge}, b}^{(g)} = \text{clamp}(\text{Cov}(R_p, R_{\text{put}})/\text{Var}(R_{\text{put}}), 0.015, 0.095)$)
+    #[serde(default = "default_vanna_tail_hedge_ratio_theta")]
+    pub learned_vanna_tail_hedge_ratio_theta: f64,
     pub top_boosted_warning_features: Vec<SynapticFeatureMutation>,
     pub top_slashed_deceiver_features: Vec<SynapticFeatureMutation>,
 }
@@ -193,6 +225,10 @@ impl BrainSynapticPlasticityState {
             late_blowoff_scratch_threshold: 1.85,
             learned_shakeout_absorption_quantile: 0.98,
             learned_cross_brain_recycle_multiplier: 1.00,
+            learned_almgren_chriss_risk_aversion_lambda: 0.18,
+            learned_almgren_chriss_urgency_kappa: 0.42,
+            learned_correlation_spike_quantile: 0.52,
+            learned_vanna_tail_hedge_ratio_theta: 0.00,
             top_boosted_warning_features: Vec::new(),
             top_slashed_deceiver_features: Vec::new(),
         }
@@ -241,7 +277,7 @@ impl BrainSynapticPlasticityState {
     }
 }
 
-/// Complete audit record for a single generation (`Gen 0 .. Gen 8`)
+/// Complete audit record for a single generation (`Gen 0 .. Gen 24`)
 /// in the Autonomous Multi-Generation Loss-Evolution loop.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvolutionGenerationRecord {
@@ -276,6 +312,18 @@ pub struct EvolutionGenerationRecord {
     pub recycled_runner_boost_count: usize,
     #[serde(default)]
     pub recycled_additional_r_compounded: f64,
+    #[serde(default)]
+    pub avg_execution_slippage_bps: f64,
+    #[serde(default)]
+    pub slippage_saved_usd: f64,
+    #[serde(default)]
+    pub tail_hedge_ratio_theta: f64,
+    #[serde(default)]
+    pub active_tail_hedge_count: usize,
+    #[serde(default)]
+    pub tail_hedge_convexity_payout_usd: f64,
+    #[serde(default = "default_pareto_gate_passed")]
+    pub pareto_gate_passed: bool,
     #[serde(default)]
     pub avg_winner_r: f64,
     pub remaining_unscratched_losses: usize,

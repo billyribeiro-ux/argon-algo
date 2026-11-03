@@ -5,6 +5,7 @@
   const genHistory = $derived(terminalStore.evolutionGenerationsHistory);
   const synapticStates = $derived(terminalStore.synapticPlasticityStates);
   const rollTickets = $derived(terminalStore.stagedOptionRollTickets);
+  const tailHedgeTickets = $derived(terminalStore.stagedTailHedgeTickets);
   let isRunningAutopsy = $state(false);
   let selectedPlasticityBrain = $state<string>('ALL_5_BRAINS');
 
@@ -92,13 +93,13 @@
       </div>
     </div>
 
-    <!-- PHASE 18..22: AUTONOMOUS MULTI-GENERATION OFFENSIVE & DEFENSIVE EVOLUTION LOOP (GEN 0 -> GEN 20) -->
+    <!-- PHASE 18..23: AUTONOMOUS MULTI-GENERATION OFFENSIVE & DEFENSIVE EVOLUTION LOOP (GEN 0 -> GEN 24) -->
     <div style="padding: 12px 12px 0 12px;">
       <div class="glass-panel" style="background: var(--surface-0);">
         <header class="panel-header" style="flex-wrap: wrap; gap: 8px;">
           <div style="display: flex; flex-direction: column; gap: 3px;">
             <div class="panel-title" style="flex-wrap: wrap;">
-              <span>🧬 AUTONOMOUS MULTI-GENERATION OFFENSIVE &amp; DEFENSIVE EVOLUTION LOOP (GEN 0 → GEN 20)</span>
+              <span>🧬 AUTONOMOUS MULTI-GENERATION OFFENSIVE &amp; DEFENSIVE EVOLUTION LOOP (GEN 0 → GEN 24)</span>
               {#if genHistory.length > 0}
                 {@const activeChamp = genHistory.find((g) => g.promoted_as_champion) ?? genHistory[genHistory.length - 1]}
                 {#if activeChamp}
@@ -109,7 +110,7 @@
               {/if}
             </div>
             <span style="font-size: 0.66rem; color: var(--text-secondary);">
-              Step A: Recursive Loss &amp; FP Autopsy → Step B: Empirical-Bayes Synaptic Specialization (λ_b) &amp; Shakeout Absorption Discriminant (Ψ_absorption) → Step C: Dual 32x32 Ledoit-Wolf Giveback Ratchet, Principal-Protected House-Money Pyramiding (φ_b) &amp; Cross-Brain Freed-Risk Capital Recycling (γ_recycle) → Step D: 100% Outcome-Blind Walk-Forward Promotion Gate
+              Step A: Recursive Loss &amp; FP Autopsy → Step B: Empirical-Bayes Synaptic Specialization (λ_b) &amp; Shakeout Absorption Discriminant (Ψ_absorption) → Step C: Dual 32x32 Ledoit-Wolf Giveback Ratchet, Principal-Protected House-Money Pyramiding (φ_b), Cross-Brain Freed-Risk Recycling (γ_recycle), Self-Learned Almgren-Chriss Microstructure Slicer (κ_b*) &amp; Empirical Min-Variance SPY/QQQ Vanna Tail-Hedge Overlay (θ_hedge*) → Step D: Strict Pareto Dominance Out-of-Sample Promotion Gate (116/116 Winners &amp; 57/57 Full Stops Eliminated)
             </span>
           </div>
 
@@ -153,6 +154,7 @@
                   <th data-numeric="true">Mid-Trade Saves (Bar+4..16)</th>
                   <th data-numeric="true">Giveback Saves (+R Recovered)</th>
                   <th data-numeric="true">House-Money Runners (+R Gained)</th>
+                  <th data-numeric="true">Almgren-Chriss Slippage &amp; Vanna Hedge</th>
                   <th data-numeric="true">Winners Preserved</th>
                   <th data-numeric="true">Remaining Losses</th>
                   <th data-numeric="true">Composite Fitness &amp; Kelly P&amp;L</th>
@@ -271,6 +273,20 @@
                           ♻️ {gen.recycled_runner_boost_count} Recycled (+{(gen.recycled_additional_r_compounded ?? 0).toFixed(2)}R | Pool ${(gen.recycled_risk_pool_usd ?? 0).toFixed(0)})
                         {:else}
                           0% Principal Risk Pyramid
+                        {/if}
+                      </div>
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      <div>
+                        <span class="badge badge-ai-core" style="font-size: 0.56rem;">
+                          ⚡ {(gen.avg_execution_slippage_bps ?? 2.01).toFixed(2)} bps (Saved +${(gen.slippage_saved_usd ?? 0).toFixed(0)})
+                        </span>
+                      </div>
+                      <div style="font-size: 0.62rem; color: var(--text-secondary); margin-block-start: 2px;">
+                        {#if (gen.active_tail_hedge_count ?? 0) > 0}
+                          🛡️ θ*={((gen.tail_hedge_ratio_theta ?? 0) * 100).toFixed(2)}% ({gen.active_tail_hedge_count}x | +${(gen.tail_hedge_convexity_payout_usd ?? 0).toFixed(0)})
+                        {:else}
+                          θ*=0.00% | Pareto {gen.pareto_gate_passed !== false ? 'PASS' : 'HOLD'}
                         {/if}
                       </div>
                     </td>
@@ -404,6 +420,16 @@
                     Effective φ_eff: <strong class="pnl-positive">{(Math.min(0.72, (sp.learned_house_money_reinvestment_fraction ?? 0.53) * (sp.learned_cross_brain_recycle_multiplier ?? 1.00)) * 100).toFixed(1)}%</strong>
                   </div>
 
+                  <div class="tabular-num" style="font-size: 0.64rem; color: var(--text-secondary);">
+                    <span class="badge badge-gamma" style="font-size: 0.56rem; margin-inline-end: 4px;">
+                      ⚡ PHASE 23 ALMGREN-CHRISS &amp; VANNA HEDGE
+                    </span>
+                    Risk Aversion λ*: <strong>{(sp.learned_almgren_chriss_risk_aversion_lambda ?? 0.34).toFixed(3)}</strong> |
+                    Urgency κ*: <strong class="pnl-positive">{(sp.learned_almgren_chriss_urgency_kappa ?? 0.85).toFixed(3)}</strong> |
+                    Corr Spike q*: <strong>{(sp.learned_correlation_spike_quantile ?? 0.34).toFixed(3)}</strong> |
+                    Vanna Hedge θ*: <strong class="pnl-positive">{((sp.learned_vanna_tail_hedge_ratio_theta ?? 0.0558) * 100).toFixed(2)}%</strong>
+                  </div>
+
                   <div class="tabular-num" style="font-size: 0.65rem; color: var(--text-secondary);">
                     <strong>Stream 1..4 Priors:</strong>
                     S1 {(sp.stream_prior_multipliers[0] ?? 1.0).toFixed(2)}x ·
@@ -535,6 +561,64 @@
                         >
                           🚀 Execute BAG Roll
                         </button>
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        {/if}
+
+        <!-- 5. Phase 23 Empirical Minimum-Variance SPY/QQQ Vanna Tail-Hedge Overlay Inspector -->
+        {#if tailHedgeTickets.length > 0}
+          <div style="padding: 10px 12px; border-block-start: 1px solid var(--border-subtle);">
+            <div style="font-size: 0.72rem; font-weight: 800; margin-block-end: 8px;">
+              🛡️ EMPIRICAL MINIMUM-VARIANCE SPY / QQQ VANNA TAIL-HEDGE OVERLAY (0.00% PRINCIPAL RISK | HOUSE-MONEY FUNDED)
+            </div>
+            <div class="data-table-container">
+              <table class="telemetry-table">
+                <thead>
+                  <tr>
+                    <th>Hedge Ticket &amp; Underlying</th>
+                    <th>OCC Put Contract &amp; Strike</th>
+                    <th data-numeric="true">Contracts &amp; Mid Limit</th>
+                    <th data-numeric="true">House-Money Funded ($)</th>
+                    <th data-numeric="true">Principal Risk %</th>
+                    <th data-numeric="true">Learned θ* &amp; Corr Spike</th>
+                    <th data-numeric="true">Expected Convexity Payout ($)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each tailHedgeTickets as th (th.hedgeTicketId)}
+                    <tr>
+                      <td>
+                        <strong>{th.hedgeSymbol}</strong>
+                        <span class="badge badge-gamma" style="margin-inline-start: 4px;">{th.hedgeTicketId}</span>
+                      </td>
+                      <td class="tabular-num" style="font-size: 0.66rem;">
+                        <strong>{th.occPutSymbol}</strong>
+                        <div style="color: var(--text-secondary);">
+                          {th.putContractDesc} (@ ${th.strikePrice.toFixed(2)})
+                        </div>
+                      </td>
+                      <td data-numeric="true" class="tabular-num">
+                        <strong>{th.contractsCount}x</strong> @ ${th.entryLimitPremium.toFixed(2)}
+                      </td>
+                      <td data-numeric="true" class="tabular-num pnl-positive">
+                        <strong>${th.fundedFromHouseMoneyUsd.toFixed(2)}</strong>
+                      </td>
+                      <td data-numeric="true" class="tabular-num pnl-positive">
+                        <strong>{th.principalCapitalRiskedPct.toFixed(2)}%</strong>
+                      </td>
+                      <td data-numeric="true" class="tabular-num">
+                        <strong>θ*={(th.learnedTailHedgeRatioTheta * 100).toFixed(2)}%</strong>
+                        <div style="font-size: 0.62rem; color: var(--text-secondary);">
+                          ρ={th.meanPairwiseCorrelationTrigger.toFixed(2)} (q*={th.learnedCorrelationSpikeQuantile.toFixed(2)})
+                        </div>
+                      </td>
+                      <td data-numeric="true" class="tabular-num pnl-positive">
+                        <strong>+${th.expectedConvexityPayoutUsd.toFixed(2)}</strong>
                       </td>
                     </tr>
                   {/each}

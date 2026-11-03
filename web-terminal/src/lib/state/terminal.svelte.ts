@@ -277,6 +277,14 @@ export interface OpenPositionItem {
   championLlrThreshold: number;
   sequentialSafetyMarginPct: number;
   nextBarRatchetStopPreview: number;
+  houseMoneyScaleEligible?: boolean;
+  learnedHouseMoneyPhi?: number;
+  lockedProfitR?: number;
+  guaranteedNetFloorR?: number;
+  nextGammaWallStrike?: number;
+  nextGammaWallContract?: string;
+  bankedOptionGainUsd?: number;
+  rolledOptionBudgetUsd?: number;
   streamWeights: {
     priceVolumeAnomaly: number;
     optionsGammaVanna: number;
@@ -357,6 +365,9 @@ export interface ClosedTradeLedgerItem {
   wasProtectedFromGiveback: boolean;
   givebackRatchetBarOffset: number;
   givebackRSaved: number;
+  wasScaledWithHouseMoney?: boolean;
+  houseMoneyScaleBarOffset?: number;
+  houseMoneyAdditionalRGained?: number;
 }
 
 export interface ProviderStatusEntry {
@@ -442,6 +453,9 @@ export interface BrainSynapticPlasticityState {
   giveback_exhaustion_threshold?: number;
   runner_continuation_threshold?: number;
   learned_giveback_retention_ratio?: number;
+  learned_profit_lock_activation_r?: number;
+  learned_house_money_reinvestment_fraction?: number;
+  late_blowoff_scratch_threshold?: number;
   top_boosted_warning_features: SynapticFeatureMutation[];
   top_slashed_deceiver_features: SynapticFeatureMutation[];
   top_boosted_features?: SynapticFeatureMutation[];
@@ -474,6 +488,8 @@ export interface EvolutionGenerationRecord {
   fp_mid_trade_scratches?: number;
   giveback_saves_count?: number;
   total_giveback_r_recovered?: number;
+  house_money_scaled_runners_count?: number;
+  total_house_money_r_gained?: number;
   avg_winner_r?: number;
   tp_scratches?: number;
   expectancy_r?: number;
@@ -673,6 +689,41 @@ export interface StagedBrokerOrderTicketEntry {
   ibkrTwsPayloadJson: string;
   schwabTraderPayloadJson: string;
   alpacaApiPayloadJson: string;
+}
+
+export interface StagedOptionRollUpTicketEntry {
+  rollTicketId: string;
+  positionId: string;
+  stagedAtIso: string;
+  symbol: string;
+  brainId: string;
+  brainName: string;
+  direction: TradeDirection;
+  rollStatus: string;
+  isGammaRollActive: boolean;
+  currentItmOccSymbol: string;
+  currentItmContractDesc: string;
+  sellToCloseContracts: number;
+  currentItmEntryPremium: number;
+  currentItmLivePremium: number;
+  intrinsicOptionGainUsd: number;
+  bankedCashFraction: number;
+  bankedRealizedCashUsd: number;
+  houseMoneyReinvestmentFractionPhi: number;
+  houseMoneyRollBudgetUsd: number;
+  nextGammaWallStrike: number;
+  nextGammaWallOccSymbol: string;
+  nextGammaWallContractDesc: string;
+  buyToOpenRollContracts: number;
+  nextGammaWallLimitPremium: number;
+  lockedProfitR: number;
+  learnedProfitLockQuantileR: number;
+  liveGivebackLlr: number;
+  runnerContinuationThreshold: number;
+  guaranteedNetFloorR: number;
+  ibkrComboRollPayloadJson: string;
+  schwabRollPayloadJson: string;
+  alpacaRollPayloadJson: string;
 }
 
 const API_BASE: string = import.meta.env.VITE_ARGON_API_BASE ?? 'http://127.0.0.1:8090';
@@ -885,6 +936,7 @@ export class TerminalStore {
     overlappingClustersSummary: 'No active open positions'
   });
   brokerOrderTickets = $state<StagedBrokerOrderTicketEntry[]>([]);
+  stagedOptionRollTickets = $state<StagedOptionRollUpTicketEntry[]>([]);
   activeStagedTicketModal = $state<StagedBrokerOrderTicketEntry | null>(null);
   webhookStatus = $state<WebhookStatusPayload>({
     config: {
@@ -1477,7 +1529,7 @@ export class TerminalStore {
     return {
       ticketId: String(t.ticket_id ?? t.position_id ?? ''),
       positionId: String(t.position_id ?? ''),
-      stagedAtIso: String(t.staged_at_iso ?? new Date().toISOString()),
+      stagedAtIso: String(t.staged_at_iso ?? ''),
       symbol: String(t.symbol ?? 'NVDA'),
       exchangeIndex: String(t.exchange_index ?? 'NASDAQ_100'),
       brainId: String(t.brain_id ?? 'BRAIN-02'),
@@ -1511,6 +1563,45 @@ export class TerminalStore {
     };
   }
 
+  private mapStagedOptionRollUpTicket(t: Record<string, unknown>): StagedOptionRollUpTicketEntry {
+    return {
+      rollTicketId: String(t.roll_ticket_id ?? t.position_id ?? ''),
+      positionId: String(t.position_id ?? ''),
+      stagedAtIso: String(t.staged_at_iso ?? ''),
+      symbol: String(t.symbol ?? 'NVDA'),
+      brainId: String(t.brain_id ?? 'BRAIN-02'),
+      brainName: String(t.brain_name ?? 'BRAIN-02 INTRADAY DAY TRADE'),
+      direction: (String(t.direction ?? 'LONG').toUpperCase() === 'SHORT'
+        ? 'SHORT'
+        : 'LONG') as TradeDirection,
+      rollStatus: String(t.roll_status ?? 'HOUSE_MONEY_GAMMA_ROLL_STAGED'),
+      isGammaRollActive: Boolean(t.is_gamma_roll_active ?? false),
+      currentItmOccSymbol: String(t.current_itm_occ_symbol ?? ''),
+      currentItmContractDesc: String(t.current_itm_contract_desc ?? ''),
+      sellToCloseContracts: Number(t.sell_to_close_contracts ?? 1),
+      currentItmEntryPremium: Number(t.current_itm_entry_premium ?? 0),
+      currentItmLivePremium: Number(t.current_itm_live_premium ?? 0),
+      intrinsicOptionGainUsd: Number(t.intrinsic_option_gain_usd ?? 0),
+      bankedCashFraction: Number(t.banked_cash_fraction ?? 0.46),
+      bankedRealizedCashUsd: Number(t.banked_realized_cash_usd ?? 0),
+      houseMoneyReinvestmentFractionPhi: Number(t.house_money_reinvestment_fraction_phi ?? 0.54),
+      houseMoneyRollBudgetUsd: Number(t.house_money_roll_budget_usd ?? 0),
+      nextGammaWallStrike: Number(t.next_gamma_wall_strike ?? 0),
+      nextGammaWallOccSymbol: String(t.next_gamma_wall_occ_symbol ?? ''),
+      nextGammaWallContractDesc: String(t.next_gamma_wall_contract_desc ?? ''),
+      buyToOpenRollContracts: Number(t.buy_to_open_roll_contracts ?? 1),
+      nextGammaWallLimitPremium: Number(t.next_gamma_wall_limit_premium ?? 0),
+      lockedProfitR: Number(t.locked_profit_r ?? 0),
+      learnedProfitLockQuantileR: Number(t.learned_profit_lock_quantile_r ?? 0.4),
+      liveGivebackLlr: Number(t.live_giveback_llr ?? 0.28),
+      runnerContinuationThreshold: Number(t.runner_continuation_threshold ?? -0.52),
+      guaranteedNetFloorR: Number(t.guaranteed_net_floor_r ?? 0),
+      ibkrComboRollPayloadJson: String(t.ibkr_combo_roll_payload_json ?? '{}'),
+      schwabRollPayloadJson: String(t.schwab_roll_payload_json ?? '{}'),
+      alpacaRollPayloadJson: String(t.alpaca_roll_payload_json ?? '{}')
+    };
+  }
+
   public async fetchExecutionTickets(): Promise<void> {
     try {
       const res = await fetch(`${API_BASE}/api/v1/execution/tickets`);
@@ -1519,6 +1610,11 @@ export class TerminalStore {
       if (Array.isArray(payload.tickets)) {
         this.brokerOrderTickets = payload.tickets.map((t: Record<string, unknown>) =>
           this.mapBrokerOrderTicket(t)
+        );
+      }
+      if (Array.isArray(payload.staged_option_roll_tickets)) {
+        this.stagedOptionRollTickets = payload.staged_option_roll_tickets.map(
+          (t: Record<string, unknown>) => this.mapStagedOptionRollUpTicket(t)
         );
       }
     } catch {
@@ -1940,6 +2036,11 @@ export class TerminalStore {
       giveback_exhaustion_threshold: Number(s.giveback_exhaustion_threshold ?? 1.36),
       runner_continuation_threshold: Number(s.runner_continuation_threshold ?? -0.52),
       learned_giveback_retention_ratio: Number(s.learned_giveback_retention_ratio ?? 0.8),
+      learned_profit_lock_activation_r: Number(s.learned_profit_lock_activation_r ?? 0.4),
+      learned_house_money_reinvestment_fraction: Number(
+        s.learned_house_money_reinvestment_fraction ?? 0.53
+      ),
+      late_blowoff_scratch_threshold: Number(s.late_blowoff_scratch_threshold ?? 1.28),
       top_boosted_warning_features: boosted,
       top_slashed_deceiver_features: slashed,
       top_boosted_features: boosted,
@@ -1984,6 +2085,8 @@ export class TerminalStore {
       fp_mid_trade_scratches: Number(g.fp_mid_trade_scratches ?? 0),
       giveback_saves_count: Number(g.giveback_saves_count ?? 0),
       total_giveback_r_recovered: Number(g.total_giveback_r_recovered ?? 0),
+      house_money_scaled_runners_count: Number(g.house_money_scaled_runners_count ?? 0),
+      total_house_money_r_gained: Number(g.total_house_money_r_gained ?? 0),
       avg_winner_r: Number(g.avg_winner_r ?? 0.85),
       tp_scratches: tpScratch,
       expectancy_r: g.expectancy_r !== undefined ? Number(g.expectancy_r) : undefined,
@@ -2453,6 +2556,14 @@ export class TerminalStore {
         nextBarRatchetStopPreview: Number(
           p.next_bar_ratchet_stop_preview ?? p.structural_stop_price ?? 0
         ),
+        houseMoneyScaleEligible: Boolean(p.house_money_scale_eligible ?? false),
+        learnedHouseMoneyPhi: Number(p.learned_house_money_phi ?? 0.53),
+        lockedProfitR: Number(p.locked_profit_r ?? 0),
+        guaranteedNetFloorR: Number(p.guaranteed_net_floor_r ?? 0),
+        nextGammaWallStrike: Number(p.next_gamma_wall_strike ?? 0),
+        nextGammaWallContract: String(p.next_gamma_wall_contract ?? ''),
+        bankedOptionGainUsd: Number(p.banked_option_gain_usd ?? 0),
+        rolledOptionBudgetUsd: Number(p.rolled_option_budget_usd ?? 0),
         streamWeights: {
           priceVolumeAnomaly: Number(sw.chart_tape_physics_weight ?? 0.35),
           optionsGammaVanna: Number(sw.options_gamma_vanna_weight ?? 0.25),
@@ -2595,7 +2706,10 @@ export class TerminalStore {
         lossAffinityPosteriorPct: Number(c.loss_affinity_posterior_pct ?? 0),
         wasProtectedFromGiveback: Boolean(c.was_protected_from_giveback ?? false),
         givebackRatchetBarOffset: Number(c.giveback_ratchet_bar_offset ?? 0),
-        givebackRSaved: Number(c.giveback_r_saved ?? 0)
+        givebackRSaved: Number(c.giveback_r_saved ?? 0),
+        wasScaledWithHouseMoney: Boolean(c.was_scaled_with_house_money ?? false),
+        houseMoneyScaleBarOffset: Number(c.house_money_scale_bar_offset ?? 0),
+        houseMoneyAdditionalRGained: Number(c.house_money_additional_r_gained ?? 0)
       };
     });
 

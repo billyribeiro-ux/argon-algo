@@ -1384,4 +1384,211 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
     expect(sp12.runner_continuation_threshold).toBeCloseTo(-0.52, 2);
     expect(sp12.learned_giveback_retention_ratio).toBeCloseTo(0.8, 2);
   });
+
+  it('hydrates Phase 21 Gen 0..Gen 16 House-Money Runner Pyramiding, Zero-Tail-Loss Autopsy, & CBOE Gamma Roll-Up Stager', () => {
+    const store = new TerminalStore(false);
+    store.ingestBackendSnapshot({
+      positions_opened: [
+        {
+          position_id: 'OPEN-P21-AMD',
+          opened_timestamp_ns: 1_730_510_000_000_000_000,
+          live_hold_duration_ms: 86_400_000,
+          symbol: 'AMD',
+          exchange_index: 'NASDAQ_100',
+          brain_id: 'BRAIN-04',
+          direction: 'LONG',
+          entry_price: 566.42,
+          live_price: 567.854,
+          quantity_shares: 18.0,
+          kelly_fraction_pct: 2.1,
+          risk_budget_usd: 972.39,
+          notional_allocated_usd: 10195.56,
+          tranche_count: 1,
+          scale_in_history: ['T1: Entry 18.00 sh @ $566.42'],
+          entry_bar_idx: 24,
+          structural_stop_price: 512.39848,
+          target_1_price: 631.76916,
+          target_2_price: 683.08175,
+          unrealized_stock_pnl_usd: 25.81,
+          unrealized_stock_pnl_pct: 0.25,
+          option_structure: 'DIAGONAL_SPREAD',
+          matched_option_contract: 'AMD 2026-12-18 $565.00C',
+          option_entry_premium: 38.4,
+          option_live_premium: 39.25,
+          option_contracts_count: 2,
+          unrealized_option_pnl_usd: 170.0,
+          unrealized_option_pnl_pct: 2.21,
+          contract_delta: 0.62,
+          contract_gamma: 0.018,
+          contract_vanna: 0.009,
+          contract_theta: -0.24,
+          contract_vega: 0.52,
+          contract_iv: 0.44,
+          current_r_multiple: 1.18,
+          mfe_pct: 3.85,
+          mae_pct: 0.12,
+          ai_confidence_pct: 74.0,
+          primary_driver: 'GAMMA_SQUEEZE',
+          engine_mode: 'CONSENSUS_BOTH_ENGINES',
+          strategy_archetype: 'GAMMA_SQUEEZE_IGNITION',
+          trace_health_badge: 'OPTIMAL',
+          precedent_matches_count: 25,
+          precedent_win_rate_pct: 88.0,
+          bars_held_count: 11,
+          active_sequential_stage: 'STAGE_3_RUNNER_GIVEBACK_GUARD (Bar 6+)',
+          live_sequential_llr: -0.58,
+          champion_llr_threshold: 1.36,
+          sequential_safety_margin_pct: 91.5,
+          next_bar_ratchet_stop_preview: 598.15,
+          house_money_scale_eligible: true,
+          learned_house_money_phi: 0.524,
+          locked_profit_r: 0.587,
+          guaranteed_net_floor_r: 0.279,
+          next_gamma_wall_strike: 655.0,
+          next_gamma_wall_contract: 'AMD 2026-12-18 $655.00C (GAMMA WALL ROLL)',
+          banked_option_gain_usd: 89.08,
+          rolled_option_budget_usd: 80.92
+        }
+      ],
+      closed_trades: [
+        {
+          trade_id: 'TRD-P21-RUNNER',
+          opened_timestamp_ns: 1_730_450_000_000_000_000,
+          closed_timestamp_ns: 1_730_456_000_000_000_000,
+          hold_duration_ms: 6_000_000,
+          symbol: 'NVDA',
+          exchange_index: 'NASDAQ_100',
+          brain_id: 'BRAIN-04',
+          direction: 'LONG',
+          entry_price: 149.87554,
+          actual_exit_price: 168.93722,
+          quantity_shares: 100.0,
+          kelly_fraction_pct: 2.35,
+          risk_budget_usd: 850.0,
+          notional_allocated_usd: 14987.55,
+          kelly_net_pnl_usd: 3420.0,
+          initial_structural_stop: 140.48,
+          target_1_price: 161.5,
+          target_2_price: 170.0,
+          outcome_badge: 'CLOSED - TARGET HIT',
+          is_winner: true,
+          net_pnl_usd: 2131.55,
+          stock_return_pct: 12.72,
+          option_contracts_count: 2,
+          option_net_pnl_usd: 640.0,
+          realized_r_multiple: 2.03,
+          mfe_pct: 13.1,
+          mae_pct: 0.25,
+          ai_confidence_pct: 91.5,
+          primary_driver: 'GAMMA_SQUEEZE',
+          engine_mode: 'CONSENSUS_BOTH_ENGINES',
+          strategy_archetype: 'GAMMA_SQUEEZE_IGNITION',
+          was_vetoed_by_loss_autopsy: false,
+          was_scratched_by_loss_autopsy: false,
+          was_protected_from_giveback: false,
+          was_scaled_with_house_money: true,
+          house_money_scale_bar_offset: 6,
+          house_money_additional_r_gained: 0.89,
+          adaptive_outcome_badge: 'CLOSED - TARGET HIT (+HOUSE-MONEY PYRAMID)',
+          adaptive_exit_price: 168.93722,
+          adaptive_scratch_exit_r: 2.92,
+          adaptive_net_pnl_usd: 3066.2,
+          adaptive_kelly_net_pnl_usd: 4919.8,
+          adaptive_loss_saved_usd: 934.65,
+          adaptive_kelly_loss_saved_usd: 1499.8
+        }
+      ],
+      evolution_generations_history: [
+        {
+          generation_id: 16,
+          status_label: 'GEN-16 PROMOTED CHAMPION',
+          is_current_champion: true,
+          timestamp_iso: '2026-11-02T23:59:59Z',
+          active_trades: 153,
+          wins: 115,
+          losses: 38,
+          win_rate_pct: 75.16,
+          tp_losses_vetoed: 20,
+          fp_winners_vetoed: 0,
+          entry_veto_precision_pct: 100.0,
+          tp_losses_scratched: 37,
+          fp_winners_scratched: 1,
+          scratch_precision_pct: 97.37,
+          early_scratches_bar1_to_3: 19,
+          mid_trade_stall_saves_bar4_to_6: 18,
+          giveback_saves_count: 19,
+          total_giveback_r_recovered: 13.09,
+          house_money_scaled_runners_count: 23,
+          total_house_money_r_gained: 17.14,
+          avg_winner_r: 1.06,
+          tp_losses_caught_total: 57,
+          fp_winners_clipped_total: 1,
+          remaining_unscratched_losses: 0,
+          profit_factor: 18.98,
+          kelly_profit_factor: 18.32,
+          fixed_net_pnl_usd: 68551.95,
+          kelly_net_pnl_usd: 107175.98,
+          max_drawdown_usd: 310.3,
+          composite_fitness_score: 133796.03,
+          mutations_applied_summary: [
+            'Gen 16: 0 Remaining Unscratched Losses (KULR Bar+15 scratched at -0.22R), 23 House-Money Runners (+17.14R)'
+          ]
+        }
+      ],
+      synaptic_plasticity_states: [
+        {
+          brain_id: 'BRAIN-04',
+          generation_id: 16,
+          synaptic_feature_weights_32: Array(32).fill(1.18),
+          stream_prior_multipliers: [1.16, 1.08, 1.14, 1.28],
+          wald_sprt_thresholds: [1.46, 1.38, 1.44],
+          entry_veto_margin_delta: 0.015,
+          trap_conviction_weights: {},
+          empirical_bayes_shrinkage_lambda: 0.8344,
+          mid_trade_wald_sprt_thresholds: [1.42, 1.38, 1.35],
+          learned_mid_trade_mfe_norm_quantile: 0.55,
+          learned_mid_trade_stop_ratchet_r: -0.121,
+          learned_itm_mfe_activation_r: 1.024,
+          giveback_exhaustion_threshold: 1.36,
+          runner_continuation_threshold: -0.52,
+          learned_giveback_retention_ratio: 0.807,
+          learned_profit_lock_activation_r: 0.416,
+          learned_house_money_reinvestment_fraction: 0.524,
+          late_blowoff_scratch_threshold: 1.28,
+          top_boosted_warning_features: [],
+          top_slashed_deceiver_features: [],
+          cumulative_tp_vetoes: 6,
+          cumulative_fp_vetoes: 0,
+          cumulative_tp_scratches: 7,
+          cumulative_fp_scratches: 0,
+          remaining_unscratched_losses: 0,
+          last_mutation_summary: 'Gen 16 promoted champion'
+        }
+      ]
+    });
+
+    const openPos = store.openPositions[0]!;
+    expect(openPos.houseMoneyScaleEligible).toBe(true);
+    expect(openPos.learnedHouseMoneyPhi).toBeCloseTo(0.524, 3);
+    expect(openPos.lockedProfitR).toBeCloseTo(0.587, 3);
+    expect(openPos.guaranteedNetFloorR).toBeCloseTo(0.279, 3);
+    expect(openPos.nextGammaWallStrike).toBeCloseTo(655.0, 2);
+
+    const closedRunner = store.closedLedger[0]!;
+    expect(closedRunner.wasScaledWithHouseMoney).toBe(true);
+    expect(closedRunner.houseMoneyScaleBarOffset).toBe(6);
+    expect(closedRunner.houseMoneyAdditionalRGained).toBeCloseTo(0.89, 2);
+
+    const gen16 = store.evolutionGenerationsHistory[0]!;
+    expect(gen16.generation_id).toBe(16);
+    expect(gen16.remaining_full_stops).toBe(0);
+    expect(gen16.house_money_scaled_runners_count).toBe(23);
+    expect(gen16.total_house_money_r_gained).toBeCloseTo(17.14, 2);
+    expect(gen16.avg_winner_r).toBeCloseTo(1.06, 2);
+
+    const sp16 = store.synapticPlasticityStates[0]!;
+    expect(sp16.learned_profit_lock_activation_r).toBeCloseTo(0.416, 3);
+    expect(sp16.learned_house_money_reinvestment_fraction).toBeCloseTo(0.524, 3);
+    expect(sp16.late_blowoff_scratch_threshold).toBeCloseTo(1.28, 2);
+  });
 });

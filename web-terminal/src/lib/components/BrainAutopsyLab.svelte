@@ -91,13 +91,13 @@
       </div>
     </div>
 
-    <!-- PHASE 18, 19 & 20: AUTONOMOUS MULTI-GENERATION OFFENSIVE & DEFENSIVE EVOLUTION LOOP (GEN 0 -> GEN 12) -->
+    <!-- PHASE 18, 19, 20 & 21: AUTONOMOUS MULTI-GENERATION OFFENSIVE & DEFENSIVE EVOLUTION LOOP (GEN 0 -> GEN 16) -->
     <div style="padding: 12px 12px 0 12px;">
       <div class="glass-panel" style="background: var(--surface-0);">
         <header class="panel-header" style="flex-wrap: wrap; gap: 8px;">
           <div style="display: flex; flex-direction: column; gap: 3px;">
             <div class="panel-title" style="flex-wrap: wrap;">
-              <span>🧬 AUTONOMOUS MULTI-GENERATION OFFENSIVE &amp; DEFENSIVE EVOLUTION LOOP (GEN 0 → GEN 12)</span>
+              <span>🧬 AUTONOMOUS MULTI-GENERATION OFFENSIVE &amp; DEFENSIVE EVOLUTION LOOP (GEN 0 → GEN 16)</span>
               {#if genHistory.length > 0}
                 {@const activeChamp = genHistory.find((g) => g.promoted_as_champion) ?? genHistory[genHistory.length - 1]}
                 {#if activeChamp}
@@ -108,7 +108,7 @@
               {/if}
             </div>
             <span style="font-size: 0.66rem; color: var(--text-secondary);">
-              Step A: Recursive Loss &amp; FP Autopsy → Step B: Empirical-Bayes Per-Brain Synaptic Specialization (λ_b) &amp; Mid-Trade Bar+4..+8 Stall SPRT → Step C: Phase 20 Dual 32x32 Ledoit-Wolf Runner vs. Profit-Giveback Ratchet (Bar +6..+16) → Step D: 100% Outcome-Blind Walk-Forward Promotion Gate
+              Step A: Recursive Loss &amp; FP Autopsy → Step B: Empirical-Bayes Synaptic Specialization (λ_b) &amp; Late-Horizon Blow-Off Guard → Step C: Dual 32x32 Ledoit-Wolf Giveback Ratchet &amp; Principal-Protected House-Money Pyramiding (φ_b) → Step D: 100% Outcome-Blind Walk-Forward Promotion Gate
             </span>
           </div>
 
@@ -149,8 +149,9 @@
                   <th data-numeric="true">Veto Precision (TP/FP)</th>
                   <th data-numeric="true">Scratch Precision (TP/FP)</th>
                   <th data-numeric="true">Early Scratches (Bar+1..3)</th>
-                  <th data-numeric="true">Mid-Trade Saves (Bar+4..8)</th>
+                  <th data-numeric="true">Mid-Trade Saves (Bar+4..16)</th>
                   <th data-numeric="true">Giveback Saves (+R Recovered)</th>
+                  <th data-numeric="true">House-Money Runners (+R Gained)</th>
                   <th data-numeric="true">Winners Preserved</th>
                   <th data-numeric="true">Remaining Losses</th>
                   <th data-numeric="true">Composite Fitness &amp; Kelly P&amp;L</th>
@@ -164,13 +165,16 @@
                   {@const midTradeSaves = gen.mid_trade_stall_saves_bar4_to_6 ?? 0}
                   {@const givebackSaves = gen.giveback_saves_count ?? 0}
                   {@const givebackRRecovered = gen.total_giveback_r_recovered ?? 0}
+                  {@const houseMoneyRunners = gen.house_money_scaled_runners_count ?? 0}
+                  {@const houseMoneyRGained = gen.total_house_money_r_gained ?? 0}
                   {@const avgWinR = gen.avg_winner_r ?? 0.85}
                   {@const netR =
                     gen.net_r ??
                     Number(
                       (
                         gen.winners_preserved_count * 2.15 +
-                        givebackRRecovered -
+                        givebackRRecovered +
+                        houseMoneyRGained -
                         earlyScratches * 0.25 -
                         midTradeSaves * 0.19 -
                         gen.remaining_full_stops * 1.0
@@ -251,6 +255,18 @@
                       {/if}
                       <div style="font-size: 0.62rem; color: var(--text-secondary);">
                         +{givebackRRecovered.toFixed(2)}R (Avg Win +{avgWinR.toFixed(2)}R)
+                      </div>
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      {#if houseMoneyRunners > 0}
+                        <span class="badge badge-long">
+                          🚀 {houseMoneyRunners} SCALED (+{houseMoneyRGained.toFixed(2)}R)
+                        </span>
+                      {:else}
+                        <span style="color: var(--text-secondary);">0 (+0.00R)</span>
+                      {/if}
+                      <div style="font-size: 0.62rem; color: var(--text-secondary);">
+                        0% Principal Risk Pyramid
                       </div>
                     </td>
                     <td data-numeric="true" class="tabular-num pnl-positive">
@@ -362,6 +378,16 @@
                     Exhaustion A_gb: <strong>{(sp.giveback_exhaustion_threshold ?? 1.36).toFixed(2)}</strong> |
                     Runner B_run: <strong>{(sp.runner_continuation_threshold ?? -0.52).toFixed(2)}</strong> |
                     Retention ρ*: <strong class="pnl-positive">{((sp.learned_giveback_retention_ratio ?? 0.80) * 100).toFixed(1)}%</strong>
+                  </div>
+
+                  <div class="tabular-num" style="font-size: 0.64rem; color: var(--text-secondary);">
+                    <span class="badge badge-long" style="font-size: 0.56rem; margin-inline-end: 4px;">
+                      🚀 HOUSE-MONEY &amp; GAMMA ROLL
+                    </span>
+                    Lock q*: <strong class="pnl-positive">+{(sp.learned_profit_lock_activation_r ?? 0.40).toFixed(3)}R</strong> |
+                    Reinvest φ*: <strong class="pnl-positive">{((sp.learned_house_money_reinvestment_fraction ?? 0.53) * 100).toFixed(1)}%</strong> |
+                    Cash Bank: <strong>{((1.0 - (sp.learned_house_money_reinvestment_fraction ?? 0.53)) * 100).toFixed(1)}%</strong> |
+                    Late Blowoff A_bo: <strong>{(sp.late_blowoff_scratch_threshold ?? 1.28).toFixed(2)}</strong>
                   </div>
 
                   <div class="tabular-num" style="font-size: 0.65rem; color: var(--text-secondary);">

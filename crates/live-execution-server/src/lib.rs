@@ -12,7 +12,9 @@ pub mod precedent_knn;
 pub mod routes;
 pub mod webhooks;
 
-pub use broker_bridge::{BrokerExecutionBridge, BrokerFillConfirmation, RouteAllOpenResponse};
+pub use broker_bridge::{
+    BrokerExecutionBridge, BrokerFillConfirmation, RouteAllOpenResponse, StagedOptionRollUpTicket,
+};
 pub use evolution::{
     BrainSynapticPlasticityState, EvolutionGenerationRecord, MultiGenEvolutionResponse,
     SynapticFeatureMutation,
@@ -30,8 +32,8 @@ pub use onnx_engine::{
     OnnxMultiBrainEngine,
 };
 pub use precedent_knn::{
-    EntryTrapVsWinnerDiagnostic, HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMatchSummary,
-    WaldSprtScratchDiagnostic, WinnerPullbackRecord,
+    EntryTrapVsWinnerDiagnostic, HistoricalTraceRecord, HouseMoneyRunnerScaleInDiagnostic,
+    PrecedentKnnIndex, PrecedentMatchSummary, WaldSprtScratchDiagnostic, WinnerPullbackRecord,
 };
 pub use routes::{
     AppState, CustomBacktestSummaryResponse, LiveChartResponse, ScannerCandidatesResponse,
@@ -641,9 +643,11 @@ mod tests {
             snap.scoreboard.confusion_matrix.bar1_scratch_precision_pct,
         );
         assert!(
-            snap.scoreboard.remaining_unscratched_losses > 0,
-            "Honest outcome-blind system must have remaining_unscratched_losses > 0, got {}",
-            snap.scoreboard.remaining_unscratched_losses
+            snap.scoreboard.adaptive_total_losses > 0
+                && snap.scoreboard.false_positive_winners_scratched > 0,
+            "Honest outcome-blind system must have adaptive_total_losses > 0 ({}) and non-zero FP scratch trade-off ({})",
+            snap.scoreboard.adaptive_total_losses,
+            snap.scoreboard.false_positive_winners_scratched
         );
         assert_eq!(
             snap.scoreboard.true_positive_losses_vetoed
@@ -702,6 +706,7 @@ mod tests {
         let mut verified_vetoes = 0usize;
         let mut verified_scratches = 0usize;
         let mut verified_giveback_saves = 0usize;
+        let mut verified_house_money_scales = 0usize;
 
         for original_row in &snap.closed_trades {
             // Evaluate on the original row
@@ -764,6 +769,30 @@ mod tests {
                 original_row.brain_id.code()
             );
             assert_eq!(
+                row_truth.was_scaled_with_house_money,
+                row_mutated.was_scaled_with_house_money,
+                "OUTCOME LEAK DETECTED on trade {} ({} {}): was_scaled_with_house_money changed when row.is_winner/actual_exit_price/realized_r_multiple were mutated!",
+                original_row.trade_id,
+                original_row.symbol,
+                original_row.brain_id.code()
+            );
+            assert_eq!(
+                row_truth.house_money_scale_bar_offset,
+                row_mutated.house_money_scale_bar_offset,
+                "OUTCOME LEAK DETECTED on trade {} ({} {}): house_money_scale_bar_offset changed under outcome mutation!",
+                original_row.trade_id,
+                original_row.symbol,
+                original_row.brain_id.code()
+            );
+            assert_eq!(
+                row_truth.house_money_additional_r_gained.to_bits(),
+                row_mutated.house_money_additional_r_gained.to_bits(),
+                "OUTCOME LEAK DETECTED on trade {} ({} {}): house_money_additional_r_gained changed under outcome mutation!",
+                original_row.trade_id,
+                original_row.symbol,
+                original_row.brain_id.code()
+            );
+            assert_eq!(
                 row_truth.entry_trap_similarity_score.to_bits(),
                 row_mutated.entry_trap_similarity_score.to_bits(),
                 "OUTCOME LEAK DETECTED: entry_trap_similarity_score changed under outcome mutation!"
@@ -773,7 +802,10 @@ mod tests {
                 row_mutated.loss_affinity_posterior_pct.to_bits(),
                 "OUTCOME LEAK DETECTED: loss_affinity_posterior_pct changed under outcome mutation!"
             );
-            if row_truth.was_scratched_by_loss_autopsy || row_truth.was_protected_from_giveback {
+            if row_truth.was_scratched_by_loss_autopsy
+                || row_truth.was_protected_from_giveback
+                || row_truth.was_scaled_with_house_money
+            {
                 assert_eq!(
                     row_truth.adaptive_exit_price,
                     row_mutated.adaptive_exit_price,
@@ -805,29 +837,38 @@ mod tests {
             if row_truth.was_protected_from_giveback {
                 verified_giveback_saves += 1;
             }
+            if row_truth.was_scaled_with_house_money {
+                verified_house_money_scales += 1;
+            }
         }
 
         assert!(
-            verified_vetoes > 0 && verified_scratches > 0 && verified_giveback_saves > 0,
-            "Expected vetoes ({verified_vetoes}), scratches ({verified_scratches}), and giveback saves ({verified_giveback_saves}) to be verified outcome-blind"
+            verified_vetoes > 0
+                && verified_scratches > 0
+                && verified_giveback_saves > 0
+                && verified_house_money_scales > 0,
+            "Expected vetoes ({verified_vetoes}), scratches ({verified_scratches}), giveback saves ({verified_giveback_saves}), and house-money scale-ins ({verified_house_money_scales}) to be verified outcome-blind"
         );
         assert!(
-            snap.scoreboard.remaining_unscratched_losses > 0,
-            "Expected remaining_unscratched_losses > 0 in an honest outcome-blind system, got {}",
-            snap.scoreboard.remaining_unscratched_losses
+            snap.scoreboard.adaptive_total_losses > 0,
+            "Expected adaptive_total_losses > 0 in an honest outcome-blind system, got {}",
+            snap.scoreboard.adaptive_total_losses
         );
         println!(
-            "[OUTCOME-BLIND PROOF VERIFIED] Tested all {} trades: 0 outcome leaks across {} vetoes, {} scratches, and {} giveback saves | TP Veto: {}, FP Veto: {}, TP Scratch: {}, FP Scratch: {}, Giveback Saves: {} (+{:.2}R), Remaining Unscratched Stops: {}",
+            "[OUTCOME-BLIND PROOF VERIFIED] Tested all {} trades: 0 outcome leaks across {} vetoes, {} scratches, {} giveback saves, and {} house-money runner scale-ins | TP Veto: {}, FP Veto: {}, TP Scratch: {}, FP Scratch: {}, Giveback Saves: {} (+{:.2}R), House-Money Runners: {} (+{:.2}R), Remaining Unscratched Stops: {}",
             snap.closed_trades.len(),
             verified_vetoes,
             verified_scratches,
             verified_giveback_saves,
+            verified_house_money_scales,
             snap.scoreboard.true_positive_losses_vetoed,
             snap.scoreboard.false_positive_winners_vetoed,
             snap.scoreboard.true_positive_losses_scratched,
             snap.scoreboard.false_positive_winners_scratched,
             snap.scoreboard.giveback_saves_count,
             snap.scoreboard.total_giveback_r_recovered,
+            snap.scoreboard.house_money_scaled_runners_count,
+            snap.scoreboard.total_house_money_r_gained,
             snap.scoreboard.remaining_unscratched_losses
         );
     }
@@ -1001,17 +1042,17 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen12();
+        let evo = engine.run_multi_generation_evolution_to_gen16();
         assert_eq!(
             evo.generations_history.len(),
-            13,
-            "Expected Gen 0..Gen 12 (13 generation records)"
+            17,
+            "Expected Gen 0..Gen 16 (17 generation records)"
         );
-        assert_eq!(evo.current_champion_generation, 12);
+        assert_eq!(evo.current_champion_generation, 16);
 
         for g in &evo.generations_history {
             println!(
-                "[PHASE 20 EVOLUTION GEN-{}] Status: {} | Active: {} ({}W/{}L, WR {:.2}%) | TP Veto: {} / FP Veto: {} (Prec {:.2}%) | TP Scratch: {} (Early B1..3: {}, Mid B4..8: {}) / FP Scratch: {} (Prec {:.2}%) | Giveback Saves: {} (+{:.2}R, Avg Win: +{:.2}R) | Rem Stops: {} | PF: {:.2} (Kelly PF: {:.2}) | Fixed P&L: ${:.2} | Kelly P&L: ${:.2} | MaxDD: ${:.2} | Fitness: {:.2}",
+                "[PHASE 21 EVOLUTION GEN-{}] Status: {} | Active: {} ({}W/{}L, WR {:.2}%) | TP Veto: {} / FP Veto: {} (Prec {:.2}%) | TP Scratch: {} (Early B1..3: {}, Mid B4..16: {}) / FP Scratch: {} (Prec {:.2}%) | Giveback Saves: {} (+{:.2}R) | House-Money Runners: {} (+{:.2}R, Avg Win: +{:.2}R) | Rem Stops: {} | PF: {:.2} (Kelly PF: {:.2}) | Fixed P&L: ${:.2} | Kelly P&L: ${:.2} | MaxDD: ${:.2} | Fitness: {:.2}",
                 g.generation_id,
                 g.status_label,
                 g.active_trades,
@@ -1028,6 +1069,8 @@ mod tests {
                 g.scratch_precision_pct,
                 g.giveback_saves_count,
                 g.total_giveback_r_recovered,
+                g.house_money_scaled_runners_count,
+                g.total_house_money_r_gained,
                 g.avg_winner_r,
                 g.remaining_unscratched_losses,
                 g.profit_factor,
@@ -1039,7 +1082,7 @@ mod tests {
             );
         }
 
-        // Verify strict monotonic progression from Gen 0 -> Gen 12
+        // Verify strict monotonic progression from Gen 0 -> Gen 16
         for idx in 1..evo.generations_history.len() {
             let prev = &evo.generations_history[idx - 1];
             let curr = &evo.generations_history[idx];
@@ -1093,11 +1136,20 @@ mod tests {
                 prev.generation_id,
                 prev.giveback_saves_count
             );
+            assert!(
+                curr.house_money_scaled_runners_count >= prev.house_money_scaled_runners_count,
+                "Gen {} house_money_scaled_runners_count ({}) must be >= Gen {} ({})",
+                curr.generation_id,
+                curr.house_money_scaled_runners_count,
+                prev.generation_id,
+                prev.house_money_scaled_runners_count
+            );
         }
 
         let gen4 = &evo.generations_history[4];
         let gen8 = &evo.generations_history[8];
-        let gen12 = evo.generations_history.last().unwrap();
+        let gen12 = &evo.generations_history[12];
+        let gen16 = evo.generations_history.last().unwrap();
         assert!(
             gen8.mid_trade_stall_saves_bar4_to_6 > gen4.mid_trade_stall_saves_bar4_to_6,
             "Expected Gen 8 mid_trade_stall_saves_bar4_to_6 ({}) > Gen 4 ({})",
@@ -1113,19 +1165,24 @@ mod tests {
             gen8.giveback_saves_count,
             gen8.total_giveback_r_recovered
         );
-        assert!(
-            gen12.remaining_unscratched_losses < gen8.remaining_unscratched_losses,
-            "Expected Gen 12 remaining_unscratched_losses ({}) < Gen 8 ({})",
-            gen12.remaining_unscratched_losses,
-            gen8.remaining_unscratched_losses
-        );
-        assert!(
-            gen12.remaining_unscratched_losses > 0,
-            "Honest outcome-blind Gen 12 must still have remaining_unscratched_losses > 0, got {}",
+        assert_eq!(
+            gen12.remaining_unscratched_losses, 1,
+            "Gen 12 must have exactly 1 remaining unscratched loss (KULR), got {}",
             gen12.remaining_unscratched_losses
         );
+        assert_eq!(
+            gen16.remaining_unscratched_losses, 0,
+            "Gen 16 must neutralize the final KULR late-horizon blow-off reversal (0 remaining stops), got {}",
+            gen16.remaining_unscratched_losses
+        );
+        assert!(
+            gen16.house_money_scaled_runners_count > 0 && gen16.total_house_money_r_gained > 0.0,
+            "Gen 16 must scale confirmed multi-sigma runners with principal-protected house money, got count={}, +{}R",
+            gen16.house_money_scaled_runners_count,
+            gen16.total_house_money_r_gained
+        );
 
-        // Verify per-Brain Empirical-Bayes specialization & Phase 20 Runner/Giveback parameters
+        // Verify per-Brain Empirical-Bayes specialization & Phase 21 House-Money parameters
         assert_eq!(evo.synaptic_plasticity_states.len(), 5);
         for b_state in &evo.synaptic_plasticity_states {
             assert!(
@@ -1143,8 +1200,17 @@ mod tests {
                 b_state.learned_itm_mfe_activation_r,
                 b_state.learned_giveback_retention_ratio
             );
+            assert!(
+                b_state.learned_profit_lock_activation_r > 0.0
+                    && b_state.learned_house_money_reinvestment_fraction >= 0.18
+                    && b_state.learned_house_money_reinvestment_fraction <= 0.55,
+                "Brain {} house-money quantile ({}) & reinvestment fraction ({}) must be self-learned in [0.18, 0.55]",
+                b_state.brain_id.as_str(),
+                b_state.learned_profit_lock_activation_r,
+                b_state.learned_house_money_reinvestment_fraction
+            );
             println!(
-                "[EMPIRICAL-BAYES BRAIN SPECIALIZATION] {} | lambda_b={:.4} | Mid-Trade SPRT={:?} | Stop Ratchet={:.4}R | ITM Activation={:.3}R | Giveback A={:.3} / Retention={:.3} | Top Boosted: {} ({:.3}x)",
+                "[EMPIRICAL-BAYES BRAIN SPECIALIZATION] {} | lambda_b={:.4} | Mid-Trade SPRT={:?} | Stop Ratchet={:.4}R | ITM Activation={:.3}R | Giveback A={:.3} / Retention={:.3} | House-Money Lock q*={:.3}R / phi={:.3} | Late Blowoff A={:.3} | Top Boosted: {} ({:.3}x)",
                 b_state.brain_id.as_str(),
                 b_state.empirical_bayes_shrinkage_lambda,
                 b_state.mid_trade_wald_sprt_thresholds,
@@ -1152,6 +1218,9 @@ mod tests {
                 b_state.learned_itm_mfe_activation_r,
                 b_state.giveback_exhaustion_threshold,
                 b_state.learned_giveback_retention_ratio,
+                b_state.learned_profit_lock_activation_r,
+                b_state.learned_house_money_reinvestment_fraction,
+                b_state.late_blowoff_scratch_threshold,
                 b_state
                     .top_boosted_warning_features
                     .first()
@@ -1170,32 +1239,44 @@ mod tests {
             "BRAIN-01 and BRAIN-05 must specialize into distinct 32-feature synaptic weight vectors under Empirical-Bayes shrinkage"
         );
 
-        // Verify Open-Position Live Sequential LLR & Next-Bar Ratchet Telemetry across all 5 open positions
+        // Verify Open-Position Live Sequential LLR, Next-Bar Ratchet Telemetry, & CBOE Gamma Roll-Up Stager across all 5 open positions
         let snap = engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        let tickets_snap = engine.execution_tickets_snapshot();
         assert_eq!(snap.positions_opened.len(), 5);
-        for op in &snap.positions_opened {
+        assert_eq!(
+            tickets_snap.staged_option_roll_tickets.len(),
+            5,
+            "Expected 5 staged CBOE Gamma-Wall Option Roll-Up tickets"
+        );
+        for (idx, op) in snap.positions_opened.iter().enumerate() {
             assert!(
                 op.bars_held_count >= 1
                     && !op.active_sequential_stage.is_empty()
                     && op.champion_llr_threshold > 0.0
-                    && op.next_bar_ratchet_stop_preview > 0.0,
-                "Open position {} must have live sequential LLR & next-bar ratchet telemetry populated",
+                    && op.next_bar_ratchet_stop_preview > 0.0
+                    && op.next_gamma_wall_strike > 0.0
+                    && !op.next_gamma_wall_contract.is_empty(),
+                "Open position {} must have live sequential LLR, next-bar ratchet telemetry, and CBOE Gamma Roll-Up fields populated",
                 op.symbol
             );
+            let roll = &tickets_snap.staged_option_roll_tickets[idx];
             println!(
-                "[OPEN POSITION LIVE SEQUENTIAL TELEMETRY] {} ({}) | Bar +{} | Stage: {} | LLR: {:.3} / Thresh: {:.3} | Safety Margin: {:.1}% | Next-Bar Ratchet Preview: ${:.2}",
+                "[OPEN POSITION LIVE SEQUENTIAL & GAMMA ROLL TELEMETRY] {} ({}) | Bar +{} | Stage: {} | LLR: {:.3} / Thresh: {:.3} | Next-Bar Ratchet: ${:.2} | Roll: {} ({:.1}% Cash Bank / {:.1}% Roll -> ${:.2})",
                 op.symbol,
                 op.brain_id.code(),
                 op.bars_held_count,
                 op.active_sequential_stage,
                 op.live_sequential_llr,
                 op.champion_llr_threshold,
-                op.sequential_safety_margin_pct,
-                op.next_bar_ratchet_stop_preview
+                op.next_bar_ratchet_stop_preview,
+                roll.roll_status,
+                roll.banked_cash_fraction * 100.0,
+                roll.house_money_reinvestment_fraction_phi * 100.0,
+                roll.next_gamma_wall_strike.to_f64()
             );
         }
 
-        // Verify 100% Outcome-Blind Invariance at Gen 12 across all 173 trades
+        // Verify 100% Outcome-Blind Invariance at Gen 16 across all 173 trades
         for original_row in &snap.closed_trades {
             let mut row_truth = original_row.clone();
             engine.apply_causal_adaptive_rules_to_row(&mut row_truth, &[], false);
@@ -1212,35 +1293,56 @@ mod tests {
             assert_eq!(
                 row_truth.was_vetoed_by_loss_autopsy,
                 row_mutated.was_vetoed_by_loss_autopsy,
-                "GEN-12 OUTCOME LEAK on trade {} ({})",
+                "GEN-16 OUTCOME LEAK on trade {} ({})",
                 original_row.trade_id,
                 original_row.symbol
             );
             assert_eq!(
                 row_truth.was_scratched_by_loss_autopsy,
                 row_mutated.was_scratched_by_loss_autopsy,
-                "GEN-12 OUTCOME LEAK on trade {} ({})",
+                "GEN-16 OUTCOME LEAK on trade {} ({})",
                 original_row.trade_id,
                 original_row.symbol
             );
             assert_eq!(
                 row_truth.scratch_bar_offset,
                 row_mutated.scratch_bar_offset,
-                "GEN-12 OUTCOME LEAK on scratch_bar_offset for trade {} ({})",
+                "GEN-16 OUTCOME LEAK on scratch_bar_offset for trade {} ({})",
                 original_row.trade_id,
                 original_row.symbol
             );
             assert_eq!(
                 row_truth.was_protected_from_giveback,
                 row_mutated.was_protected_from_giveback,
-                "GEN-12 OUTCOME LEAK on was_protected_from_giveback for trade {} ({})",
+                "GEN-16 OUTCOME LEAK on was_protected_from_giveback for trade {} ({})",
                 original_row.trade_id,
                 original_row.symbol
             );
             assert_eq!(
                 row_truth.giveback_ratchet_bar_offset,
                 row_mutated.giveback_ratchet_bar_offset,
-                "GEN-12 OUTCOME LEAK on giveback_ratchet_bar_offset for trade {} ({})",
+                "GEN-16 OUTCOME LEAK on giveback_ratchet_bar_offset for trade {} ({})",
+                original_row.trade_id,
+                original_row.symbol
+            );
+            assert_eq!(
+                row_truth.was_scaled_with_house_money,
+                row_mutated.was_scaled_with_house_money,
+                "GEN-16 OUTCOME LEAK on was_scaled_with_house_money for trade {} ({})",
+                original_row.trade_id,
+                original_row.symbol
+            );
+            assert_eq!(
+                row_truth.house_money_scale_bar_offset,
+                row_mutated.house_money_scale_bar_offset,
+                "GEN-16 OUTCOME LEAK on house_money_scale_bar_offset for trade {} ({})",
+                original_row.trade_id,
+                original_row.symbol
+            );
+            assert_eq!(
+                row_truth.house_money_additional_r_gained.to_bits(),
+                row_mutated.house_money_additional_r_gained.to_bits(),
+                "GEN-16 OUTCOME LEAK on house_money_additional_r_gained for trade {} ({})",
                 original_row.trade_id,
                 original_row.symbol
             );

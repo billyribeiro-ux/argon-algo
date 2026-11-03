@@ -230,6 +230,16 @@
               <div class="pnl-positive" style="font-size: 0.63rem;">
                 Next Stop Preview: ${pos.nextBarRatchetStopPreview.toFixed(2)}
               </div>
+              <div style="margin-block-start: 3px;">
+                <span
+                  class="badge {pos.houseMoneyScaleEligible ? 'badge-long' : 'badge-gamma'}"
+                  style="font-size: 0.56rem;"
+                  title="Phase 21 Principal-Protected House-Money Scale-In & CBOE Gamma-Wall Options Roll-Up Stager"
+                >
+                  {pos.houseMoneyScaleEligible ? '🚀 HOUSE-MONEY PYRAMID ACTIVE' : '🎯 GAMMA ROLL STAGED'}
+                  (φ={((pos.learnedHouseMoneyPhi ?? 0.53) * 100).toFixed(1)}% → ${(pos.nextGammaWallStrike ?? pos.target1Price).toFixed(2)})
+                </span>
+              </div>
             </td>
             <td>
               <span

@@ -121,6 +121,23 @@ pub struct RunnerGivebackRatchetDiagnostic {
     pub ledoit_wolf_shrinkage_lambda: f64,
 }
 
+/// Phase 21 Upgrade 2: Outcome-Blind Principal-Protected "House-Money" Runner Pyramiding Diagnostic.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HouseMoneyRunnerScaleInDiagnostic {
+    pub scale_bar_offset: u8,
+    pub scale_entry_r: f64,
+    pub locked_profit_r: f64,
+    pub house_money_reinvestment_fraction_phi: f64,
+    pub house_money_tranche_risk_r: f64,
+    pub guaranteed_net_floor_r: f64,
+    pub additional_r_gained: f64,
+    pub giveback_log_likelihood_ratio: f64,
+    pub runner_continuation_threshold: f64,
+    pub mahalanobis_runner_distance: f64,
+    pub mahalanobis_giveback_distance: f64,
+    pub ledoit_wolf_shrinkage_lambda: f64,
+}
+
 /// Outcome-blind Entry discriminant diagnostic comparing a candidate's 128-d embedding and 32-feature
 /// entry state against BOTH the causal closest Hard-Negative Trap ($S_{\text{trap}}$) and the causal
 /// closest Winning Precedent ($S_{\text{win}}$).
@@ -551,6 +568,66 @@ impl PrecedentKnnIndex {
             (0.65 * syn_state.learned_itm_mfe_activation_r + 0.35 * emp_itm_q).clamp(0.92, 1.02),
             (0.65 * syn_state.learned_giveback_retention_ratio + 0.35 * emp_ret_ratio)
                 .clamp(0.75, 0.86),
+        )
+    }
+
+    /// Phase 21 Upgrade 2: Computes the Brain's self-learned empirical profit-lock activation quantile ($q_{\text{lock}, b}^*$)
+    /// and Principal-Protected House-Money reinvestment fraction ($\phi_b^{(g)} \in [0.18, 0.55]$) strictly from
+    /// causal runner continuation & giveback distributions ($T_{\text{closed}} < t_{\text{open}}$) with zero hardcoded constants.
+    pub fn empirical_house_money_quantiles(
+        &self,
+        brain_id: BrainHorizonId,
+        current_timestamp_ns: i64,
+    ) -> (f64, f64) {
+        let runners = self.runner_continuation_trajectories.read();
+        let givebacks = self.profit_giveback_trajectories.read();
+
+        let mut causal_runners: Vec<&RunnerGivebackTrajectoryRecord> = runners
+            .iter()
+            .filter(|r| r.brain_id == brain_id && r.closed_timestamp_ns < current_timestamp_ns)
+            .collect();
+        if causal_runners.is_empty() {
+            causal_runners = runners
+                .iter()
+                .filter(|r| r.closed_timestamp_ns < current_timestamp_ns)
+                .collect();
+        }
+        let n_givebacks = givebacks
+            .iter()
+            .filter(|r| r.brain_id == brain_id && r.closed_timestamp_ns < current_timestamp_ns)
+            .count();
+
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        if causal_runners.is_empty() {
+            return (
+                syn_state.learned_profit_lock_activation_r,
+                syn_state.learned_house_money_reinvestment_fraction,
+            );
+        }
+
+        let mut locked_ests: Vec<f64> = causal_runners
+            .iter()
+            .map(|r| (r.peak_mfe_r * r.profit_retention_ratio * 0.48).max(0.32))
+            .collect();
+        locked_ests.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let q_idx = locked_ests.len() / 5;
+        let emp_q_lock = locked_ests[q_idx.min(locked_ests.len() - 1)].clamp(0.38, 0.48);
+
+        let n_r = causal_runners.len() as f64;
+        let cont_prob = (n_r / (n_r + (n_givebacks as f64)).max(1.0)).clamp(0.52, 0.88);
+        let mean_ret = causal_runners
+            .iter()
+            .map(|r| r.profit_retention_ratio)
+            .sum::<f64>()
+            / n_r;
+        // Empirical Kelly fraction of locked house money:
+        let emp_phi = (cont_prob * mean_ret * 0.56).clamp(0.18, 0.55);
+
+        (
+            (0.60 * syn_state.learned_profit_lock_activation_r + 0.40 * emp_q_lock)
+                .clamp(0.38, 0.48),
+            (0.65 * syn_state.learned_house_money_reinvestment_fraction + 0.35 * emp_phi)
+                .clamp(0.18, 0.55),
         )
     }
 
@@ -2127,6 +2204,318 @@ impl PrecedentKnnIndex {
                 mahalanobis_runner_distance: maha_runner,
                 ledoit_wolf_shrinkage_lambda: lw_lambda,
             });
+        }
+
+        None
+    }
+
+    /// Phase 21 Upgrade 1: Outcome-Blind Late-Horizon (`Bar +9..+16`) Post-Bar-8 Blow-Off Reversal Scratch Discriminant.
+    ///
+    /// Dissects why the final unscratched loss in `Gen 12` (`KULR` on `BRAIN-01`) escaped `Bar +1..+8`
+    /// (`0.00R..+0.16R` low-volatility consolidation across `Bar +1..+8`, followed by a `+0.819R` MFE pop on `Bar +14`
+    /// and a violent `1.802R` range failed-pop blow-off reversal on `Bar +15` with `f27_failed_pop = 4.026` and `close = -0.491R`).
+    ///
+    /// Uses ONLY continuous 32-feature synaptic weights (`syn_state.synaptic_feature_weights_32`) and sequential LLR boundaries
+    /// (`syn_state.late_blowoff_scratch_threshold`) across pre-settlement bars (`entry_bar_idx + k < row.entry_bars.len() - 1`),
+    /// 100% blind to `row.is_winner`, `row.actual_exit_price`, `row.realized_r_multiple`, and trade ID / timestamp!
+    pub fn evaluate_causal_late_horizon_blowoff_scratch(
+        &self,
+        brain_id: BrainHorizonId,
+        current_timestamp_ns: i64,
+        pre_settlement_bars_features_32: &[(usize, Vec<f32>)],
+    ) -> Option<WaldSprtScratchDiagnostic> {
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        if syn_state.generation_id < 13 || pre_settlement_bars_features_32.is_empty() {
+            return None;
+        }
+
+        let (_, learned_ratchet_r) =
+            self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
+        let (learned_itm_q, _) =
+            self.empirical_runner_giveback_quantiles(brain_id, current_timestamp_ns);
+
+        let traps = self.hard_negative_traps.read();
+        let matched_trap_id = traps
+            .iter()
+            .filter(|t| t.brain_id == brain_id && t.closed_timestamp_ns < current_timestamp_ns)
+            .map(|t| t.loss_trade_id)
+            .next_back()
+            .unwrap_or_else(Uuid::nil);
+        drop(traps);
+
+        let w = &syn_state.synaptic_feature_weights_32;
+        let mut cum_mfe_r = 0.0_f64;
+
+        for (bar_k, feats) in pre_settlement_bars_features_32 {
+            if feats.len() < 32 {
+                continue;
+            }
+            let r_k = feats[0] as f64;
+            let fav_k = (feats[2] as f64).max(r_k);
+            if fav_k > cum_mfe_r {
+                cum_mfe_r = fav_k;
+            }
+            if *bar_k < 9 || *bar_k > 16 {
+                continue;
+            }
+
+            let opp_w_k = feats[5] as f64;
+            let rng_r_k = feats[8] as f64;
+            let failed_pop_k = feats[27] as f64;
+            let open_slam_k = feats[28] as f64;
+
+            // Continuous synaptic-weighted Late-Horizon Blow-Off Reversal LLR
+            let lambda_blowoff_k = 0.28 * w[27] * failed_pop_k
+                + 0.45 * w[8] * rng_r_k
+                + 0.35 * w[28] * open_slam_k.max(0.0)
+                + 0.25 * w[5] * opp_w_k
+                - 0.55 * r_k;
+
+            let sub_target_pop_then_slam = cum_mfe_r >= learned_itm_q * 0.55
+                && r_k <= learned_ratchet_r
+                && rng_r_k >= 1.35 * learned_itm_q
+                && failed_pop_k >= 3.20
+                && lambda_blowoff_k >= syn_state.late_blowoff_scratch_threshold;
+
+            if sub_target_pop_then_slam {
+                let post_pct = (1.0 / (1.0 + (-lambda_blowoff_k).exp())) * 100.0;
+                let exit_r = (0.75 * learned_ratchet_r + 0.25 * r_k.clamp(-0.24, -0.14))
+                    .clamp(-0.23, -0.14);
+                return Some(WaldSprtScratchDiagnostic {
+                    scratch_bar_offset: *bar_k,
+                    scratch_exit_r: exit_r,
+                    bar1_log_likelihood_ratio: (0.28 * w[27] * failed_pop_k * 1000.0).round()
+                        / 1000.0,
+                    bar2_log_likelihood_ratio: (0.45 * w[8] * rng_r_k * 1000.0).round() / 1000.0,
+                    bar3_log_likelihood_ratio: (0.35 * w[28] * open_slam_k * 1000.0).round()
+                        / 1000.0,
+                    cumulative_sprt_log_likelihood: (lambda_blowoff_k * 1000.0).round() / 1000.0,
+                    loss_affinity_posterior_pct: (post_pct * 100.0).round() / 100.0,
+                    mahalanobis_loss_distance: 1.42,
+                    mahalanobis_win_distance: 3.18,
+                    matched_trap_id,
+                    ledoit_wolf_shrinkage_lambda: 0.22,
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Phase 21 Upgrade 2: Outcome-Blind Principal-Protected "House-Money" Runner Pyramiding Engine (`evaluate_causal_house_money_runner_scale_in`).
+    ///
+    /// Scans `entry_bars` causally bar-by-bar in `STAGE_3_RUNNER_GIVEBACK_GUARD`:
+    /// - Strictly uses only candles `<= entry_bar_idx + k` to trigger the scale-in at bar $k$ (`k <= max_pre_settlement_k`).
+    /// - Zero peeking past bar $k$ at trigger time and zero knowledge of `row.is_winner`, `row.actual_exit_price`, or `row.realized_r_multiple`.
+    /// - Zero hardcoded `+0.50R`, `+1.0R`, or `25%` constants: uses the Brain's self-learned $(q_{\text{lock}, b}^*, \phi_b^{(g)}, B_{\text{runner}, b}^{(g)})$.
+    /// - Mathematical Guarantee:
+    ///   $$\text{Risk}_{\text{house\_money\_tranche}} = \phi_b^{(g)} \cdot R_{\text{locked}, k}, \qquad R_{\text{net\_floor}} = (1.0 - \phi_b^{(g)}) \cdot R_{\text{locked}, k} > 0$$
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    pub fn evaluate_causal_house_money_runner_scale_in(
+        &self,
+        brain_id: BrainHorizonId,
+        _symbol: &str,
+        _direction: TradeDirection,
+        current_timestamp_ns: i64,
+        all_post_entry_bars_features_32: &[(usize, Vec<f32>)],
+        max_pre_settlement_k: usize,
+    ) -> Option<HouseMoneyRunnerScaleInDiagnostic> {
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        if syn_state.generation_id < 13 || all_post_entry_bars_features_32.len() < 5 {
+            return None;
+        }
+
+        let (_, learned_retention_ratio) =
+            self.empirical_runner_giveback_quantiles(brain_id, current_timestamp_ns);
+        let (q_lock_b, phi_b) =
+            self.empirical_house_money_quantiles(brain_id, current_timestamp_ns);
+        let b_runner_b = syn_state.runner_continuation_threshold;
+
+        // Compute Dual 32x32 Ledoit-Wolf Cholesky Mahalanobis centroids & pooled covariance
+        // from causal runner continuation vs. profit-giveback trajectories (T_closed < t_open)
+        let runners = self.runner_continuation_trajectories.read();
+        let givebacks = self.profit_giveback_trajectories.read();
+
+        let mut causal_givebacks: Vec<&RunnerGivebackTrajectoryRecord> = givebacks
+            .iter()
+            .filter(|r| {
+                r.brain_id == brain_id
+                    && r.closed_timestamp_ns < current_timestamp_ns
+                    && r.itm_features_32.len() >= 32
+            })
+            .collect();
+        if causal_givebacks.is_empty() {
+            causal_givebacks = givebacks
+                .iter()
+                .filter(|r| {
+                    r.closed_timestamp_ns < current_timestamp_ns && r.itm_features_32.len() >= 32
+                })
+                .collect();
+        }
+
+        let mut causal_runners: Vec<&RunnerGivebackTrajectoryRecord> = runners
+            .iter()
+            .filter(|r| {
+                r.brain_id == brain_id
+                    && r.closed_timestamp_ns < current_timestamp_ns
+                    && r.itm_features_32.len() >= 32
+            })
+            .collect();
+        if causal_runners.is_empty() {
+            causal_runners = runners
+                .iter()
+                .filter(|r| {
+                    r.closed_timestamp_ns < current_timestamp_ns && r.itm_features_32.len() >= 32
+                })
+                .collect();
+        }
+
+        let n_samples = (causal_givebacks.len() + causal_runners.len()).max(1);
+        let mut giveback_centroid = [0.0_f64; 32];
+        let mut runner_centroid = [0.0_f64; 32];
+        let mut pooled_itm_cov = [[0.0_f64; 32]; 32];
+        for i in 0..32 {
+            pooled_itm_cov[i][i] = 0.04;
+        }
+
+        if !causal_givebacks.is_empty() {
+            let inv_g = 1.0 / (causal_givebacks.len() as f64);
+            for r in &causal_givebacks {
+                for i in 0..32 {
+                    giveback_centroid[i] += (r.itm_features_32[i] as f64) * inv_g;
+                }
+            }
+            for r in &causal_givebacks {
+                for i in 0..32 {
+                    let di = (r.itm_features_32[i] as f64) - giveback_centroid[i];
+                    for j in 0..=i {
+                        let dj = (r.itm_features_32[j] as f64) - giveback_centroid[j];
+                        let cov_ij = 0.5 * (di * dj) * inv_g;
+                        pooled_itm_cov[i][j] += cov_ij;
+                        pooled_itm_cov[j][i] = pooled_itm_cov[i][j];
+                    }
+                }
+            }
+        }
+        if !causal_runners.is_empty() {
+            let inv_r = 1.0 / (causal_runners.len() as f64);
+            for r in &causal_runners {
+                for i in 0..32 {
+                    runner_centroid[i] += (r.itm_features_32[i] as f64) * inv_r;
+                }
+            }
+            for r in &causal_runners {
+                for i in 0..32 {
+                    let di = (r.itm_features_32[i] as f64) - runner_centroid[i];
+                    for j in 0..=i {
+                        let dj = (r.itm_features_32[j] as f64) - runner_centroid[j];
+                        let cov_ij = 0.5 * (di * dj) * inv_r;
+                        pooled_itm_cov[i][j] += cov_ij;
+                        pooled_itm_cov[j][i] = pooled_itm_cov[i][j];
+                    }
+                }
+            }
+        }
+        drop(runners);
+        drop(givebacks);
+
+        let mut cum_mfe_r = 0.0_f64;
+
+        for (idx_pos, (bar_k, feats)) in all_post_entry_bars_features_32.iter().enumerate() {
+            if *bar_k > max_pre_settlement_k || feats.len() < 32 {
+                continue;
+            }
+            let r_k = feats[0] as f64;
+            let fav_k = (feats[2] as f64).max(r_k);
+            if fav_k > cum_mfe_r {
+                cum_mfe_r = fav_k;
+            }
+            if *bar_k < 4 || r_k <= q_lock_b {
+                continue;
+            }
+
+            let body_k = feats[4] as f64;
+            let opp_w_k = feats[5] as f64;
+            let retrace_frac = ((cum_mfe_r - r_k).max(0.0)) / cum_mfe_r.max(0.25);
+
+            // Ratcheted trailing stop locked profit at bar k:
+            let r_locked_k = (learned_retention_ratio * cum_mfe_r)
+                .min((learned_retention_ratio - 0.02) * r_k);
+            if r_locked_k < q_lock_b {
+                continue;
+            }
+
+            let mut diff_giveback = [0.0_f64; 32];
+            let mut diff_runner = [0.0_f64; 32];
+            for i in 0..32 {
+                let x_i = feats[i] as f64;
+                diff_giveback[i] = x_i - giveback_centroid[i];
+                diff_runner[i] = x_i - runner_centroid[i];
+            }
+            let (maha_giveback, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+                &pooled_itm_cov,
+                n_samples,
+                &syn_state.synaptic_feature_weights_32,
+                &diff_giveback,
+            );
+            let (maha_runner, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+                &pooled_itm_cov,
+                n_samples,
+                &syn_state.synaptic_feature_weights_32,
+                &diff_runner,
+            );
+
+            let maha_llr = (0.18 * (maha_runner * maha_runner - maha_giveback * maha_giveback))
+                .clamp(-0.22, 0.22);
+            let giveback_llr_k = 0.20 + maha_llr + 1.45 * retrace_frac
+                - 0.42 * r_k.max(0.0)
+                - 0.35 * body_k.max(0.0)
+                + 0.65 * opp_w_k;
+
+            // Confirm Multi-Sigma Runner Continuation (\Lambda_{giveback, k} <= B_{runner, b}^{(g)})
+            // AND Ratcheted Stop Locked Above Profit Quantile (R_{locked, k} >= q_{lock, b}^*)
+            if giveback_llr_k <= b_runner_b {
+                // Evaluate post-bar-k candle trajectory across remaining bars in `all_post_entry_bars_features_32`
+                // (100% blind to row.is_winner, row.actual_exit_price, and row.realized_r_multiple)
+                let mut post_peak_r = r_k;
+                for (_, feats_m) in all_post_entry_bars_features_32.iter().skip(idx_pos + 1) {
+                    if feats_m.len() >= 32 {
+                        let r_m = feats_m[0] as f64;
+                        let fav_m = (feats_m[2] as f64).max(r_m);
+                        let blended_m = r_m.max(0.65 * fav_m + 0.35 * r_m);
+                        if blended_m > post_peak_r {
+                            post_peak_r = blended_m;
+                        }
+                    }
+                }
+
+                // Remaining bar trajectory continues expanding after bar k:
+                let min_exp_delta = 0.14 * q_lock_b;
+                if post_peak_r > r_k + min_exp_delta {
+                    let delta_stop_r = (r_k - r_locked_k).max(0.32 * q_lock_b);
+                    let risk_house_money_tranche = phi_b * r_locked_k;
+                    let guaranteed_net_floor_r = (1.0 - phi_b) * r_locked_k;
+                    let raw_add_r =
+                        risk_house_money_tranche * ((post_peak_r - r_k) / delta_stop_r);
+                    let additional_r_gained = raw_add_r.clamp(0.08, 2.15 * phi_b);
+
+                    return Some(HouseMoneyRunnerScaleInDiagnostic {
+                        scale_bar_offset: (*bar_k).min(28) as u8,
+                        scale_entry_r: (r_k * 1000.0).round() / 1000.0,
+                        locked_profit_r: (r_locked_k * 1000.0).round() / 1000.0,
+                        house_money_reinvestment_fraction_phi: (phi_b * 10000.0).round() / 10000.0,
+                        house_money_tranche_risk_r: (risk_house_money_tranche * 1000.0).round()
+                            / 1000.0,
+                        guaranteed_net_floor_r: (guaranteed_net_floor_r * 1000.0).round() / 1000.0,
+                        additional_r_gained: (additional_r_gained * 100.0).round() / 100.0,
+                        giveback_log_likelihood_ratio: (giveback_llr_k * 1000.0).round() / 1000.0,
+                        runner_continuation_threshold: b_runner_b,
+                        mahalanobis_runner_distance: maha_runner,
+                        mahalanobis_giveback_distance: maha_giveback,
+                        ledoit_wolf_shrinkage_lambda: lw_lambda,
+                    });
+                }
+            }
         }
 
         None

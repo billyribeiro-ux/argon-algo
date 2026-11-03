@@ -82,7 +82,19 @@ fn default_giveback_retention_ratio() -> f64 {
     0.81
 }
 
-/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 20`).
+fn default_profit_lock_activation_r() -> f64 {
+    0.44
+}
+
+fn default_house_money_reinvestment_fraction() -> f64 {
+    0.34
+}
+
+fn default_late_blowoff_scratch_threshold() -> f64 {
+    1.85
+}
+
+/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 21`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainSynapticPlasticityState {
     pub brain_id: BrainHorizonId,
@@ -121,19 +133,30 @@ pub struct BrainSynapticPlasticityState {
     /// Phase 20 Upgrade 1: Self-learned empirical MFE retention lock quantile ($\rho_{\text{lock}, b}^*$) from causal winner retention distributions
     #[serde(default = "default_giveback_retention_ratio")]
     pub learned_giveback_retention_ratio: f64,
+    /// Phase 21 Upgrade 2: Self-learned empirical profit-lock activation quantile ($q_{\text{lock}, b}^*$) from causal runner retention distributions
+    #[serde(default = "default_profit_lock_activation_r")]
+    pub learned_profit_lock_activation_r: f64,
+    /// Phase 21 Upgrade 2 & 3: Self-learned Principal-Protected House-Money reinvestment & CBOE Gamma-Wall roll-up fraction ($\phi_b^{(g)} \in [0.18, 0.55]$)
+    #[serde(default = "default_house_money_reinvestment_fraction")]
+    pub learned_house_money_reinvestment_fraction: f64,
+    /// Phase 21 Upgrade 1: Self-learned Late-Horizon (`Bar +9..+16`) Failed-Pop Blow-Off Reversal LLR boundary ($A_{\text{blowoff}, b}^{(g)}$)
+    #[serde(default = "default_late_blowoff_scratch_threshold")]
+    pub late_blowoff_scratch_threshold: f64,
     pub top_boosted_warning_features: Vec<SynapticFeatureMutation>,
     pub top_slashed_deceiver_features: Vec<SynapticFeatureMutation>,
 }
 
 impl BrainSynapticPlasticityState {
     pub fn new_gen0(brain_id: BrainHorizonId) -> Self {
-        let (itm_mfe_q, ret_ratio) = match brain_id {
+        let (itm_mfe_q, ret_ratio): (f64, f64) = match brain_id {
             BrainHorizonId::Brain01PennyAnomaly => (1.01, 0.80),
             BrainHorizonId::Brain02IntradayDayTrade => (0.94, 0.80),
             BrainHorizonId::Brain03ShortTermSwing => (1.18, 0.81),
             BrainHorizonId::Brain04CoreSwing => (1.08, 0.82),
             BrainHorizonId::Brain05LongTermWealth => (1.01, 0.83),
         };
+        let lock_act_q = ((itm_mfe_q * ret_ratio * 0.52_f64) * 1000.0).round() / 1000.0;
+        let hm_phi_0 = ((1.0_f64 - ret_ratio) * 1.45_f64).clamp(0.22, 0.32);
         Self {
             brain_id,
             brain_name: brain_id.display_name().to_string(),
@@ -151,6 +174,9 @@ impl BrainSynapticPlasticityState {
             giveback_exhaustion_threshold: 1.38,
             runner_continuation_threshold: -0.25,
             learned_giveback_retention_ratio: ret_ratio,
+            learned_profit_lock_activation_r: lock_act_q,
+            learned_house_money_reinvestment_fraction: (hm_phi_0 * 1000.0).round() / 1000.0,
+            late_blowoff_scratch_threshold: 1.85,
             top_boosted_warning_features: Vec::new(),
             top_slashed_deceiver_features: Vec::new(),
         }
@@ -224,6 +250,10 @@ pub struct EvolutionGenerationRecord {
     pub giveback_saves_count: usize,
     #[serde(default)]
     pub total_giveback_r_recovered: f64,
+    #[serde(default)]
+    pub house_money_scaled_runners_count: usize,
+    #[serde(default)]
+    pub total_house_money_r_gained: f64,
     #[serde(default)]
     pub avg_winner_r: f64,
     pub remaining_unscratched_losses: usize,

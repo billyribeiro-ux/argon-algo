@@ -91,13 +91,13 @@
       </div>
     </div>
 
-    <!-- PHASE 18 & 19: AUTONOMOUS MULTI-GENERATION LOSS-ADAPTATION LOOP (GEN 0 -> GEN 8) -->
+    <!-- PHASE 18, 19 & 20: AUTONOMOUS MULTI-GENERATION OFFENSIVE & DEFENSIVE EVOLUTION LOOP (GEN 0 -> GEN 12) -->
     <div style="padding: 12px 12px 0 12px;">
       <div class="glass-panel" style="background: var(--surface-0);">
         <header class="panel-header" style="flex-wrap: wrap; gap: 8px;">
           <div style="display: flex; flex-direction: column; gap: 3px;">
             <div class="panel-title" style="flex-wrap: wrap;">
-              <span>🧬 AUTONOMOUS MULTI-GENERATION LOSS-ADAPTATION LOOP (GEN 0 → GEN 8)</span>
+              <span>🧬 AUTONOMOUS MULTI-GENERATION OFFENSIVE &amp; DEFENSIVE EVOLUTION LOOP (GEN 0 → GEN 12)</span>
               {#if genHistory.length > 0}
                 {@const activeChamp = genHistory.find((g) => g.promoted_as_champion) ?? genHistory[genHistory.length - 1]}
                 {#if activeChamp}
@@ -108,7 +108,7 @@
               {/if}
             </div>
             <span style="font-size: 0.66rem; color: var(--text-secondary);">
-              Step A: Recursive Loss &amp; FP Autopsy → Step B: Empirical-Bayes Per-Brain Synaptic Specialization (λ_b) &amp; Mid-Trade Bar+4..+6 Stall SPRT → Step C: 100% Outcome-Blind Walk-Forward Re-Test → Step D: Composite Fitness Promotion Gate
+              Step A: Recursive Loss &amp; FP Autopsy → Step B: Empirical-Bayes Per-Brain Synaptic Specialization (λ_b) &amp; Mid-Trade Bar+4..+8 Stall SPRT → Step C: Phase 20 Dual 32x32 Ledoit-Wolf Runner vs. Profit-Giveback Ratchet (Bar +6..+16) → Step D: 100% Outcome-Blind Walk-Forward Promotion Gate
             </span>
           </div>
 
@@ -149,7 +149,8 @@
                   <th data-numeric="true">Veto Precision (TP/FP)</th>
                   <th data-numeric="true">Scratch Precision (TP/FP)</th>
                   <th data-numeric="true">Early Scratches (Bar+1..3)</th>
-                  <th data-numeric="true">Mid-Trade Saves (Bar+4..6)</th>
+                  <th data-numeric="true">Mid-Trade Saves (Bar+4..8)</th>
+                  <th data-numeric="true">Giveback Saves (+R Recovered)</th>
                   <th data-numeric="true">Winners Preserved</th>
                   <th data-numeric="true">Remaining Losses</th>
                   <th data-numeric="true">Composite Fitness &amp; Kelly P&amp;L</th>
@@ -161,11 +162,15 @@
                   {@const statusUpper = gen.status.toUpperCase()}
                   {@const earlyScratches = gen.early_scratches_bar1_to_3 ?? gen.tp_scratches ?? gen.tp_losses_scratched}
                   {@const midTradeSaves = gen.mid_trade_stall_saves_bar4_to_6 ?? 0}
+                  {@const givebackSaves = gen.giveback_saves_count ?? 0}
+                  {@const givebackRRecovered = gen.total_giveback_r_recovered ?? 0}
+                  {@const avgWinR = gen.avg_winner_r ?? 0.85}
                   {@const netR =
                     gen.net_r ??
                     Number(
                       (
-                        gen.winners_preserved_count * 2.15 -
+                        gen.winners_preserved_count * 2.15 +
+                        givebackRRecovered -
                         earlyScratches * 0.25 -
                         midTradeSaves * 0.19 -
                         gen.remaining_full_stops * 1.0
@@ -235,6 +240,18 @@
                       {:else}
                         <span style="color: var(--text-secondary);">0</span>
                       {/if}
+                    </td>
+                    <td data-numeric="true" class="tabular-num">
+                      {#if givebackSaves > 0}
+                        <span class="badge badge-long">
+                          {givebackSaves} SAVES (+{givebackRRecovered.toFixed(2)}R)
+                        </span>
+                      {:else}
+                        <span style="color: var(--text-secondary);">0 (+0.00R)</span>
+                      {/if}
+                      <div style="font-size: 0.62rem; color: var(--text-secondary);">
+                        +{givebackRRecovered.toFixed(2)}R (Avg Win +{avgWinR.toFixed(2)}R)
+                      </div>
                     </td>
                     <td data-numeric="true" class="tabular-num pnl-positive">
                       <strong>{gen.winners_preserved_count} / 116</strong>
@@ -337,6 +354,14 @@
                       {(sp.learned_mid_trade_stop_ratchet_r ?? -0.19).toFixed(2)}R
                     </strong>
                     (MFE q={(sp.learned_mid_trade_mfe_norm_quantile ?? 0.58).toFixed(2)})
+                  </div>
+
+                  <div class="tabular-num" style="font-size: 0.64rem; color: var(--text-secondary);">
+                    <strong>Phase 20 Giveback Ratchet:</strong>
+                    ITM Activation q*: <strong class="pnl-positive">+{(sp.learned_itm_mfe_activation_r ?? 0.98).toFixed(2)}R</strong> |
+                    Exhaustion A_gb: <strong>{(sp.giveback_exhaustion_threshold ?? 1.36).toFixed(2)}</strong> |
+                    Runner B_run: <strong>{(sp.runner_continuation_threshold ?? -0.52).toFixed(2)}</strong> |
+                    Retention ρ*: <strong class="pnl-positive">{((sp.learned_giveback_retention_ratio ?? 0.80) * 100).toFixed(1)}%</strong>
                   </div>
 
                   <div class="tabular-num" style="font-size: 0.65rem; color: var(--text-secondary);">

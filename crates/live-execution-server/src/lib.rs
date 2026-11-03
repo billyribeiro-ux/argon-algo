@@ -1245,5 +1245,7 @@ mod tests {
                 original_row.symbol
             );
         }
+
+        let _ = engine.save_to_disk(std::path::Path::new("../../data/ledger_state.json"));
     }
 }

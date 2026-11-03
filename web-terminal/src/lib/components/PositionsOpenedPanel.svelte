@@ -131,6 +131,7 @@
           <th data-numeric="true">Greeks (Δ / Γ / IV)</th>
           <th data-numeric="true">R-Mult &amp; Excursion</th>
           <th>Hold Window</th>
+          <th data-numeric="true">Live Sequential LLR &amp; Next-Bar Ratchet</th>
           <th>Speed-1 AI Trace Health</th>
           <th>Archive / Exit</th>
         </tr>
@@ -216,6 +217,19 @@
             </td>
             <td class="tabular-num">
               {formatHoldDuration(pos.elapsedHoldMs)} / {formatHoldDuration(pos.predictedHoldMs)}
+            </td>
+            <td data-numeric="true" class="tabular-num">
+              <div>
+                <span class="badge badge-ai-core" style="font-size: 0.58rem;">
+                  Bar +{pos.barsHeldCount} | {pos.activeSequentialStage}
+                </span>
+              </div>
+              <div style="font-size: 0.65rem; margin-block-start: 2px;">
+                LLR {pos.liveSequentialLlr.toFixed(3)} / {pos.championLlrThreshold.toFixed(3)} (Margin {pos.sequentialSafetyMarginPct.toFixed(1)}%)
+              </div>
+              <div class="pnl-positive" style="font-size: 0.63rem;">
+                Next Stop Preview: ${pos.nextBarRatchetStopPreview.toFixed(2)}
+              </div>
             </td>
             <td>
               <span

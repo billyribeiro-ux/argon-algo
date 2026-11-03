@@ -1241,4 +1241,147 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
     expect(sp8.mid_trade_wald_sprt_thresholds).toEqual([1.31, 1.28, 1.24]);
     expect(sp8.learned_mid_trade_stop_ratchet_r).toBeCloseTo(-0.18, 2);
   });
+
+  it('hydrates Phase 20 Gen 0..Gen 12 Profit-Giveback Ratchet Evolution & Open-Position Live Sequential LLR Telemetry', () => {
+    const store = new TerminalStore(false);
+
+    store.ingestBackendSnapshot({
+      positions_opened: [
+        {
+          position_id: 'POS-P20-1',
+          opened_timestamp_ns: 1_730_500_000_000_000_000,
+          symbol: 'NVDA',
+          exchange_index: 'NASDAQ_100',
+          brain_id: 'BRAIN-02',
+          direction: 'LONG',
+          entry_price: 138.5,
+          live_price: 142.1,
+          quantity_shares: 100,
+          structural_stop_price: 136.8,
+          target_1_price: 141.5,
+          target_2_price: 145.0,
+          bars_held_count: 9,
+          active_sequential_stage: 'STAGE_3_RUNNER_GIVEBACK_GUARD (Bar 6+)',
+          live_sequential_llr: -0.42,
+          champion_llr_threshold: 1.36,
+          sequential_safety_margin_pct: 84.2,
+          next_bar_ratchet_stop_preview: 141.38
+        }
+      ],
+      closed_trades: [
+        {
+          trade_id: 'TRD-P20-GB-1',
+          opened_timestamp_ns: 1_730_490_000_000_000_000,
+          closed_timestamp_ns: 1_730_495_400_000_000_000,
+          hold_duration_ms: 5_400_000,
+          symbol: 'PLTR',
+          exchange_index: 'NYSE',
+          brain_id: 'BRAIN-03',
+          direction: 'LONG',
+          entry_price: 42.0,
+          actual_exit_price: 43.2,
+          quantity_shares: 250,
+          initial_structural_stop: 40.8,
+          target_1_price: 43.8,
+          target_2_price: 45.5,
+          outcome_badge: 'CLOSED - TARGET HIT',
+          is_winner: true,
+          net_pnl_usd: 300.0,
+          stock_return_pct: 2.86,
+          realized_r_multiple: 1.0,
+          was_protected_from_giveback: true,
+          giveback_ratchet_bar_offset: 8,
+          giveback_r_saved: 0.72
+        }
+      ],
+      evolution_generations_history: [
+        {
+          generation_id: 12,
+          status_label: 'GEN-12 PROMOTED CHAMPION',
+          is_current_champion: true,
+          timestamp_iso: '2026-11-02T22:00:00Z',
+          active_trades: 153,
+          wins: 115,
+          losses: 38,
+          win_rate_pct: 75.16,
+          tp_losses_vetoed: 20,
+          fp_winners_vetoed: 0,
+          entry_veto_precision_pct: 100.0,
+          tp_losses_scratched: 36,
+          fp_winners_scratched: 1,
+          scratch_precision_pct: 97.3,
+          early_scratches_bar1_to_3: 19,
+          mid_trade_stall_saves_bar4_to_6: 17,
+          giveback_saves_count: 19,
+          total_giveback_r_recovered: 13.09,
+          avg_winner_r: 0.91,
+          tp_losses_caught_total: 56,
+          fp_winners_clipped_total: 1,
+          remaining_unscratched_losses: 1,
+          profit_factor: 15.16,
+          kelly_profit_factor: 14.54,
+          fixed_net_pnl_usd: 57937.26,
+          kelly_net_pnl_usd: 90959.59,
+          max_drawdown_usd: 353.64,
+          composite_fitness_score: 111762.24,
+          mutations_applied_summary: [
+            'BRAIN-02 (Gen 12): Giveback Saves=19 (+13.09R recovered), Avg Winner=+0.91R'
+          ]
+        }
+      ],
+      synaptic_plasticity_states: [
+        {
+          brain_id: 'BRAIN-02',
+          generation_id: 12,
+          synaptic_feature_weights_32: Array(32).fill(1.15),
+          stream_prior_multipliers: [1.2, 1.14, 0.95, 1.05],
+          wald_sprt_thresholds: [1.46, 1.52, 1.58],
+          entry_veto_margin_delta: 0.015,
+          trap_conviction_weights: {},
+          empirical_bayes_shrinkage_lambda: 0.8904,
+          mid_trade_wald_sprt_thresholds: [1.42, 1.38, 1.35],
+          learned_mid_trade_mfe_norm_quantile: 0.55,
+          learned_mid_trade_stop_ratchet_r: -0.121,
+          learned_itm_mfe_activation_r: 0.931,
+          giveback_exhaustion_threshold: 1.36,
+          runner_continuation_threshold: -0.52,
+          learned_giveback_retention_ratio: 0.8,
+          top_boosted_warning_features: [],
+          top_slashed_deceiver_features: [],
+          cumulative_tp_vetoes: 8,
+          cumulative_fp_vetoes: 0,
+          cumulative_tp_scratches: 12,
+          cumulative_fp_scratches: 0,
+          remaining_unscratched_losses: 0,
+          last_mutation_summary: 'Gen 12 promoted champion'
+        }
+      ]
+    });
+
+    const openPos = store.openPositions[0]!;
+    expect(openPos.barsHeldCount).toBe(9);
+    expect(openPos.activeSequentialStage).toBe('STAGE_3_RUNNER_GIVEBACK_GUARD (Bar 6+)');
+    expect(openPos.liveSequentialLlr).toBeCloseTo(-0.42, 2);
+    expect(openPos.championLlrThreshold).toBeCloseTo(1.36, 2);
+    expect(openPos.sequentialSafetyMarginPct).toBeCloseTo(84.2, 1);
+    expect(openPos.nextBarRatchetStopPreview).toBeCloseTo(141.38, 2);
+
+    const closedTr = store.closedLedger[0]!;
+    expect(closedTr.wasProtectedFromGiveback).toBe(true);
+    expect(closedTr.givebackRatchetBarOffset).toBe(8);
+    expect(closedTr.givebackRSaved).toBeCloseTo(0.72, 2);
+
+    const gen12 = store.evolutionGenerationsHistory[0]!;
+    expect(gen12.generation_id).toBe(12);
+    expect(gen12.giveback_saves_count).toBe(19);
+    expect(gen12.total_giveback_r_recovered).toBeCloseTo(13.09, 2);
+    expect(gen12.avg_winner_r).toBeCloseTo(0.91, 2);
+    expect(gen12.remaining_full_stops).toBe(1);
+
+    const sp12 = store.synapticPlasticityStates[0]!;
+    expect(sp12.learned_itm_mfe_activation_r).toBeCloseTo(0.931, 3);
+    expect(sp12.giveback_exhaustion_threshold).toBeCloseTo(1.36, 2);
+    expect(sp12.runner_continuation_threshold).toBeCloseTo(-0.52, 2);
+    expect(sp12.learned_giveback_retention_ratio).toBeCloseTo(0.8, 2);
+  });
 });

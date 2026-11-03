@@ -271,6 +271,12 @@ export interface OpenPositionItem {
   strategyArchetype: StrategyArchetypeId;
   traceHealthBadge: TraceHealthBadge;
   precedentLabel: string;
+  barsHeldCount: number;
+  activeSequentialStage: string;
+  liveSequentialLlr: number;
+  championLlrThreshold: number;
+  sequentialSafetyMarginPct: number;
+  nextBarRatchetStopPreview: number;
   streamWeights: {
     priceVolumeAnomaly: number;
     optionsGammaVanna: number;
@@ -348,6 +354,9 @@ export interface ClosedTradeLedgerItem {
   adaptiveLossSavedUsd: number;
   adaptiveKellyLossSavedUsd: number;
   lossAffinityPosteriorPct: number;
+  wasProtectedFromGiveback: boolean;
+  givebackRatchetBarOffset: number;
+  givebackRSaved: number;
 }
 
 export interface ProviderStatusEntry {
@@ -429,6 +438,10 @@ export interface BrainSynapticPlasticityState {
   mid_trade_wald_sprt_thresholds?: [number, number, number];
   learned_mid_trade_mfe_norm_quantile?: number;
   learned_mid_trade_stop_ratchet_r?: number;
+  learned_itm_mfe_activation_r?: number;
+  giveback_exhaustion_threshold?: number;
+  runner_continuation_threshold?: number;
+  learned_giveback_retention_ratio?: number;
   top_boosted_warning_features: SynapticFeatureMutation[];
   top_slashed_deceiver_features: SynapticFeatureMutation[];
   top_boosted_features?: SynapticFeatureMutation[];
@@ -459,6 +472,9 @@ export interface EvolutionGenerationRecord {
   early_scratches_bar1_to_3?: number;
   mid_trade_stall_saves_bar4_to_6?: number;
   fp_mid_trade_scratches?: number;
+  giveback_saves_count?: number;
+  total_giveback_r_recovered?: number;
+  avg_winner_r?: number;
   tp_scratches?: number;
   expectancy_r?: number;
   net_r?: number;
@@ -1920,6 +1936,10 @@ export class TerminalStore {
         s.learned_mid_trade_mfe_norm_quantile ?? 0.58
       ),
       learned_mid_trade_stop_ratchet_r: Number(s.learned_mid_trade_stop_ratchet_r ?? -0.19),
+      learned_itm_mfe_activation_r: Number(s.learned_itm_mfe_activation_r ?? 0.98),
+      giveback_exhaustion_threshold: Number(s.giveback_exhaustion_threshold ?? 1.36),
+      runner_continuation_threshold: Number(s.runner_continuation_threshold ?? -0.52),
+      learned_giveback_retention_ratio: Number(s.learned_giveback_retention_ratio ?? 0.8),
       top_boosted_warning_features: boosted,
       top_slashed_deceiver_features: slashed,
       top_boosted_features: boosted,
@@ -1962,6 +1982,9 @@ export class TerminalStore {
       early_scratches_bar1_to_3: earlyScratches,
       mid_trade_stall_saves_bar4_to_6: midTradeSaves,
       fp_mid_trade_scratches: Number(g.fp_mid_trade_scratches ?? 0),
+      giveback_saves_count: Number(g.giveback_saves_count ?? 0),
+      total_giveback_r_recovered: Number(g.total_giveback_r_recovered ?? 0),
+      avg_winner_r: Number(g.avg_winner_r ?? 0.85),
       tp_scratches: tpScratch,
       expectancy_r: g.expectancy_r !== undefined ? Number(g.expectancy_r) : undefined,
       net_r: g.net_r !== undefined ? Number(g.net_r) : undefined,
@@ -2420,6 +2443,16 @@ export class TerminalStore {
         ) as StrategyArchetypeId,
         traceHealthBadge: mapBackendTraceHealth(String(p.trace_health_badge ?? 'ACCELERATING')),
         precedentLabel: `Matches ${wins}/${matchesCnt} Past Expansion Traces (${winRate.toFixed(0)}% Win Rate)`,
+        barsHeldCount: Number(p.bars_held_count ?? 1),
+        activeSequentialStage: String(
+          p.active_sequential_stage ?? 'STAGE_1_EARLY_SPRT (Bar 1..3)'
+        ),
+        liveSequentialLlr: Number(p.live_sequential_llr ?? 0.28),
+        championLlrThreshold: Number(p.champion_llr_threshold ?? 1.4),
+        sequentialSafetyMarginPct: Number(p.sequential_safety_margin_pct ?? 46.5),
+        nextBarRatchetStopPreview: Number(
+          p.next_bar_ratchet_stop_preview ?? p.structural_stop_price ?? 0
+        ),
         streamWeights: {
           priceVolumeAnomaly: Number(sw.chart_tape_physics_weight ?? 0.35),
           optionsGammaVanna: Number(sw.options_gamma_vanna_weight ?? 0.25),
@@ -2559,7 +2592,10 @@ export class TerminalStore {
         adaptiveKellyNetPnlUsd: Number(c.adaptive_kelly_net_pnl_usd ?? kellyStockNet),
         adaptiveLossSavedUsd: Number(c.adaptive_loss_saved_usd ?? 0),
         adaptiveKellyLossSavedUsd: Number(c.adaptive_kelly_loss_saved_usd ?? 0),
-        lossAffinityPosteriorPct: Number(c.loss_affinity_posterior_pct ?? 0)
+        lossAffinityPosteriorPct: Number(c.loss_affinity_posterior_pct ?? 0),
+        wasProtectedFromGiveback: Boolean(c.was_protected_from_giveback ?? false),
+        givebackRatchetBarOffset: Number(c.giveback_ratchet_bar_offset ?? 0),
+        givebackRSaved: Number(c.giveback_r_saved ?? 0)
       };
     });
 
@@ -3329,6 +3365,12 @@ export class TerminalStore {
               : 'POC_VOLUME_ABSORPTION',
       traceHealthBadge: 'OPTIMAL',
       precedentLabel: `Matches ${candidate.precedentMatchSummary.matchingWins}/${candidate.precedentMatchSummary.totalK} Past Expansion Traces (${candidate.precedentMatchSummary.winRatePct.toFixed(0)}% Win Rate)`,
+      barsHeldCount: 1,
+      activeSequentialStage: 'STAGE_1_EARLY_SPRT (Bar 1..3)',
+      liveSequentialLlr: 0.28,
+      championLlrThreshold: 1.4,
+      sequentialSafetyMarginPct: 46.5,
+      nextBarRatchetStopPreview: candidate.structuralStopPrice,
       streamWeights: { ...candidate.streamWeights }
     };
     this.openPositions = [newPos, ...this.openPositions];
@@ -3459,7 +3501,10 @@ export class TerminalStore {
       adaptiveKellyNetPnlUsd: stockPnlUsd * 1.15,
       adaptiveLossSavedUsd: 0,
       adaptiveKellyLossSavedUsd: 0,
-      lossAffinityPosteriorPct: 0
+      lossAffinityPosteriorPct: 0,
+      wasProtectedFromGiveback: false,
+      givebackRatchetBarOffset: 0,
+      givebackRSaved: 0
     };
 
     this.closedLedger = [closedItem, ...this.closedLedger];

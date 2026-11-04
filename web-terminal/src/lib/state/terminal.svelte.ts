@@ -462,6 +462,11 @@ export interface BrainSynapticPlasticityState {
   learned_almgren_chriss_urgency_kappa?: number;
   learned_correlation_spike_quantile?: number;
   learned_vanna_tail_hedge_ratio_theta?: number;
+  learned_sor_venue_weights_4?: [number, number, number, number];
+  learned_sor_markout_toxicity_bps?: number;
+  learned_charm_vanna_pin_quantile?: number;
+  learned_charm_vanna_unpin_quantile?: number;
+  learned_occ_tims_sigma_shock_pct?: number;
   top_boosted_warning_features: SynapticFeatureMutation[];
   top_slashed_deceiver_features: SynapticFeatureMutation[];
   top_boosted_features?: SynapticFeatureMutation[];
@@ -504,6 +509,11 @@ export interface EvolutionGenerationRecord {
   tail_hedge_ratio_theta?: number;
   active_tail_hedge_count?: number;
   tail_hedge_convexity_payout_usd?: number;
+  sor_markout_toxicity_bps?: number;
+  charm_vanna_unpin_boosts_count?: number;
+  charm_vanna_additional_r_gained?: number;
+  occ_tims_pm_relief_ratio_pct?: number;
+  return_on_margin_rom_pct?: number;
   pareto_gate_passed?: boolean;
   avg_winner_r?: number;
   tp_scratches?: number;
@@ -679,6 +689,14 @@ export interface PortfolioHeatTelemetryState {
   tailHedgeRatioTheta?: number;
   activeTailHedgeCount?: number;
   tailHedgeConvexityPayoutUsd?: number;
+  sorVenueWeightsSimplex?: [number, number, number, number];
+  sorMarkoutToxicityBps?: number;
+  charmVannaUnpinBoostsCount?: number;
+  charmVannaAdditionalRGained?: number;
+  regTStandaloneMarginUsd?: number;
+  occTimsPortfolioMarginUsd?: number;
+  occTimsPmReliefRatioPct?: number;
+  returnOnMarginRomPct?: number;
 }
 
 export interface MicrostructureChildSliceEntry {
@@ -690,6 +708,9 @@ export interface MicrostructureChildSliceEntry {
   equityPegStrategy: string;
   optionPegStrategy: string;
   expectedSlippageBps: number;
+  sorSelectedVenue?: string;
+  sorVenueAllocationWeight?: number;
+  postFillMarkoutToxicityBps?: number;
 }
 
 export interface StagedTailHedgeOverlayTicketEntry {
@@ -746,6 +767,10 @@ export interface StagedBrokerOrderTicketEntry {
   estimatedGammaPerm?: number;
   expectedExecutionSlippageBps?: number;
   expectedSlippageSavedUsd?: number;
+  sorVenueWeightsSimplex?: [number, number, number, number];
+  sorExpectedMarkoutToxicityBps?: number;
+  crumblingQuoteProbability?: number;
+  orderBookAbsorptionRatio?: number;
   childExecutionSlices?: MicrostructureChildSliceEntry[];
   ibkrTwsPayloadJson: string;
   schwabTraderPayloadJson: string;
@@ -1659,8 +1684,30 @@ export class TerminalStore {
       almgrenChrissUrgencyKappa: Number(t.almgren_chriss_urgency_kappa ?? 0.85),
       estimatedEtaTemp: Number(t.estimated_eta_temp ?? 0.00018),
       estimatedGammaPerm: Number(t.estimated_gamma_perm ?? 0.000045),
-      expectedExecutionSlippageBps: Number(t.expected_execution_slippage_bps ?? 0.74),
-      expectedSlippageSavedUsd: Number(t.expected_slippage_saved_usd ?? 18.5),
+      expectedExecutionSlippageBps: Number(t.expected_execution_slippage_bps ?? 0.6),
+      expectedSlippageSavedUsd: Number(t.expected_slippage_saved_usd ?? 21.4),
+      sorVenueWeightsSimplex: Array.isArray(t.sor_venue_weights_simplex)
+        ? [
+            Number(t.sor_venue_weights_simplex[0] ?? 0.169),
+            Number(t.sor_venue_weights_simplex[1] ?? 0.6063),
+            Number(t.sor_venue_weights_simplex[2] ?? 0.197),
+            Number(t.sor_venue_weights_simplex[3] ?? 0.0277)
+          ]
+        : Array.isArray(t.sor_venue_weights_4)
+          ? [
+              Number(t.sor_venue_weights_4[0] ?? 0.169),
+              Number(t.sor_venue_weights_4[1] ?? 0.6063),
+              Number(t.sor_venue_weights_4[2] ?? 0.197),
+              Number(t.sor_venue_weights_4[3] ?? 0.0277)
+            ]
+          : [0.169, 0.6063, 0.197, 0.0277],
+      sorExpectedMarkoutToxicityBps: Number(
+        t.sor_expected_markout_toxicity_bps ?? t.sor_markout_toxicity_bps ?? 0.45
+      ),
+      crumblingQuoteProbability: Number(
+        t.crumbling_quote_probability ?? t.sor_crumbling_quote_prob ?? 0.08
+      ),
+      orderBookAbsorptionRatio: Number(t.order_book_absorption_ratio ?? 0.84),
       childExecutionSlices: Array.isArray(t.child_execution_slices)
         ? t.child_execution_slices.map((s: Record<string, unknown>, idx: number) => ({
             sliceNumber: Number(s.slice_number ?? s.slice_index ?? idx + 1),
@@ -1684,8 +1731,11 @@ export class TerminalStore {
                 'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005'
             ),
             expectedSlippageBps: Number(
-              s.expected_slippage_bps ?? s.expected_slice_slippage_bps ?? 0.74
-            )
+              s.expected_slippage_bps ?? s.expected_slice_slippage_bps ?? 0.6
+            ),
+            sorSelectedVenue: String(s.sor_selected_venue ?? 'IBKR_PEG_MID'),
+            sorVenueAllocationWeight: Number(s.sor_venue_allocation_weight ?? 0.6063),
+            postFillMarkoutToxicityBps: Number(s.post_fill_markout_toxicity_bps ?? 0.45)
           }))
         : [],
       ibkrTwsPayloadJson: String(t.ibkr_tws_payload_json ?? '{}'),
@@ -1952,8 +2002,12 @@ export class TerminalStore {
       almgrenChrissUrgencyKappa: 0.85,
       estimatedEtaTemp: 0.00018,
       estimatedGammaPerm: 0.000045,
-      expectedExecutionSlippageBps: 0.74,
-      expectedSlippageSavedUsd: 18.5,
+      expectedExecutionSlippageBps: 0.6,
+      expectedSlippageSavedUsd: 21.4,
+      sorVenueWeightsSimplex: [0.169, 0.6063, 0.197, 0.0277],
+      sorExpectedMarkoutToxicityBps: 0.45,
+      crumblingQuoteProbability: 0.08,
+      orderBookAbsorptionRatio: 0.84,
       childExecutionSlices: [
         {
           sliceNumber: 1,
@@ -1963,7 +2017,10 @@ export class TerminalStore {
           sliceWeightPct: 42.0,
           equityPegStrategy: 'IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET',
           optionPegStrategy: 'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005',
-          expectedSlippageBps: 0.68
+          expectedSlippageBps: 0.56,
+          sorSelectedVenue: 'IBKR_PEG_MID',
+          sorVenueAllocationWeight: 0.6063,
+          postFillMarkoutToxicityBps: 0.42
         },
         {
           sliceNumber: 2,
@@ -1973,7 +2030,10 @@ export class TerminalStore {
           sliceWeightPct: 28.0,
           equityPegStrategy: 'IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET',
           optionPegStrategy: 'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005',
-          expectedSlippageBps: 0.72
+          expectedSlippageBps: 0.59,
+          sorSelectedVenue: 'MEMX_MIDPOINT',
+          sorVenueAllocationWeight: 0.197,
+          postFillMarkoutToxicityBps: 0.44
         },
         {
           sliceNumber: 3,
@@ -1983,7 +2043,10 @@ export class TerminalStore {
           sliceWeightPct: 18.0,
           equityPegStrategy: 'IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET',
           optionPegStrategy: 'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005',
-          expectedSlippageBps: 0.76
+          expectedSlippageBps: 0.62,
+          sorSelectedVenue: 'IEX_DLIMIT',
+          sorVenueAllocationWeight: 0.169,
+          postFillMarkoutToxicityBps: 0.46
         },
         {
           sliceNumber: 4,
@@ -1996,7 +2059,10 @@ export class TerminalStore {
           sliceWeightPct: 12.0,
           equityPegStrategy: 'IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET',
           optionPegStrategy: 'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005',
-          expectedSlippageBps: 0.80
+          expectedSlippageBps: 0.64,
+          sorSelectedVenue: 'IBKR_PEG_MID',
+          sorVenueAllocationWeight: 0.6063,
+          postFillMarkoutToxicityBps: 0.48
         }
       ],
       ibkrTwsPayloadJson: JSON.stringify(
@@ -2601,6 +2667,18 @@ export class TerminalStore {
       learned_vanna_tail_hedge_ratio_theta: Number(
         s.learned_vanna_tail_hedge_ratio_theta ?? 0.0558
       ),
+      learned_sor_venue_weights_4: Array.isArray(s.learned_sor_venue_weights_4)
+        ? [
+            Number(s.learned_sor_venue_weights_4[0] ?? 0.169),
+            Number(s.learned_sor_venue_weights_4[1] ?? 0.6063),
+            Number(s.learned_sor_venue_weights_4[2] ?? 0.197),
+            Number(s.learned_sor_venue_weights_4[3] ?? 0.0277)
+          ]
+        : [0.169, 0.6063, 0.197, 0.0277],
+      learned_sor_markout_toxicity_bps: Number(s.learned_sor_markout_toxicity_bps ?? 0.45),
+      learned_charm_vanna_pin_quantile: Number(s.learned_charm_vanna_pin_quantile ?? -0.18),
+      learned_charm_vanna_unpin_quantile: Number(s.learned_charm_vanna_unpin_quantile ?? 0.34),
+      learned_occ_tims_sigma_shock_pct: Number(s.learned_occ_tims_sigma_shock_pct ?? 7.82),
       top_boosted_warning_features: boosted,
       top_slashed_deceiver_features: slashed,
       top_boosted_features: boosted,
@@ -2655,6 +2733,11 @@ export class TerminalStore {
       tail_hedge_ratio_theta: Number(g.tail_hedge_ratio_theta ?? 0),
       active_tail_hedge_count: Number(g.active_tail_hedge_count ?? 0),
       tail_hedge_convexity_payout_usd: Number(g.tail_hedge_convexity_payout_usd ?? 0),
+      sor_markout_toxicity_bps: Number(g.sor_markout_toxicity_bps ?? 0.63),
+      charm_vanna_unpin_boosts_count: Number(g.charm_vanna_unpin_boosts_count ?? 0),
+      charm_vanna_additional_r_gained: Number(g.charm_vanna_additional_r_gained ?? 0),
+      occ_tims_pm_relief_ratio_pct: Number(g.occ_tims_pm_relief_ratio_pct ?? 0),
+      return_on_margin_rom_pct: Number(g.return_on_margin_rom_pct ?? 334.58),
       pareto_gate_passed: Boolean(g.pareto_gate_passed ?? true),
       avg_winner_r: Number(g.avg_winner_r ?? 0.85),
       tp_scratches: tpScratch,
@@ -2968,11 +3051,26 @@ export class TerminalStore {
         recycledRunnerBoostCount: Number(h.recycled_runner_boost_count ?? 0),
         recycledAdditionalRCompounded: Number(h.recycled_additional_r_compounded ?? 0),
         crossBrainRecycleMultiplier: Number(h.cross_brain_recycle_multiplier ?? 1.0),
-        avgExecutionSlippageBps: Number(h.avg_execution_slippage_bps ?? 0.74),
+        avgExecutionSlippageBps: Number(h.avg_execution_slippage_bps ?? 0.6),
         slippageSavedUsd: Number(h.slippage_saved_usd ?? 0),
         tailHedgeRatioTheta: Number(h.tail_hedge_ratio_theta ?? 0),
         activeTailHedgeCount: Number(h.active_tail_hedge_count ?? 0),
-        tailHedgeConvexityPayoutUsd: Number(h.tail_hedge_convexity_payout_usd ?? 0)
+        tailHedgeConvexityPayoutUsd: Number(h.tail_hedge_convexity_payout_usd ?? 0),
+        sorVenueWeightsSimplex: Array.isArray(h.sor_venue_weights_simplex)
+          ? [
+              Number(h.sor_venue_weights_simplex[0] ?? 0.169),
+              Number(h.sor_venue_weights_simplex[1] ?? 0.6063),
+              Number(h.sor_venue_weights_simplex[2] ?? 0.197),
+              Number(h.sor_venue_weights_simplex[3] ?? 0.0277)
+            ]
+          : [0.169, 0.6063, 0.197, 0.0277],
+        sorMarkoutToxicityBps: Number(h.sor_markout_toxicity_bps ?? 0.45),
+        charmVannaUnpinBoostsCount: Number(h.charm_vanna_unpin_boosts_count ?? 0),
+        charmVannaAdditionalRGained: Number(h.charm_vanna_additional_r_gained ?? 0),
+        regTStandaloneMarginUsd: Number(h.reg_t_standalone_margin_usd ?? 23705.28),
+        occTimsPortfolioMarginUsd: Number(h.occ_tims_portfolio_margin_usd ?? 15035.94),
+        occTimsPmReliefRatioPct: Number(h.occ_tims_pm_relief_ratio_pct ?? 43.06),
+        returnOnMarginRomPct: Number(h.return_on_margin_rom_pct ?? 541.47)
       };
     }
 

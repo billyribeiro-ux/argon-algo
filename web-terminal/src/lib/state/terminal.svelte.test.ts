@@ -1928,4 +1928,176 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
       'IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005'
     );
   });
+
+  it('hydrates Phase 24 Gen-28 Cross-Venue NBBO SOR Markout Toxicity, Dealer Charm/Vanna Unpinning, and OCC TIMS Portfolio Margin Relief', async () => {
+    const store = new TerminalStore(false);
+    store.ingestBackendSnapshot({
+      positions_opened: [
+        {
+          position_id: 'OPEN-P24-NVDA',
+          opened_timestamp_ns: 1_793_739_300_000_000_000,
+          symbol: 'NVDA',
+          exchange_index: 'NASDAQ_100',
+          brain_id: 'BRAIN-02',
+          direction: 'LONG',
+          entry_price: 210.0,
+          live_price: 221.4,
+          quantity_shares: 120,
+          kelly_fraction_pct: 2.15,
+          risk_budget_usd: 1120.0,
+          notional_allocated_usd: 25200.0,
+          tranche_count: 2,
+          structural_stop_price: 204.5,
+          target_1_price: 222.0,
+          target_2_price: 235.0,
+          unrealized_stock_pnl_usd: 1368.0,
+          unrealized_stock_pnl_pct: 5.43,
+          option_structure: 'LONG_CALL_GAMMA',
+          matched_option_contract: 'NVDA 2026-11-20 $210.00C',
+          option_entry_premium: 6.4,
+          option_live_premium: 13.2,
+          option_contracts_count: 6,
+          unrealized_option_pnl_usd: 4080.0,
+          unrealized_option_pnl_pct: 106.25
+        }
+      ],
+      closed_trades: [],
+      portfolio_heat_telemetry: {
+        account_equity_usd: 230449.62,
+        open_positions_count: 5,
+        aggregate_open_risk_usd: 2680.0,
+        aggregate_open_risk_pct: 1.16,
+        portfolio_heat_cap_pct: 8.5,
+        gross_portfolio_notional_usd: 54000.0,
+        net_portfolio_beta_delta_usd: 14800.0,
+        net_portfolio_gamma_1pct_usd: 1920.0,
+        net_portfolio_vanna_1pct_usd: 680.0,
+        mean_pairwise_correlation: 0.18,
+        max_pairwise_correlation: 0.34,
+        correlation_heat_multiplier: 1.0,
+        heat_regime_badge: 'LOW HEAT — FULL 1.00x KELLY CAPACITY',
+        position_labels: ['NVDA (BRAIN-02)'],
+        cross_position_correlation_matrix: [[1.0]],
+        pairwise_correlations: [],
+        overlapping_clusters_summary: 'Independent multi-horizon exposure',
+        recycled_risk_pool_usd: 50507.68,
+        recycled_runner_boost_count: 24,
+        recycled_additional_r_compounded: 10.63,
+        cross_brain_recycle_multiplier: 1.33,
+        avg_execution_slippage_bps: 0.6,
+        slippage_saved_usd: 3325.08,
+        tail_hedge_ratio_theta: 0.0558,
+        active_tail_hedge_count: 44,
+        tail_hedge_convexity_payout_usd: 1765.62,
+        sor_venue_weights_simplex: [0.169, 0.6063, 0.197, 0.0277],
+        sor_markout_toxicity_bps: 0.45,
+        charm_vanna_unpin_boosts_count: 24,
+        charm_vanna_additional_r_gained: 2.32,
+        reg_t_standalone_margin_usd: 23705.28,
+        occ_tims_portfolio_margin_usd: 15035.94,
+        occ_tims_pm_relief_ratio_pct: 43.06,
+        return_on_margin_rom_pct: 541.47
+      },
+      evolution_generations_history: [
+        {
+          generation_id: 28,
+          status_label: 'GEN-28 PROMOTED CHAMPION',
+          is_current_champion: true,
+          timestamp_iso: '2026-11-03T19:10:00Z',
+          active_trades: 153,
+          wins: 116,
+          losses: 37,
+          win_rate_pct: 75.82,
+          tp_losses_vetoed: 20,
+          fp_winners_vetoed: 0,
+          entry_veto_precision_pct: 100.0,
+          tp_losses_scratched: 37,
+          fp_winners_scratched: 0,
+          scratch_precision_pct: 100.0,
+          early_scratches_bar1_to_3: 19,
+          mid_trade_stall_saves_bar4_to_6: 18,
+          giveback_saves_count: 19,
+          total_giveback_r_recovered: 13.09,
+          house_money_scaled_runners_count: 24,
+          total_house_money_r_gained: 30.08,
+          recycled_risk_pool_usd: 50507.68,
+          recycled_runner_boost_count: 24,
+          recycled_additional_r_compounded: 10.63,
+          avg_execution_slippage_bps: 0.6,
+          slippage_saved_usd: 3325.08,
+          tail_hedge_ratio_theta: 0.0558,
+          active_tail_hedge_count: 44,
+          tail_hedge_convexity_payout_usd: 1765.62,
+          sor_markout_toxicity_bps: 0.45,
+          charm_vanna_unpin_boosts_count: 24,
+          charm_vanna_additional_r_gained: 2.32,
+          occ_tims_pm_relief_ratio_pct: 43.06,
+          return_on_margin_rom_pct: 541.47,
+          pareto_gate_passed: true,
+          avg_winner_r: 1.15,
+          tp_losses_caught_total: 57,
+          fp_winners_clipped_total: 0,
+          remaining_unscratched_losses: 0,
+          profit_factor: 31.05,
+          kelly_profit_factor: 29.61,
+          fixed_net_pnl_usd: 81415.76,
+          kelly_net_pnl_usd: 130449.62,
+          max_drawdown_usd: 225.31,
+          composite_fitness_score: 174226.84,
+          mutations_applied_summary: [
+            'Gen 28: Pareto Gate Passed (116/116 Winners, 57/57 Full Stops Eliminated), Cross-Venue SOR Slippage 0.60 bps (Markout Toxicity 0.45 bps), Charm/Vanna Unpin +2.32R, OCC TIMS PM Relief 43.06% (ROM 541.47%)'
+          ]
+        }
+      ],
+      synaptic_plasticity_states: [
+        {
+          brain_id: 'BRAIN-02',
+          generation_id: 28,
+          synaptic_feature_weights_32: Array(32).fill(1.26),
+          stream_prior_multipliers: [1.22, 1.17, 1.14, 1.3],
+          wald_sprt_thresholds: [1.44, 1.36, 1.42],
+          entry_veto_margin_delta: 0.015,
+          trap_conviction_weights: {},
+          empirical_bayes_shrinkage_lambda: 0.892,
+          learned_almgren_chriss_risk_aversion_lambda: 0.42,
+          learned_almgren_chriss_urgency_kappa: 0.94,
+          learned_correlation_spike_quantile: 0.34,
+          learned_vanna_tail_hedge_ratio_theta: 0.0558,
+          learned_sor_venue_weights_4: [0.169, 0.6063, 0.197, 0.0277],
+          learned_sor_markout_toxicity_bps: 0.45,
+          learned_charm_vanna_pin_quantile: -0.18,
+          learned_charm_vanna_unpin_quantile: 0.34,
+          learned_occ_tims_sigma_shock_pct: 7.82,
+          top_boosted_warning_features: [],
+          top_slashed_deceiver_features: [],
+          cumulative_tp_vetoes: 4,
+          cumulative_fp_vetoes: 0,
+          cumulative_tp_scratches: 9,
+          cumulative_fp_scratches: 0,
+          remaining_unscratched_losses: 0,
+          last_mutation_summary: 'Gen 28 promoted champion'
+        }
+      ]
+    });
+
+    const gen28 = store.evolutionGenerationsHistory[0]!;
+    expect(gen28.generation_id).toBe(28);
+    expect(gen28.winners_preserved_count).toBe(116);
+    expect(gen28.remaining_full_stops).toBe(0);
+    expect(gen28.profit_factor_fixed).toBeCloseTo(31.05, 2);
+    expect(gen28.sor_markout_toxicity_bps).toBeCloseTo(0.45, 2);
+    expect(gen28.charm_vanna_unpin_boosts_count).toBe(24);
+    expect(gen28.charm_vanna_additional_r_gained).toBeCloseTo(2.32, 2);
+    expect(gen28.occ_tims_pm_relief_ratio_pct).toBeCloseTo(43.06, 2);
+    expect(gen28.return_on_margin_rom_pct).toBeCloseTo(541.47, 2);
+
+    expect(store.portfolioHeatTelemetry.sorMarkoutToxicityBps).toBeCloseTo(0.45, 2);
+    expect(store.portfolioHeatTelemetry.occTimsPmReliefRatioPct).toBeCloseTo(43.06, 2);
+    expect(store.portfolioHeatTelemetry.returnOnMarginRomPct).toBeCloseTo(541.47, 2);
+
+    const ticket = await store.stageBrokerOrderTicket('OPEN-P24-NVDA', 'IBKR_TWS');
+    expect(ticket).not.toBeNull();
+    expect(ticket?.sorExpectedMarkoutToxicityBps).toBeCloseTo(0.45, 2);
+    expect(ticket?.childExecutionSlices?.[0]?.sorSelectedVenue).toBe('IBKR_PEG_MID');
+  });
 });

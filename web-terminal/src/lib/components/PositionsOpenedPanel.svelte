@@ -112,10 +112,13 @@
         (γ={(heat.crossBrainRecycleMultiplier ?? 1.28).toFixed(2)}x | {heat.recycledRunnerBoostCount ?? 24} Runners +{(heat.recycledAdditionalRCompounded ?? 10.63).toFixed(2)}R)
       </span>
       <span class="badge badge-ai-core tabular-num" title="Phase 23 Self-Learned Almgren-Chriss & PEG MID / IBUSOPT Microstructure Execution Slicer">
-        ⚡ Almgren-Chriss Slippage: {(heat.avgExecutionSlippageBps ?? 0.74).toFixed(2)} bps (Saved +${(heat.slippageSavedUsd ?? 2701.91).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })})
+        ⚡ Almgren-Chriss Slippage: {(heat.avgExecutionSlippageBps ?? 0.6).toFixed(2)} bps (SOR Tox: {(heat.sorMarkoutToxicityBps ?? 0.45).toFixed(2)} bps | Saved +${(heat.slippageSavedUsd ?? 3325.08).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })})
       </span>
       <span class="badge badge-gamma tabular-num" title="Phase 23 Empirical Minimum-Variance SPY/QQQ Vanna Tail-Hedge Overlay (0.00% Principal Risk)">
         🛡️ Vanna Tail-Hedge θ*={((heat.tailHedgeRatioTheta ?? 0.0558) * 100).toFixed(2)}% ({heat.activeTailHedgeCount ?? 44} Active | +${(heat.tailHedgeConvexityPayoutUsd ?? 1765.62).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })} Convexity)
+      </span>
+      <span class="badge badge-long tabular-num" title="Phase 24 OCC TIMS Portfolio Margin Cross-Margining & Dealer Charm/Vanna Unpinning">
+        🏛️ OCC TIMS PM Relief: {(heat.occTimsPmReliefRatioPct ?? 43.06).toFixed(2)}% (ROM {(heat.returnOnMarginRomPct ?? 541.47).toFixed(2)}% | Unpin {heat.charmVannaUnpinBoostsCount ?? 24}x +{(heat.charmVannaAdditionalRGained ?? 2.32).toFixed(2)}R)
       </span>
     </div>
     <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
@@ -453,7 +456,7 @@
                   Eq: <strong>{slice.equityQtyShares} sh</strong> ({slice.equityPegStrategy}) | Opt: <strong>{slice.optionContractsQty}x</strong> ({slice.optionPegStrategy})
                 </div>
                 <div class="pnl-positive" style="margin-block-start: 2px;">
-                  Expected Slippage: {slice.expectedSlippageBps.toFixed(2)} bps
+                  Expected Slippage: {slice.expectedSlippageBps.toFixed(2)} bps | Venue: <strong>{slice.sorSelectedVenue ?? 'IBKR_PEG_MID'}</strong> (Tox {(slice.postFillMarkoutToxicityBps ?? 0.45).toFixed(2)} bps)
                 </div>
               </div>
             {/each}

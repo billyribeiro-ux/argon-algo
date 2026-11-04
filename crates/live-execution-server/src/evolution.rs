@@ -118,11 +118,31 @@ fn default_vanna_tail_hedge_ratio_theta() -> f64 {
     0.00
 }
 
+fn default_sor_venue_weights_4() -> [f64; 4] {
+    [0.25, 0.25, 0.25, 0.25]
+}
+
+fn default_sor_markout_toxicity_bps() -> f64 {
+    0.94
+}
+
+fn default_charm_vanna_pin_quantile() -> f64 {
+    0.32
+}
+
+fn default_charm_vanna_unpin_quantile() -> f64 {
+    0.68
+}
+
+fn default_occ_tims_sigma_shock_pct() -> f64 {
+    0.115
+}
+
 fn default_pareto_gate_passed() -> bool {
     true
 }
 
-/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 23`).
+/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 24`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainSynapticPlasticityState {
     pub brain_id: BrainHorizonId,
@@ -185,9 +205,25 @@ pub struct BrainSynapticPlasticityState {
     /// Phase 23 Upgrade 2: Self-learned empirical cross-position Ledoit-Wolf correlation spike activation quantile ($q_{\text{corr}, b}^*$)
     #[serde(default = "default_correlation_spike_quantile")]
     pub learned_correlation_spike_quantile: f64,
-    /// Phase 23 Upgrade 2: Self-learned Minimum-Variance Vanna-Convexity Tail-Hedge Ratio ($\theta_{\text{hedge}, b}^{(g)} = \text{clamp}(\text{Cov}(R_p, R_{\text{put}})/\text{Var}(R_{\text{put}}), 0.015, 0.095)$)
+    /// Phase 23 Upgrade 2: Self-learned Minimum-Variance Vanna-Convexity Tail-Hedge Ratio ($\theta_{\text{hedge}, b}^{(g)}$)
     #[serde(default = "default_vanna_tail_hedge_ratio_theta")]
     pub learned_vanna_tail_hedge_ratio_theta: f64,
+    /// Phase 24 Upgrade 1: Self-learned Cross-Venue NBBO Smart Order Router simplex weights $w_{\text{venue}, b}^{(g)} \in \Delta^4$
+    /// across `[IEX_DLIMIT, IBKR_PEG_MID, MEMX_MIDPOINT, CBOE_EDGX_LIT]` solved via Exponential-Weights Mirror-Descent
+    #[serde(default = "default_sor_venue_weights_4")]
+    pub learned_sor_venue_weights_4: [f64; 4],
+    /// Phase 24 Upgrade 1: Self-learned expected post-fill adverse selection markout toxicity (bps) $\widehat{\mathcal{M}}_{b}^{(g)}$
+    #[serde(default = "default_sor_markout_toxicity_bps")]
+    pub learned_sor_markout_toxicity_bps: f64,
+    /// Phase 24 Upgrade 2: Self-learned Dealer Charm-Vanna Gamma Pinning quantile $Q_{\alpha_{\text{pin}, b}^{(g)}}(\Upsilon_{0..t})$
+    #[serde(default = "default_charm_vanna_pin_quantile")]
+    pub learned_charm_vanna_pin_quantile: f64,
+    /// Phase 24 Upgrade 2: Self-learned Dealer Charm-Vanna Unpinning Squeeze quantile $Q_{1 - \alpha_{\text{unpin}, b}^{(g)}}(\Upsilon_{0..t})$
+    #[serde(default = "default_charm_vanna_unpin_quantile")]
+    pub learned_charm_vanna_unpin_quantile: f64,
+    /// Phase 24 Upgrade 3: Self-learned OCC TIMS scenario base volatility shock $\hat{\sigma}_{\text{LW}, b, 0..t}$ from $32 \times 32$ Ledoit-Wolf covariance
+    #[serde(default = "default_occ_tims_sigma_shock_pct")]
+    pub learned_occ_tims_sigma_shock_pct: f64,
     pub top_boosted_warning_features: Vec<SynapticFeatureMutation>,
     pub top_slashed_deceiver_features: Vec<SynapticFeatureMutation>,
 }
@@ -229,6 +265,11 @@ impl BrainSynapticPlasticityState {
             learned_almgren_chriss_urgency_kappa: 0.42,
             learned_correlation_spike_quantile: 0.52,
             learned_vanna_tail_hedge_ratio_theta: 0.00,
+            learned_sor_venue_weights_4: [0.25, 0.25, 0.25, 0.25],
+            learned_sor_markout_toxicity_bps: 0.94,
+            learned_charm_vanna_pin_quantile: 0.32,
+            learned_charm_vanna_unpin_quantile: 0.68,
+            learned_occ_tims_sigma_shock_pct: 0.115,
             top_boosted_warning_features: Vec::new(),
             top_slashed_deceiver_features: Vec::new(),
         }
@@ -322,6 +363,16 @@ pub struct EvolutionGenerationRecord {
     pub active_tail_hedge_count: usize,
     #[serde(default)]
     pub tail_hedge_convexity_payout_usd: f64,
+    #[serde(default)]
+    pub sor_markout_toxicity_bps: f64,
+    #[serde(default)]
+    pub charm_vanna_unpin_boosts_count: usize,
+    #[serde(default)]
+    pub charm_vanna_additional_r_gained: f64,
+    #[serde(default)]
+    pub occ_tims_pm_relief_ratio_pct: f64,
+    #[serde(default)]
+    pub return_on_margin_rom_pct: f64,
     #[serde(default = "default_pareto_gate_passed")]
     pub pareto_gate_passed: bool,
     #[serde(default)]

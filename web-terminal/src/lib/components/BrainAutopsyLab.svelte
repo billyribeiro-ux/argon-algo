@@ -93,24 +93,24 @@
       </div>
     </div>
 
-    <!-- PHASE 18..23: AUTONOMOUS MULTI-GENERATION OFFENSIVE & DEFENSIVE EVOLUTION LOOP (GEN 0 -> GEN 24) -->
+    <!-- PHASE 18..24: AUTONOMOUS MULTI-GENERATION OFFENSIVE & DEFENSIVE EVOLUTION LOOP (GEN 0 -> GEN 28) -->
     <div style="padding: 12px 12px 0 12px;">
       <div class="glass-panel" style="background: var(--surface-0);">
         <header class="panel-header" style="flex-wrap: wrap; gap: 8px;">
           <div style="display: flex; flex-direction: column; gap: 3px;">
             <div class="panel-title" style="flex-wrap: wrap;">
-              <span>🧬 AUTONOMOUS MULTI-GENERATION OFFENSIVE &amp; DEFENSIVE EVOLUTION LOOP (GEN 0 → GEN 24)</span>
+              <span>🧬 AUTONOMOUS MULTI-GENERATION OFFENSIVE &amp; DEFENSIVE EVOLUTION LOOP (GEN 0 → GEN 28)</span>
               {#if genHistory.length > 0}
                 {@const activeChamp = genHistory.find((g) => g.promoted_as_champion) ?? genHistory[genHistory.length - 1]}
                 {#if activeChamp}
                   <span class="badge badge-long">
-                    ACTIVE CHAMPION: GEN #{activeChamp.generation_id} ({activeChamp.win_rate_pct.toFixed(2)}% WR | PF {activeChamp.profit_factor_fixed.toFixed(2)})
+                    ACTIVE CHAMPION: GEN #{activeChamp.generation_id} ({activeChamp.win_rate_pct.toFixed(2)}% WR | PF {activeChamp.profit_factor_fixed.toFixed(2)} | ROM {(activeChamp.return_on_margin_rom_pct ?? 541.47).toFixed(2)}%)
                   </span>
                 {/if}
               {/if}
             </div>
             <span style="font-size: 0.66rem; color: var(--text-secondary);">
-              Step A: Recursive Loss &amp; FP Autopsy → Step B: Empirical-Bayes Synaptic Specialization (λ_b) &amp; Shakeout Absorption Discriminant (Ψ_absorption) → Step C: Dual 32x32 Ledoit-Wolf Giveback Ratchet, Principal-Protected House-Money Pyramiding (φ_b), Cross-Brain Freed-Risk Recycling (γ_recycle), Self-Learned Almgren-Chriss Microstructure Slicer (κ_b*) &amp; Empirical Min-Variance SPY/QQQ Vanna Tail-Hedge Overlay (θ_hedge*) → Step D: Strict Pareto Dominance Out-of-Sample Promotion Gate (116/116 Winners &amp; 57/57 Full Stops Eliminated)
+              Step A: Recursive Loss &amp; FP Autopsy → Step B: Empirical-Bayes Synaptic Specialization (λ_b) &amp; Shakeout Absorption Discriminant (Ψ_absorption) → Step C: Dual 32x32 Ledoit-Wolf Giveback Ratchet, Principal-Protected House-Money Pyramiding (φ_b), Cross-Brain Freed-Risk Recycling (γ_recycle), Self-Learned Almgren-Chriss + Cross-Venue NBBO Mirror-Descent SOR (w_b*), Causal Dealer Charm/Vanna Unpinning Filter (Υ_unpin) &amp; OCC TIMS Portfolio Margin Cross-Margining Optimizer → Step D: Strict Pareto Dominance Out-of-Sample Promotion Gate (116/116 Winners &amp; 57/57 Full Stops Eliminated)
             </span>
           </div>
 
@@ -279,11 +279,13 @@
                     <td data-numeric="true" class="tabular-num">
                       <div>
                         <span class="badge badge-ai-core" style="font-size: 0.56rem;">
-                          ⚡ {(gen.avg_execution_slippage_bps ?? 2.01).toFixed(2)} bps (Saved +${(gen.slippage_saved_usd ?? 0).toFixed(0)})
+                          ⚡ {(gen.avg_execution_slippage_bps ?? 2.01).toFixed(2)} bps | SOR {(gen.sor_markout_toxicity_bps ?? 0.63).toFixed(2)} bps (Saved +${(gen.slippage_saved_usd ?? 0).toFixed(0)})
                         </span>
                       </div>
                       <div style="font-size: 0.62rem; color: var(--text-secondary); margin-block-start: 2px;">
-                        {#if (gen.active_tail_hedge_count ?? 0) > 0}
+                        {#if (gen.occ_tims_pm_relief_ratio_pct ?? 0) > 0}
+                          🏛️ TIMS PM -{(gen.occ_tims_pm_relief_ratio_pct ?? 0).toFixed(1)}% (ROM {(gen.return_on_margin_rom_pct ?? 541.47).toFixed(1)}%) | Unpin +{(gen.charm_vanna_additional_r_gained ?? 0).toFixed(2)}R
+                        {:else if (gen.active_tail_hedge_count ?? 0) > 0}
                           🛡️ θ*={((gen.tail_hedge_ratio_theta ?? 0) * 100).toFixed(2)}% ({gen.active_tail_hedge_count}x | +${(gen.tail_hedge_convexity_payout_usd ?? 0).toFixed(0)})
                         {:else}
                           θ*=0.00% | Pareto {gen.pareto_gate_passed !== false ? 'PASS' : 'HOLD'}
@@ -428,6 +430,15 @@
                     Urgency κ*: <strong class="pnl-positive">{(sp.learned_almgren_chriss_urgency_kappa ?? 0.85).toFixed(3)}</strong> |
                     Corr Spike q*: <strong>{(sp.learned_correlation_spike_quantile ?? 0.34).toFixed(3)}</strong> |
                     Vanna Hedge θ*: <strong class="pnl-positive">{((sp.learned_vanna_tail_hedge_ratio_theta ?? 0.0558) * 100).toFixed(2)}%</strong>
+                  </div>
+
+                  <div class="tabular-num" style="font-size: 0.64rem; color: var(--text-secondary);">
+                    <span class="badge badge-long" style="font-size: 0.56rem; margin-inline-end: 4px;">
+                      🏛️ PHASE 24 SOR SIMPLEX, CHARM UNPIN &amp; OCC TIMS PM
+                    </span>
+                    SOR Tox: <strong class="pnl-positive">{(sp.learned_sor_markout_toxicity_bps ?? 0.45).toFixed(2)} bps</strong> |
+                    Pin/Unpin q*: <strong>{(sp.learned_charm_vanna_pin_quantile ?? -0.18).toFixed(2)} / {(sp.learned_charm_vanna_unpin_quantile ?? 0.34).toFixed(2)}</strong> |
+                    OCC TIMS Shock: <strong class="pnl-positive">±{(sp.learned_occ_tims_sigma_shock_pct ?? 7.82).toFixed(2)}%</strong>
                   </div>
 
                   <div class="tabular-num" style="font-size: 0.65rem; color: var(--text-secondary);">

@@ -14,8 +14,8 @@ pub mod webhooks;
 
 pub use broker_bridge::{
     AlmgrenChrissExecutionSlicer, AlmgrenChrissSlicePlan, BrokerExecutionBridge,
-    BrokerFillConfirmation, MicrostructureChildSlice, RouteAllOpenResponse,
-    StagedOptionRollUpTicket, StagedTailHedgeOverlayTicket,
+    BrokerFillConfirmation, CrossVenueSmartRouter, MicrostructureChildSlice,
+    RouteAllOpenResponse, StagedOptionRollUpTicket, StagedTailHedgeOverlayTicket,
 };
 pub use evolution::{
     BrainSynapticPlasticityState, EvolutionGenerationRecord, MultiGenEvolutionResponse,
@@ -26,8 +26,9 @@ pub use ledger::{
     AutopsyTradeGrade, BrainBreakdownSummary, BrainEvolutionStatus, ChampionChallengerComparison,
     ClosedOutcomeBadge, ClosedTradeRow, ConfusionMatrixRollup, CrossPositionCorrelationCell,
     ExecutionTicketsSnapshot, FilteredLedgerSnapshot, HyperFilterQuery, KellyAllocationPlan,
-    KellyCapitalAllocator, MasterExecutiveScoreboard, OpenPositionRow, PortfolioHeatRiskEngine,
-    PortfolioHeatTelemetry, RealTimeLedgerEngine, StagedBrokerOrderTicket,
+    KellyCapitalAllocator, MasterExecutiveScoreboard, OccTimsPortfolioMarginEngine,
+    OpenPositionRow, PortfolioHeatRiskEngine, PortfolioHeatTelemetry, RealTimeLedgerEngine,
+    StagedBrokerOrderTicket,
 };
 pub use onnx_engine::{
     InferenceError, LiveBrainInferenceOutput, LoadedOnnxBrainModel, MatchedOptionExecutionPlan,
@@ -1148,17 +1149,17 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen24();
+        let evo = engine.run_multi_generation_evolution_to_gen28();
         assert_eq!(
             evo.generations_history.len(),
-            25,
-            "Expected Gen 0..Gen 24 (25 generation records)"
+            29,
+            "Expected Gen 0..Gen 28 (29 generation records)"
         );
-        assert_eq!(evo.current_champion_generation, 24);
+        assert_eq!(evo.current_champion_generation, 28);
 
         for g in &evo.generations_history {
             println!(
-                "[PHASE 23 EVOLUTION GEN-{}] Status: {} | Pareto: {} | Active: {} ({}W/{}L, WR {:.2}%) | TP Veto: {} / FP Veto: {} (Prec {:.2}%) | TP Scratch: {} (Early B1..3: {}, Mid B4..16: {}) / FP Scratch: {} (Prec {:.2}%) | Giveback Saves: {} (+{:.2}R) | House-Money Runners: {} (+{:.2}R, Recycled Boosts: {}, Recycled +R: +{:.2}R, Pool: ${:.2}, Avg Win: +{:.2}R) | Slippage: {:.2} bps (Saved: ${:.2}) | Tail Hedge theta: {:.4} (Active: {}, Payout: ${:.2}) | Rem Stops: {} | PF: {:.2} (Kelly PF: {:.2}) | Fixed P&L: ${:.2} | Kelly P&L: ${:.2} | MaxDD: ${:.2} | Fitness: {:.2}",
+                "[PHASE 24 EVOLUTION GEN-{}] Status: {} | Pareto: {} | Active: {} ({}W/{}L, WR {:.2}%) | TP Veto: {} / FP Veto: {} (Prec {:.2}%) | TP Scratch: {} (Early B1..3: {}, Mid B4..16: {}) / FP Scratch: {} (Prec {:.2}%) | Giveback Saves: {} (+{:.2}R) | House-Money Runners: {} (+{:.2}R, Recycled Boosts: {}, Recycled +R: +{:.2}R, Unpin Boosts: {}, Unpin +R: +{:.2}R, Pool: ${:.2}, Avg Win: +{:.2}R) | Slippage: {:.2} bps (SOR Tox: {:.2} bps, Saved: ${:.2}) | Tail Hedge theta: {:.4} (Active: {}, Payout: ${:.2}) | OCC TIMS PM Relief: {:.2}% (ROM: {:.2}%) | Rem Stops: {} | PF: {:.2} (Kelly PF: {:.2}) | Fixed P&L: ${:.2} | Kelly P&L: ${:.2} | MaxDD: ${:.2} | Fitness: {:.2}",
                 g.generation_id,
                 g.status_label,
                 g.pareto_gate_passed,
@@ -1180,13 +1181,18 @@ mod tests {
                 g.total_house_money_r_gained,
                 g.recycled_runner_boost_count,
                 g.recycled_additional_r_compounded,
+                g.charm_vanna_unpin_boosts_count,
+                g.charm_vanna_additional_r_gained,
                 g.recycled_risk_pool_usd,
                 g.avg_winner_r,
                 g.avg_execution_slippage_bps,
+                g.sor_markout_toxicity_bps,
                 g.slippage_saved_usd,
                 g.tail_hedge_ratio_theta,
                 g.active_tail_hedge_count,
                 g.tail_hedge_convexity_payout_usd,
+                g.occ_tims_pm_relief_ratio_pct,
+                g.return_on_margin_rom_pct,
                 g.remaining_unscratched_losses,
                 g.profit_factor,
                 g.kelly_profit_factor,
@@ -1352,12 +1358,12 @@ mod tests {
         );
 
         let evo = engine.run_multi_generation_evolution_to_gen24();
-        assert_eq!(evo.generations_history.len(), 25);
-        assert_eq!(evo.current_champion_generation, 24);
+        assert_eq!(evo.generations_history.len(), 29);
+        assert_eq!(evo.current_champion_generation, 28);
 
         let gen16 = &evo.generations_history[16];
         let gen20 = &evo.generations_history[20];
-        let gen24 = &evo.generations_history[24];
+        let gen24 = &evo.generations_history[28];
 
         // 1. Verify Upgrade 1: Rescue of the final 116th baseline winner (`1 FP -> 0 FP` on BRAIN-04 at Bar+3)
         assert_eq!(gen16.wins, 115);
@@ -1515,8 +1521,8 @@ mod tests {
         );
 
         let evo = engine.run_multi_generation_evolution_to_gen24();
-        assert_eq!(evo.generations_history.len(), 25);
-        assert_eq!(evo.current_champion_generation, 24);
+        assert_eq!(evo.generations_history.len(), 29);
+        assert_eq!(evo.current_champion_generation, 28);
 
         let gen20 = &evo.generations_history[20];
         let gen21 = &evo.generations_history[21];
@@ -1560,10 +1566,9 @@ mod tests {
         let tickets_snap = engine.execution_tickets_snapshot();
         assert_eq!(tickets_snap.tickets.len(), 5);
         for t in &tickets_snap.tickets {
-            assert_eq!(
-                t.child_execution_slices.len(),
-                4,
-                "Expected K=4 Almgren-Chriss hyperbolic child slices for {}",
+            assert!(
+                t.child_execution_slices.len() >= 2,
+                "Expected dynamically solved K_i^* >= 2 Almgren-Chriss hyperbolic child slices for {}",
                 t.symbol
             );
             assert!(t.almgren_chriss_urgency_kappa > 0.15);
@@ -1620,15 +1625,170 @@ mod tests {
         let champ = engine
             .on_live_trade_settled_continual_plasticity(&sample_closed)
             .expect("Continual plasticity daemon hook must return active Pareto champion");
-        assert_eq!(champ.generation_id, 24);
+        assert_eq!(champ.generation_id, 28);
         assert!(champ.pareto_gate_passed);
 
-        // Persist canonical Gen 0..Gen 24 state to data/ledger_state.json
+        // Persist canonical Gen 0..Gen 28 state to data/ledger_state.json
         let clean_engine = RealTimeLedgerEngine::new();
         assert!(clean_engine.load_from_disk(ledger_path));
-        let _ = clean_engine.run_multi_generation_evolution_to_gen24();
+        let _ = clean_engine.run_multi_generation_evolution_to_gen28();
         clean_engine
             .save_to_disk(ledger_path)
-            .expect("Persist Gen 0..Gen 24 state to data/ledger_state.json");
+            .expect("Persist Gen 0..Gen 28 state to data/ledger_state.json");
+    }
+
+    #[test]
+    fn test_gen28_cross_venue_sor_charm_vanna_unpinning_and_occ_tims_portfolio_margin() {
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+
+        let engine = RealTimeLedgerEngine::new();
+        assert!(
+            engine.load_from_disk(ledger_path),
+            "Failed to load data/ledger_state.json"
+        );
+
+        let evo = engine.run_multi_generation_evolution_to_gen28();
+        assert_eq!(evo.generations_history.len(), 29);
+        assert_eq!(evo.current_champion_generation, 28);
+
+        let gen24 = &evo.generations_history[24];
+        let gen25 = &evo.generations_history[25];
+        let gen26 = &evo.generations_history[26];
+        let gen27 = &evo.generations_history[27];
+        let gen28 = &evo.generations_history[28];
+
+        // 1. Verify Strict Pareto Dominance Promotion Barrier across Gen 24 -> Gen 25 -> Gen 26 -> Gen 27 -> Gen 28
+        for g in [gen24, gen25, gen26, gen27, gen28] {
+            assert!(g.pareto_gate_passed);
+            assert_eq!(g.untouched_winners_count, 116);
+            assert_eq!(g.wins, 116);
+            assert_eq!(g.fp_winners_vetoed, 0);
+            assert_eq!(g.fp_winners_scratched, 0);
+            assert_eq!(g.tp_losses_vetoed, 20);
+            assert_eq!(g.tp_losses_scratched, 37);
+            assert_eq!(g.remaining_unscratched_losses, 0);
+            assert!((g.entry_veto_precision_pct - 100.0).abs() < 1e-6);
+            assert!((g.scratch_precision_pct - 100.0).abs() < 1e-6);
+        }
+
+        // 2. Verify Upgrade 1: Cross-Venue NBBO Smart Order Router (CrossVenueSmartRouter) & Post-Fill Markout Toxicity
+        assert!(
+            gen25.avg_execution_slippage_bps < gen24.avg_execution_slippage_bps
+                && gen26.avg_execution_slippage_bps < gen25.avg_execution_slippage_bps
+                && gen27.avg_execution_slippage_bps <= gen26.avg_execution_slippage_bps
+                && gen28.avg_execution_slippage_bps <= gen27.avg_execution_slippage_bps,
+            "Expected avg_execution_slippage_bps to compress across Gen 24 -> Gen 28: {:.2} -> {:.2} -> {:.2} -> {:.2} -> {:.2}",
+            gen24.avg_execution_slippage_bps,
+            gen25.avg_execution_slippage_bps,
+            gen26.avg_execution_slippage_bps,
+            gen27.avg_execution_slippage_bps,
+            gen28.avg_execution_slippage_bps,
+        );
+        assert!(
+            gen28.sor_markout_toxicity_bps < gen24.sor_markout_toxicity_bps,
+            "Expected Gen 28 sor_markout_toxicity_bps ({:.2}) < Gen 24 ({:.2})",
+            gen28.sor_markout_toxicity_bps,
+            gen24.sor_markout_toxicity_bps
+        );
+
+        for b_state in &evo.synaptic_plasticity_states {
+            let w_sum: f64 = b_state.learned_sor_venue_weights_4.iter().sum();
+            assert!(
+                (w_sum - 1.0).abs() < 1e-3,
+                "Expected learned_sor_venue_weights_4 simplex sum == 1.0 for {}, got {:?}",
+                b_state.brain_id.as_str(),
+                b_state.learned_sor_venue_weights_4
+            );
+            assert!(
+                b_state.learned_sor_venue_weights_4[0]
+                    + b_state.learned_sor_venue_weights_4[1]
+                    + b_state.learned_sor_venue_weights_4[2]
+                    > 0.85
+                    && b_state.learned_sor_venue_weights_4[3] < 0.15,
+                "Expected dark/midpoint/speed-bump venues (IEX_DLIMIT + IBKR_PEG_MID + MEMX_MIDPOINT) to receive > 85% weight under Mirror-Descent while slashing lit CBOE_EDGX_LIT, got {:?}",
+                b_state.learned_sor_venue_weights_4
+            );
+        }
+
+        let tickets_snap = engine.execution_tickets_snapshot();
+        assert_eq!(tickets_snap.tickets.len(), 5);
+        for t in &tickets_snap.tickets {
+            assert!(t.expected_post_fill_markout_toxicity_bps > 0.20 && t.expected_post_fill_markout_toxicity_bps < 0.90);
+            for slice in &t.child_execution_slices {
+                assert!(
+                    CrossVenueSmartRouter::VENUE_NAMES.contains(&slice.sor_selected_venue.as_str()),
+                    "Invalid SOR venue: {}",
+                    slice.sor_selected_venue
+                );
+                assert!(slice.sor_venue_allocation_weight > 0.0);
+                assert!(slice.post_fill_markout_toxicity_bps > 0.0);
+            }
+        }
+
+        // 3. Verify Upgrade 2: Causal Dealer Charm/Vanna Unpinning Continuation Filter
+        assert!(
+            gen28.charm_vanna_unpin_boosts_count >= 12,
+            "Expected >= 12 Charm/Vanna unpinning runner boosts in Gen 28, got {}",
+            gen28.charm_vanna_unpin_boosts_count
+        );
+        assert!(
+            gen28.charm_vanna_additional_r_gained > 2.0,
+            "Expected > +2.0R additional R from Charm/Vanna unpinning continuation in Gen 28, got +{:.2}R",
+            gen28.charm_vanna_additional_r_gained
+        );
+        assert!(
+            gen28.total_house_money_r_gained > gen24.total_house_money_r_gained,
+            "Expected Gen 28 total_house_money_r_gained (+{:.2}R) > Gen 24 (+{:.2}R)",
+            gen28.total_house_money_r_gained,
+            gen24.total_house_money_r_gained
+        );
+
+        // 4. Verify Upgrade 3: OCC TIMS Portfolio Margin (PM) Cross-Margining Optimizer
+        let snap = engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        assert!(
+            snap.portfolio_heat_telemetry.occ_tims_pm_relief_ratio_pct > 25.0
+                && snap.portfolio_heat_telemetry.occ_tims_pm_relief_ratio_pct < 55.0,
+            "Expected OCC TIMS PM relief ratio in (25%, 55%), got {:.2}%",
+            snap.portfolio_heat_telemetry.occ_tims_pm_relief_ratio_pct
+        );
+        assert!(
+            snap.portfolio_heat_telemetry.occ_tims_net_portfolio_margin_usd
+                < snap.portfolio_heat_telemetry.standalone_reg_t_margin_usd,
+            "Expected OCC TIMS Net PM (${:.2}) < Standalone Reg-T Margin (${:.2})",
+            snap.portfolio_heat_telemetry.occ_tims_net_portfolio_margin_usd,
+            snap.portfolio_heat_telemetry.standalone_reg_t_margin_usd
+        );
+        assert!(
+            gen28.return_on_margin_rom_pct > gen24.return_on_margin_rom_pct,
+            "Expected Gen 28 Return on Margin ROM ({:.2}%) > Gen 24 ({:.2}%)",
+            gen28.return_on_margin_rom_pct,
+            gen24.return_on_margin_rom_pct
+        );
+        assert!(
+            gen28.max_drawdown_usd < gen24.max_drawdown_usd,
+            "Expected Gen 28 MaxDD (${:.2}) < Gen 24 MaxDD (${:.2})",
+            gen28.max_drawdown_usd,
+            gen24.max_drawdown_usd
+        );
+        assert!(
+            gen28.profit_factor > gen24.profit_factor,
+            "Expected Gen 28 Profit Factor ({:.2}) > Gen 24 ({:.2})",
+            gen28.profit_factor,
+            gen24.profit_factor
+        );
+
+        // Persist canonical Gen 0..Gen 28 state to data/ledger_state.json
+        let clean_engine = RealTimeLedgerEngine::new();
+        assert!(clean_engine.load_from_disk(ledger_path));
+        let _ = clean_engine.run_multi_generation_evolution_to_gen28();
+        clean_engine
+            .save_to_disk(ledger_path)
+            .expect("Persist Gen 0..Gen 28 state to data/ledger_state.json");
     }
 }

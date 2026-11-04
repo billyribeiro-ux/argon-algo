@@ -1070,11 +1070,11 @@ impl PrecedentKnnIndex {
         best_match
     }
 
-    /// Outcome-Blind Entry Trap vs. Winner Precedent Discriminant (Phase 16 Upgrade 1):
+    /// Outcome-Blind Entry Trap vs. Winner Precedent Discriminant (Phase 24.2 Pure Causal):
     /// At Entry ($t_{\text{open}}$), compares the candidate's 128-d embedding and causal 32-feature entry vector
-    /// against **both** the causal closest Hard-Negative Trap ($S_{\text{trap}}$) and the causal closest
-    /// Winning Precedent ($S_{\text{win}}$), vetoing only when:
-    /// $$S_{\text{trap}} \ge \tau_{\text{veto}} \quad \text{AND} \quad S_{\text{trap}} > S_{\text{win}} + \delta_{\text{margin}}$$
+    /// against **both** the causal Hard-Negative Trap distribution ($S_{\text{trap}}$) and the causal
+    /// Winning Precedent distribution ($S_{\text{win}}$) using Ledoit-Wolf Mahalanobis + Fisher + RBF kernel similarity.
+    /// When fewer than $N_{\min} = 3$ settled prior precedents exist on `brain_id` at cold start, honestly abstains.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn evaluate_causal_entry_trap_vs_winner_discriminant(
         &self,
@@ -1090,32 +1090,31 @@ impl PrecedentKnnIndex {
         let traps = self.hard_negative_traps.read();
         let wins = self.winner_pullbacks.read();
 
-        // Filter strictly causal traps on this Brain (`closed_timestamp_ns < current_timestamp_ns`, excluding synthetic Era-1 warmup seeds at 1.60e18)
         let causal_traps: Vec<&HardNegativeTrapRecord> = traps
             .iter()
             .filter(|t| {
                 t.brain_id == brain_id
                     && t.closed_timestamp_ns < current_timestamp_ns
-                    && t.closed_timestamp_ns > 1_605_000_000_000_000_000
+                    && t.entry_features_32.len() >= 32
             })
             .collect();
 
-        let mut causal_wins: Vec<&WinnerPullbackRecord> = wins
+        let causal_wins: Vec<&WinnerPullbackRecord> = wins
             .iter()
             .filter(|w| {
                 w.brain_id == brain_id
                     && w.closed_timestamp_ns < current_timestamp_ns
-                    && w.closed_timestamp_ns > 1_605_000_000_000_000_000
+                    && w.entry_features_32.len() >= 32
             })
             .collect();
-        if causal_wins.is_empty() {
-            causal_wins = wins
-                .iter()
-                .filter(|w| w.closed_timestamp_ns < current_timestamp_ns)
-                .collect();
-        }
 
-        if causal_traps.is_empty() {
+        let n_traps = causal_traps.len();
+        let n_wins = causal_wins.len();
+        if n_traps == 0
+            || n_wins == 0
+            || (n_traps + n_wins) < 3
+            || query_entry_features_32.len() < 32
+        {
             return EntryTrapVsWinnerDiagnostic {
                 trap_similarity_score: 0.42,
                 winner_similarity_score: 0.88,
@@ -1126,24 +1125,95 @@ impl PrecedentKnnIndex {
             };
         }
 
-        // Pre-entry microstructure physics from causal `0..=entry_bar_idx`:
-        // f[0] = pos10 (position in 10-bar range), f[1] = disp1 (1-bar entry impulse in R), f[2] = max_opp12 (max opposing wick on bm1/bm2)
-        let has_entry_physics = query_entry_features_32.len() >= 16;
-        let (q_pos10, q_disp1, q_max_opp12) = if has_entry_physics {
-            (
-                query_entry_features_32[0] as f64,
-                query_entry_features_32[1] as f64,
-                query_entry_features_32[2] as f64,
-            )
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        let mut culprit_weights = [0.0_f64; 32];
+        let w_sum: f64 = syn_state
+            .synaptic_feature_weights_32
+            .iter()
+            .sum::<f64>()
+            .max(1e-6);
+        for i in 0..32 {
+            culprit_weights[i] = (syn_state.synaptic_feature_weights_32[i] / w_sum) * 6.0;
+        }
+
+        let mut trap_centroid = [0.0_f64; 32];
+        let mut win_centroid = [0.0_f64; 32];
+        let inv_t = 1.0 / (n_traps as f64);
+        let inv_w = 1.0 / (n_wins as f64);
+        for t in &causal_traps {
+            for i in 0..32 {
+                trap_centroid[i] += (t.entry_features_32[i] as f64) * inv_t;
+            }
+        }
+        for w in &causal_wins {
+            for i in 0..32 {
+                win_centroid[i] += (w.entry_features_32[i] as f64) * inv_w;
+            }
+        }
+
+        let mut pooled_entry_cov = [[0.0_f64; 32]; 32];
+        for i in 0..32 {
+            pooled_entry_cov[i][i] = 0.035;
+        }
+        for t in &causal_traps {
+            for i in 0..32 {
+                let di = (t.entry_features_32[i] as f64) - trap_centroid[i];
+                for j in 0..=i {
+                    let dj = (t.entry_features_32[j] as f64) - trap_centroid[j];
+                    let c_ij = 0.5 * (di * dj) * inv_t;
+                    pooled_entry_cov[i][j] += c_ij;
+                    pooled_entry_cov[j][i] = pooled_entry_cov[i][j];
+                }
+            }
+        }
+        for w in &causal_wins {
+            for i in 0..32 {
+                let di = (w.entry_features_32[i] as f64) - win_centroid[i];
+                for j in 0..=i {
+                    let dj = (w.entry_features_32[j] as f64) - win_centroid[j];
+                    let c_ij = 0.5 * (di * dj) * inv_w;
+                    pooled_entry_cov[i][j] += c_ij;
+                    pooled_entry_cov[j][i] = pooled_entry_cov[i][j];
+                }
+            }
+        }
+
+        let mut diff_trap = [0.0_f64; 32];
+        let mut diff_win = [0.0_f64; 32];
+        let mut fisher_num = 0.0_f64;
+        let mut fisher_den = 0.0_f64;
+        for i in 0..32 {
+            let q_i = query_entry_features_32[i] as f64;
+            diff_trap[i] = q_i - trap_centroid[i];
+            diff_win[i] = q_i - win_centroid[i];
+            let mid_i = 0.5 * (trap_centroid[i] + win_centroid[i]);
+            let sep_i = trap_centroid[i] - win_centroid[i];
+            let var_i = pooled_entry_cov[i][i].max(0.02);
+            let wi = culprit_weights[i] / 6.0;
+            fisher_num += wi * ((q_i - mid_i) * sep_i) / var_i;
+            fisher_den += wi * (sep_i * sep_i) / var_i;
+        }
+        let fisher_llr = if fisher_den > 1e-6 {
+            (fisher_num / fisher_den.sqrt()).clamp(-4.0, 4.0)
         } else {
-            (0.95, 0.35, 0.20)
+            0.0
         };
 
-        // Coiled mid-range entry with prior rejection wick signature (`pos10 < 0.90 && disp1 < 0.28 && max_opp12 > 0.38`)
-        let is_coiled_wick_trap =
-            has_entry_physics && q_pos10 < 0.90 && q_disp1 < 0.28 && q_max_opp12 > 0.38;
+        let n_causal = n_traps + n_wins;
+        let (maha_trap, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+            &pooled_entry_cov,
+            n_causal,
+            &culprit_weights,
+            &diff_trap,
+        );
+        let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+            &pooled_entry_cov,
+            n_causal,
+            &culprit_weights,
+            &diff_win,
+        );
 
-        let mut best_trap_sim = 0.0_f64;
+        let mut max_trap_kernel = 0.0_f64;
         let mut best_trap_id = causal_traps[0].loss_trade_id;
         let mut best_trap_cat = causal_traps[0].root_cause_category.clone();
 
@@ -1154,37 +1224,32 @@ impl PrecedentKnnIndex {
                 .map(|(a, b)| (*a as f64) * (*b as f64))
                 .sum::<f64>()
                 .clamp(-1.0, 1.0);
+            let mut d_sq = 0.0_f64;
+            for k in 0..32 {
+                let d = (query_entry_features_32[k] as f64) - (trap.entry_features_32[k] as f64);
+                let var_k = pooled_entry_cov[k][k].max(0.02);
+                d_sq += (culprit_weights[k] / 6.0) * (d * d) / var_k;
+            }
             let sym_bonus = if trap.symbol.eq_ignore_ascii_case(symbol) {
-                0.025
+                0.015
             } else {
                 0.0
             };
-
-            let sim = if has_entry_physics && trap.entry_features_32.len() >= 16 {
-                let mut f_dist_sq = 0.0_f64;
-                for k in 0..8 {
-                    let d = (query_entry_features_32[k] as f64) - (trap.entry_features_32[k] as f64);
-                    f_dist_sq += d * d;
-                }
-                let f_sim = (-0.35 * f_dist_sq).exp();
-                let trap_coil_bonus = if is_coiled_wick_trap {
-                    0.18 + 0.08 * (q_max_opp12 - 0.38).clamp(0.0, 0.50)
-                } else {
-                    -0.14
-                };
-                (0.54 * f_sim + 0.32 * dot_128 + sym_bonus + trap_coil_bonus).clamp(0.35, 0.985)
-            } else {
-                (0.76 + 0.22 * dot_128 + sym_bonus).clamp(0.35, 0.985)
-            };
-
-            if sim > best_trap_sim {
-                best_trap_sim = sim;
+            let trap_w = syn_state
+                .trap_conviction_weights
+                .get(&trap.loss_trade_id.to_string())
+                .copied()
+                .unwrap_or(1.0);
+            let k_sim = (0.72 * (-0.32 * d_sq).exp() + 0.28 * (0.5 * (1.0 + dot_128)) + sym_bonus)
+                * trap_w.clamp(0.75, 1.25);
+            if k_sim > max_trap_kernel {
+                max_trap_kernel = k_sim;
                 best_trap_id = trap.loss_trade_id;
                 best_trap_cat = trap.root_cause_category.clone();
             }
         }
 
-        let mut best_win_sim = 0.72_f64;
+        let mut max_win_kernel = 0.0_f64;
         for win in &causal_wins {
             let dot_128: f64 = query_embedding_128
                 .iter()
@@ -1192,123 +1257,44 @@ impl PrecedentKnnIndex {
                 .map(|(a, b)| (*a as f64) * (*b as f64))
                 .sum::<f64>()
                 .clamp(-1.0, 1.0);
+            let mut d_sq = 0.0_f64;
+            for k in 0..32 {
+                let d = (query_entry_features_32[k] as f64) - (win.entry_features_32[k] as f64);
+                let var_k = pooled_entry_cov[k][k].max(0.02);
+                d_sq += (culprit_weights[k] / 6.0) * (d * d) / var_k;
+            }
             let sym_bonus = if win.symbol.eq_ignore_ascii_case(symbol) {
-                0.025
+                0.015
             } else {
                 0.0
             };
-            let sim = if has_entry_physics && win.entry_features_32.len() >= 16 {
-                let mut f_dist_sq = 0.0_f64;
-                for k in 0..8 {
-                    let d = (query_entry_features_32[k] as f64) - (win.entry_features_32[k] as f64);
-                    f_dist_sq += d * d;
-                }
-                let f_sim = (-0.35 * f_dist_sq).exp();
-                let clean_breakout_bonus = if !is_coiled_wick_trap {
-                    0.16 + 0.06 * (q_pos10 - 0.85).clamp(0.0, 0.25)
-                } else {
-                    -0.12
-                };
-                (0.54 * f_sim + 0.32 * dot_128 + sym_bonus + clean_breakout_bonus).clamp(0.35, 0.985)
-            } else {
-                (0.74 + 0.22 * dot_128 + sym_bonus).clamp(0.35, 0.985)
-            };
-            if sim > best_win_sim {
-                best_win_sim = sim;
+            let k_sim = 0.72 * (-0.32 * d_sq).exp() + 0.28 * (0.5 * (1.0 + dot_128)) + sym_bonus;
+            if k_sim > max_win_kernel {
+                max_win_kernel = k_sim;
             }
         }
 
-        if is_coiled_wick_trap {
-            best_trap_sim = best_trap_sim.max(tau_veto + 0.015);
-            best_win_sim = best_win_sim.min(best_trap_sim - delta_margin - 0.018);
-        } else if has_entry_physics {
-            best_trap_sim = best_trap_sim.min(tau_veto - 0.025);
-            best_win_sim = best_win_sim.max(best_trap_sim + 0.020);
-        }
+        drop(traps);
+        drop(wins);
 
-        // Phase 18 Upgrade 1: Apply Multi-Generation Synaptic Plasticity & Trap Conviction Gravity
-        // Strictly outcome-blind: depends ONLY on `syn_state` (continuous parameters) and `query_entry_features_32` (`0..=entry_bar_idx`).
-        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        // Continuous Antisymmetric Bayesian Entry Log-Likelihood Ratio combining Ledoit-Wolf Mahalanobis,
+        // standardized Fisher centroid projection, and nearest-neighbor RBF kernel affinity:
+        let maha_llr = (0.28 * (maha_win * maha_win - maha_trap * maha_trap)).clamp(-3.5, 3.5);
+        let kernel_llr = 5.50 * (max_trap_kernel - max_win_kernel);
+        let entry_llr = (maha_llr + 0.75 * fisher_llr + kernel_llr).clamp(-12.0, 12.0);
+        let p_trap = 1.0 / (1.0 + (-entry_llr).exp());
+
+        let best_trap_sim = (0.50 + 0.48 * p_trap).clamp(0.05, 0.995);
+        let best_win_sim = (0.50 + 0.48 * (1.0 - p_trap)).clamp(0.05, 0.995);
+        let margin = best_trap_sim - best_win_sim;
+
         let eff_delta_margin = if syn_state.generation_id >= 1 {
             syn_state.entry_veto_margin_delta
         } else {
             delta_margin
         };
-
-        if syn_state.generation_id >= 1 && has_entry_physics {
-            let q_disp2 = query_entry_features_32[3] as f64;
-            let q_body_b0 = query_entry_features_32[8] as f64;
-            let q_opp_b0 = query_entry_features_32[9] as f64;
-            let q_body_bm1 = query_entry_features_32[11] as f64;
-
-            let w_opp12 = syn_state.synaptic_feature_weights_32[2];
-            let w_opp_b0 = syn_state.synaptic_feature_weights_32[9];
-            let w_body_bm1 = syn_state.synaptic_feature_weights_32[11];
-
-            let matched_trap_weight = syn_state
-                .trap_conviction_weights
-                .get(&best_trap_id.to_string())
-                .copied()
-                .unwrap_or(1.0);
-
-            // 1. Hard-Negative Trap Gravity Plasticity & Clean-Impulse Protection (active when trap weight decayed or w_opp_b0 boosted):
-            let clean_b0_impulse = q_opp_b0 < 0.05 && q_body_b0 >= 0.45 && q_max_opp12 < 0.48;
-            let aligned_two_bar_impulse = q_body_b0 >= 0.40 && q_body_bm1 >= 0.38;
-            let decayed_fp_trap = matched_trap_weight < 0.85;
-
-            if clean_b0_impulse || aligned_two_bar_impulse || decayed_fp_trap {
-                best_trap_sim = (best_trap_sim * matched_trap_weight.min(0.84)).min(tau_veto - 0.030);
-                best_win_sim = best_win_sim.max(best_trap_sim + eff_delta_margin + 0.025);
-            }
-
-            // 2. Boosted Warning Feature `f09_entry_opposing_wick_trap` + `f11_prior_bar_bm1_body_vector` (`w_opp_b0 >= 1.08`):
-            // Catches entry rejection wick (`opp_b0 >= 0.50`) immediately following a bearish `bm1` candle (`body_bm1 <= -0.48 && disp2 < 0.0`).
-            let entry_wick_after_bear_bm1 =
-                w_opp_b0 >= 1.08 && q_opp_b0 >= 0.50 && q_body_bm1 <= -0.48 && q_disp2 < 0.0;
-            let mid_wick_whipsaw = w_opp_b0 >= 1.08
-                && (0.74..=0.80).contains(&q_pos10)
-                && q_disp1 >= 0.28
-                && q_disp2 <= -0.25
-                && q_opp_b0 >= 0.50
-                && q_body_bm1 <= -0.50;
-
-            if entry_wick_after_bear_bm1 || mid_wick_whipsaw {
-                best_trap_sim = best_trap_sim.max(tau_veto + 0.022);
-                best_win_sim = best_win_sim.min(best_trap_sim - eff_delta_margin - 0.024);
-            }
-
-            // 3. Generation 4 Cross-Stream Exhaustion & Whipsaw Convergence (`w_opp12 >= 1.24 && w_body_bm1 >= 1.20`):
-            if syn_state.generation_id >= 4 && w_opp12 >= 1.24 && w_body_bm1 >= 1.20 {
-                // Separate constructive dip-pullback (`disp2 < -0.05 && body_bm1 < -0.70 && max_opp12 <= 0.52`) from extended trap
-                if q_disp2 < -0.05 && q_body_bm1 < -0.70 && q_max_opp12 <= 0.52 && q_opp_b0 >= 0.60 {
-                    best_trap_sim = best_trap_sim.min(tau_veto - 0.030);
-                    best_win_sim = best_win_sim.max(best_trap_sim + eff_delta_margin + 0.025);
-                }
-
-                let swing_prior_wick_wall = brain_id == BrainHorizonId::Brain04CoreSwing
-                    && q_pos10 >= 0.90
-                    && q_disp1 >= 0.30
-                    && q_max_opp12 >= 0.72
-                    && q_body_bm1 < 0.15;
-                let intraday_climax_exhaustion = brain_id == BrainHorizonId::Brain02IntradayDayTrade
-                    && q_pos10 >= 0.99
-                    && q_max_opp12 >= 0.56
-                    && ((q_disp1 >= 0.40 && q_body_bm1 < -0.10)
-                        || (q_max_opp12 >= 0.78 && q_body_bm1 > 0.90));
-                let wealth_midrange_whipsaw = brain_id == BrainHorizonId::Brain05LongTermWealth
-                    && q_pos10 < 0.72
-                    && q_disp1 > 0.50
-                    && q_body_bm1 < -0.65;
-
-                if swing_prior_wick_wall || intraday_climax_exhaustion || wealth_midrange_whipsaw {
-                    best_trap_sim = best_trap_sim.max(tau_veto + 0.026);
-                    best_win_sim = best_win_sim.min(best_trap_sim - eff_delta_margin - 0.028);
-                }
-            }
-        }
-
-        let margin = best_trap_sim - best_win_sim;
-        let should_veto = best_trap_sim >= tau_veto && margin > eff_delta_margin;
+        let eff_tau_veto = tau_veto.clamp(0.84, 0.93);
+        let should_veto = best_trap_sim >= eff_tau_veto && margin > eff_delta_margin;
 
         EntryTrapVsWinnerDiagnostic {
             trap_similarity_score: (best_trap_sim * 1000.0).round() / 1000.0,
@@ -1381,19 +1367,17 @@ impl PrecedentKnnIndex {
     }
 
     /// Dual-Distribution Bayesian Log-Likelihood Ratio (`Loss Breakdown Centroid` vs. `Winner Pullback Centroid`):
-    /// Evaluates a causal `Bar +1` 32-feature state vector $X_{\text{bar1}}$ (`r_bar1 < -0.12R`) against:
+    /// Evaluates a causal `Bar +1..+3` 32-feature state vector $X_{\text{bar } k}$ against:
     /// 1. Causal Loss Breakdown Distribution ($\bar{X}_{\text{loss, bar1}}, \Sigma_{\text{LW}}^{\text{loss}}$)
     /// 2. Causal Winner Pullback Distribution ($\bar{X}_{\text{win, bar1}}, \Sigma_{\text{LW}}^{\text{win}}$)
     ///
-    /// Computing both Ledoit-Wolf Cholesky Mahalanobis distances $D_{\text{loss}}(X_{\text{bar1}})$ and
-    /// $D_{\text{win}}(X_{\text{bar1}})$ and the exact Bayesian posterior probability:
-    /// $$P(\text{Loss} \mid X_{\text{bar1}}) = \frac{1}{1 + \exp\!\left(0.5 \cdot \left(D_{\text{loss}}^2 - D_{\text{win}}^2\right)\right)}$$
+    /// Strictly abstains at cold start when fewer than $N_{\min} = 3$ settled prior precedents exist on `brain_id`.
     #[allow(clippy::needless_range_loop)]
     pub fn evaluate_causal_post_entry_scratch(
         &self,
         brain_id: BrainHorizonId,
         symbol: &str,
-        direction: TradeDirection,
+        _direction: TradeDirection,
         current_timestamp_ns: i64,
         live_bar_features_32: &[f32],
         learned_posterior_threshold: f64,
@@ -1404,185 +1388,152 @@ impl PrecedentKnnIndex {
         let traps = self.hard_negative_traps.read();
         let wins = self.winner_pullbacks.read();
 
-        let brain_causal_traps: Vec<&HardNegativeTrapRecord> = traps
+        let causal_traps: Vec<&HardNegativeTrapRecord> = traps
             .iter()
             .filter(|t| {
                 t.brain_id == brain_id
-                    && t.direction == direction
                     && t.closed_timestamp_ns < current_timestamp_ns
-            })
-            .collect();
-
-        // Pool direction-aligned R-normalized underwater Bar+1 traps when WinnerPullback distribution is populated,
-        // while requiring strict causality (`closed_timestamp_ns < current_timestamp_ns`).
-        let pooled_underwater_traps: Vec<&HardNegativeTrapRecord> = traps
-            .iter()
-            .filter(|t| {
-                t.closed_timestamp_ns < current_timestamp_ns
                     && t.post_entry_bar1_features_32.len() >= 32
-                    && t.bar1_r_multiple < -0.12
             })
             .collect();
 
-        let causal_traps: Vec<&HardNegativeTrapRecord> =
-            if !wins.is_empty() && pooled_underwater_traps.len() >= 2 {
-                pooled_underwater_traps
-            } else {
-                brain_causal_traps
-            };
+        let causal_wins: Vec<&WinnerPullbackRecord> = wins
+            .iter()
+            .filter(|w| {
+                w.brain_id == brain_id
+                    && w.closed_timestamp_ns < current_timestamp_ns
+                    && w.post_entry_bar1_features_32.len() >= 32
+            })
+            .collect();
 
-        if causal_traps.is_empty() {
+        // Strict Cold-Start Abstention (N_min = 3 settled prior precedents on brain_id with both classes observed)
+        if causal_traps.is_empty()
+            || causal_wins.is_empty()
+            || (causal_traps.len() + causal_wins.len()) < 3
+        {
             return None;
         }
 
         let matched_prior_loss_count = causal_traps.len();
         let n_loss = matched_prior_loss_count as f64;
+        let n_win = causal_wins.len() as f64;
         let mut loss_centroid = [0.0_f64; 32];
-        let mut best_trap_id = causal_traps[0].loss_trade_id;
-        let mut best_trap_dist_sq = f64::MAX;
+        let mut win_centroid = [0.0_f64; 32];
+
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        let weights = &syn_state.synaptic_feature_weights_32;
 
         for trap in &causal_traps {
-            let src_feats = if trap.post_entry_bar1_features_32.len() >= 32 {
-                &trap.post_entry_bar1_features_32[0..32]
-            } else {
-                &trap.embedding_128[0..32.min(trap.embedding_128.len())]
-            };
-            let mut d_sq = 0.0_f64;
-            for (i, &val) in src_feats.iter().enumerate() {
-                let v = val as f64;
-                loss_centroid[i] += v / n_loss;
-                let dl = (live_bar_features_32[i] as f64) - v;
-                d_sq += dl * dl;
+            for (i, &val) in trap.post_entry_bar1_features_32.iter().take(32).enumerate() {
+                loss_centroid[i] += (val as f64) / n_loss;
             }
-            if trap.symbol.eq_ignore_ascii_case(symbol) {
-                d_sq *= 0.75;
-            }
-            if d_sq < best_trap_dist_sq {
-                best_trap_dist_sq = d_sq;
-                best_trap_id = trap.loss_trade_id;
+        }
+        for w in &causal_wins {
+            for (i, &val) in w.post_entry_bar1_features_32.iter().take(32).enumerate() {
+                win_centroid[i] += (val as f64) / n_win;
             }
         }
 
-        // Empirical 32x32 cross-stream sample covariance matrix \hat{\Sigma}_loss (with Era-1 conjugate prior variance 0.16 / n_loss)
         let mut loss_sample_cov = [[0.0_f64; 32]; 32];
-        let prior_var_l = 0.16 / n_loss;
+        let mut win_sample_cov = [[0.0_f64; 32]; 32];
+        let prior_var_l = 0.08 / n_loss;
+        let prior_var_w = 0.08 / n_win;
         for i in 0..32 {
             loss_sample_cov[i][i] = prior_var_l;
+            win_sample_cov[i][i] = prior_var_w;
         }
         for trap in &causal_traps {
-            if trap.closed_timestamp_ns <= 1_605_000_000_000_000_000 {
-                continue;
-            }
-            let src_feats = if trap.post_entry_bar1_features_32.len() >= 32 {
-                &trap.post_entry_bar1_features_32[0..32]
-            } else {
-                &trap.embedding_128[0..32.min(trap.embedding_128.len())]
-            };
+            let src_feats = &trap.post_entry_bar1_features_32[0..32];
             for i in 0..32 {
                 let di = (src_feats[i] as f64) - loss_centroid[i];
                 for j in 0..=i {
                     let dj = (src_feats[j] as f64) - loss_centroid[j];
-                    let cov_ij = (di * dj) / n_loss;
-                    loss_sample_cov[i][j] += cov_ij;
+                    loss_sample_cov[i][j] += (di * dj) / n_loss;
+                }
+            }
+        }
+        for w in &causal_wins {
+            let src_feats = &w.post_entry_bar1_features_32[0..32];
+            for i in 0..32 {
+                let di = (src_feats[i] as f64) - win_centroid[i];
+                for j in 0..=i {
+                    let dj = (src_feats[j] as f64) - win_centroid[j];
+                    win_sample_cov[i][j] += (di * dj) / n_win;
                 }
             }
         }
         for i in 0..32 {
             for j in 0..i {
                 loss_sample_cov[j][i] = loss_sample_cov[i][j];
+                win_sample_cov[j][i] = win_sample_cov[i][j];
             }
         }
 
-        // Build Causal Winner Pullback Distribution (\bar{X}_{win, bar1}, \Sigma_{LW}^{win})
-        let causal_wins: Vec<&WinnerPullbackRecord> = wins
-            .iter()
-            .filter(|w| {
-                w.closed_timestamp_ns < current_timestamp_ns
-                    && w.post_entry_bar1_features_32.len() >= 32
-                    && w.bar1_r_multiple < -0.12
-            })
-            .collect();
-
-        let mut win_centroid = [0.0_f64; 32];
-        let mut win_sample_cov = [[0.0_f64; 32]; 32];
-
-        if !causal_wins.is_empty() {
-            let n_win = causal_wins.len() as f64;
-            for w in &causal_wins {
-                for (i, &val) in w.post_entry_bar1_features_32.iter().take(32).enumerate() {
-                    win_centroid[i] += (val as f64) / n_win;
-                }
-            }
-            let prior_var_w = 0.16 / n_win;
-            for i in 0..32 {
-                win_sample_cov[i][i] = prior_var_w;
-            }
-            for w in &causal_wins {
-                if w.closed_timestamp_ns <= 1_605_000_000_000_000_000 {
-                    continue;
-                }
-                for i in 0..32 {
-                    let di = (w.post_entry_bar1_features_32[i] as f64) - win_centroid[i];
-                    for j in 0..=i {
-                        let dj = (w.post_entry_bar1_features_32[j] as f64) - win_centroid[j];
-                        win_sample_cov[i][j] += (di * dj) / n_win;
-                    }
-                }
-            }
-            for i in 0..32 {
-                for j in 0..i {
-                    win_sample_cov[j][i] = win_sample_cov[i][j];
-                }
-            }
-        } else {
-            let (fallback_mean, fallback_sigma) =
-                self.winning_feature_centroid_32(brain_id, symbol, current_timestamp_ns);
-            win_centroid = fallback_mean;
-            let dir_sign = direction.sign();
-            for (i, w_c) in win_centroid.iter_mut().enumerate() {
-                match i {
-                    0 | 3 => {
-                        *w_c = w_c.abs().max(0.14);
-                    }
-                    6 | 12 | 15 | 21 | 22 | 26..=29 => {
-                        *w_c = w_c.abs().max(0.14) * dir_sign;
-                    }
-                    _ => {}
-                }
-            }
-            for i in 0..32 {
-                win_sample_cov[i][i] = (fallback_sigma[i] * fallback_sigma[i]).clamp(0.0025, 0.25);
-            }
-        }
-        drop(traps);
-        drop(wins);
-
-        // Compute pooled 32x32 cross-stream covariance matrix and structural feature weights
-        let base_feat_weights: [f64; 32] = [
-            0.25, 0.85, 0.70, 0.45, 1.10, 0.30, 0.10, 0.45,
-            0.10, 0.15, 0.35, 0.10, 0.25, 1.40,
-            0.65, 0.30, 0.25, 0.25, 0.30, 0.65, 0.35,
-            0.25, 0.15, 0.85, 0.55,
-            0.75, 0.35, 0.45, 0.55,
-            0.20, 0.35, 0.75,
-        ];
         let mut pooled_sample_cov = [[0.0_f64; 32]; 32];
         let mut culprit_weights = [0.0_f64; 32];
         for i in 0..32 {
             for j in 0..32 {
                 let raw_ij = 0.5 * (loss_sample_cov[i][j] + win_sample_cov[i][j]);
                 pooled_sample_cov[i][j] = if i == j {
-                    raw_ij.max(0.020)
+                    raw_ij.max(0.025)
                 } else {
-                    raw_ij * 0.015
+                    raw_ij
                 };
             }
-            culprit_weights[i] = base_feat_weights[i];
+            let sep_i = (loss_centroid[i] - win_centroid[i]).abs();
+            let sigma_i = pooled_sample_cov[i][i].sqrt().max(0.10);
+            culprit_weights[i] = weights[i] * (0.40 + (sep_i / sigma_i).min(2.5));
         }
         let weight_sum: f64 = culprit_weights.iter().sum::<f64>().max(1e-6);
         for w in &mut culprit_weights {
             *w = (*w / weight_sum) * 6.0;
         }
+
+        let mut best_trap_id = causal_traps[0].loss_trade_id;
+        let mut max_loss_kernel = 0.0_f64;
+        for trap in &causal_traps {
+            let src_feats = &trap.post_entry_bar1_features_32[0..32];
+            let mut d_sq = 0.0_f64;
+            for i in 0..32 {
+                let dl = (live_bar_features_32[i] as f64) - (src_feats[i] as f64);
+                let var_i = pooled_sample_cov[i][i].max(0.025);
+                d_sq += (culprit_weights[i] / 6.0) * (dl * dl) / var_i;
+            }
+            let sym_b = if trap.symbol.eq_ignore_ascii_case(symbol) {
+                0.015
+            } else {
+                0.0
+            };
+            let k_loss = (-0.35 * d_sq).exp() + sym_b;
+            if k_loss > max_loss_kernel {
+                max_loss_kernel = k_loss;
+                best_trap_id = trap.loss_trade_id;
+            }
+        }
+
+        let mut max_win_kernel = 0.0_f64;
+        for w in &causal_wins {
+            let src_feats = &w.post_entry_bar1_features_32[0..32];
+            let mut d_sq = 0.0_f64;
+            for i in 0..32 {
+                let dw = (live_bar_features_32[i] as f64) - (src_feats[i] as f64);
+                let var_i = pooled_sample_cov[i][i].max(0.025);
+                d_sq += (culprit_weights[i] / 6.0) * (dw * dw) / var_i;
+            }
+            let sym_b = if w.symbol.eq_ignore_ascii_case(symbol) {
+                0.015
+            } else {
+                0.0
+            };
+            let k_win = (-0.35 * d_sq).exp() + sym_b;
+            if k_win > max_win_kernel {
+                max_win_kernel = k_win;
+            }
+        }
+
+        let n_total_bar1 = matched_prior_loss_count + causal_wins.len();
+        drop(traps);
+        drop(wins);
 
         let mut diff_loss = [0.0_f64; 32];
         let mut diff_win = [0.0_f64; 32];
@@ -1591,6 +1542,8 @@ impl PrecedentKnnIndex {
         let mut norm_x_sq = 0.0_f64;
         let mut norm_loss_sq = 0.0_f64;
         let mut norm_win_sq = 0.0_f64;
+        let mut fisher_num = 0.0_f64;
+        let mut fisher_den = 0.0_f64;
 
         for i in 0..32 {
             let x_i = live_bar_features_32[i] as f64;
@@ -1603,17 +1556,23 @@ impl PrecedentKnnIndex {
             norm_x_sq += w_i * x_i * x_i;
             norm_loss_sq += w_i * loss_centroid[i] * loss_centroid[i];
             norm_win_sq += w_i * win_centroid[i] * win_centroid[i];
+
+            let var_i = pooled_sample_cov[i][i].max(0.025);
+            let delta_mu_i = loss_centroid[i] - win_centroid[i];
+            let midpoint_i = 0.5 * (loss_centroid[i] + win_centroid[i]);
+            fisher_num += w_i * (delta_mu_i / var_i) * (x_i - midpoint_i);
+            fisher_den += w_i * (delta_mu_i * delta_mu_i) / var_i;
         }
 
         let (maha_loss, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
             &pooled_sample_cov,
-            matched_prior_loss_count,
+            n_total_bar1,
             &culprit_weights,
             &diff_loss,
         );
         let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
             &pooled_sample_cov,
-            matched_prior_loss_count,
+            n_total_bar1,
             &culprit_weights,
             &diff_win,
         );
@@ -1621,11 +1580,19 @@ impl PrecedentKnnIndex {
             (dot_loss / (norm_x_sq.sqrt() * norm_loss_sq.sqrt()).max(1e-6)).clamp(-1.0, 1.0);
         let cos_win =
             (dot_win / (norm_x_sq.sqrt() * norm_win_sq.sqrt()).max(1e-6)).clamp(-1.0, 1.0);
+        let fisher_llr = if fisher_den > 1e-6 {
+            (fisher_num / fisher_den.sqrt()).clamp(-4.0, 4.0)
+        } else {
+            0.0
+        };
+        let kernel_llr = 4.20 * (max_loss_kernel - max_win_kernel);
 
-        // Exact Bayesian Log-Likelihood Ratio Posterior:
-        // P(Loss | X_bar1) = 1 / (1 + exp(0.5 * (D_loss^2 - D_win^2)))
-        let exponent = (0.5 * (maha_loss * maha_loss - maha_win * maha_win)).clamp(-20.0, 20.0);
-        let posterior = 1.0 / (1.0 + exponent.exp());
+        // Continuous Antisymmetric Bayesian + Fisher + RBF Kernel Log-Likelihood Ratio Posterior:
+        let llr = (0.30 * (maha_win * maha_win - maha_loss * maha_loss)
+            + 0.65 * fisher_llr
+            + kernel_llr)
+            .clamp(-20.0, 20.0);
+        let posterior = 1.0 / (1.0 + (-llr).exp());
 
         if posterior >= learned_posterior_threshold {
             Some(PostEntryScratchDiagnostic {
@@ -1643,18 +1610,7 @@ impl PrecedentKnnIndex {
         }
     }
 
-    /// 3-Bar Wald Sequential Probability Ratio Test (SPRT) Post-Entry Scratch Discriminant (Phase 17 Upgrade 1).
-    ///
-    /// Evaluates sequential post-entry state vectors $(X_{\text{bar } 1}, X_{\text{bar } 2}, X_{\text{bar } 3})$ across
-    /// `Bar +1`, `Bar +2`, and `Bar +3` against the Dual $32 \times 32$ Ledoit-Wolf Cholesky Mahalanobis distributions:
-    /// $$\ell_m = \frac{1}{2}\left(D_{\text{win}}^2(X_{\text{bar } m}) - D_{\text{loss}}^2(X_{\text{bar } m})\right) + \gamma_m(r_m, b_m), \qquad \Lambda_k = \sum_{m=1}^k \ell_m$$
-    /// $$P_{\text{SPRT}}\!\left(\text{Loss} \mid X_{1..k}\right) = \frac{1}{1 + \exp(-\Lambda_k)}$$
-    /// Strictly causal at each step $k \in \{1, 2, 3\}$:
-    /// - At $k = 1$ (`Bar +1`), only `bar1_features_32` (`0..=entry_bar_idx + 1`) is inspected.
-    /// - At $k = 2$ (`Bar +2`), only `bar1_features_32` and `bar2_features_32` (`0..=entry_bar_idx + 2`) are inspected.
-    /// - At $k = 3$ (`Bar +3`), only `bar1..=bar3_features_32` (`0..=entry_bar_idx + 3`) are inspected.
-    ///
-    /// 100% blind to `row.is_winner`, `row.actual_exit_price`, and `row.realized_r_multiple`.
+    /// 3-Bar Wald Sequential Probability Ratio Test (SPRT) Post-Entry Scratch Discriminant (Phase 24.2 Pure Causal).
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate_causal_wald_sprt_post_entry_scratch(
         &self,
@@ -1679,31 +1635,31 @@ impl PrecedentKnnIndex {
             0.0,
         )?;
 
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        let (_, emp_ratchet_r) =
+            self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
+        let learned_ratchet_r =
+            (0.65 * syn_state.learned_mid_trade_stop_ratchet_r + 0.35 * emp_ratchet_r)
+                .clamp(-0.25, -0.12);
+
         let p1 = (base_bar1_diag.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
-        let l1_maha = (p1 / (1.0 - p1)).ln();
+        let l1 = (p1 / (1.0 - p1)).ln();
         let r1 = bar1_features_32[0] as f64;
-        let b1 = bar1_features_32[4] as f64;
 
-        // Step k = 1 (Bar +1):
-        // Immediate Bar +1 stop boundary B_1 requires severe single-bar impulse breakdown (`r1 <= -0.285 && b1 <= -0.78`)
-        // combined with high Mahalanobis posterior (`p1 >= 0.69`), while moderate dips enter the Wald Continuation Region.
-        let l1 = l1_maha + (-1.85 * (r1 + 0.25)) + (-0.65 * b1);
-        let b1_stop = r1 <= -0.285
-            && b1 <= -0.78
-            && p1 >= (learned_posterior_threshold - 0.01).clamp(0.68, 0.82)
-            && (r1 > -0.50 || p1 >= 0.90);
-
-        if b1_stop {
-            let lambda1 = l1.max(1.35);
-            let post1 = (1.0 / (1.0 + (-lambda1).exp())) * 100.0;
+        // Step k = 1 (Bar +1): Continuous Wald boundary A_1
+        let a1_thresh = syn_state.wald_sprt_thresholds[0]
+            .max((learned_posterior_threshold / (1.0 - learned_posterior_threshold.min(0.95))).ln());
+        if l1 >= a1_thresh {
+            let post1 = (1.0 / (1.0 + (-l1).exp())) * 100.0;
+            let exit_r_1 = (0.50 * learned_ratchet_r + 0.50 * r1).clamp(-0.25, -0.12);
             return Some(WaldSprtScratchDiagnostic {
                 scratch_bar_offset: 1,
-                scratch_exit_r: r1.clamp(-0.24, -0.12),
+                scratch_exit_r: exit_r_1,
                 bar1_log_likelihood_ratio: (l1 * 1000.0).round() / 1000.0,
                 bar2_log_likelihood_ratio: 0.0,
                 bar3_log_likelihood_ratio: 0.0,
-                cumulative_sprt_log_likelihood: (lambda1 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post1 * 100.0).round() / 100.0,
+                cumulative_sprt_log_likelihood: (l1 * 1000.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post1 * 100.0).round() / 1000.0,
                 mahalanobis_loss_distance: base_bar1_diag.mahalanobis_loss_distance,
                 mahalanobis_win_distance: base_bar1_diag.mahalanobis_win_distance,
                 matched_trap_id: base_bar1_diag.matched_trap_id,
@@ -1711,168 +1667,86 @@ impl PrecedentKnnIndex {
             });
         }
 
-        // Step k = 2 (Bar +2):
-        // Evaluate sequential continuation on Bar +2 using ONLY `bar1_features_32` and `bar2_features_32` (`0..=entry_bar_idx + 2`).
+        // Step k = 2 (Bar +2): Continuous sequential LLR evaluation on Bar +2
         let b2_feats = bar2_features_32.filter(|f| f.len() >= 32)?;
+        let bar2_diag = self.evaluate_causal_post_entry_scratch(
+            brain_id,
+            symbol,
+            direction,
+            current_timestamp_ns,
+            b2_feats,
+            0.0,
+        )?;
+        let p2 = (bar2_diag.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
+        let l2 = (p2 / (1.0 - p2)).ln();
+        let lambda2 = 0.55 * l1 + 0.75 * l2;
         let r2 = b2_feats[0] as f64;
-        let b2 = b2_feats[4] as f64;
-        let b1_opp = bar1_features_32[5] as f64;
-        let b2_opp = b2_feats[5] as f64;
-        let b2_fav = b2_feats[6] as f64;
-        let l2 = (-2.60 * (r2 + 0.14)) + (-1.20 * b2) + if r2 <= r1 { 0.80 } else { -0.95 };
-        let lambda2 = l1 + l2;
+        let a2_thresh = syn_state.wald_sprt_thresholds[1];
 
-        let syn_state = self.get_synaptic_plasticity_state(brain_id);
-        let w_body = syn_state.synaptic_feature_weights_32[4];
-        let w_opp_wick = syn_state.synaptic_feature_weights_32[5];
-        let a1_thresh = syn_state.wald_sprt_thresholds[0];
-
-        let gen2_bar2_recovery_defer = syn_state.generation_id >= 2
-            && a1_thresh >= 1.38
-            && w_body >= 1.12
-            && (b1 >= 0.50 || (b2_fav >= 0.25 && b2 > -0.58));
-
-        let persistent_2bar_breakdown = !gen2_bar2_recovery_defer
-            && r1 <= -0.115
-            && r2 <= -0.140
-            && p1 >= 0.765
-            && (b2 <= -0.08 || r2 <= -0.195)
-            && !(b1 > -0.60 && b2 > -0.10 && r2 < -0.35);
-        let accelerated_bar2_plunge = !gen2_bar2_recovery_defer
-            && r1 <= -0.110
-            && r2 <= -0.50
-            && b2 <= -0.65;
-        let gen2_wick_slam_bar2 = syn_state.generation_id >= 2
-            && w_opp_wick >= 1.12
-            && r1 <= -0.55
-            && b1_opp >= 0.85
-            && r2 <= -0.25;
-
-        if persistent_2bar_breakdown || accelerated_bar2_plunge || gen2_wick_slam_bar2 {
-            let eff_lambda2 = lambda2.max(syn_state.wald_sprt_thresholds[1].max(1.42));
-            let post2 = (1.0 / (1.0 + (-eff_lambda2).exp())) * 100.0;
+        if lambda2 >= a2_thresh && l2 > 0.25 {
+            let post2 = (1.0 / (1.0 + (-lambda2).exp())) * 100.0;
+            let exit_r_2 = (0.50 * learned_ratchet_r + 0.50 * (0.5 * (r1 + r2))).clamp(-0.25, -0.12);
             return Some(WaldSprtScratchDiagnostic {
                 scratch_bar_offset: 2,
-                scratch_exit_r: (0.5 * (r1 + r2)).clamp(-0.24, -0.12),
+                scratch_exit_r: exit_r_2,
                 bar1_log_likelihood_ratio: (l1 * 1000.0).round() / 1000.0,
                 bar2_log_likelihood_ratio: (l2 * 1000.0).round() / 1000.0,
                 bar3_log_likelihood_ratio: 0.0,
-                cumulative_sprt_log_likelihood: (eff_lambda2 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post2 * 100.0).round() / 100.0,
-                mahalanobis_loss_distance: base_bar1_diag.mahalanobis_loss_distance,
-                mahalanobis_win_distance: base_bar1_diag.mahalanobis_win_distance,
-                matched_trap_id: base_bar1_diag.matched_trap_id,
-                ledoit_wolf_shrinkage_lambda: base_bar1_diag.ledoit_wolf_shrinkage_lambda,
+                cumulative_sprt_log_likelihood: (lambda2 * 1000.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post2 * 100.0).round() / 1000.0,
+                mahalanobis_loss_distance: bar2_diag.mahalanobis_loss_distance,
+                mahalanobis_win_distance: bar2_diag.mahalanobis_win_distance,
+                matched_trap_id: bar2_diag.matched_trap_id,
+                ledoit_wolf_shrinkage_lambda: bar2_diag.ledoit_wolf_shrinkage_lambda,
             });
         }
 
-        // Step k = 3 (Bar +3):
-        // Evaluate 3-bar cumulative trajectory using ONLY `bar1_features_32`, `bar2_features_32`, and `bar3_features_32` (`0..=entry_bar_idx + 3`).
+        // Step k = 3 (Bar +3): Continuous sequential LLR evaluation on Bar +3
         let b3_feats = bar3_features_32.filter(|f| f.len() >= 32)?;
-        let r3 = b3_feats[0] as f64;
-        let b3 = b3_feats[4] as f64;
-        let psi_absorption_3 = self.compute_cross_stream_shakeout_absorption_score(
+        let bar3_diag = self.evaluate_causal_post_entry_scratch(
             brain_id,
-            bar1_features_32,
+            symbol,
+            direction,
+            current_timestamp_ns,
             b3_feats,
-        );
-        let learned_abs_q =
-            self.empirical_shakeout_absorption_quantile(brain_id, current_timestamp_ns);
-        let absorption_llr_discount = if syn_state.generation_id >= 17 {
-            1.25 * (psi_absorption_3 - learned_abs_q).max(0.0)
-        } else {
-            0.0
-        };
-        let l3 = (-2.40 * (r3 + 0.18))
-            + (-1.10 * b3)
-            + if r3 <= r2 { 0.90 } else { -1.10 }
-            - absorption_llr_discount;
-        let lambda3 = lambda2 + l3;
+            0.0,
+        )?;
+        let p3 = (bar3_diag.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
+        let l3 = (p3 / (1.0 - p3)).ln();
+        let lambda3 = 0.40 * l1 + 0.55 * l2 + 0.85 * l3;
+        let r3 = b3_feats[0] as f64;
+        let a3_thresh = syn_state.wald_sprt_thresholds[2];
 
-        let gen2_bar2_green_rebound = syn_state.generation_id >= 2
-            && w_body >= 1.12
-            && b2 >= 0.25
-            && r2 > r1 + 0.20;
-        // Phase 22 Upgrade 1: Self-learned Cross-Stream Shakeout Absorption discriminant at Bar +3 (`Gen 17..Gen 20`):
-        // When a trade exhibits constructive cross-stream institutional absorption (\Psi_{absorption}(X_{t+3}) >= q_{absorption, b}^*)
-        // combined with stopping-volume absorption on Bar +1, defer the Bar +3 scratch to STAGE_2_MID_STALL_GUARD (Bar +4..+6)!
-        let gen17_cross_stream_shakeout_absorption_defer = syn_state.generation_id >= 17
-            && psi_absorption_3 >= learned_abs_q
-            && b1 >= 0.40;
-
-        let three_bar_staircase_breakdown = r1 <= 0.02
-            && r1 > -0.20
-            && r2 <= -0.07
-            && r3 <= -0.38
-            && b1 <= 0.20
-            && b2 <= -0.20
-            && b3 <= -0.50;
-        let delayed_3bar_collapse = !gen2_bar2_green_rebound
-            && !gen17_cross_stream_shakeout_absorption_defer
-            && r1 <= 0.0
-            && r2 <= -0.25
-            && r3 <= -0.50
-            && b1 >= -0.35;
-        let failed_bar2_bounce_rejection = (r1 <= -0.125
-            && (0.78..=0.90).contains(&p1)
-            && r2 > 0.03
-            && b3 <= -0.25)
-            && !(r3 > 0.18 && b3 > 0.0);
-        let gen2_full_bear_bar3_reject = syn_state.generation_id >= 2
-            && w_body >= 1.12
-            && r1 <= -0.44
-            && b1 <= -0.95
-            && r3 <= 0.01
-            && b3 <= -0.45;
-        let gen3_failed_pop_wick_stall = syn_state.generation_id >= 3
-            && w_opp_wick >= 1.24
-            && ((r1 >= 0.10 && b2_opp >= 0.70 && r3 <= -0.35 && b3 <= -0.80)
-                || (r1 >= 0.04 && r2 <= -0.24 && b2_opp >= 0.65 && r3 <= -0.24));
-
-        if three_bar_staircase_breakdown
-            || delayed_3bar_collapse
-            || failed_bar2_bounce_rejection
-            || gen2_full_bear_bar3_reject
-            || gen3_failed_pop_wick_stall
-        {
-            let eff_lambda3 = lambda3.max(syn_state.wald_sprt_thresholds[2].max(1.48));
-            let post3 = (1.0 / (1.0 + (-eff_lambda3).exp())) * 100.0;
+        if lambda3 >= a3_thresh && l3 > 0.20 {
+            let post3 = (1.0 / (1.0 + (-lambda3).exp())) * 100.0;
+            let exit_r_3 =
+                (0.50 * learned_ratchet_r + 0.50 * ((r1 + r2 + r3) / 3.0)).clamp(-0.25, -0.12);
             return Some(WaldSprtScratchDiagnostic {
                 scratch_bar_offset: 3,
-                scratch_exit_r: ((r1 + r2 + r3) / 3.0).clamp(-0.25, -0.12),
+                scratch_exit_r: exit_r_3,
                 bar1_log_likelihood_ratio: (l1 * 1000.0).round() / 1000.0,
                 bar2_log_likelihood_ratio: (l2 * 1000.0).round() / 1000.0,
                 bar3_log_likelihood_ratio: (l3 * 1000.0).round() / 1000.0,
-                cumulative_sprt_log_likelihood: (eff_lambda3 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post3 * 100.0).round() / 100.0,
-                mahalanobis_loss_distance: base_bar1_diag.mahalanobis_loss_distance,
-                mahalanobis_win_distance: base_bar1_diag.mahalanobis_win_distance,
-                matched_trap_id: base_bar1_diag.matched_trap_id,
-                ledoit_wolf_shrinkage_lambda: base_bar1_diag.ledoit_wolf_shrinkage_lambda,
+                cumulative_sprt_log_likelihood: (lambda3 * 1000.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post3 * 100.0).round() / 1000.0,
+                mahalanobis_loss_distance: bar3_diag.mahalanobis_loss_distance,
+                mahalanobis_win_distance: bar3_diag.mahalanobis_win_distance,
+                matched_trap_id: bar3_diag.matched_trap_id,
+                ledoit_wolf_shrinkage_lambda: bar3_diag.ledoit_wolf_shrinkage_lambda,
             });
         }
 
         None
     }
 
-    /// Phase 19 Upgrade 2: Self-Learned Mid-Trade (`Bar +4..+6`) Stall & Rollover Sequential Discriminant.
+    /// Phase 24.2 Pure Causal Mid-Trade (`Bar +4..+8`) Stall & Rollover Sequential Discriminant.
     ///
-    /// Evaluates active trades that survived `Bar +1..+3` across `Bar +4, Bar +5, Bar +6` ($k \in \{4, 5, 6\}$)
-    /// against the Dual $32 \times 32$ Ledoit-Wolf Cholesky Mahalanobis Mid-Trade Distributions:
-    /// 1. **Mid-Trade Winner Continuation Distribution ($\bar{Z}_{\text{win, mid}}, \Sigma_{\text{LW}}^{\text{win, mid}}$)**
-    /// 2. **Mid-Trade Late-Failure Stall Distribution ($\bar{Z}_{\text{loss, mid}}, \Sigma_{\text{LW}}^{\text{loss, mid}}$)**
+    /// Evaluates active trades that survived `Bar +1..+3` across `Bar +4..+8` ($k \in \{4, 5, 6, 7, 8\}$)
+    /// against the Dual $32 \times 32$ Ledoit-Wolf Cholesky Mahalanobis & Fisher Linear Discriminant
+    /// Mid-Trade Distributions built strictly from settled prior trajectories ($T_{\text{closed}, j} < t$).
     ///
-    /// weighted by the Brain's Empirical-Bayes specialized 32-feature synaptic weights $\nabla^{\text{EB}}_b w_f$,
-    /// normalized cumulative MFE stall deficit ($MFE_{1..3} / \tilde{\mu}_{\text{MFE}, b}$ vs. `learned_mid_trade_mfe_norm_quantile`),
-    /// excursion velocity $\Delta r_{4..k}$, and opposing absorption shift.
-    ///
-    /// Strictly 100% outcome-blind at each bar $k \in \{4, 5, 6\}$:
-    /// - At $k = 4$, only `bar1..=bar4_features_32` (`0..=entry_bar_idx + 4`) are inspected.
-    /// - At $k = 5$, only `bar1..=bar5_features_32` (`0..=entry_bar_idx + 5`) are inspected.
-    /// - At $k = 6$, only `bar1..=bar6_features_32` (`0..=entry_bar_idx + 6`) are inspected.
-    /// - Never reads `row.is_winner`, `row.actual_exit_price`, or `row.realized_r_multiple`.
-    /// - Zero hardcoded `-0.35R` or `+0.40R` constants: exit R is derived from the Brain's self-learned
-    ///   80th-percentile adverse excursion quantile (`learned_mid_trade_stop_ratchet_r`).
+    /// - Strictly abstains during cold start when fewer than $N_{\min} = 3$ settled prior mid-trade trajectories exist on `brain_id`.
+    /// - Zero hardcoded per-Brain boolean predicates or sign assumptions.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn evaluate_causal_mid_trade_stall_discriminant(
         &self,
@@ -1890,9 +1764,6 @@ impl PrecedentKnnIndex {
         bar8_features_32: Option<&[f32]>,
     ) -> Option<WaldSprtScratchDiagnostic> {
         let syn_state = self.get_synaptic_plasticity_state(brain_id);
-        if syn_state.generation_id < 5 {
-            return None;
-        }
         let b1 = bar1_features_32;
         let b2 = bar2_features_32.filter(|f| f.len() >= 32)?;
         let b3 = bar3_features_32.filter(|f| f.len() >= 32)?;
@@ -1901,11 +1772,10 @@ impl PrecedentKnnIndex {
             return None;
         }
 
-        // Compute Dual 32x32 Ledoit-Wolf Cholesky Mahalanobis Mid-Trade baseline from causal mid-trade trajectories
         let mid_losses = self.mid_trade_loss_trajectories.read();
         let mid_wins = self.mid_trade_winner_trajectories.read();
 
-        let mut causal_mid_losses: Vec<&MidTradeTrajectoryRecord> = mid_losses
+        let causal_mid_losses: Vec<&MidTradeTrajectoryRecord> = mid_losses
             .iter()
             .filter(|r| {
                 r.brain_id == brain_id
@@ -1913,17 +1783,8 @@ impl PrecedentKnnIndex {
                     && r.mid_trade_features_32.len() >= 32
             })
             .collect();
-        if causal_mid_losses.is_empty() {
-            causal_mid_losses = mid_losses
-                .iter()
-                .filter(|r| {
-                    r.closed_timestamp_ns < current_timestamp_ns
-                        && r.mid_trade_features_32.len() >= 32
-                })
-                .collect();
-        }
 
-        let mut causal_mid_wins: Vec<&MidTradeTrajectoryRecord> = mid_wins
+        let causal_mid_wins: Vec<&MidTradeTrajectoryRecord> = mid_wins
             .iter()
             .filter(|r| {
                 r.brain_id == brain_id
@@ -1931,14 +1792,13 @@ impl PrecedentKnnIndex {
                     && r.mid_trade_features_32.len() >= 32
             })
             .collect();
-        if causal_mid_wins.is_empty() {
-            causal_mid_wins = mid_wins
-                .iter()
-                .filter(|r| {
-                    r.closed_timestamp_ns < current_timestamp_ns
-                        && r.mid_trade_features_32.len() >= 32
-                })
-                .collect();
+
+        // Strict Cold-Start Abstention (N_min = 3 settled prior mid-trade precedents on brain_id with both classes observed)
+        if causal_mid_losses.is_empty()
+            || causal_mid_wins.is_empty()
+            || (causal_mid_losses.len() + causal_mid_wins.len()) < 3
+        {
+            return None;
         }
 
         let matched_trap_id = causal_mid_losses
@@ -1948,7 +1808,7 @@ impl PrecedentKnnIndex {
             .map(|r| r.trade_id)
             .unwrap_or_else(Uuid::nil);
 
-        let n_loss = causal_mid_losses.len().max(1);
+        let n_total = causal_mid_losses.len() + causal_mid_wins.len();
         let mut loss_mid_centroid = [0.0_f64; 32];
         let mut win_mid_centroid = [0.0_f64; 32];
         let mut pooled_mid_cov = [[0.0_f64; 32]; 32];
@@ -1956,207 +1816,155 @@ impl PrecedentKnnIndex {
         for i in 0..32 {
             pooled_mid_cov[i][i] = 0.04;
         }
-        if !causal_mid_losses.is_empty() {
-            let inv_l = 1.0 / (causal_mid_losses.len() as f64);
-            for r in &causal_mid_losses {
-                for i in 0..32 {
-                    loss_mid_centroid[i] += (r.mid_trade_features_32[i] as f64) * inv_l;
-                }
+        let inv_l = 1.0 / (causal_mid_losses.len() as f64);
+        for r in &causal_mid_losses {
+            for i in 0..32 {
+                loss_mid_centroid[i] += (r.mid_trade_features_32[i] as f64) * inv_l;
             }
-            for r in &causal_mid_losses {
-                for i in 0..32 {
-                    let di = (r.mid_trade_features_32[i] as f64) - loss_mid_centroid[i];
-                    for j in 0..=i {
-                        let dj = (r.mid_trade_features_32[j] as f64) - loss_mid_centroid[j];
-                        let cov_ij = 0.5 * (di * dj) * inv_l;
-                        pooled_mid_cov[i][j] += cov_ij;
-                        pooled_mid_cov[j][i] = pooled_mid_cov[i][j];
-                    }
+        }
+        for r in &causal_mid_losses {
+            for i in 0..32 {
+                let di = (r.mid_trade_features_32[i] as f64) - loss_mid_centroid[i];
+                for j in 0..=i {
+                    let dj = (r.mid_trade_features_32[j] as f64) - loss_mid_centroid[j];
+                    let cov_ij = 0.5 * (di * dj) * inv_l;
+                    pooled_mid_cov[i][j] += cov_ij;
+                    pooled_mid_cov[j][i] = pooled_mid_cov[i][j];
                 }
             }
         }
-        if !causal_mid_wins.is_empty() {
-            let inv_w = 1.0 / (causal_mid_wins.len() as f64);
-            for r in &causal_mid_wins {
-                for i in 0..32 {
-                    win_mid_centroid[i] += (r.mid_trade_features_32[i] as f64) * inv_w;
-                }
+
+        let inv_w = 1.0 / (causal_mid_wins.len() as f64);
+        for r in &causal_mid_wins {
+            for i in 0..32 {
+                win_mid_centroid[i] += (r.mid_trade_features_32[i] as f64) * inv_w;
             }
-            for r in &causal_mid_wins {
-                for i in 0..32 {
-                    let di = (r.mid_trade_features_32[i] as f64) - win_mid_centroid[i];
-                    for j in 0..=i {
-                        let dj = (r.mid_trade_features_32[j] as f64) - win_mid_centroid[j];
-                        let cov_ij = 0.5 * (di * dj) * inv_w;
-                        pooled_mid_cov[i][j] += cov_ij;
-                        pooled_mid_cov[j][i] = pooled_mid_cov[i][j];
-                    }
+        }
+        for r in &causal_mid_wins {
+            for i in 0..32 {
+                let di = (r.mid_trade_features_32[i] as f64) - win_mid_centroid[i];
+                for j in 0..=i {
+                    let dj = (r.mid_trade_features_32[j] as f64) - win_mid_centroid[j];
+                    let cov_ij = 0.5 * (di * dj) * inv_w;
+                    pooled_mid_cov[i][j] += cov_ij;
+                    pooled_mid_cov[j][i] = pooled_mid_cov[i][j];
                 }
             }
         }
+
+        let loss_mid_vecs: Vec<(String, Vec<f32>)> = causal_mid_losses
+            .iter()
+            .map(|r| (r.symbol.clone(), r.mid_trade_features_32.clone()))
+            .collect();
+        let win_mid_vecs: Vec<(String, Vec<f32>)> = causal_mid_wins
+            .iter()
+            .map(|r| (r.symbol.clone(), r.mid_trade_features_32.clone()))
+            .collect();
         drop(mid_losses);
         drop(mid_wins);
 
-        let mut diff_loss = [0.0_f64; 32];
-        let mut diff_win = [0.0_f64; 32];
-        for i in 0..32 {
-            let x_i = b4[i] as f64;
-            diff_loss[i] = x_i - loss_mid_centroid[i];
-            diff_win[i] = x_i - win_mid_centroid[i];
-        }
-        let (maha_loss, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
-            &pooled_mid_cov,
-            n_loss,
-            &syn_state.synaptic_feature_weights_32,
-            &diff_loss,
-        );
-        let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
-            &pooled_mid_cov,
-            n_loss,
-            &syn_state.synaptic_feature_weights_32,
-            &diff_win,
-        );
-        let base_maha_llr = (0.5 * (maha_win * maha_win - maha_loss * maha_loss)).clamp(-1.8, 1.8);
-
-        let r1 = b1[0] as f64;
-        let r2 = b2[0] as f64;
-        let r3 = b3[0] as f64;
-        let mfe3 = (b1[2] as f64).max(b2[2] as f64).max(b3[2] as f64);
-
-        let (emp_mfe_norm_q, emp_stop_ratchet_r) =
+        let (_, emp_stop_ratchet_r) =
             self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
         let learned_ratchet_r = (0.65 * syn_state.learned_mid_trade_stop_ratchet_r
             + 0.35 * emp_stop_ratchet_r)
-            .clamp(-0.23, -0.14);
-        let _learned_mfe_q =
-            0.5 * (syn_state.learned_mid_trade_mfe_norm_quantile + emp_mfe_norm_q);
+            .clamp(-0.24, -0.13);
 
-        // Step k = 4 (Bar +4): Strictly causal using ONLY `bar1..=bar4_features_32` (`0..=entry_bar_idx + 4`)
-        let r4 = b4[0] as f64;
-        let body4 = b4[4] as f64;
-        let opp_w4 = b4[5] as f64;
-        let vel_4 = r4 - (r1 + r2 + r3) / 3.0;
-        let l4 = base_maha_llr + (-1.65 * r4) + (-0.85 * body4) + (-0.95 * vel_4);
+        let evaluate_bar_k_llr = |feats_k: &[f32]| -> (f64, f64, f64, f64) {
+            let mut diff_loss = [0.0_f64; 32];
+            let mut diff_win = [0.0_f64; 32];
+            let mut fisher_num = 0.0_f64;
+            let mut fisher_den = 0.0_f64;
+            for i in 0..32 {
+                let x_i = feats_k[i] as f64;
+                let w_i = syn_state.synaptic_feature_weights_32[i];
+                diff_loss[i] = x_i - loss_mid_centroid[i];
+                diff_win[i] = x_i - win_mid_centroid[i];
+                let var_i = pooled_mid_cov[i][i].max(0.03);
+                let delta_mu_i = loss_mid_centroid[i] - win_mid_centroid[i];
+                let midpoint_i = 0.5 * (loss_mid_centroid[i] + win_mid_centroid[i]);
+                fisher_num += w_i * (delta_mu_i / var_i) * (x_i - midpoint_i);
+                fisher_den += w_i * (delta_mu_i * delta_mu_i) / var_i;
+            }
+            let mut max_l_k = 0.0_f64;
+            for (sym_l, v_l) in &loss_mid_vecs {
+                let mut d_sq = 0.0_f64;
+                for i in 0..32 {
+                    let dl = (feats_k[i] as f64) - (v_l[i] as f64);
+                    let var_i = pooled_mid_cov[i][i].max(0.03);
+                    d_sq += (syn_state.synaptic_feature_weights_32[i] / 32.0) * (dl * dl) / var_i;
+                }
+                let sb = if sym_l.eq_ignore_ascii_case(symbol) { 0.015 } else { 0.0 };
+                let kl = (-0.35 * d_sq * 6.0).exp() + sb;
+                if kl > max_l_k {
+                    max_l_k = kl;
+                }
+            }
+            let mut max_w_k = 0.0_f64;
+            for (sym_w, v_w) in &win_mid_vecs {
+                let mut d_sq = 0.0_f64;
+                for i in 0..32 {
+                    let dw = (feats_k[i] as f64) - (v_w[i] as f64);
+                    let var_i = pooled_mid_cov[i][i].max(0.03);
+                    d_sq += (syn_state.synaptic_feature_weights_32[i] / 32.0) * (dw * dw) / var_i;
+                }
+                let sb = if sym_w.eq_ignore_ascii_case(symbol) { 0.015 } else { 0.0 };
+                let kw = (-0.35 * d_sq * 6.0).exp() + sb;
+                if kw > max_w_k {
+                    max_w_k = kw;
+                }
+            }
+            let (maha_loss, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+                &pooled_mid_cov,
+                n_total,
+                &syn_state.synaptic_feature_weights_32,
+                &diff_loss,
+            );
+            let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+                &pooled_mid_cov,
+                n_total,
+                &syn_state.synaptic_feature_weights_32,
+                &diff_win,
+            );
+            let maha_llr = (0.30 * (maha_win * maha_win - maha_loss * maha_loss)).clamp(-2.5, 2.5);
+            let fisher_llr = if fisher_den > 1e-6 {
+                (fisher_num / fisher_den.sqrt()).clamp(-3.5, 3.5)
+            } else {
+                0.0
+            };
+            let kernel_llr = 4.0 * (max_l_k - max_w_k);
+            (0.40 * maha_llr + 0.65 * fisher_llr + kernel_llr, maha_loss, maha_win, lw_lambda)
+        };
 
-        let bar4_penny_stall = brain_id == BrainHorizonId::Brain01PennyAnomaly
-            && r1 < -0.18
-            && r2 < -0.18
-            && r3 < -0.18
-            && r4 < -0.30
-            && body4 <= -0.90;
-        let bar4_intraday_flat_breakdown = brain_id == BrainHorizonId::Brain02IntradayDayTrade
-            && mfe3 < 0.02
-            && r1 < -0.15
-            && r2 < -0.18
-            && r4 < -0.28
-            && body4 < -0.50;
-        let bar4_intraday_pop_reversal = brain_id == BrainHorizonId::Brain02IntradayDayTrade
-            && r1 > 0.18
-            && r3 < -0.08
-            && r4 < -0.42
-            && body4 < -0.75;
-        let bar4_swing_1h_collapse = brain_id == BrainHorizonId::Brain03ShortTermSwing
-            && mfe3 < 0.09
-            && r1 < -0.10
-            && r2 < -0.10
-            && r4 < -0.60
-            && body4 < -0.20;
-        let bar4_core_swing_plunge = syn_state.generation_id >= 6
-            && brain_id == BrainHorizonId::Brain04CoreSwing
-            && mfe3 < -0.05
-            && r1 > -0.26
-            && r1 < -0.20
-            && r3 < -0.40
-            && r4 < -0.80
-            && body4 < -0.70;
-
-        if bar4_penny_stall
-            || bar4_intraday_flat_breakdown
-            || bar4_intraday_pop_reversal
-            || bar4_swing_1h_collapse
-            || bar4_core_swing_plunge
-        {
-            let a_mid_4 = syn_state.mid_trade_wald_sprt_thresholds[0].max(1.42);
-            let lambda_mid_4 = l4.max(a_mid_4 + 0.14);
-            let post_mid_4 = (1.0 / (1.0 + (-lambda_mid_4).exp())) * 100.0;
-            let exit_r_4 = (0.65 * learned_ratchet_r + 0.35 * r4.clamp(-0.24, -0.14))
-                .clamp(-0.23, -0.14);
+        let _ = (b2, b3);
+        let (l4, maha_loss_4, maha_win_4, lw_lambda_4) = evaluate_bar_k_llr(b4);
+        let a_mid_4 = syn_state.mid_trade_wald_sprt_thresholds[0];
+        if l4 >= a_mid_4 {
+            let post_mid_4 = (1.0 / (1.0 + (-l4).exp())) * 100.0;
+            let r4 = b4[0] as f64;
+            let exit_r_4 = (0.65 * learned_ratchet_r + 0.35 * r4).clamp(-0.24, -0.13);
             return Some(WaldSprtScratchDiagnostic {
                 scratch_bar_offset: 4,
                 scratch_exit_r: exit_r_4,
                 bar1_log_likelihood_ratio: (l4 * 1000.0).round() / 1000.0,
                 bar2_log_likelihood_ratio: 0.0,
                 bar3_log_likelihood_ratio: 0.0,
-                cumulative_sprt_log_likelihood: (lambda_mid_4 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post_mid_4 * 100.0).round() / 100.0,
-                mahalanobis_loss_distance: maha_loss,
-                mahalanobis_win_distance: maha_win,
+                cumulative_sprt_log_likelihood: (l4 * 1000.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post_mid_4 * 100.0).round() / 1000.0,
+                mahalanobis_loss_distance: maha_loss_4,
+                mahalanobis_win_distance: maha_win_4,
                 matched_trap_id,
-                ledoit_wolf_shrinkage_lambda: lw_lambda,
+                ledoit_wolf_shrinkage_lambda: lw_lambda_4,
             });
         }
 
-        // Step k = 5 (Bar +5): Strictly causal using ONLY `bar1..=bar5_features_32` (`0..=entry_bar_idx + 5`)
-        if syn_state.generation_id < 6 {
-            return None;
-        }
         let b5 = bar5_features_32.filter(|f| f.len() >= 32)?;
-        let r5 = b5[0] as f64;
-        let body5 = b5[4] as f64;
-        let opp_w5 = b5[5] as f64;
-        let l5 = (-1.80 * r5) + (-0.95 * body5) + (0.65 * opp_w5);
-        let lambda_mid_5_raw = l4 + l5;
-
-        let bar5_intraday_slam = brain_id == BrainHorizonId::Brain02IntradayDayTrade
-            && mfe3 > 0.08
-            && mfe3 < 0.16
-            && r5 < -0.28
-            && body5 <= -0.90;
-        let bar5_swing_wick_absorption = brain_id == BrainHorizonId::Brain03ShortTermSwing
-            && mfe3 > 0.14
-            && mfe3 < 0.18
-            && r1 > 0.03
-            && r2 > 0.03
-            && r3 > 0.03
-            && r4 < -0.10
-            && r5 < -0.09
-            && opp_w5 > 0.65;
-        let bar5_core_swing_rollover = syn_state.generation_id >= 7
-            && brain_id == BrainHorizonId::Brain04CoreSwing
-            && ((mfe3 > 0.55
-                && r3 > 0.35
-                && r4 > 0.20
-                && body4 < -0.30
-                && r5 < -0.04
-                && body5 < -0.65)
-                || (mfe3 > 0.15
-                    && mfe3 < 0.22
-                    && r3 < -0.08
-                    && r4 < -0.04
-                    && body4 > 0.55
-                    && r5 < -0.20
-                    && body5 < -0.30));
-        let bar5_wealth_tide_stall = syn_state.generation_id >= 7
-            && brain_id == BrainHorizonId::Brain05LongTermWealth
-            && mfe3 > 0.08
-            && mfe3 < 0.14
-            && r1 < -0.04
-            && r2 < -0.10
-            && r4 < -0.06
-            && r5 < -0.30
-            && body5 < -0.30
-            && opp_w5 > 0.30;
-
-        if bar5_intraday_slam
-            || bar5_swing_wick_absorption
-            || bar5_core_swing_rollover
-            || bar5_wealth_tide_stall
-        {
-            let a_mid_5 = syn_state.mid_trade_wald_sprt_thresholds[1].max(1.38);
-            let lambda_mid_5 = lambda_mid_5_raw.max(a_mid_5 + 0.16);
+        let (l5, maha_loss_5, maha_win_5, lw_lambda_5) = evaluate_bar_k_llr(b5);
+        let lambda_mid_5 = 0.45 * l4 + 0.75 * l5;
+        let a_mid_5 = syn_state.mid_trade_wald_sprt_thresholds[1];
+        if lambda_mid_5 >= a_mid_5 && l5 > 0.20 {
             let post_mid_5 = (1.0 / (1.0 + (-lambda_mid_5).exp())) * 100.0;
-            let exit_r_5 = (0.65 * learned_ratchet_r + 0.35 * r5.clamp(-0.24, -0.13))
-                .clamp(-0.23, -0.13);
+            let r5 = b5[0] as f64;
+            let exit_r_5 = (0.65 * learned_ratchet_r + 0.35 * r5).clamp(-0.24, -0.13);
             return Some(WaldSprtScratchDiagnostic {
                 scratch_bar_offset: 5,
                 scratch_exit_r: exit_r_5,
@@ -2164,57 +1972,22 @@ impl PrecedentKnnIndex {
                 bar2_log_likelihood_ratio: (l5 * 1000.0).round() / 1000.0,
                 bar3_log_likelihood_ratio: 0.0,
                 cumulative_sprt_log_likelihood: (lambda_mid_5 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post_mid_5 * 100.0).round() / 100.0,
-                mahalanobis_loss_distance: maha_loss,
-                mahalanobis_win_distance: maha_win,
+                loss_affinity_posterior_pct: (post_mid_5 * 100.0).round() / 1000.0,
+                mahalanobis_loss_distance: maha_loss_5,
+                mahalanobis_win_distance: maha_win_5,
                 matched_trap_id,
-                ledoit_wolf_shrinkage_lambda: lw_lambda,
+                ledoit_wolf_shrinkage_lambda: lw_lambda_5,
             });
         }
 
-        // Step k = 6 (Bar +6): Strictly causal using ONLY `bar1..=bar6_features_32` (`0..=entry_bar_idx + 6`)
-        if syn_state.generation_id < 8 {
-            return None;
-        }
         let b6 = bar6_features_32.filter(|f| f.len() >= 32)?;
-        let r6 = b6[0] as f64;
-        let body6 = b6[4] as f64;
-        let opp_w6 = b6[5] as f64;
-        let l6 = (-1.90 * r6) + (-1.05 * body6) + (0.60 * opp_w6);
-        let lambda_mid_6_raw = lambda_mid_5_raw + l6;
-
-        let bar6_penny_failed_pop = brain_id == BrainHorizonId::Brain01PennyAnomaly
-            && mfe3 > 0.40
-            && r4 > 0.20
-            && opp_w4 > 0.75
-            && r5 > 0.20
-            && body5 < -0.25
-            && r6 < 0.10
-            && body6 <= -0.90;
-        let bar6_intraday_rollover = brain_id == BrainHorizonId::Brain02IntradayDayTrade
-            && mfe3 > 0.30
-            && r1 > 0.05
-            && r4 > 0.02
-            && r5 > 0.05
-            && opp_w5 > 0.42
-            && r6 <= 0.01
-            && body6 <= -0.45;
-        let bar6_swing_rejection_plunge = brain_id == BrainHorizonId::Brain03ShortTermSwing
-            && mfe3 > 0.09
-            && mfe3 < 0.16
-            && r4 < -0.03
-            && body4 < -0.12
-            && r5 > 0.03
-            && body5 > 0.60
-            && r6 < -0.80
-            && body6 < -0.70;
-
-        if bar6_penny_failed_pop || bar6_intraday_rollover || bar6_swing_rejection_plunge {
-            let a_mid_6 = syn_state.mid_trade_wald_sprt_thresholds[2].max(1.35);
-            let lambda_mid_6 = lambda_mid_6_raw.max(a_mid_6 + 0.18);
+        let (l6, maha_loss_6, maha_win_6, lw_lambda_6) = evaluate_bar_k_llr(b6);
+        let lambda_mid_6 = 0.30 * l4 + 0.45 * l5 + 0.75 * l6;
+        let a_mid_6 = syn_state.mid_trade_wald_sprt_thresholds[2];
+        if lambda_mid_6 >= a_mid_6 && l6 > 0.20 {
             let post_mid_6 = (1.0 / (1.0 + (-lambda_mid_6).exp())) * 100.0;
-            let exit_r_6 = (0.70 * learned_ratchet_r + 0.30 * r6.clamp(-0.24, -0.13))
-                .clamp(-0.23, -0.13);
+            let r6 = b6[0] as f64;
+            let exit_r_6 = (0.65 * learned_ratchet_r + 0.35 * r6).clamp(-0.24, -0.13);
             return Some(WaldSprtScratchDiagnostic {
                 scratch_bar_offset: 6,
                 scratch_exit_r: exit_r_6,
@@ -2222,72 +1995,43 @@ impl PrecedentKnnIndex {
                 bar2_log_likelihood_ratio: (l5 * 1000.0).round() / 1000.0,
                 bar3_log_likelihood_ratio: (l6 * 1000.0).round() / 1000.0,
                 cumulative_sprt_log_likelihood: (lambda_mid_6 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post_mid_6 * 100.0).round() / 100.0,
-                mahalanobis_loss_distance: maha_loss,
-                mahalanobis_win_distance: maha_win,
+                loss_affinity_posterior_pct: (post_mid_6 * 100.0).round() / 1000.0,
+                mahalanobis_loss_distance: maha_loss_6,
+                mahalanobis_win_distance: maha_win_6,
                 matched_trap_id,
-                ledoit_wolf_shrinkage_lambda: lw_lambda,
+                ledoit_wolf_shrinkage_lambda: lw_lambda_6,
             });
         }
 
-        // Step k = 8 (Bar +7..+8): Phase 20 Gen 9+ extended post-peak rollover check (`0..=entry_bar_idx + 8`)
-        if syn_state.generation_id < 9 {
-            return None;
-        }
-        let b7 = bar7_features_32.filter(|f| f.len() >= 32)?;
-        let b8 = bar8_features_32.filter(|f| f.len() >= 32)?;
-        let r7 = b7[0] as f64;
-        let r8 = b8[0] as f64;
-        let body8 = b8[4] as f64;
-        let opp_w8 = b8[5] as f64;
-        let l8 = (-2.10 * r8) + (-1.15 * body8) + (0.65 * opp_w8);
-        let lambda_mid_8_raw = lambda_mid_6_raw + l8;
-
-        let bar8_core_swing_delayed_rollover = brain_id == BrainHorizonId::Brain04CoreSwing
-            && mfe3 > 0.25
-            && r6 > 0.30
-            && r7 > 0.30
-            && r8 < -0.05
-            && body8 < -0.60;
-
-        if bar8_core_swing_delayed_rollover {
-            let a_mid_8 = syn_state.mid_trade_wald_sprt_thresholds[2].max(1.34);
-            let lambda_mid_8 = lambda_mid_8_raw.max(a_mid_8 + 0.16);
-            let post_mid_8 = (1.0 / (1.0 + (-lambda_mid_8).exp())) * 100.0;
-            let exit_r_8 = (0.65 * learned_ratchet_r + 0.35 * r8.clamp(-0.24, -0.12))
-                .clamp(-0.22, -0.12);
-            return Some(WaldSprtScratchDiagnostic {
-                scratch_bar_offset: 8,
-                scratch_exit_r: exit_r_8,
-                bar1_log_likelihood_ratio: (l4 * 1000.0).round() / 1000.0,
-                bar2_log_likelihood_ratio: (l6 * 1000.0).round() / 1000.0,
-                bar3_log_likelihood_ratio: (l8 * 1000.0).round() / 1000.0,
-                cumulative_sprt_log_likelihood: (lambda_mid_8 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post_mid_8 * 100.0).round() / 100.0,
-                mahalanobis_loss_distance: maha_loss,
-                mahalanobis_win_distance: maha_win,
-                matched_trap_id,
-                ledoit_wolf_shrinkage_lambda: lw_lambda,
-            });
+        if let Some(b8) = bar8_features_32.filter(|f| f.len() >= 32) {
+            let b7 = bar7_features_32.unwrap_or(b8);
+            let (l7, _, _, _) = evaluate_bar_k_llr(b7);
+            let (l8, maha_loss_8, maha_win_8, lw_lambda_8) = evaluate_bar_k_llr(b8);
+            let lambda_mid_8 = 0.25 * l6 + 0.35 * l7 + 0.80 * l8;
+            if lambda_mid_8 >= a_mid_6 && l8 > 0.20 {
+                let post_mid_8 = (1.0 / (1.0 + (-lambda_mid_8).exp())) * 100.0;
+                let r8 = b8[0] as f64;
+                let exit_r_8 = (0.65 * learned_ratchet_r + 0.35 * r8).clamp(-0.24, -0.13);
+                return Some(WaldSprtScratchDiagnostic {
+                    scratch_bar_offset: 8,
+                    scratch_exit_r: exit_r_8,
+                    bar1_log_likelihood_ratio: (l6 * 1000.0).round() / 1000.0,
+                    bar2_log_likelihood_ratio: (l7 * 1000.0).round() / 1000.0,
+                    bar3_log_likelihood_ratio: (l8 * 1000.0).round() / 1000.0,
+                    cumulative_sprt_log_likelihood: (lambda_mid_8 * 1000.0).round() / 1000.0,
+                    loss_affinity_posterior_pct: (post_mid_8 * 100.0).round() / 1000.0,
+                    mahalanobis_loss_distance: maha_loss_8,
+                    mahalanobis_win_distance: maha_win_8,
+                    matched_trap_id,
+                    ledoit_wolf_shrinkage_lambda: lw_lambda_8,
+                });
+            }
         }
 
         None
     }
 
-    /// Phase 20 Upgrade 1: Outcome-Blind Late-Stage (`Bar +6..+16`) Runner Continuation vs. Profit-Giveback Ratchet Discriminant.
-    ///
-    /// Evaluates active trades that reach the Brain's self-learned in-the-money MFE activation quantile ($q_{\text{ITM}, b}^*$)
-    /// across `Bar +6..+16` against the Dual $32 \times 32$ Ledoit-Wolf Cholesky Mahalanobis Distributions:
-    /// 1. **Causal Multi-Sigma Runner Continuation Distribution ($\bar{X}_{\text{runner}}, \Sigma_{\text{LW}}^{\text{runner}}$)**
-    /// 2. **Causal Profit-Giveback / Climax Exhaustion Distribution ($\bar{X}_{\text{giveback}}, \Sigma_{\text{LW}}^{\text{giveback}}$)**
-    ///
-    /// $$\Lambda_{\text{giveback}, k} = \frac{1}{2}\left(D_{\text{Maha, LW}}^2(X_{t+k}, \bar{X}_{\text{runner}}) - D_{\text{Maha, LW}}^2(X_{t+k}, \bar{X}_{\text{giveback}})\right) + \gamma_{\text{retrace}}\!\left(\frac{\text{MFE}_{1..k} - r_k}{\text{MFE}_{1..k}}\right)$$
-    ///
-    /// Strictly 100% outcome-blind at each bar $k \in \{6, \dots, 16\}$:
-    /// - Only post-entry bars strictly prior to the trade's final settlement bar are supplied (`entry_bar_idx + k < row.entry_bars.len() - 1`).
-    /// - Never reads `row.is_winner`, `row.actual_exit_price`, or `row.realized_r_multiple`.
-    /// - Zero hardcoded `+1.2R..+2.0R` constants: uses the Brain's self-learned $q_{\text{ITM}, b}^*$, $\rho_{\text{lock}, b}^*$,
-    ///   and $A_{\text{giveback}, b}^{(g)}$ evolved across `Gen 9..Gen 12`.
+    /// Phase 24.2 Pure Causal Late-Stage (`Bar +6..+16`) Runner Continuation vs. Profit-Giveback Discriminant.
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn evaluate_causal_runner_giveback_ratchet(
         &self,
@@ -2298,19 +2042,17 @@ impl PrecedentKnnIndex {
         post_entry_bars_features_32: &[(usize, Vec<f32>)],
     ) -> Option<RunnerGivebackRatchetDiagnostic> {
         let syn_state = self.get_synaptic_plasticity_state(brain_id);
-        if syn_state.generation_id < 9 || post_entry_bars_features_32.is_empty() {
+        if post_entry_bars_features_32.len() < 6 {
             return None;
         }
 
         let (learned_itm_q, learned_retention_ratio) =
             self.empirical_runner_giveback_quantiles(brain_id, current_timestamp_ns);
 
-        // Compute Dual 32x32 Ledoit-Wolf Cholesky Mahalanobis centroids & pooled covariance
-        // from causal runner continuation vs. profit-giveback trajectories (T_closed < t_open)
         let runners = self.runner_continuation_trajectories.read();
         let givebacks = self.profit_giveback_trajectories.read();
 
-        let mut causal_givebacks: Vec<&RunnerGivebackTrajectoryRecord> = givebacks
+        let causal_givebacks: Vec<&RunnerGivebackTrajectoryRecord> = givebacks
             .iter()
             .filter(|r| {
                 r.brain_id == brain_id
@@ -2318,16 +2060,8 @@ impl PrecedentKnnIndex {
                     && r.itm_features_32.len() >= 32
             })
             .collect();
-        if causal_givebacks.is_empty() {
-            causal_givebacks = givebacks
-                .iter()
-                .filter(|r| {
-                    r.closed_timestamp_ns < current_timestamp_ns && r.itm_features_32.len() >= 32
-                })
-                .collect();
-        }
 
-        let mut causal_runners: Vec<&RunnerGivebackTrajectoryRecord> = runners
+        let causal_runners: Vec<&RunnerGivebackTrajectoryRecord> = runners
             .iter()
             .filter(|r| {
                 r.brain_id == brain_id
@@ -2335,13 +2069,12 @@ impl PrecedentKnnIndex {
                     && r.itm_features_32.len() >= 32
             })
             .collect();
-        if causal_runners.is_empty() {
-            causal_runners = runners
-                .iter()
-                .filter(|r| {
-                    r.closed_timestamp_ns < current_timestamp_ns && r.itm_features_32.len() >= 32
-                })
-                .collect();
+
+        if causal_givebacks.is_empty()
+            || causal_runners.is_empty()
+            || (causal_givebacks.len() + causal_runners.len()) < 3
+        {
+            return None;
         }
 
         let n_samples = (causal_givebacks.len() + causal_runners.len()).max(1);
@@ -2352,55 +2085,45 @@ impl PrecedentKnnIndex {
             pooled_itm_cov[i][i] = 0.04;
         }
 
-        if !causal_givebacks.is_empty() {
-            let inv_g = 1.0 / (causal_givebacks.len() as f64);
-            for r in &causal_givebacks {
-                for i in 0..32 {
-                    giveback_centroid[i] += (r.itm_features_32[i] as f64) * inv_g;
-                }
+        let inv_g = 1.0 / (causal_givebacks.len() as f64);
+        for r in &causal_givebacks {
+            for i in 0..32 {
+                giveback_centroid[i] += (r.itm_features_32[i] as f64) * inv_g;
             }
-            for r in &causal_givebacks {
-                for i in 0..32 {
-                    let di = (r.itm_features_32[i] as f64) - giveback_centroid[i];
-                    for j in 0..=i {
-                        let dj = (r.itm_features_32[j] as f64) - giveback_centroid[j];
-                        let cov_ij = 0.5 * (di * dj) * inv_g;
-                        pooled_itm_cov[i][j] += cov_ij;
-                        pooled_itm_cov[j][i] = pooled_itm_cov[i][j];
-                    }
+        }
+        for r in &causal_givebacks {
+            for i in 0..32 {
+                let di = (r.itm_features_32[i] as f64) - giveback_centroid[i];
+                for j in 0..=i {
+                    let dj = (r.itm_features_32[j] as f64) - giveback_centroid[j];
+                    let cov_ij = 0.5 * (di * dj) * inv_g;
+                    pooled_itm_cov[i][j] += cov_ij;
+                    pooled_itm_cov[j][i] = pooled_itm_cov[i][j];
                 }
             }
         }
-        if !causal_runners.is_empty() {
-            let inv_r = 1.0 / (causal_runners.len() as f64);
-            for r in &causal_runners {
-                for i in 0..32 {
-                    runner_centroid[i] += (r.itm_features_32[i] as f64) * inv_r;
-                }
+        let inv_r = 1.0 / (causal_runners.len() as f64);
+        for r in &causal_runners {
+            for i in 0..32 {
+                runner_centroid[i] += (r.itm_features_32[i] as f64) * inv_r;
             }
-            for r in &causal_runners {
-                for i in 0..32 {
-                    let di = (r.itm_features_32[i] as f64) - runner_centroid[i];
-                    for j in 0..=i {
-                        let dj = (r.itm_features_32[j] as f64) - runner_centroid[j];
-                        let cov_ij = 0.5 * (di * dj) * inv_r;
-                        pooled_itm_cov[i][j] += cov_ij;
-                        pooled_itm_cov[j][i] = pooled_itm_cov[i][j];
-                    }
+        }
+        for r in &causal_runners {
+            for i in 0..32 {
+                let di = (r.itm_features_32[i] as f64) - runner_centroid[i];
+                for j in 0..=i {
+                    let dj = (r.itm_features_32[j] as f64) - runner_centroid[j];
+                    let cov_ij = 0.5 * (di * dj) * inv_r;
+                    pooled_itm_cov[i][j] += cov_ij;
+                    pooled_itm_cov[j][i] = pooled_itm_cov[i][j];
                 }
             }
         }
         drop(runners);
         drop(givebacks);
 
-        // Derived stall & retrace gates from the Brain's self-learned exhaustion boundary A_{giveback, b}^{(g)}
         let a_giveback = syn_state.giveback_exhaustion_threshold;
-        let (bsh_min, retrace_frac_gate) = match syn_state.generation_id {
-            9 => (3usize, 0.55),
-            10 => (2usize, 0.48),
-            11 => (1usize, 0.42),
-            _ => (1usize, 0.35),
-        };
+        let retrace_frac_gate = (1.0 - learned_retention_ratio).clamp(0.30, 0.60);
 
         let mut cum_mfe_r = 0.0_f64;
         let mut peak_bar_offset = 1_usize;
@@ -2421,7 +2144,6 @@ impl PrecedentKnnIndex {
         if *last_k < 6 || *last_k > 28 || last_feats.len() < 32 {
             return None;
         }
-        // Only activate when cumulative MFE reaches the Brain's self-learned ITM quantile q_{ITM, b}^*
         if cum_mfe_r < learned_itm_q {
             return None;
         }
@@ -2431,9 +2153,7 @@ impl PrecedentKnnIndex {
         let opp_w_last = last_feats[5] as f64;
         let bars_since_high = last_k.saturating_sub(peak_bar_offset);
 
-        // Case B — Confirmed Multi-Sigma Runner Continuation: if the trade is actively printing new highs
-        // or holding above the exhaustion stall boundary, never clip the runner!
-        if bars_since_high < bsh_min || r_last < 0.05 {
+        if bars_since_high < 1 || r_last < 0.05 {
             return None;
         }
 
@@ -2461,21 +2181,16 @@ impl PrecedentKnnIndex {
         );
 
         let maha_llr =
-            (0.5 * (maha_runner * maha_runner - maha_giveback * maha_giveback)).clamp(-0.65, 0.65);
-        let giveback_llr = 0.72
+            (0.5 * (maha_runner * maha_runner - maha_giveback * maha_giveback)).clamp(-1.2, 1.2);
+        let giveback_llr = 0.50
             + maha_llr
-            + 2.45 * retrace_frac
-            + 0.35 * (-body_last)
-            + 0.30 * opp_w_last
-            + 0.14 * (bars_since_high as f64);
+            + 2.15 * retrace_frac
+            + 0.30 * (-body_last)
+            + 0.25 * opp_w_last
+            + 0.12 * (bars_since_high as f64);
 
-        // Case A — Confirmed Giveback / Climax Exhaustion:
-        // Requires post-peak stall (bars_since_high >= bsh_min) and retrace fraction >= retrace_frac_gate.
-        if retrace_frac >= retrace_frac_gate {
-            let eff_llr = giveback_llr.max(a_giveback + 0.08);
-            let post_pct = (1.0 / (1.0 + (-eff_llr).exp())) * 100.0;
-            // Ratchet active stop to the Brain's self-learned empirical retention floor:
-            // R_{locked, k} = max(r_last + 0.08, \rho_{lock, b}^* * MFE_{1..k})
+        if retrace_frac >= retrace_frac_gate && giveback_llr >= a_giveback {
+            let post_pct = (1.0 / (1.0 + (-giveback_llr).exp())) * 100.0;
             let locked_r = (learned_retention_ratio * cum_mfe_r)
                 .max(r_last + 0.08)
                 .min(cum_mfe_r * 0.92);
@@ -2483,8 +2198,8 @@ impl PrecedentKnnIndex {
                 ratchet_bar_offset: (*last_k).min(16) as u8,
                 locked_profit_r: (locked_r * 1000.0).round() / 1000.0,
                 cumulative_mfe_r: (cum_mfe_r * 1000.0).round() / 1000.0,
-                giveback_log_likelihood_ratio: (eff_llr * 1000.0).round() / 1000.0,
-                exhaustion_posterior_pct: (post_pct * 100.0).round() / 100.0,
+                giveback_log_likelihood_ratio: (giveback_llr * 1000.0).round() / 1000.0,
+                exhaustion_posterior_pct: (post_pct * 100.0).round() / 1000.0,
                 mahalanobis_giveback_distance: maha_giveback,
                 mahalanobis_runner_distance: maha_runner,
                 ledoit_wolf_shrinkage_lambda: lw_lambda,
@@ -2494,15 +2209,7 @@ impl PrecedentKnnIndex {
         None
     }
 
-    /// Phase 21 Upgrade 1: Outcome-Blind Late-Horizon (`Bar +9..+16`) Post-Bar-8 Blow-Off Reversal Scratch Discriminant.
-    ///
-    /// Dissects why the final unscratched loss in `Gen 12` (`KULR` on `BRAIN-01`) escaped `Bar +1..+8`
-    /// (`0.00R..+0.16R` low-volatility consolidation across `Bar +1..+8`, followed by a `+0.819R` MFE pop on `Bar +14`
-    /// and a violent `1.802R` range failed-pop blow-off reversal on `Bar +15` with `f27_failed_pop = 4.026` and `close = -0.491R`).
-    ///
-    /// Uses ONLY continuous 32-feature synaptic weights (`syn_state.synaptic_feature_weights_32`) and sequential LLR boundaries
-    /// (`syn_state.late_blowoff_scratch_threshold`) across pre-settlement bars (`entry_bar_idx + k < row.entry_bars.len() - 1`),
-    /// 100% blind to `row.is_winner`, `row.actual_exit_price`, `row.realized_r_multiple`, and trade ID / timestamp!
+    /// Phase 24.2 Pure Causal Late-Horizon (`Bar +9..+16`) Post-Bar-8 Blow-Off Reversal Scratch Discriminant.
     pub fn evaluate_causal_late_horizon_blowoff_scratch(
         &self,
         brain_id: BrainHorizonId,
@@ -2510,77 +2217,44 @@ impl PrecedentKnnIndex {
         pre_settlement_bars_features_32: &[(usize, Vec<f32>)],
     ) -> Option<WaldSprtScratchDiagnostic> {
         let syn_state = self.get_synaptic_plasticity_state(brain_id);
-        if syn_state.generation_id < 13 || pre_settlement_bars_features_32.is_empty() {
+        if pre_settlement_bars_features_32.is_empty() {
             return None;
         }
 
         let (_, learned_ratchet_r) =
             self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
-        let (learned_itm_q, _) =
-            self.empirical_runner_giveback_quantiles(brain_id, current_timestamp_ns);
-
-        let traps = self.hard_negative_traps.read();
-        let matched_trap_id = traps
-            .iter()
-            .filter(|t| t.brain_id == brain_id && t.closed_timestamp_ns < current_timestamp_ns)
-            .map(|t| t.loss_trade_id)
-            .next_back()
-            .unwrap_or_else(Uuid::nil);
-        drop(traps);
-
-        let w = &syn_state.synaptic_feature_weights_32;
-        let mut cum_mfe_r = 0.0_f64;
 
         for (bar_k, feats) in pre_settlement_bars_features_32 {
-            if feats.len() < 32 {
+            if *bar_k < 9 || *bar_k > 16 || feats.len() < 32 {
                 continue;
             }
-            let r_k = feats[0] as f64;
-            let fav_k = (feats[2] as f64).max(r_k);
-            if fav_k > cum_mfe_r {
-                cum_mfe_r = fav_k;
-            }
-            if *bar_k < 9 || *bar_k > 16 {
-                continue;
-            }
-
-            let opp_w_k = feats[5] as f64;
-            let rng_r_k = feats[8] as f64;
-            let failed_pop_k = feats[27] as f64;
-            let open_slam_k = feats[28] as f64;
-
-            // Continuous synaptic-weighted Late-Horizon Blow-Off Reversal LLR
-            let lambda_blowoff_k = 0.28 * w[27] * failed_pop_k
-                + 0.45 * w[8] * rng_r_k
-                + 0.35 * w[28] * open_slam_k.max(0.0)
-                + 0.25 * w[5] * opp_w_k
-                - 0.55 * r_k;
-
-            let sub_target_pop_then_slam = cum_mfe_r >= learned_itm_q * 0.55
-                && r_k <= learned_ratchet_r
-                && rng_r_k >= 1.35 * learned_itm_q
-                && failed_pop_k >= 3.20
-                && lambda_blowoff_k >= syn_state.late_blowoff_scratch_threshold;
-
-            if sub_target_pop_then_slam {
-                let post_pct = (1.0 / (1.0 + (-lambda_blowoff_k).exp())) * 100.0;
-                let exit_r = (0.75 * learned_ratchet_r + 0.25 * r_k.clamp(-0.24, -0.14))
-                    .clamp(-0.23, -0.14);
-                return Some(WaldSprtScratchDiagnostic {
-                    scratch_bar_offset: *bar_k,
-                    scratch_exit_r: exit_r,
-                    bar1_log_likelihood_ratio: (0.28 * w[27] * failed_pop_k * 1000.0).round()
-                        / 1000.0,
-                    bar2_log_likelihood_ratio: (0.45 * w[8] * rng_r_k * 1000.0).round() / 1000.0,
-                    bar3_log_likelihood_ratio: (0.35 * w[28] * open_slam_k * 1000.0).round()
-                        / 1000.0,
-                    cumulative_sprt_log_likelihood: (lambda_blowoff_k * 1000.0).round() / 1000.0,
-                    loss_affinity_posterior_pct: (post_pct * 100.0).round() / 100.0,
-                    mahalanobis_loss_distance: 1.42,
-                    mahalanobis_win_distance: 3.18,
-                    matched_trap_id,
-                    ledoit_wolf_shrinkage_lambda: 0.22,
-                });
+            if let Some(diag) = self.evaluate_causal_post_entry_scratch(
+                brain_id,
+                "",
+                TradeDirection::Long,
+                current_timestamp_ns,
+                feats,
+                0.0,
+            ) {
+                let p_k = (diag.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
+                let llr_k = (p_k / (1.0 - p_k)).ln();
+                if llr_k >= syn_state.late_blowoff_scratch_threshold {
+                    let r_k = feats[0] as f64;
+                    let exit_r = (0.70 * learned_ratchet_r + 0.30 * r_k).clamp(-0.24, -0.13);
+                    return Some(WaldSprtScratchDiagnostic {
+                        scratch_bar_offset: *bar_k,
+                        scratch_exit_r: exit_r,
+                        bar1_log_likelihood_ratio: (llr_k * 1000.0).round() / 1000.0,
+                        bar2_log_likelihood_ratio: 0.0,
+                        bar3_log_likelihood_ratio: 0.0,
+                        cumulative_sprt_log_likelihood: (llr_k * 1000.0).round() / 1000.0,
+                        loss_affinity_posterior_pct: diag.loss_affinity_posterior_pct,
+                        mahalanobis_loss_distance: diag.mahalanobis_loss_distance,
+                        mahalanobis_win_distance: diag.mahalanobis_win_distance,
+                        matched_trap_id: diag.matched_trap_id,
+                        ledoit_wolf_shrinkage_lambda: diag.ledoit_wolf_shrinkage_lambda,
+                    });
+                }
             }
         }
 
@@ -2606,7 +2280,7 @@ impl PrecedentKnnIndex {
         max_pre_settlement_k: usize,
     ) -> Option<HouseMoneyRunnerScaleInDiagnostic> {
         let syn_state = self.get_synaptic_plasticity_state(brain_id);
-        if syn_state.generation_id < 13 || all_post_entry_bars_features_32.len() < 5 {
+        if all_post_entry_bars_features_32.len() < 5 {
             return None;
         }
 
@@ -2653,6 +2327,10 @@ impl PrecedentKnnIndex {
                     r.closed_timestamp_ns < current_timestamp_ns && r.itm_features_32.len() >= 32
                 })
                 .collect();
+        }
+
+        if causal_runners.is_empty() || (causal_givebacks.len() + causal_runners.len()) < 3 {
+            return None;
         }
 
         let n_samples = (causal_givebacks.len() + causal_runners.len()).max(1);

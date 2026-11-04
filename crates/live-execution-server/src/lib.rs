@@ -1991,4 +1991,248 @@ mod tests {
             expected_portfolio_unpin_r
         );
     }
+
+    #[test]
+    fn test_adversarial_scanner_truth_audit() {
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+
+        let base_engine = RealTimeLedgerEngine::new();
+        assert!(base_engine.load_from_disk(ledger_path));
+        let base_snap = base_engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        let base_trades = base_snap.closed_trades.clone();
+        assert_eq!(base_trades.len(), 173);
+
+        // =========================================================================
+        // TEST 3A: STRICT EXPANDING-WINDOW COLD-START (ZERO PRE-SEEDED PROTOTYPES)
+        // =========================================================================
+        // Sort all 173 trades strictly by entry timestamp (`opened_timestamp_ns`)
+        let mut chronological_trades = base_trades.clone();
+        chronological_trades.sort_by_key(|r| r.opened_timestamp_ns);
+
+        for &(label, run_expanding_plasticity) in &[
+            ("3A-1: Cold-Start Uniform Weights (Gen 0, Zero Era-1 Seeds)", false),
+            ("3A-2: Cold-Start Expanding-Window Plasticity (Gen 28, Zero Era-1 Seeds)", true),
+        ] {
+            let cold_engine = RealTimeLedgerEngine::new();
+            // Wipe ALL pre-seeded Era-1 prototypes, traps, pullbacks, and trajectories
+            cold_engine.precedent_knn().replace_all_records(Vec::new());
+            cold_engine.precedent_knn().clear_all_hard_negative_traps();
+            cold_engine.precedent_knn().clear_all_winner_pullbacks();
+            cold_engine.precedent_knn().clear_all_mid_trade_trajectories();
+            cold_engine.precedent_knn().clear_all_runner_giveback_trajectories();
+            cold_engine.precedent_knn().reset_synaptic_plasticity_states_to_gen0();
+            if !run_expanding_plasticity {
+                // Force strictly uniform 1/32 weights (1.0 normalized)
+                let mut states = cold_engine.precedent_knn().ordered_synaptic_plasticity_states();
+                for st in &mut states {
+                    st.generation_id = 0;
+                    st.synaptic_feature_weights_32 = [1.0; 32];
+                }
+                cold_engine.precedent_knn().restore_synaptic_plasticity_states(states);
+            }
+
+            let mut tp_veto = 0usize;
+            let mut fp_veto = 0usize;
+            let mut tp_scratch = 0usize;
+            let mut fp_scratch = 0usize;
+            let mut untouched_winners = 0usize;
+            let mut unscratched_losses = 0usize;
+
+            for i in 0..chronological_trades.len() {
+                let mut candidate = chronological_trades[i].clone();
+                let entry_ts = candidate.opened_timestamp_ns;
+
+                // Wipe index and insert ONLY trades j < i whose ACTUAL exit timestamp T_{exit, j} < T_{entry, i}
+                cold_engine.precedent_knn().clear_all_hard_negative_traps();
+                cold_engine.precedent_knn().clear_all_winner_pullbacks();
+                cold_engine.precedent_knn().clear_all_mid_trade_trajectories();
+                cold_engine.precedent_knn().clear_all_runner_giveback_trajectories();
+
+                let mut settled_prior: Vec<crate::ledger::ClosedTradeRow> = Vec::new();
+                for j in 0..i {
+                    if chronological_trades[j].closed_timestamp_ns < entry_ts {
+                        cold_engine.sync_closed_row_to_precedent_knn(&chronological_trades[j]);
+                        settled_prior.push(chronological_trades[j].clone());
+                    }
+                }
+
+                if run_expanding_plasticity {
+                    cold_engine.replace_closed_trades_for_audit(settled_prior.clone());
+                    let _ = cold_engine.run_multi_generation_evolution_to_gen28();
+                    // Re-ensure zero Era-1 warmup seeds were injected during evolution
+                    cold_engine.precedent_knn().clear_all_hard_negative_traps();
+                    cold_engine.precedent_knn().clear_all_winner_pullbacks();
+                    cold_engine.precedent_knn().clear_all_mid_trade_trajectories();
+                    cold_engine.precedent_knn().clear_all_runner_giveback_trajectories();
+                    for settled in &settled_prior {
+                        cold_engine.sync_closed_row_to_precedent_knn(settled);
+                    }
+                }
+
+                let prior_losses: Vec<_> = settled_prior
+                    .iter()
+                    .filter(|r| {
+                        r.brain_id == candidate.brain_id
+                            && r.direction == candidate.direction
+                            && !r.is_winner
+                    })
+                    .cloned()
+                    .collect();
+
+                cold_engine.apply_causal_adaptive_rules_to_row(&mut candidate, &prior_losses, false);
+
+                if candidate.was_vetoed_by_loss_autopsy {
+                    if candidate.is_winner {
+                        fp_veto += 1;
+                    } else {
+                        tp_veto += 1;
+                    }
+                } else if candidate.was_scratched_by_loss_autopsy {
+                    if candidate.is_winner {
+                        fp_scratch += 1;
+                    } else {
+                        tp_scratch += 1;
+                    }
+                } else if candidate.is_winner {
+                    untouched_winners += 1;
+                } else {
+                    unscratched_losses += 1;
+                }
+            }
+
+            println!(
+                "\n[TRAP 3 — {}]\n  TP Vetoes: {} | FP Vetoes: {} | TP Scratches: {} | FP Scratches: {} | Winners Preserved: {} / 116 | Full Stops Eliminated: {} / 57 (Remaining Unscratched Losses: {})",
+                label,
+                tp_veto,
+                fp_veto,
+                tp_scratch,
+                fp_scratch,
+                untouched_winners,
+                tp_veto + tp_scratch,
+                unscratched_losses
+            );
+        }
+
+        // =========================================================================
+        // TEST 3B: FULL LABEL + TRAJECTORY INVERSION BEFORE INDEX CONSTRUCTION
+        // =========================================================================
+        let inv_engine = RealTimeLedgerEngine::new();
+        assert!(inv_engine.load_from_disk(ledger_path));
+        inv_engine.precedent_knn().replace_all_records(Vec::new());
+        inv_engine.precedent_knn().clear_all_hard_negative_traps();
+        inv_engine.precedent_knn().clear_all_winner_pullbacks();
+        inv_engine.precedent_knn().clear_all_mid_trade_trajectories();
+        inv_engine.precedent_knn().clear_all_runner_giveback_trajectories();
+
+        let mut inverted_trades = base_trades.clone();
+        for r in &mut inverted_trades {
+            r.is_winner = !r.is_winner;
+            r.realized_r_multiple = -r.realized_r_multiple;
+            r.net_pnl_usd = -r.net_pnl_usd;
+            r.gross_pnl_usd = -r.gross_pnl_usd;
+            r.kelly_net_pnl_usd = -r.kelly_net_pnl_usd;
+            std::mem::swap(&mut r.mfe_pct, &mut r.mae_pct);
+            r.outcome_badge = ClosedOutcomeBadge::AiDynamicExit;
+            r.loss_forensic_autopsy = None;
+            r.was_vetoed_by_loss_autopsy = false;
+            r.was_scratched_by_loss_autopsy = false;
+        }
+        inv_engine.replace_closed_trades_for_audit(inverted_trades);
+        let _ = inv_engine.run_multi_generation_evolution_to_gen28();
+        let inv_snap = inv_engine.query_filtered_snapshot(&HyperFilterQuery::default());
+
+        // Count against both the inverted labels and the original labels
+        let mut vetoed_orig_winners = 0usize;
+        let mut vetoed_orig_losers = 0usize;
+        let mut scratched_orig_winners = 0usize;
+        let mut scratched_orig_losers = 0usize;
+        for (inv_r, orig_r) in inv_snap.closed_trades.iter().zip(base_trades.iter()) {
+            if inv_r.was_vetoed_by_loss_autopsy {
+                if orig_r.is_winner {
+                    vetoed_orig_winners += 1;
+                } else {
+                    vetoed_orig_losers += 1;
+                }
+            } else if inv_r.was_scratched_by_loss_autopsy {
+                if orig_r.is_winner {
+                    scratched_orig_winners += 1;
+                } else {
+                    scratched_orig_losers += 1;
+                }
+            }
+        }
+        println!(
+            "\n[TRAP 3 — 3B: Full Label + Outcome Inversion BEFORE Index Construction]\n  Against Inverted Labels (57 'Wins' / 116 'Losses'): TP Vetoes={} FP Vetoes={} | TP Scratches={} FP Scratches={}\n  Against Original Labels (116 Wins / 57 Losses): Vetoed Orig Winners={} Vetoed Orig Losers={} | Scratched Orig Winners={} Scratched Orig Losers={}",
+            inv_snap.scoreboard.true_positive_losses_vetoed,
+            inv_snap.scoreboard.false_positive_winners_vetoed,
+            inv_snap.scoreboard.true_positive_losses_scratched,
+            inv_snap.scoreboard.false_positive_winners_scratched,
+            vetoed_orig_winners,
+            vetoed_orig_losers,
+            scratched_orig_winners,
+            scratched_orig_losers,
+        );
+
+        // =========================================================================
+        // TEST 3C: RANDOM FEATURE PERMUTATION (NULL HYPOTHESIS TEST)
+        // =========================================================================
+        let shuf_engine = RealTimeLedgerEngine::new();
+        assert!(shuf_engine.load_from_disk(ledger_path));
+        shuf_engine.precedent_knn().replace_all_records(Vec::new());
+        shuf_engine.precedent_knn().clear_all_hard_negative_traps();
+        shuf_engine.precedent_knn().clear_all_winner_pullbacks();
+        shuf_engine.precedent_knn().clear_all_mid_trade_trajectories();
+        shuf_engine.precedent_knn().clear_all_runner_giveback_trajectories();
+
+        let mut shuffled_trades = base_trades.clone();
+        // Deterministic Fisher-Yates permutation of the feature trajectories across all 173 trades
+        let n = shuffled_trades.len();
+        let mut perm: Vec<usize> = (0..n).collect();
+        let mut rng_state = 0x9E37_79B9_7F4A_7C15_u64;
+        for i in (1..n).rev() {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = (rng_state as usize) % (i + 1);
+            perm.swap(i, j);
+        }
+        for i in 0..n {
+            let donor = &base_trades[perm[i]];
+            shuffled_trades[i].entry_embedding_128 = donor.entry_embedding_128.clone();
+            shuffled_trades[i].post_entry_bar1_features_32 =
+                donor.post_entry_bar1_features_32.clone();
+            shuffled_trades[i].entry_bars = donor.entry_bars.clone();
+            shuffled_trades[i].entry_bar_idx = donor.entry_bar_idx;
+            shuffled_trades[i].entry_price = donor.entry_price;
+            shuffled_trades[i].initial_structural_stop = donor.initial_structural_stop;
+            shuffled_trades[i].target_1_price = donor.target_1_price;
+            shuffled_trades[i].direction = donor.direction;
+            shuffled_trades[i].ai_confidence_pct = donor.ai_confidence_pct;
+            shuffled_trades[i].precedent_win_rate_pct = donor.precedent_win_rate_pct;
+            shuffled_trades[i].was_vetoed_by_loss_autopsy = false;
+            shuffled_trades[i].was_scratched_by_loss_autopsy = false;
+        }
+        shuf_engine.replace_closed_trades_for_audit(shuffled_trades);
+        let _ = shuf_engine.run_multi_generation_evolution_to_gen28();
+        let shuf_snap = shuf_engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        let shuf_cm = &shuf_snap.scoreboard.confusion_matrix;
+
+        println!(
+            "\n[TRAP 3 — 3C: Random Feature Permutation (Null Hypothesis Test)]\n  TP Vetoes: {} | FP Vetoes: {} | TP Scratches: {} | FP Scratches: {} | Winners Preserved: {} / 116 | Remaining Unscratched Losses: {} / 57 | Veto Precision: {:.2}% | Scratch Precision: {:.2}%\n",
+            shuf_cm.true_positive_losses_vetoed,
+            shuf_cm.false_positive_winners_vetoed,
+            shuf_cm.true_positive_losses_scratched,
+            shuf_cm.false_positive_winners_scratched,
+            shuf_cm.untouched_winners_count,
+            shuf_cm.remaining_unscratched_losses,
+            shuf_cm.entry_veto_precision_pct,
+            shuf_cm.bar1_scratch_precision_pct,
+        );
+    }
 }

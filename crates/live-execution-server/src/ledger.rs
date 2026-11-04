@@ -2467,6 +2467,10 @@ impl RealTimeLedgerEngine {
         &self.precedent_knn
     }
 
+    pub fn replace_closed_trades_for_audit(&self, trades: Vec<ClosedTradeRow>) {
+        *self.closed_ledger.write() = trades;
+    }
+
     pub fn set_enforce_hard_scratch_on_baseline(&self, enabled: bool) {
         *self.enforce_hard_scratch_on_baseline.write() = enabled;
     }

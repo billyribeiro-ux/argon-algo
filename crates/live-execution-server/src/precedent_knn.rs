@@ -2522,494 +2522,120 @@ impl PrecedentKnnIndex {
         None
     }
 
-    /// Phase 25 (`Gen 29 -> Gen 32`) Pure Causal Bar-by-Bar (`k = 1..16`) Sequential Velocity,
-    /// Acceleration & Shakeout-Absorption Wald SPRT + Causal Conformal False-Positive Risk Control
-    /// + Small-Sample Sparse Fisher / Shrinkage Discriminant Over `settled_prior` ($T_{\text{closed}, j} < T_{\text{opened}, i}$).
-    ///
-    /// Executes identically in walk-forward replay (`apply_causal_adaptive_rules_to_row`) and
-    /// real-time bar-by-bar paper trading (`process_live_bar_internal`).
+    /// Phase 25.2 (`Gen 29 -> Gen 32`) Pure Causal Bar-by-Bar Sequential Velocity, Acceleration &
+    /// Shakeout-Absorption Wald SPRT + Causal Conformal False-Positive Risk Control Over `settled_prior` ($T_{\text{closed}, j} < T_{\text{opened}, i}$).
     #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     pub fn evaluate_phase25_sequential_velocity_absorption_sprt(
-        &self,
-        brain_id: BrainHorizonId,
-        symbol: &str,
-        direction: TradeDirection,
-        current_timestamp_ns: i64,
-        pre_settlement_bars_features_32: &[(usize, Vec<f32>)],
-        learned_posterior_threshold: f64,
+        &self, brain_id: BrainHorizonId, symbol: &str, direction: TradeDirection,
+        current_timestamp_ns: i64, pre_settlement_bars_features_32: &[(usize, Vec<f32>)],
+        _learned_posterior_threshold: f64,
     ) -> Option<WaldSprtScratchDiagnostic> {
-        if pre_settlement_bars_features_32.is_empty() {
-            return None;
-        }
-        let max_pre_k = pre_settlement_bars_features_32
-            .iter()
-            .map(|(k, _)| *k)
-            .max()
-            .unwrap_or(1)
-            .min(28);
-
+        if pre_settlement_bars_features_32.is_empty() { return None; }
+        let max_pre_k = pre_settlement_bars_features_32.iter().map(|(k, _)| *k).max().unwrap_or(1).min(28);
         let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        let lambda_decay = syn_state.learned_velocity_absorption_damping_weight.clamp(0.45, 0.70);
+        let alpha_g = syn_state.learned_conformal_alpha.clamp(0.025, 0.10);
+        let (_, emp_ratchet_r) = self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
+        let learned_ratchet_r = (0.65 * syn_state.learned_mid_trade_stop_ratchet_r + 0.35 * emp_ratchet_r).clamp(-0.25, -0.12);
 
-        // Inspect causal prior ($T_{\text{closed}, j} < T_{\text{opened}, i}$) to compute empirical
-        // excursion dispersion, absorption dispersion, and settled_prior winner/loser quantile distributions
-        // (100% scale-invariant under any $c > 0$).
-        let (
-            brain_win_cnt,
-            brain_loss_cnt,
-            total_settled_prior,
-            win_r_mean,
-            loss_r_mean,
-            sigma_range_prior,
-            win_zr_sorted,
-            loss_zr_sorted,
-            win_zmfe_sorted,
-            loss_zmfe_sorted,
-            win_zbounce_sorted,
-            win_zpsi_sorted,
-            loss_zpsi_sorted,
-        ) = {
-            let traps = self.hard_negative_traps.read();
-            let wins = self.winner_pullbacks.read();
-            let mut b_wins = 0usize;
-            let mut b_losses = 0usize;
-            let mut tot_wins = 0usize;
-            let mut tot_losses = 0usize;
-            let mut win_r_sum = 0.0_f64;
-            let mut loss_r_sum = 0.0_f64;
-            let mut range_sum = 0.0_f64;
-            let mut range_cnt = 0usize;
-            let mut raw_win_kin: Vec<(f64, f64, f64, f64)> = Vec::new();
-            let mut raw_loss_kin: Vec<(f64, f64, f64, f64)> = Vec::new();
-
-            let extract_prior_kin = |fk: &[f32]| -> (f64, f64, f64, f64, f64) {
-                let r0 = fk.first().copied().unwrap_or(0.0) as f64;
-                let fav0 = (fk.get(2).copied().unwrap_or(0.0) as f64).max(r0);
-                let adv0 = (fk.get(3).copied().unwrap_or(0.0) as f64).min(r0);
-                let rng_p = if fk.len() >= 7 {
-                    (fk[4] as f64).abs() + (fk[5] as f64).abs() + (fk[6] as f64).abs()
-                } else {
-                    0.0
-                };
-                let psi0 = if fk.len() >= 32 {
-                    let s1_w = ((fk[6] as f64) - (fk[5] as f64))
-                        + 0.55 * (fk[4] as f64)
-                        + 0.45 * (fk[7] as f64);
-                    let s2_g: f64 = fk[12..20].iter().map(|&x| x as f64).sum::<f64>() / 8.0;
-                    let s4_b: f64 = fk[26..32].iter().map(|&x| x as f64).sum::<f64>() / 6.0;
-                    0.50 * s1_w + 0.30 * s2_g + 0.20 * s4_b
-                } else {
-                    0.0
-                };
-                (r0, fav0, adv0, psi0, rng_p)
-            };
-
-            for w in wins
-                .iter()
-                .filter(|w| w.closed_timestamp_ns < current_timestamp_ns)
-            {
-                tot_wins += 1;
-                if w.brain_id == brain_id {
-                    b_wins += 1;
-                }
-                let (r0, fav0, adv0, psi0, _) =
-                    extract_prior_kin(&w.post_entry_bar1_features_32);
-                win_r_sum += r0;
-                if w.entry_features_32.len() >= 11 {
-                    let rng_p = (w.entry_features_32[8] as f64).abs()
-                        + (w.entry_features_32[9] as f64).abs()
-                        + (w.entry_features_32[10] as f64).abs();
-                    if rng_p > 1e-9 {
-                        range_sum += rng_p;
-                        range_cnt += 1;
-                    }
-                }
-                raw_win_kin.push((r0, fav0, adv0, psi0));
-            }
-            for t in traps
-                .iter()
-                .filter(|t| t.closed_timestamp_ns < current_timestamp_ns)
-            {
-                tot_losses += 1;
-                if t.brain_id == brain_id {
-                    b_losses += 1;
-                }
-                let (r0, fav0, adv0, psi0, _) =
-                    extract_prior_kin(&t.post_entry_bar1_features_32);
-                loss_r_sum += r0;
-                if t.entry_features_32.len() >= 11 {
-                    let rng_p = (t.entry_features_32[8] as f64).abs()
-                        + (t.entry_features_32[9] as f64).abs()
-                        + (t.entry_features_32[10] as f64).abs();
-                    if rng_p > 1e-9 {
-                        range_sum += rng_p;
-                        range_cnt += 1;
-                    }
-                }
-                raw_loss_kin.push((r0, fav0, adv0, psi0));
-            }
-            let tot_n = tot_wins + tot_losses;
-            let wr_m = if tot_wins > 0 {
-                win_r_sum / (tot_wins as f64)
-            } else {
-                0.0
-            };
-            let lr_m = if tot_losses > 0 {
-                loss_r_sum / (tot_losses as f64)
-            } else {
-                0.0
-            };
-            let sig_rng = if range_cnt > 0 {
-                (range_sum / (range_cnt as f64)).max(1e-9)
-            } else {
-                1.0
-            };
-
-            let mut w_zr: Vec<f64> = raw_win_kin.iter().map(|k| k.0 / sig_rng).collect();
-            let mut l_zr: Vec<f64> = raw_loss_kin.iter().map(|k| k.0 / sig_rng).collect();
-            let mut w_zmfe: Vec<f64> = raw_win_kin.iter().map(|k| k.1 / sig_rng).collect();
-            let mut l_zmfe: Vec<f64> = raw_loss_kin.iter().map(|k| k.1 / sig_rng).collect();
-            let mut w_zbon: Vec<f64> = raw_win_kin.iter().map(|k| (k.0 - k.2) / sig_rng).collect();
-            let mut w_zpsi: Vec<f64> = raw_win_kin.iter().map(|k| k.3 / sig_rng).collect();
-            let mut l_zpsi: Vec<f64> = raw_loss_kin.iter().map(|k| k.3 / sig_rng).collect();
-
-            for vec_ref in [
-                &mut w_zr,
-                &mut l_zr,
-                &mut w_zmfe,
-                &mut l_zmfe,
-                &mut w_zbon,
-                &mut w_zpsi,
-                &mut l_zpsi,
-            ] {
-                vec_ref.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            }
-
-            (
-                b_wins,
-                b_losses,
-                tot_n,
-                wr_m,
-                lr_m,
-                sig_rng,
-                w_zr,
-                l_zr,
-                w_zmfe,
-                l_zmfe,
-                w_zbon,
-                w_zpsi,
-                l_zpsi,
-            )
+        // 1. Symmetric 6D Kinematic Feature Vector \xi_k = [z_{r, k}, z_{MAE, 1:k}, z_{MFE, 1:k}, z_{v, k}, z_{a, k}, z_{\Psi, k}]
+        let extract_xi_6 = |fk: &[f32], prev_zr: f64, prev_zv: f64, sig_rng: f64| -> [f64; 6] {
+            let (zr, zmae, zmfe) = ((fk[0] as f64) / sig_rng, (fk[3] as f64) / sig_rng, (fk[2] as f64) / sig_rng);
+            let zv = 0.50 * ((fk[4] as f64) / sig_rng + (zr - prev_zr));
+            let za = zv - prev_zv;
+            let s1_w = ((fk[6] as f64) - (fk[5] as f64)) + 0.55 * (fk[4] as f64) + 0.45 * (fk[7] as f64);
+            let s2_g: f64 = fk[12..20].iter().map(|&x| x as f64).sum::<f64>() / 8.0;
+            let s4_b: f64 = fk[26..32].iter().map(|&x| x as f64).sum::<f64>() / 6.0;
+            let zpsi = (0.50 * s1_w + 0.30 * s2_g + 0.20 * s4_b) / sig_rng;
+            [zr, zmae, zmfe, zv, za, zpsi]
         };
 
-        if total_settled_prior < 3 {
-            return None;
-        }
-
-        if total_settled_prior >= 10 && win_r_mean < loss_r_mean - 0.05 * sigma_range_prior {
-            let bar1_x32 = pre_settlement_bars_features_32
-                .iter()
-                .find(|(k, _)| *k == 1)
-                .map(|(_, v)| v.as_slice())?;
-            let bar2_x32 = pre_settlement_bars_features_32
-                .iter()
-                .find(|(k, _)| *k == 2)
-                .map(|(_, v)| v.as_slice());
-            let bar3_x32 = pre_settlement_bars_features_32
-                .iter()
-                .find(|(k, _)| *k == 3)
-                .map(|(_, v)| v.as_slice());
-            return self
-                .evaluate_causal_wald_sprt_post_entry_scratch(
-                    brain_id,
-                    symbol,
-                    direction,
-                    current_timestamp_ns,
-                    bar1_x32,
-                    bar2_x32,
-                    bar3_x32,
-                    learned_posterior_threshold,
-                )
-                .or_else(|| {
-                    if max_pre_k < 4 {
-                        return None;
-                    }
-                    let bar4_x32 = pre_settlement_bars_features_32
-                        .iter()
-                        .find(|(k, _)| *k == 4)
-                        .map(|(_, v)| v.as_slice());
-                    let bar5_x32 = pre_settlement_bars_features_32
-                        .iter()
-                        .find(|(k, _)| *k == 5)
-                        .map(|(_, v)| v.as_slice());
-                    let bar6_x32 = pre_settlement_bars_features_32
-                        .iter()
-                        .find(|(k, _)| *k == 6)
-                        .map(|(_, v)| v.as_slice());
-                    let bar7_x32 = pre_settlement_bars_features_32
-                        .iter()
-                        .find(|(k, _)| *k == 7)
-                        .map(|(_, v)| v.as_slice());
-                    let bar8_x32 = pre_settlement_bars_features_32
-                        .iter()
-                        .find(|(k, _)| *k == 8)
-                        .map(|(_, v)| v.as_slice());
-                    self.evaluate_causal_mid_trade_stall_discriminant(
-                        brain_id,
-                        symbol,
-                        direction,
-                        current_timestamp_ns,
-                        bar1_x32,
-                        bar2_x32,
-                        bar3_x32,
-                        bar4_x32,
-                        bar5_x32,
-                        bar6_x32,
-                        bar7_x32,
-                        bar8_x32,
-                    )
-                });
-        }
-
-        // Empirical-Bayes shrunk quantile estimator over settled_prior standardized by sigma_range_prior
-        let eb_shrunk_quantile = |sorted: &[f64], q: f64, prior_anchor: f64| -> f64 {
-            if sorted.is_empty() {
-                return prior_anchor;
+        let (prior_win_xi, prior_loss_xi, prior_win_l_mahal, sigma_range_prior) = {
+            let (traps, wins) = (self.hard_negative_traps.read(), self.winner_pullbacks.read());
+            let same_b_wins = wins.iter().filter(|w| w.brain_id == brain_id && w.closed_timestamp_ns < current_timestamp_ns && w.post_entry_bar1_features_32.len() >= 32).count();
+            let same_b_traps = traps.iter().filter(|t| t.brain_id == brain_id && t.closed_timestamp_ns < current_timestamp_ns && t.post_entry_bar1_features_32.len() >= 32).count();
+            if same_b_wins == 0 || same_b_traps == 0 || (same_b_wins + same_b_traps) < 3 { return None; }
+            let (mut rng_sum, mut rng_cnt) = (0.0_f64, 0usize);
+            for w in wins.iter().filter(|w| w.brain_id == brain_id && w.closed_timestamp_ns < current_timestamp_ns && w.entry_features_32.len() >= 11) {
+                let r_p = (w.entry_features_32[8] as f64).abs() + (w.entry_features_32[9] as f64).abs() + (w.entry_features_32[10] as f64).abs();
+                if r_p > 1e-9 { rng_sum += r_p; rng_cnt += 1; }
             }
-            let pos = (q.clamp(0.0, 1.0)) * ((sorted.len() - 1) as f64);
-            let lo = pos.floor() as usize;
-            let hi = pos.ceil() as usize;
-            let frac = pos - (lo as f64);
-            let emp_q = sorted[lo] * (1.0 - frac) + sorted[hi.min(sorted.len() - 1)] * frac;
-            let n_s = sorted.len() as f64;
-            let gamma_eb = (n_s / (n_s + 2400.0)).clamp(0.0, 0.08);
-            (1.0 - gamma_eb) * prior_anchor + gamma_eb * emp_q
+            for t in traps.iter().filter(|t| t.brain_id == brain_id && t.closed_timestamp_ns < current_timestamp_ns && t.entry_features_32.len() >= 11) {
+                let r_p = (t.entry_features_32[8] as f64).abs() + (t.entry_features_32[9] as f64).abs() + (t.entry_features_32[10] as f64).abs();
+                if r_p > 1e-9 { rng_sum += r_p; rng_cnt += 1; }
+            }
+            let sig_rng = if rng_cnt > 0 { (rng_sum / (rng_cnt as f64)).max(1e-9) } else { 1.0 };
+            let (mut w_xi, mut w_feats, mut l_xi) = (Vec::new(), Vec::new(), Vec::new());
+            for w in wins.iter().filter(|w| w.brain_id == brain_id && w.closed_timestamp_ns < current_timestamp_ns && w.post_entry_bar1_features_32.len() >= 32) {
+                let fk = &w.post_entry_bar1_features_32;
+                w_xi.push(extract_xi_6(fk, (fk[1] as f64) / sig_rng, ((fk[0] as f64) - (fk[1] as f64)) / sig_rng, sig_rng));
+                w_feats.push((w.brain_id, w.symbol.clone(), w.direction, fk.clone()));
+            }
+            for t in traps.iter().filter(|t| t.brain_id == brain_id && t.closed_timestamp_ns < current_timestamp_ns && t.post_entry_bar1_features_32.len() >= 32) {
+                let fk = &t.post_entry_bar1_features_32;
+                l_xi.push(extract_xi_6(fk, (fk[1] as f64) / sig_rng, ((fk[0] as f64) - (fk[1] as f64)) / sig_rng, sig_rng));
+            }
+            drop((traps, wins));
+            let w_lm: Vec<f64> = w_feats.iter().map(|(b_id, sym, dir, fk)| {
+                self.evaluate_causal_post_entry_scratch(*b_id, sym, *dir, current_timestamp_ns, fk, 0.0)
+                    .map(|d| { let p = (d.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99); (p / (1.0 - p)).ln() }).unwrap_or(0.0)
+            }).collect();
+            (w_xi, l_xi, w_lm, sig_rng)
         };
 
-        let q_win_zr_low = eb_shrunk_quantile(&win_zr_sorted, 0.12, -0.16);
-        let q_loss_zr_med = eb_shrunk_quantile(&loss_zr_sorted, 0.50, -0.30);
-        let q_loss_zr_deep = eb_shrunk_quantile(&loss_zr_sorted, 0.22, -0.35);
-        let q_loss_zr_tail = eb_shrunk_quantile(&loss_zr_sorted, 0.10, -0.56);
-        let q_win_zmfe_low = eb_shrunk_quantile(&win_zmfe_sorted, 0.15, 0.10);
-        let q_loss_zmfe_med = eb_shrunk_quantile(&loss_zmfe_sorted, 0.55, 0.25);
-        let q_win_zbounce_med = eb_shrunk_quantile(&win_zbounce_sorted, 0.45, 0.20);
-        let q_win_zpsi_med = eb_shrunk_quantile(&win_zpsi_sorted, 0.50, 0.20);
-        let q_loss_zpsi_med = eb_shrunk_quantile(&loss_zpsi_sorted, 0.45, -0.18);
-        let q_loss_zpsi_deep = eb_shrunk_quantile(&loss_zpsi_sorted, 0.20, -0.25);
-
-        let (_, emp_ratchet_r) =
-            self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
-        let learned_ratchet_r =
-            (0.65 * syn_state.learned_mid_trade_stop_ratchet_r + 0.35 * emp_ratchet_r)
-                .clamp(-0.25, -0.12);
-        let damp_w = syn_state
-            .learned_velocity_absorption_damping_weight
-            .clamp(0.45, 0.70);
-
-        #[derive(Clone, Copy, Default)]
-        struct BarKinematics {
-            present: bool,
-            zr_k: f64,
-            zmae_1_k: f64,
-            zmfe_1_k: f64,
-            zv_k: f64,
-            za_k: f64,
-            zpsi_absorb_k: f64,
-        }
-        let mut kin_by_k = [BarKinematics::default(); 29];
-        let mut feats_by_k: Vec<Option<&[f32]>> = vec![None; 29];
-        for (k_off, f_vec) in pre_settlement_bars_features_32 {
-            if *k_off >= 1 && *k_off <= 28 && f_vec.len() >= 32 {
-                feats_by_k[*k_off] = Some(f_vec.as_slice());
+        // 2. Empirical Class Mean & Variance on settled_prior + Fisher Separability Weights w_d
+        let (nw, nl) = (prior_win_xi.len() as f64, prior_loss_xi.len() as f64);
+        let (mut mu_w, mut mu_l, mut var_w, mut var_l, mut w_d) = ([0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6]);
+        for xi in &prior_win_xi { for d in 0..6 { mu_w[d] += xi[d] / nw; } }
+        for xi in &prior_loss_xi { for d in 0..6 { mu_l[d] += xi[d] / nl; } }
+        for xi in &prior_win_xi { for d in 0..6 { let df = xi[d] - mu_w[d]; var_w[d] += (df * df) / nw; } }
+        for xi in &prior_loss_xi { for d in 0..6 { let df = xi[d] - mu_l[d]; var_l[d] += (df * df) / nl; } }
+        for d in 0..6 { w_d[d] = (mu_w[d] - mu_l[d]).abs() / (var_w[d] + var_l[d]).sqrt().max(1e-6); }
+        let w_sum: f64 = w_d.iter().sum::<f64>().max(1e-6);
+        let score_xi = |xi: &[f64; 6]| -> ([f64; 6], f64) {
+            let (mut s_d, mut num) = ([0.0_f64; 6], 0.0_f64);
+            for d in 0..6 {
+                let sgn = if mu_l[d] >= mu_w[d] { 1.0 } else { -1.0 };
+                s_d[d] = sgn * (xi[d] - 0.5 * (mu_w[d] + mu_l[d])) / (var_w[d] + var_l[d]).sqrt().max(1e-6);
+                num += w_d[d] * s_d[d];
             }
-        }
+            (s_d, num / w_sum)
+        };
 
-        let mut prev_zr = 0.0_f64;
-        let mut prev_zv = 0.0_f64;
-        let mut running_zmae = 0.0_f64;
-        let mut running_zmfe = 0.0_f64;
+        // 4. Conformal Winner Upper-Quantile Stopping Boundary Q_{1 - \alpha_g}({\Lambda^{prior}(j) : j \in W_{0..t}})
+        let mut prior_win_lambdas: Vec<f64> = prior_win_xi.iter().zip(prior_win_l_mahal.iter())
+            .map(|(xi, &lm)| (score_xi(xi).1 + lm).max(0.0) / (1.0 - lambda_decay)).collect();
+        prior_win_lambdas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let q_pos = ((1.0 - alpha_g).clamp(0.0, 1.0)) * ((prior_win_lambdas.len() - 1) as f64);
+        let q_win_upper = (prior_win_lambdas[q_pos.floor() as usize] * (1.0 - q_pos.fract())
+            + prior_win_lambdas[(q_pos.ceil() as usize).min(prior_win_lambdas.len() - 1)] * q_pos.fract())
+            .max(syn_state.learned_conformal_early_scratch_quantile);
+
+        // 3. Single Continuous Log-Likelihood Increment \ell_k & Sequential Wald SPRT Loop (Zero match k)
+        let (mut prev_zr, mut prev_zv, mut lambda_k, mut bar_llrs) = (0.0_f64, 0.0_f64, 0.0_f64, [0.0_f64; 4]);
         for k in 1..=max_pre_k {
-            if let Some(fk) = feats_by_k[k] {
-                let zr_k = (fk[0] as f64) / sigma_range_prior;
-                let zfav_k = ((fk[2] as f64) / sigma_range_prior).max(zr_k);
-                let zadv_k = ((fk[3] as f64) / sigma_range_prior).min(zr_k);
-                if k == 1 {
-                    running_zmae = zadv_k;
-                    running_zmfe = zfav_k;
-                } else {
-                    running_zmae = running_zmae.min(zadv_k);
-                    running_zmfe = running_zmfe.max(zfav_k);
-                }
-                let zv_k = zr_k - prev_zr;
-                let za_k = if k == 1 { 0.0 } else { zv_k - prev_zv };
-                prev_zr = zr_k;
-                prev_zv = zv_k;
-                let s1_wick_rej =
-                    ((fk[6] as f64) - (fk[5] as f64)) + 0.55 * (fk[4] as f64) + 0.45 * (fk[7] as f64);
-                let s2_gex: f64 = fk[12..20].iter().map(|&x| x as f64).sum::<f64>() / 8.0;
-                let s4_breadth: f64 = fk[26..32].iter().map(|&x| x as f64).sum::<f64>() / 6.0;
-                let psi_absorb_k = 0.50 * s1_wick_rej + 0.30 * s2_gex + 0.20 * s4_breadth;
-                let zpsi_absorb_k = psi_absorb_k / sigma_range_prior;
-                kin_by_k[k] = BarKinematics {
-                    present: true,
-                    zr_k,
-                    zmae_1_k: running_zmae,
-                    zmfe_1_k: running_zmfe,
-                    zv_k,
-                    za_k,
-                    zpsi_absorb_k,
-                };
-            }
-        }
-
-        let q_zv_rec = syn_state
-            .learned_recovery_velocity_guard_quantile
-            .clamp(0.005, 0.045);
-        let q_zabs_rec = q_win_zpsi_med.clamp(0.12, 0.32);
-
-        let is_recovering_at_k = |k_chk: usize| -> bool {
-            if k_chk > 28 || !kin_by_k[k_chk].present {
-                return false;
-            }
-            let bk = &kin_by_k[k_chk];
-            let zbounce_from_mae = bk.zr_k - bk.zmae_1_k;
-            bk.zr_k >= -0.01
-                || (bk.zv_k > q_zv_rec && bk.zpsi_absorb_k > 0.04)
-                || (bk.zv_k >= 0.12 && zbounce_from_mae >= q_win_zbounce_med && bk.zpsi_absorb_k >= -0.02)
-                || (zbounce_from_mae >= 1.70 * q_win_zbounce_med && (bk.zv_k >= -0.065 || bk.zpsi_absorb_k > 0.25))
-                || (bk.za_k >= 0.24
-                    && bk.zv_k >= -0.18
-                    && (bk.zpsi_absorb_k > 0.08 || bk.za_k >= 0.70))
-                || (bk.zv_k >= -0.005
-                    && bk.zpsi_absorb_k > q_zabs_rec
-                    && zbounce_from_mae >= q_win_zbounce_med)
-        };
-
-        let a1_w = syn_state.wald_sprt_thresholds[0];
-        let a2_w = syn_state.wald_sprt_thresholds[1];
-        let a3_w = syn_state.wald_sprt_thresholds[2];
-        let a_mid_4 = syn_state.mid_trade_wald_sprt_thresholds[0];
-        let a_mid_6 = syn_state.mid_trade_wald_sprt_thresholds[2];
-
-        // Evaluate early LLR l1, l2, l3 using evaluate_causal_post_entry_scratch (with Empirical-Bayes cross-brain fallback if brain is in cold start):
-        let mut early_l = [0.0_f64; 4];
-        let mut early_diag: [Option<PostEntryScratchDiagnostic>; 4] = [None, None, None, None];
-        for k in 1..=3.min(max_pre_k) {
-            let eval_brain_k = if k <= 2
-                && (brain_win_cnt == 0 || brain_loss_cnt == 0)
-                && total_settled_prior >= 10
-            {
-                BrainHorizonId::Brain04CoreSwing
-            } else {
-                brain_id
-            };
-            if let Some(fk) = feats_by_k[k]
-                && let Some(d) = self.evaluate_causal_post_entry_scratch(
-                    eval_brain_k,
-                    symbol,
-                    direction,
-                    current_timestamp_ns,
-                    fk,
-                    0.0,
-                )
-            {
-                let p = (d.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
-                early_l[k] = (p / (1.0 - p)).ln();
-                early_diag[k] = Some(d);
-            }
-        }
-
-        // Stage 1: Sequential k = 1, 2, 3 in standardized settled_prior coordinates
-        for k in 1..=3.min(max_pre_k) {
-            let Some(ref d_k) = early_diag[k] else {
-                continue;
-            };
-            if is_recovering_at_k(k) || !kin_by_k[k].present {
-                continue;
-            }
-            let bk = &kin_by_k[k];
-            let r_k_unit = bk.zr_k;
-            let (fired, cum_llr, exit_r) = match k {
-                1 => {
-                    let f = early_l[1] >= a1_w + 0.95
-                        && bk.zr_k <= q_loss_zr_tail
-                        && bk.zv_k <= q_loss_zr_tail
-                        && bk.zpsi_absorb_k <= 1.40 * q_loss_zpsi_deep
-                        && bk.zmfe_1_k <= 0.50 * q_win_zmfe_low;
-                    let er = (damp_w * learned_ratchet_r + (1.0 - damp_w) * r_k_unit)
-                        .clamp(-0.25, -0.12);
-                    (f, early_l[1], er)
-                }
-                2 => {
-                    let lam2 = 0.45 * early_l[1] + 0.70 * early_l[2];
-                    let b1_neg = kin_by_k[1].present
-                        && kin_by_k[1].zr_k <= q_win_zr_low
-                        && kin_by_k[1].zv_k <= q_win_zr_low;
-                    let f = (early_l[2] >= a2_w + 1.45
-                        && bk.zr_k <= 0.80 * q_loss_zr_med
-                        && bk.zv_k <= -0.28
-                        && bk.zpsi_absorb_k <= 1.10 * q_loss_zpsi_med
-                        && bk.za_k <= -0.25
-                        && bk.zmfe_1_k <= q_loss_zmfe_med)
-                        || (b1_neg
-                            && lam2 >= a2_w - 0.72
-                            && early_l[1] >= 0.25
-                            && early_l[2] >= 0.95
-                            && bk.zr_k <= q_loss_zr_deep
-                            && bk.zv_k <= -0.15
-                            && bk.zpsi_absorb_k <= 0.83 * q_loss_zpsi_med
-                            && bk.za_k <= 0.08
-                            && bk.zmfe_1_k <= q_win_zmfe_low);
-                    let r1_unit = if kin_by_k[1].present {
-                        kin_by_k[1].zr_k
-                    } else {
-                        r_k_unit
-                    };
-                    let er = (damp_w * learned_ratchet_r
-                        + (1.0 - damp_w) * (0.5 * (r1_unit + r_k_unit)))
-                        .clamp(-0.25, -0.12);
-                    (f, lam2, er)
-                }
-                3 => {
-                    let lam3 = 0.30 * early_l[1] + 0.45 * early_l[2] + 0.75 * early_l[3];
-                    let f = lam3 >= a3_w + 0.30
-                        && early_l[1] > -0.40
-                        && early_l[2] > 0.25
-                        && early_l[3] > 0.65
-                        && bk.zpsi_absorb_k <= 0.22 * q_loss_zpsi_med;
-                    let r1_unit = if kin_by_k[1].present {
-                        kin_by_k[1].zr_k
-                    } else {
-                        r_k_unit
-                    };
-                    let r2_unit = if kin_by_k[2].present {
-                        kin_by_k[2].zr_k
-                    } else {
-                        r_k_unit
-                    };
-                    let er = (damp_w * learned_ratchet_r
-                        + (1.0 - damp_w) * ((r1_unit + r2_unit + r_k_unit) / 3.0))
-                        .clamp(-0.25, -0.12);
-                    (f, lam3, er)
-                }
-                _ => (false, 0.0, -0.18),
-            };
-            if fired {
-                let post_pct = (1.0 / (1.0 + (-cum_llr).exp())) * 100.0;
+            let Some((_, fk_vec)) = pre_settlement_bars_features_32.iter().find(|(k_off, f)| *k_off == k && f.len() >= 32) else { continue; };
+            let fk = fk_vec.as_slice();
+            let xi_k = extract_xi_6(fk, prev_zr, prev_zv, sigma_range_prior);
+            (prev_zr, prev_zv) = (xi_k[0], xi_k[3]);
+            let Some(d_k) = self.evaluate_causal_post_entry_scratch(brain_id, symbol, direction, current_timestamp_ns, fk, 0.0) else { continue; };
+            let p_k = (d_k.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
+            let l_mahal_k = (p_k / (1.0 - p_k)).ln();
+            let (s_k, kin_llr_k) = score_xi(&xi_k);
+            let ell_k = kin_llr_k + l_mahal_k;
+            if k <= 3 { bar_llrs[k] = ell_k; }
+            lambda_k = (1.0 - lambda_decay) * lambda_k + ell_k;
+            if (k >= 2 || k == max_pre_k) && lambda_k > (k as f64).sqrt() * q_win_upper && s_k[0] > 0.0 && s_k[3] > 0.0 && l_mahal_k > 0.0 {
+                let (lo_r, hi_r) = (learned_ratchet_r.min(xi_k[0]), learned_ratchet_r.max(xi_k[0]));
+                let exit_r = (lambda_decay * hi_r + (1.0 - lambda_decay) * lo_r).clamp(-0.21, -0.09);
+                let post_pct = (1.0 / (1.0 + (-lambda_k).exp())) * 100.0;
                 return Some(WaldSprtScratchDiagnostic {
                     scratch_bar_offset: k,
                     scratch_exit_r: exit_r,
-                    bar1_log_likelihood_ratio: (early_l[1] * 1000.0).round() / 1000.0,
-                    bar2_log_likelihood_ratio: if k >= 2 {
-                        (early_l[2] * 1000.0).round() / 1000.0
-                    } else {
-                        0.0
-                    },
-                    bar3_log_likelihood_ratio: if k >= 3 {
-                        (early_l[3] * 1000.0).round() / 1000.0
-                    } else {
-                        0.0
-                    },
-                    cumulative_sprt_log_likelihood: (cum_llr * 1000.0).round() / 1000.0,
+                    bar1_log_likelihood_ratio: (bar_llrs[1] * 1000.0).round() / 1000.0,
+                    bar2_log_likelihood_ratio: (bar_llrs[2] * 1000.0).round() / 1000.0,
+                    bar3_log_likelihood_ratio: (if k <= 3 { bar_llrs[3] } else { ell_k } * 1000.0).round() / 1000.0,
+                    cumulative_sprt_log_likelihood: (lambda_k * 1000.0).round() / 1000.0,
                     loss_affinity_posterior_pct: (post_pct * 100.0).round() / 100.0,
                     mahalanobis_loss_distance: d_k.mahalanobis_loss_distance,
                     mahalanobis_win_distance: d_k.mahalanobis_win_distance,
@@ -3018,293 +2644,6 @@ impl PrecedentKnnIndex {
                 });
             }
         }
-
-        // Stage 2: Sequential k = 4, 5, 6, 7, 8 using evaluate_causal_mid_trade_stall_discriminant + standardized kinematic z-scores
-        if max_pre_k >= 4
-            && total_settled_prior >= 10
-            && let (Some(b1s), Some(b2s), Some(b3s), Some(b4s)) =
-                (feats_by_k[1], feats_by_k[2], feats_by_k[3], feats_by_k[4])
-        {
-            let mid_ratchet_r =
-                (0.65 * syn_state.learned_mid_trade_stop_ratchet_r + 0.35 * emp_ratchet_r)
-                    .clamp(-0.24, -0.13);
-            for k in 4..=8.min(max_pre_k) {
-                if is_recovering_at_k(k) || !kin_by_k[k].present {
-                    continue;
-                }
-                let Some(fk) = feats_by_k[k] else {
-                    continue;
-                };
-                let bk = &kin_by_k[k];
-                let prev_bk = &kin_by_k[k - 1];
-                let r_k_unit = bk.zr_k;
-                let early_d_k = self.evaluate_causal_post_entry_scratch(
-                    brain_id,
-                    symbol,
-                    direction,
-                    current_timestamp_ns,
-                    fk,
-                    0.0,
-                );
-                let lk_early = early_d_k
-                    .as_ref()
-                    .map(|d| {
-                        let p = (d.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
-                        (p / (1.0 - p)).ln()
-                    })
-                    .unwrap_or(0.0);
-
-                let make_fallback_diag = |bar_off: usize, r_unit: f64, llr_val: f64| -> WaldSprtScratchDiagnostic {
-                    let exit_r = ((0.55 + 0.20 * damp_w) * mid_ratchet_r
-                        + (0.45 - 0.20 * damp_w) * r_unit)
-                        .clamp(-0.24, -0.13);
-                    let post_pct = (1.0 / (1.0 + (-llr_val.max(0.85)).exp())) * 100.0;
-                    if let Some(ref d) = early_d_k {
-                        WaldSprtScratchDiagnostic {
-                            scratch_bar_offset: bar_off,
-                            scratch_exit_r: exit_r,
-                            bar1_log_likelihood_ratio: (early_l[1] * 1000.0).round() / 1000.0,
-                            bar2_log_likelihood_ratio: (early_l[2] * 1000.0).round() / 1000.0,
-                            bar3_log_likelihood_ratio: (llr_val * 1000.0).round() / 1000.0,
-                            cumulative_sprt_log_likelihood: (llr_val * 1000.0).round() / 1000.0,
-                            loss_affinity_posterior_pct: (post_pct * 100.0).round() / 100.0,
-                            mahalanobis_loss_distance: d.mahalanobis_loss_distance,
-                            mahalanobis_win_distance: d.mahalanobis_win_distance,
-                            matched_trap_id: d.matched_trap_id,
-                            ledoit_wolf_shrinkage_lambda: d.ledoit_wolf_shrinkage_lambda,
-                        }
-                    } else {
-                        WaldSprtScratchDiagnostic {
-                            scratch_bar_offset: bar_off,
-                            scratch_exit_r: exit_r,
-                            bar1_log_likelihood_ratio: (early_l[1] * 1000.0).round() / 1000.0,
-                            bar2_log_likelihood_ratio: (early_l[2] * 1000.0).round() / 1000.0,
-                            bar3_log_likelihood_ratio: (llr_val * 1000.0).round() / 1000.0,
-                            cumulative_sprt_log_likelihood: (llr_val * 1000.0).round() / 1000.0,
-                            loss_affinity_posterior_pct: (post_pct * 100.0).round() / 100.0,
-                            mahalanobis_loss_distance: 1.15,
-                            mahalanobis_win_distance: 1.85,
-                            matched_trap_id: Uuid::nil(),
-                            ledoit_wolf_shrinkage_lambda: 0.35,
-                        }
-                    }
-                };
-
-                match k {
-                    4 => {
-                        let d4_opt = self.evaluate_causal_mid_trade_stall_discriminant(
-                            brain_id,
-                            symbol,
-                            direction,
-                            current_timestamp_ns,
-                            b1s,
-                            Some(b2s),
-                            Some(b3s),
-                            Some(b4s),
-                            None,
-                            None,
-                            None,
-                            None,
-                        );
-                        let b3_neg =
-                            prev_bk.present && prev_bk.zr_k <= -0.10 && prev_bk.zv_k <= 0.005;
-                        if d4_opt
-                            .as_ref()
-                            .is_some_and(|d4| d4.cumulative_sprt_log_likelihood >= a_mid_4 + 0.35)
-                            && bk.zr_k <= 1.00 * q_loss_zr_deep
-                            && bk.zv_k <= -0.25
-                            && bk.zpsi_absorb_k <= 1.00 * q_loss_zpsi_med
-                        {
-                            return d4_opt;
-                        }
-                        if b3_neg
-                            && bk.zr_k <= 0.94 * q_loss_zr_deep
-                            && bk.zv_k <= -0.10
-                            && bk.zpsi_absorb_k <= 1.00 * q_loss_zpsi_med
-                            && bk.zmfe_1_k <= 1.00 * q_loss_zmfe_med
-                            && (lk_early > -0.50 || bk.zv_k <= -0.34)
-                        {
-                            return Some(make_fallback_diag(4, r_k_unit, lk_early.max(1.15)));
-                        }
-                    }
-                    5 => {
-                        let b4_neg = prev_bk.present
-                            && prev_bk.zr_k <= -0.06
-                            && prev_bk.zv_k <= -0.05
-                            && prev_bk.zpsi_absorb_k <= 0.67 * q_loss_zpsi_med;
-                        if b4_neg
-                            && bk.zr_k <= 0.91 * q_loss_zr_deep
-                            && bk.zr_k > 1.52 * q_loss_zr_tail
-                            && bk.zv_k <= -0.04
-                            && bk.zpsi_absorb_k <= 0.84 * q_loss_zpsi_deep
-                            && (bk.zmfe_1_k <= 1.50 * q_win_zmfe_low
-                                || (bk.zmfe_1_k <= 1.28 * q_loss_zmfe_med && bk.zv_k <= -0.20))
-                        {
-                            return Some(make_fallback_diag(5, r_k_unit, lk_early.max(1.20)));
-                        }
-                    }
-                    6 => {
-                        let d6_opt = feats_by_k[5].zip(feats_by_k[6]).and_then(|(b5s, b6s)| {
-                            self.evaluate_causal_mid_trade_stall_discriminant(
-                                brain_id,
-                                symbol,
-                                direction,
-                                current_timestamp_ns,
-                                b1s,
-                                Some(b2s),
-                                Some(b3s),
-                                Some(b4s),
-                                Some(b5s),
-                                Some(b6s),
-                                None,
-                                None,
-                            )
-                        });
-                        if let Some(d6) = d6_opt
-                            && d6.scratch_bar_offset == 6
-                        {
-                            return Some(d6);
-                        }
-                        let b5_neg = prev_bk.present
-                            && prev_bk.zr_k <= 0.67 * q_loss_zr_med
-                            && prev_bk.zv_k <= -0.04
-                            && prev_bk.zpsi_absorb_k <= 0.56 * q_loss_zpsi_med;
-                        if (bk.zr_k <= 1.07 * q_loss_zr_tail
-                            && bk.zv_k <= -0.65
-                            && bk.zpsi_absorb_k <= 1.00 * q_loss_zpsi_deep)
-                            || (b5_neg
-                                && bk.zr_k <= 1.00 * q_loss_zr_med
-                                && bk.zv_k <= -0.09
-                                && bk.zpsi_absorb_k <= 0.17 * q_loss_zpsi_med
-                                && (bk.zmfe_1_k <= 1.60 * q_win_zmfe_low
-                                    || (bk.zmfe_1_k <= 0.96 * q_loss_zmfe_med
-                                        && bk.zr_k <= 1.28 * q_loss_zr_deep
-                                        && bk.zpsi_absorb_k <= 0.67 * q_loss_zpsi_med)))
-                        {
-                            return Some(make_fallback_diag(6, r_k_unit, lk_early.max(1.25)));
-                        }
-                    }
-                    7 => {
-                        let d7_opt = feats_by_k[5]
-                            .zip(feats_by_k[6])
-                            .zip(feats_by_k[7])
-                            .and_then(|((b5s, b6s), b7s)| {
-                                self.evaluate_causal_mid_trade_stall_discriminant(
-                                    brain_id,
-                                    symbol,
-                                    direction,
-                                    current_timestamp_ns,
-                                    b1s,
-                                    Some(b2s),
-                                    Some(b3s),
-                                    Some(b4s),
-                                    Some(b5s),
-                                    Some(b6s),
-                                    Some(b7s),
-                                    Some(b7s),
-                                )
-                            });
-                        let b6_neg = prev_bk.present
-                            && prev_bk.zr_k <= 0.50 * q_loss_zr_med
-                            && prev_bk.zv_k <= -0.20
-                            && prev_bk.zpsi_absorb_k <= 0.56 * q_loss_zpsi_med;
-                        if let Some(mut d7) = d7_opt
-                            && d7.scratch_bar_offset == 8
-                            && d7.cumulative_sprt_log_likelihood >= a_mid_6 + 0.65
-                            && bk.zr_k <= 1.37 * q_loss_zr_deep
-                            && bk.zv_k <= -0.25
-                            && b6_neg
-                            && bk.zmfe_1_k >= 1.20 * q_loss_zmfe_med
-                        {
-                            d7.scratch_bar_offset = 7;
-                            d7.scratch_exit_r =
-                                ((0.55 + 0.20 * damp_w) * mid_ratchet_r
-                                    + (0.45 - 0.20 * damp_w) * r_k_unit)
-                                    .clamp(-0.24, -0.13);
-                            return Some(d7);
-                        }
-                    }
-                    8 => {
-                        if let (Some(b5s), Some(b6s), Some(b7s), Some(b8s)) =
-                            (feats_by_k[5], feats_by_k[6], feats_by_k[7], feats_by_k[8])
-                            && let Some(d8) = self.evaluate_causal_mid_trade_stall_discriminant(
-                                brain_id,
-                                symbol,
-                                direction,
-                                current_timestamp_ns,
-                                b1s,
-                                Some(b2s),
-                                Some(b3s),
-                                Some(b4s),
-                                Some(b5s),
-                                Some(b6s),
-                                Some(b7s),
-                                Some(b8s),
-                            )
-                            && d8.scratch_bar_offset == 8
-                        {
-                            return Some(d8);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Stage 2b: Late horizon (k = 9..=16) — accumulate prev_llr across all bars 9..=16, check recovery guard at trigger
-        if max_pre_k >= 9 {
-            let zmae_1_8 = (1..=8)
-                .filter(|&k| kin_by_k[k].present)
-                .map(|k| kin_by_k[k].zmae_1_k)
-                .fold(0.0_f64, f64::min);
-            let mut prev_llr = 0.0_f64;
-            for k in 9..=16.min(max_pre_k) {
-                let Some(fk) = feats_by_k[k] else {
-                    continue;
-                };
-                if let Some(diag) = self.evaluate_causal_post_entry_scratch(
-                    brain_id,
-                    "",
-                    TradeDirection::Long,
-                    current_timestamp_ns,
-                    fk,
-                    0.0,
-                ) {
-                    let p_k = (diag.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
-                    let llr_k = (p_k / (1.0 - p_k)).ln();
-                    let combined_late_llr = 0.45 * prev_llr + 0.75 * llr_k;
-                    prev_llr = llr_k;
-                    let bk = &kin_by_k[k];
-                    let late_recovering = is_recovering_at_k(k)
-                        || bk.zr_k > 1.31 * q_loss_zr_deep
-                        || (bk.zr_k - bk.zmae_1_k) > 0.60 * q_win_zbounce_med
-                        || zmae_1_8 <= 1.00 * q_loss_zr_tail;
-                    if !late_recovering
-                        && combined_late_llr >= syn_state.late_blowoff_scratch_threshold + 0.55
-                        && llr_k > 0.85
-                    {
-                        let r_k_unit = bk.zr_k;
-                        let exit_r = ((0.60 + 0.20 * damp_w) * emp_ratchet_r
-                            + (0.40 - 0.20 * damp_w) * r_k_unit)
-                            .clamp(-0.24, -0.13);
-                        return Some(WaldSprtScratchDiagnostic {
-                            scratch_bar_offset: k,
-                            scratch_exit_r: exit_r,
-                            bar1_log_likelihood_ratio: (llr_k * 1000.0).round() / 1000.0,
-                            bar2_log_likelihood_ratio: 0.0,
-                            bar3_log_likelihood_ratio: 0.0,
-                            cumulative_sprt_log_likelihood: (llr_k * 1000.0).round() / 1000.0,
-                            loss_affinity_posterior_pct: diag.loss_affinity_posterior_pct,
-                            mahalanobis_loss_distance: diag.mahalanobis_loss_distance,
-                            mahalanobis_win_distance: diag.mahalanobis_win_distance,
-                            matched_trap_id: diag.matched_trap_id,
-                            ledoit_wolf_shrinkage_lambda: diag.ledoit_wolf_shrinkage_lambda,
-                        });
-                    }
-                }
-            }
-        }
-
         None
     }
 

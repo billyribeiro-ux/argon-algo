@@ -1590,13 +1590,72 @@ mod tests {
         let gen27 = &evo.generations_history[27];
         let gen28 = &evo.generations_history[28];
 
-        // 1. Verify Honest Out-of-Sample Dominance across Gen 24 -> Gen 25 -> Gen 26 -> Gen 27 -> Gen 28
-        for g in [gen24, gen25, gen26, gen27, gen28] {
+        // 1. Verify Honest Out-of-Sample Dominance across Gen 24 -> Gen 25 -> Gen 26 -> Gen 27 -> Gen 28 -> Gen 29 -> Gen 30 -> Gen 31 -> Gen 32
+        let gen29 = &evo.generations_history[29];
+        let gen30 = &evo.generations_history[30];
+        let gen31 = &evo.generations_history[31];
+        let gen32 = &evo.generations_history[32];
+        for g in [gen24, gen25, gen26, gen27, gen28, gen29, gen30, gen31, gen32] {
             assert!(g.pareto_gate_passed);
             assert!(g.untouched_winners_count >= 90 && g.untouched_winners_count < 116);
             assert!(g.tp_losses_scratched >= 20 && g.remaining_unscratched_losses > 0);
             assert!(g.profit_factor > 2.50);
             assert!(g.max_drawdown_usd < 2_000.0);
+        }
+        println!("\n[PHASE 25.1 PARETO MONOTONICITY SCOREBOARD (Gen 0 -> Gen 28 -> Gen 29 -> Gen 30 -> Gen 31 -> Gen 32)]");
+        for &gid in &[0usize, 24, 28, 29, 30, 31, 32] {
+            let g = &evo.generations_history[gid];
+            println!(
+                "  Gen {:02} | Vetoes: {}/{} | Scratches: {}/{} | WinPres: {}/116 | StopsElim: {}/57 | PF: {:.2} | Fixed P&L: +${:.2} | Kelly P&L: +${:.2} | MaxDD: ${:.2} | Fitness: {:.4}",
+                g.generation_id,
+                g.tp_losses_vetoed,
+                g.fp_winners_vetoed,
+                g.tp_losses_scratched,
+                g.fp_winners_scratched,
+                g.untouched_winners_count,
+                g.tp_losses_vetoed + g.tp_losses_scratched,
+                g.profit_factor,
+                g.fixed_net_pnl_usd,
+                g.kelly_net_pnl_usd,
+                g.max_drawdown_usd,
+                g.composite_fitness_score,
+            );
+        }
+        for pair in [gen28, gen29, gen30, gen31, gen32].windows(2) {
+            let prev = pair[0];
+            let next = pair[1];
+            assert!(
+                next.fixed_net_pnl_usd >= prev.fixed_net_pnl_usd,
+                "Pareto regression Fixed P&L Gen {} (${:.2}) -> Gen {} (${:.2})",
+                prev.generation_id,
+                prev.fixed_net_pnl_usd,
+                next.generation_id,
+                next.fixed_net_pnl_usd
+            );
+            assert!(
+                next.kelly_net_pnl_usd >= prev.kelly_net_pnl_usd,
+                "Pareto regression Kelly P&L Gen {} (${:.2}) -> Gen {} (${:.2})",
+                prev.generation_id,
+                prev.kelly_net_pnl_usd,
+                next.generation_id,
+                next.kelly_net_pnl_usd
+            );
+            assert!(
+                next.profit_factor >= prev.profit_factor,
+                "Pareto regression PF Gen {} ({:.2}) -> Gen {} ({:.2})",
+                prev.generation_id,
+                prev.profit_factor,
+                next.generation_id,
+                next.profit_factor
+            );
+            assert!(
+                next.composite_fitness_score >= prev.composite_fitness_score,
+                "Pareto regression Fitness Gen {} ({:.4}) -> Gen {} ({:.4})",
+                prev.generation_id,
+                prev.composite_fitness_score,
+                next.generation_id,
+                next.composite_fitness_score
+            );
         }
 
         // 2. Verify Upgrade 1: Cross-Venue NBBO Smart Order Router (CrossVenueSmartRouter) & Post-Fill Markout Toxicity
@@ -1965,8 +2024,9 @@ mod tests {
             let mut untouched_winners = 0usize;
             let mut unscratched_losses = 0usize;
 
-            for i in 0..chronological_trades.len() {
-                let mut candidate = chronological_trades[i].clone();
+            let mut run_trades = chronological_trades.clone();
+            for i in 0..run_trades.len() {
+                let mut candidate = run_trades[i].clone();
                 let entry_ts = candidate.opened_timestamp_ns;
 
                 // Wipe index and insert ONLY trades j < i whose ACTUAL exit timestamp T_{exit, j} < T_{entry, i}
@@ -1976,7 +2036,7 @@ mod tests {
                 cold_engine.precedent_knn().clear_all_runner_giveback_trajectories();
 
                 let mut settled_prior: Vec<crate::ledger::ClosedTradeRow> = Vec::new();
-                for prior in chronological_trades.iter().take(i) {
+                for prior in run_trades.iter().take(i) {
                     if prior.closed_timestamp_ns < entry_ts {
                         settled_prior.push(prior.clone());
                     }
@@ -2008,6 +2068,7 @@ mod tests {
                     .collect();
 
                 cold_engine.apply_causal_adaptive_rules_to_row(&mut candidate, &prior_losses, false);
+                run_trades[i] = candidate.clone();
 
                 if candidate.was_vetoed_by_loss_autopsy {
                     if candidate.is_winner {
@@ -2078,7 +2139,7 @@ mod tests {
         }
 
         // =========================================================================
-        // TEST 3B: FULL LABEL + TRAJECTORY INVERSION BEFORE INDEX CONSTRUCTION
+        // TEST 3B-1: FULL LABEL + TRAJECTORY INVERSION BEFORE INDEX CONSTRUCTION
         // =========================================================================
         let inv_engine = RealTimeLedgerEngine::new();
         assert!(inv_engine.load_from_disk(ledger_path));
@@ -2102,7 +2163,7 @@ mod tests {
             r.was_scratched_by_loss_autopsy = false;
         }
         inv_engine.replace_closed_trades_for_audit(inverted_trades);
-        let _ = inv_engine.run_multi_generation_evolution_to_gen28();
+        let _ = inv_engine.run_multi_generation_evolution_to_gen32();
         let inv_snap = inv_engine.query_filtered_snapshot(&HyperFilterQuery::default());
 
         // Count against both the inverted labels and the original labels
@@ -2126,7 +2187,7 @@ mod tests {
             }
         }
         println!(
-            "\n[TRAP 3 — 3B: Full Label + Outcome Inversion BEFORE Index Construction]\n  Against Inverted Labels (57 'Wins' / 116 'Losses'): TP Vetoes={} FP Vetoes={} | TP Scratches={} FP Scratches={}\n  Against Original Labels (116 Wins / 57 Losses): Vetoed Orig Winners={} Vetoed Orig Losers={} | Scratched Orig Winners={} Scratched Orig Losers={}",
+            "\n[TRAP 3 — 3B-1: Full Label + Outcome Inversion BEFORE Index Construction]\n  Against Inverted Labels (57 'Wins' / 116 'Losses'): TP Vetoes={} FP Vetoes={} | TP Scratches={} FP Scratches={}\n  Against Original Labels (116 Wins / 57 Losses): Vetoed Orig Winners={} Vetoed Orig Losers={} | Scratched Orig Winners={} Scratched Orig Losers={}",
             inv_snap.scoreboard.true_positive_losses_vetoed,
             inv_snap.scoreboard.false_positive_winners_vetoed,
             inv_snap.scoreboard.true_positive_losses_scratched,
@@ -2135,6 +2196,67 @@ mod tests {
             vetoed_orig_losers,
             scratched_orig_winners,
             scratched_orig_losers,
+        );
+        assert!(
+            vetoed_orig_winners + scratched_orig_winners > vetoed_orig_losers + scratched_orig_losers,
+            "Under full label inversion (Test 3B-1), classifier must flip direction and target original winners (the inverted 'losses') more than original losers"
+        );
+
+        // =========================================================================
+        // TEST 3B-2: ERA-1 (FIRST 86) VS ERA-2 (LAST 87) OUT-OF-SAMPLE LEARNING CURVE
+        // =========================================================================
+        let era_engine = RealTimeLedgerEngine::new();
+        assert!(era_engine.load_from_disk(ledger_path));
+        let _ = era_engine.run_multi_generation_evolution_to_gen32();
+        let era_snap = era_engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        let mut era_sorted = era_snap.closed_trades.clone();
+        era_sorted.sort_by_key(|r| (r.opened_timestamp_ns, r.closed_timestamp_ns));
+        let (era1, era2) = era_sorted.split_at(86);
+        let summarize_era = |slice: &[crate::ledger::ClosedTradeRow]| {
+            let mut wins = 0usize;
+            let mut losses = 0usize;
+            let mut tp_v = 0usize;
+            let mut fp_v = 0usize;
+            let mut tp_s = 0usize;
+            let mut fp_s = 0usize;
+            for r in slice {
+                if r.is_winner {
+                    wins += 1;
+                    if r.was_vetoed_by_loss_autopsy {
+                        fp_v += 1;
+                    } else if r.was_scratched_by_loss_autopsy {
+                        fp_s += 1;
+                    }
+                } else {
+                    losses += 1;
+                    if r.was_vetoed_by_loss_autopsy {
+                        tp_v += 1;
+                    } else if r.was_scratched_by_loss_autopsy {
+                        tp_s += 1;
+                    }
+                }
+            }
+            let win_pres = wins.saturating_sub(fp_v + fp_s);
+            let stops_elim = tp_v + tp_s;
+            (
+                wins,
+                losses,
+                tp_v,
+                fp_v,
+                tp_s,
+                fp_s,
+                win_pres,
+                (win_pres as f64 / wins.max(1) as f64) * 100.0,
+                stops_elim,
+                (stops_elim as f64 / losses.max(1) as f64) * 100.0,
+            )
+        };
+        let e1 = summarize_era(era1);
+        let e2 = summarize_era(era2);
+        println!(
+            "\n[TRAP 3 — 3B-2: Era-1 (first 86) vs Era-2 (last 87) Out-of-Sample Learning Curve]\n  Era-1 (Cold Start 0..86): Wins={} Losses={} | TP_V={} FP_V={} TP_S={} FP_S={} | WinPres={}/{} ({:.1}%) | StopsElim={}/{} ({:.1}%)\n  Era-2 (Mature 86..173):   Wins={} Losses={} | TP_V={} FP_V={} TP_S={} FP_S={} | WinPres={}/{} ({:.1}%) | StopsElim={}/{} ({:.1}%)",
+            e1.0, e1.1, e1.2, e1.3, e1.4, e1.5, e1.6, e1.0, e1.7, e1.8, e1.1, e1.9,
+            e2.0, e2.1, e2.2, e2.3, e2.4, e2.5, e2.6, e2.0, e2.7, e2.8, e2.1, e2.9,
         );
 
         // =========================================================================

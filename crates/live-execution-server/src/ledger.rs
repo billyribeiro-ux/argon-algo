@@ -3796,15 +3796,9 @@ impl RealTimeLedgerEngine {
             &bounded_pre,
             entry_idx,
         );
-        let (tau_veto, delta_margin) = self
-            .get_era1_brain_calibration(sig.brain_id)
-            .map(|c| {
-                (
-                    c.era1_learned_veto_threshold.clamp(0.84, 0.94),
-                    c.era1_learned_veto_margin.clamp(0.005, 0.05),
-                )
-            })
-            .unwrap_or((0.880, 0.015));
+        let syn_state = self.precedent_knn.get_synaptic_plasticity_state(sig.brain_id);
+        let tau_veto = 0.880;
+        let delta_margin = syn_state.entry_veto_margin_delta.clamp(0.005, 0.05);
         let diag = self
             .precedent_knn
             .evaluate_causal_entry_trap_vs_winner_discriminant(
@@ -4453,11 +4447,10 @@ impl RealTimeLedgerEngine {
             // - Stage 2b (bars_since_open in 9..=16): Causal Late-Horizon Blow-Off scratch check
             // - Stage 3 (bars_since_open >= 5): Causal Profit-Giveback Ratchet stop tightening + House-Money Scale-In
             let mut ai_scratch_exit = false;
-            if bars_since_open >= 1 && !target_hit && !stop_hit {
-                let tau_scratch = self
-                    .get_era1_brain_calibration(pos.brain_id)
-                    .map(|c| c.era1_learned_scratch_posterior_threshold.clamp(0.70, 0.85))
-                    .unwrap_or(0.70);
+            if bars_since_open >= 1 && !target_hit {
+                let syn_state = self.precedent_knn.get_synaptic_plasticity_state(pos.brain_id);
+                let tau_scratch = (1.0 / (1.0 + (-syn_state.wald_sprt_thresholds[0]).exp()))
+                    .clamp(0.70, 0.85);
                 let unified_dec = self.evaluate_unified_causal_post_entry_trajectory(
                     pos.brain_id,
                     &pos.symbol,
@@ -4474,11 +4467,14 @@ impl RealTimeLedgerEngine {
                     bars_since_open.min(28),
                     tau_scratch,
                 );
-                if unified_dec.matched_scratch.is_some()
+                if unified_dec
+                    .matched_scratch
+                    .as_ref()
+                    .is_some_and(|s| s.scratch_bar_offset <= bars_since_open)
                     && *self.enforce_hard_scratch_on_baseline.read()
                 {
                     ai_scratch_exit = true;
-                } else if *self.enforce_hard_scratch_on_baseline.read() {
+                } else if *self.enforce_hard_scratch_on_baseline.read() && bars_since_open >= 5 {
                     if let Some(ref ratchet_diag) = unified_dec.giveback_ratchet {
                         let locked_r = ratchet_diag.locked_profit_r.max(0.05);
                         let ratchet_offset_u = ((risk_u as f64) * locked_r).round() as i64;
@@ -4503,6 +4499,15 @@ impl RealTimeLedgerEngine {
                         pos.house_money_scale_eligible = true;
                         pos.locked_profit_r = hm_diag.locked_profit_r;
                         pos.guaranteed_net_floor_r = hm_diag.guaranteed_net_floor_r;
+                        let hm_tag = format!(
+                            "House-Money Pyramid (+{:.2}R | phi={:.2} | Floor +{:.2}R)",
+                            hm_diag.additional_r_gained,
+                            hm_diag.house_money_reinvestment_fraction_phi,
+                            hm_diag.guaranteed_net_floor_r
+                        );
+                        if !pos.scale_in_history.iter().any(|s| s.starts_with("House-Money Pyramid")) {
+                            pos.scale_in_history.push(hm_tag);
+                        }
                     }
                 }
             }

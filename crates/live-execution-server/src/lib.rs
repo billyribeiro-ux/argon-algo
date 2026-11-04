@@ -2172,4 +2172,353 @@ mod tests {
             shuf_cm.bar1_scratch_precision_pct,
         );
     }
+
+    #[test]
+    fn test_live_paper_trade_stage0_to_stage3_execution_parity() {
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+
+        let ref_engine = RealTimeLedgerEngine::new();
+        assert!(ref_engine.load_from_disk(ledger_path));
+        let ref_snap = ref_engine.query_filtered_snapshot(&HyperFilterQuery::default());
+
+        let mut chronological_trades = ref_snap.closed_trades.clone();
+        chronological_trades.sort_by_key(|r| (r.opened_timestamp_ns, r.closed_timestamp_ns));
+
+        let build_live_inference_for_row = |row: &crate::ledger::ClosedTradeRow| -> (
+            crate::onnx_engine::LiveBrainInferenceOutput,
+            crate::precedent_knn::PrecedentMatchSummary,
+        ) {
+            let signal = raw_fingerprint_core::AutonomousSignalBlueprint {
+                brain_id: row.brain_id,
+                symbol: row.symbol.clone(),
+                timestamp_ns: row.opened_timestamp_ns,
+                direction: row.direction,
+                ai_confidence_pct: row.ai_confidence_pct,
+                entry_price: row.entry_price,
+                structural_stop_price: row.initial_structural_stop,
+                target_1_price: row.target_1_price,
+                target_2_price: row.target_2_price,
+                predicted_hold_duration_ms: row.hold_duration_ms.max(60_000),
+                expected_r_multiple: 1.85,
+                primary_driver: row.primary_driver,
+                stream_weights: row.stream_weights,
+                latent_embedding_128: row.entry_embedding_128.clone(),
+            };
+            let matched_option = crate::onnx_engine::MatchedOptionExecutionPlan {
+                option_structure: row.option_structure.clone(),
+                matched_option_contract: row.matched_option_contract.clone(),
+                option_entry_premium: row.option_entry_premium,
+                option_live_premium: row.option_entry_premium,
+                option_stop_premium: row.option_stop_premium,
+                option_target_premium: row.option_exit_premium,
+                option_contracts_count: row.option_contracts_count,
+                contract_delta: row.contract_delta,
+                contract_gamma: row.contract_gamma,
+                contract_vanna: row.contract_vanna,
+                contract_theta: row.contract_theta,
+                contract_vega: row.contract_vega,
+                contract_iv: row.contract_iv,
+            };
+            let prec = crate::precedent_knn::PrecedentMatchSummary {
+                matches_count: row.precedent_matches_count,
+                win_rate_pct: row.precedent_win_rate_pct,
+                mean_realized_r_multiple: 1.85,
+                mean_similarity_pct: 91.5,
+                p50_mfe_pct: row.mfe_pct.max(1.5),
+                p80_mfe_pct: row.mfe_pct.max(2.2),
+                p85_mae_pct: row.mae_pct.max(0.8),
+                median_hold_duration_ms: row.hold_duration_ms.max(60_000),
+                top_exemplar_symbols: vec![row.symbol.clone()],
+            };
+            (
+                crate::onnx_engine::LiveBrainInferenceOutput {
+                    signal,
+                    matched_option,
+                    bar_attention_heatmap: vec![0.5; 24],
+                    top_shap_drivers: Vec::new(),
+                    inference_latency_micros: 120,
+                    model_version: "v1.28.0-onnx".to_string(),
+                },
+                prec,
+            )
+        };
+
+        let setup_causal_paper_engine_at_trade = |trade_idx: usize| -> RealTimeLedgerEngine {
+            let paper_engine = RealTimeLedgerEngine::new();
+            paper_engine.set_enforce_hard_scratch_on_baseline(true);
+            let entry_ts = chronological_trades[trade_idx].opened_timestamp_ns;
+            let brain_id = chronological_trades[trade_idx].brain_id;
+            let mut settled_prior = Vec::new();
+            for prior in chronological_trades.iter().take(trade_idx) {
+                if prior.closed_timestamp_ns < entry_ts {
+                    settled_prior.push(prior.clone());
+                }
+            }
+            settled_prior.sort_by_key(|r| r.closed_timestamp_ns);
+            for s in &settled_prior {
+                paper_engine.sync_closed_row_to_precedent_knn(s);
+            }
+            let causal_state = paper_engine.compute_causal_plasticity_state_for_prefix(
+                brain_id,
+                &settled_prior,
+                28,
+            );
+            paper_engine
+                .precedent_knn()
+                .set_synaptic_plasticity_state(causal_state);
+            paper_engine
+        };
+
+        // 1. Stage 0 Veto Parity (`open_position_with_bars` rejects vetoed entry & records audit)
+        let veto_idx = chronological_trades
+            .iter()
+            .position(|r| r.was_vetoed_by_loss_autopsy)
+            .expect("Expected at least 1 Stage 0 vetoed trade in chronological_trades");
+        let veto_row = &chronological_trades[veto_idx];
+        let paper_s0 = setup_causal_paper_engine_at_trade(veto_idx);
+        let (inf_s0, prec_s0) = build_live_inference_for_row(veto_row);
+        let pre_bars_s0 = veto_row.entry_bars[..=veto_row.entry_bar_idx].to_vec();
+        let opened_s0 = paper_s0.open_position_with_bars(
+            &veto_row.exchange_index,
+            &inf_s0,
+            &prec_s0,
+            10_000.0,
+            pre_bars_s0,
+        );
+        assert_eq!(
+            opened_s0.active_sequential_stage,
+            "STAGE_0_VETOED_HARD_NEGATIVE_TRAP"
+        );
+        let snap_s0 = paper_s0.query_filtered_snapshot(&HyperFilterQuery::default());
+        assert_eq!(
+            snap_s0.positions_opened.len(),
+            0,
+            "Vetoed live paper-trade entry must NOT be added to positions_opened"
+        );
+
+        // 2. Stage 1 Early Wald SPRT Scratch Parity (`bars_held in 1..=3` via `process_live_bar_for_symbol`)
+        let s1_idx = chronological_trades
+            .iter()
+            .position(|r| r.was_scratched_by_loss_autopsy && (1..=3).contains(&r.scratch_bar_offset))
+            .expect("Expected at least 1 Stage 1 scratched trade");
+        let s1_row = &chronological_trades[s1_idx];
+        let paper_s1 = setup_causal_paper_engine_at_trade(s1_idx);
+        let (inf_s1, prec_s1) = build_live_inference_for_row(s1_row);
+        let pre_bars_s1 = s1_row.entry_bars[..=s1_row.entry_bar_idx].to_vec();
+        let opened_s1 = paper_s1.open_position_with_bars(
+            &s1_row.exchange_index,
+            &inf_s1,
+            &prec_s1,
+            10_000.0,
+            pre_bars_s1.clone(),
+        );
+        assert_ne!(
+            opened_s1.active_sequential_stage,
+            "STAGE_0_VETOED_HARD_NEGATIVE_TRAP"
+        );
+        let mut live_stream_s1 = pre_bars_s1;
+        let mut closed_s1 = Vec::new();
+        for k in 1..=s1_row.scratch_bar_offset {
+            live_stream_s1.push(s1_row.entry_bars[s1_row.entry_bar_idx + k]);
+            let newly = paper_s1.process_live_bar_for_symbol(
+                &s1_row.symbol,
+                &live_stream_s1,
+                &raw_fingerprint_core::RawMarketInternalsSnapshot::default(),
+            );
+            closed_s1.extend(newly);
+        }
+        assert_eq!(
+            closed_s1.len(),
+            1,
+            "Stage 1 paper trade must close at scratch_bar_offset={}",
+            s1_row.scratch_bar_offset
+        );
+        assert_eq!(
+            closed_s1[0].outcome_badge,
+            crate::ledger::ClosedOutcomeBadge::AiLossAutopsyScratchExit
+        );
+
+        // 3. Stage 2 Mid-Trade Stall Scratch Parity (`bars_held in 4..=6` via `process_live_bar_for_symbol`)
+        let s2_idx = chronological_trades
+            .iter()
+            .position(|r| r.was_scratched_by_loss_autopsy && (4..=6).contains(&r.scratch_bar_offset))
+            .expect("Expected at least 1 Stage 2 mid-trade stall scratched trade");
+        let s2_row = &chronological_trades[s2_idx];
+        let paper_s2 = setup_causal_paper_engine_at_trade(s2_idx);
+        let (inf_s2, prec_s2) = build_live_inference_for_row(s2_row);
+        let pre_bars_s2 = s2_row.entry_bars[..=s2_row.entry_bar_idx].to_vec();
+        let _ = paper_s2.open_position_with_bars(
+            &s2_row.exchange_index,
+            &inf_s2,
+            &prec_s2,
+            10_000.0,
+            pre_bars_s2.clone(),
+        );
+        let mut live_stream_s2 = pre_bars_s2;
+        let mut closed_s2 = Vec::new();
+        for k in 1..=s2_row.scratch_bar_offset {
+            live_stream_s2.push(s2_row.entry_bars[s2_row.entry_bar_idx + k]);
+            let newly = paper_s2.process_live_bar_for_symbol(
+                &s2_row.symbol,
+                &live_stream_s2,
+                &raw_fingerprint_core::RawMarketInternalsSnapshot::default(),
+            );
+            closed_s2.extend(newly);
+        }
+        assert_eq!(
+            closed_s2.len(),
+            1,
+            "Stage 2 paper trade must close at scratch_bar_offset={}",
+            s2_row.scratch_bar_offset
+        );
+        assert_eq!(
+            closed_s2[0].outcome_badge,
+            crate::ledger::ClosedOutcomeBadge::AiLossAutopsyScratchExit
+        );
+
+        // 4. Stage 3 House-Money Runner Scale-In & Paper Ticket Staging Parity (`bars_held >= 4`)
+        let s3_idx = chronological_trades
+            .iter()
+            .position(|r| {
+                r.tranche_count == 1
+                    && r.was_scaled_with_house_money
+                    && r.house_money_scale_bar_offset.is_some()
+            })
+            .unwrap_or_else(|| {
+                chronological_trades
+                    .iter()
+                    .position(|r| {
+                        r.was_scaled_with_house_money && r.house_money_scale_bar_offset.is_some()
+                    })
+                    .expect("Expected at least 1 Stage 3 House-Money runner trade")
+            });
+        let s3_row = &chronological_trades[s3_idx];
+        let paper_s3 = setup_causal_paper_engine_at_trade(s3_idx);
+        let (inf_s3, prec_s3) = build_live_inference_for_row(s3_row);
+        let pre_bars_s3 = s3_row.entry_bars[..=s3_row.entry_bar_idx].to_vec();
+        let opened_s3 = paper_s3.open_position_with_bars(
+            &s3_row.exchange_index,
+            &inf_s3,
+            &prec_s3,
+            10_000.0,
+            pre_bars_s3.clone(),
+        );
+        let staged_ticket = paper_s3
+            .stage_broker_ticket_for_position(opened_s3.position_id, Some("IBKR_TWS"), None)
+            .expect("Must stage simulated paper-trade broker ticket for open runner");
+        assert!(staged_ticket.child_execution_slices.len() >= 3);
+
+        let total_post_bars_s3 = s3_row
+            .entry_bars
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(s3_row.entry_bar_idx);
+        let mut live_stream_s3 = pre_bars_s3;
+        let mut closed_s3 = Vec::new();
+        for k in 1..=total_post_bars_s3 {
+            live_stream_s3.push(s3_row.entry_bars[s3_row.entry_bar_idx + k]);
+            let newly = paper_s3.process_live_bar_for_symbol(
+                &s3_row.symbol,
+                &live_stream_s3,
+                &raw_fingerprint_core::RawMarketInternalsSnapshot::default(),
+            );
+            closed_s3.extend(newly);
+            if !closed_s3.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            closed_s3.len(),
+            1,
+            "Expected Stage 3 runner paper trade to settle across its bar stream"
+        );
+        assert!(
+            closed_s3[0].was_scaled_with_house_money,
+            "Expected Stage 3 closed paper trade to have was_scaled_with_house_money == true"
+        );
+        assert_eq!(
+            closed_s3[0].house_money_scale_bar_offset,
+            s3_row.house_money_scale_bar_offset
+        );
+        assert!(
+            closed_s3[0].house_money_additional_r_gained > 0.0,
+            "Expected positive house_money_additional_r_gained, got {}",
+            closed_s3[0].house_money_additional_r_gained
+        );
+
+        // 5. Stage 3 Profit-Giveback Ratchet Parity (`was_protected_from_giveback == true`)
+        let gb_idx = chronological_trades
+            .iter()
+            .position(|r| {
+                r.tranche_count == 1
+                    && r.was_protected_from_giveback
+                    && r.giveback_ratchet_bar_offset > 0
+            })
+            .unwrap_or_else(|| {
+                chronological_trades
+                    .iter()
+                    .position(|r| r.was_protected_from_giveback && r.giveback_ratchet_bar_offset > 0)
+                    .expect("Expected at least 1 Stage 3 Profit-Giveback Ratchet trade")
+            });
+        let gb_row = &chronological_trades[gb_idx];
+        let paper_gb = setup_causal_paper_engine_at_trade(gb_idx);
+        let (inf_gb, prec_gb) = build_live_inference_for_row(gb_row);
+        let pre_bars_gb = gb_row.entry_bars[..=gb_row.entry_bar_idx].to_vec();
+        let _ = paper_gb.open_position_with_bars(
+            &gb_row.exchange_index,
+            &inf_gb,
+            &prec_gb,
+            10_000.0,
+            pre_bars_gb.clone(),
+        );
+        let total_post_bars_gb = gb_row
+            .entry_bars
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(gb_row.entry_bar_idx);
+        let mut live_stream_gb = pre_bars_gb;
+        let mut closed_gb = Vec::new();
+        for k in 1..=total_post_bars_gb {
+            live_stream_gb.push(gb_row.entry_bars[gb_row.entry_bar_idx + k]);
+            let newly = paper_gb.process_live_bar_for_symbol(
+                &gb_row.symbol,
+                &live_stream_gb,
+                &raw_fingerprint_core::RawMarketInternalsSnapshot::default(),
+            );
+            closed_gb.extend(newly);
+            if !closed_gb.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(closed_gb.len(), 1);
+        assert!(closed_gb[0].was_protected_from_giveback);
+        assert!(closed_gb[0].giveback_r_saved > 0.0);
+
+        println!(
+            "[PHASE 24.2 LIVE PAPER-TRADE PARITY VERIFIED] Stage 0 Veto: {} ({}) vetoed | Stage 1 Scratch: {} ({}) closed @ Bar +{} | Stage 2 Mid-Trade Stall: {} ({}) closed @ Bar +{} | Stage 3 Giveback Ratchet: {} ({}) saved +{:.2}R @ Bar +{} | Stage 3 House-Money Runner: {} ({}) scaled @ Bar +{:?} (+{:.2}R gained, {} Almgren-Chriss SOR slices)",
+            veto_row.symbol,
+            veto_row.brain_id.as_str(),
+            s1_row.symbol,
+            s1_row.brain_id.as_str(),
+            s1_row.scratch_bar_offset,
+            s2_row.symbol,
+            s2_row.brain_id.as_str(),
+            s2_row.scratch_bar_offset,
+            gb_row.symbol,
+            gb_row.brain_id.as_str(),
+            closed_gb[0].giveback_r_saved,
+            closed_gb[0].giveback_ratchet_bar_offset,
+            s3_row.symbol,
+            s3_row.brain_id.as_str(),
+            closed_s3[0].house_money_scale_bar_offset,
+            closed_s3[0].house_money_additional_r_gained,
+            staged_ticket.child_execution_slices.len(),
+        );
+    }
 }

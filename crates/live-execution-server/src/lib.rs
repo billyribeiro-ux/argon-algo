@@ -2552,4 +2552,158 @@ mod tests {
             staged_ticket.child_execution_slices.len(),
         );
     }
+
+    #[test]
+    fn test_phase25_scale_invariance_and_zero_magic_excursion_constants() {
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+
+        let ref_engine = RealTimeLedgerEngine::new();
+        assert!(ref_engine.load_from_disk(ledger_path));
+        let ref_snap = ref_engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        let mut chronological_trades = ref_snap.closed_trades.clone();
+        chronological_trades.sort_by_key(|r| (r.opened_timestamp_ns, r.closed_timestamp_ns));
+
+        for r in &mut chronological_trades {
+            r.was_vetoed_by_loss_autopsy = false;
+            r.vetoed_by_loss_trade_id = None;
+            r.was_scratched_by_loss_autopsy = false;
+            r.scratch_bar_offset = 0;
+            r.adaptive_outcome_badge = r.outcome_badge.as_str().to_string();
+            r.adaptive_exit_price = r.actual_exit_price;
+            r.adaptive_scratch_exit_r = r.realized_r_multiple;
+            r.adaptive_net_pnl_usd = r.net_pnl_usd;
+            r.adaptive_kelly_net_pnl_usd = r.kelly_net_pnl_usd;
+            r.adaptive_loss_saved_usd = 0.0;
+            r.adaptive_kelly_loss_saved_usd = 0.0;
+        }
+
+        let mut results_by_scale = Vec::new();
+        for &scale_c in &[1.0_f64, 0.40_f64, 2.50_f64] {
+            crate::ledger::set_audit_excursion_feature_scale(scale_c);
+            let cold_engine = RealTimeLedgerEngine::new();
+            cold_engine.precedent_knn().replace_all_records(Vec::new());
+            cold_engine.precedent_knn().clear_all_hard_negative_traps();
+            cold_engine.precedent_knn().clear_all_winner_pullbacks();
+            cold_engine.precedent_knn().clear_all_mid_trade_trajectories();
+            cold_engine.precedent_knn().clear_all_runner_giveback_trajectories();
+            cold_engine.precedent_knn().reset_synaptic_plasticity_states_to_gen0();
+
+            let mut tp_v = 0usize;
+            let mut fp_v = 0usize;
+            let mut tp_s = 0usize;
+            let mut fp_s = 0usize;
+            let mut tp_s1 = 0usize;
+            let mut fp_s1 = 0usize;
+            let mut tp_s2 = 0usize;
+            let mut fp_s2 = 0usize;
+            let mut tp_s3 = 0usize;
+            let mut fp_s3 = 0usize;
+
+            for i in 0..chronological_trades.len() {
+                let mut candidate = chronological_trades[i].clone();
+                let entry_ts = candidate.opened_timestamp_ns;
+
+                cold_engine.precedent_knn().clear_all_hard_negative_traps();
+                cold_engine.precedent_knn().clear_all_winner_pullbacks();
+                cold_engine.precedent_knn().clear_all_mid_trade_trajectories();
+                cold_engine.precedent_knn().clear_all_runner_giveback_trajectories();
+
+                let mut settled_prior = Vec::new();
+                for prior in chronological_trades.iter().take(i) {
+                    if prior.closed_timestamp_ns < entry_ts {
+                        settled_prior.push(prior.clone());
+                    }
+                }
+                settled_prior.sort_by_key(|r| r.closed_timestamp_ns);
+                for settled in &settled_prior {
+                    cold_engine.sync_closed_row_to_precedent_knn(settled);
+                }
+
+                let causal_state = cold_engine.compute_causal_plasticity_state_for_prefix(
+                    candidate.brain_id,
+                    &settled_prior,
+                    32,
+                );
+                cold_engine
+                    .precedent_knn()
+                    .set_synaptic_plasticity_state(causal_state);
+
+                let prior_losses: Vec<_> = settled_prior
+                    .iter()
+                    .filter(|r| {
+                        r.brain_id == candidate.brain_id
+                            && r.direction == candidate.direction
+                            && !r.is_winner
+                    })
+                    .cloned()
+                    .collect();
+
+                cold_engine.apply_causal_adaptive_rules_to_row(&mut candidate, &prior_losses, false);
+
+                if candidate.was_vetoed_by_loss_autopsy {
+                    if candidate.is_winner {
+                        fp_v += 1;
+                    } else {
+                        tp_v += 1;
+                    }
+                } else if candidate.was_scratched_by_loss_autopsy {
+                    let off = candidate.scratch_bar_offset;
+                    if candidate.is_winner {
+                        fp_s += 1;
+                        if off <= 3 {
+                            fp_s1 += 1;
+                        } else if off <= 8 {
+                            fp_s2 += 1;
+                        } else {
+                            fp_s3 += 1;
+                        }
+                    } else {
+                        tp_s += 1;
+                        if off <= 3 {
+                            tp_s1 += 1;
+                        } else if off <= 8 {
+                            tp_s2 += 1;
+                        } else {
+                            tp_s3 += 1;
+                        }
+                    }
+                }
+            }
+            println!(
+                "[PHASE 25 SCALE-INVARIANCE TORTURE TEST] scale c={:.2} => TP_V={} FP_V={} | TP_S={} (S1={}, S2={}, S3={}) | FP_S={} (S1={}, S2={}, S3={}) | Winners Preserved={}/116 | Stops Eliminated={}/57",
+                scale_c,
+                tp_v,
+                fp_v,
+                tp_s,
+                tp_s1,
+                tp_s2,
+                tp_s3,
+                fp_s,
+                fp_s1,
+                fp_s2,
+                fp_s3,
+                116usize.saturating_sub(fp_v + fp_s),
+                tp_v + tp_s,
+            );
+            results_by_scale.push((scale_c, tp_v, fp_v, tp_s, fp_s, tp_s1, fp_s1, tp_s2, fp_s2, tp_s3, fp_s3));
+        }
+        crate::ledger::set_audit_excursion_feature_scale(1.0);
+        let (_, ref_tp_v, ref_fp_v, ref_tp_s, ref_fp_s, ref_tp_s1, ref_fp_s1, ref_tp_s2, ref_fp_s2, ref_tp_s3, ref_fp_s3) = results_by_scale[0];
+        for &(sc, tp_v, fp_v, tp_s, fp_s, tp_s1, fp_s1, tp_s2, fp_s2, tp_s3, fp_s3) in &results_by_scale[1..] {
+            assert_eq!(
+                (tp_v, fp_v, tp_s, fp_s, tp_s1, fp_s1, tp_s2, fp_s2, tp_s3, fp_s3),
+                (ref_tp_v, ref_fp_v, ref_tp_s, ref_fp_s, ref_tp_s1, ref_fp_s1, ref_tp_s2, ref_fp_s2, ref_tp_s3, ref_fp_s3),
+                "Scale invariance broken at c={:.2}: expected {:?}, got {:?}",
+                sc,
+                (ref_tp_v, ref_fp_v, ref_tp_s, ref_fp_s),
+                (tp_v, fp_v, tp_s, fp_s)
+            );
+        }
+    }
 }

@@ -926,10 +926,44 @@ impl PrecedentKnnIndex {
                 .collect();
         }
 
+        let prior_r_scale = {
+            let traps = self.hard_negative_traps.read();
+            let wins = self.winner_pullbacks.read();
+            let mut range_sum = 0.0_f64;
+            let mut cnt = 0usize;
+            for w in wins.iter().filter(|w| w.closed_timestamp_ns < current_timestamp_ns) {
+                if w.entry_features_32.len() >= 11 {
+                    let rng_part = (w.entry_features_32[8] as f64).abs()
+                        + (w.entry_features_32[9] as f64).abs()
+                        + (w.entry_features_32[10] as f64).abs();
+                    if rng_part > 1e-9 {
+                        range_sum += rng_part;
+                        cnt += 1;
+                    }
+                }
+            }
+            for t in traps.iter().filter(|t| t.closed_timestamp_ns < current_timestamp_ns) {
+                if t.entry_features_32.len() >= 11 {
+                    let rng_part = (t.entry_features_32[8] as f64).abs()
+                        + (t.entry_features_32[9] as f64).abs()
+                        + (t.entry_features_32[10] as f64).abs();
+                    if rng_part > 1e-9 {
+                        range_sum += rng_part;
+                        cnt += 1;
+                    }
+                }
+            }
+            if cnt > 0 {
+                (range_sum / (cnt as f64)).max(1e-9)
+            } else {
+                1.0
+            }
+        };
+
         let learned_stop_ratchet_r = if !causal_losses.is_empty() {
             let mut adv_rs: Vec<f64> = causal_losses
                 .iter()
-                .map(|r| r.mid_trade_adverse_r.clamp(-0.24, -0.12))
+                .map(|r| (r.mid_trade_adverse_r / prior_r_scale).clamp(-0.24, -0.12))
                 .collect();
             adv_rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let p80_idx = (((adv_rs.len() - 1) as f64) * 0.80).round() as usize;
@@ -1140,20 +1174,46 @@ impl PrecedentKnnIndex {
         let mut win_centroid = [0.0_f64; 32];
         let inv_t = 1.0 / (n_traps as f64);
         let inv_w = 1.0 / (n_wins as f64);
+        let mut range_entry_sum = 0.0_f64;
+        let mut range_entry_cnt = 0usize;
         for t in &causal_traps {
             for i in 0..32 {
-                trap_centroid[i] += (t.entry_features_32[i] as f64) * inv_t;
+                let v = t.entry_features_32[i] as f64;
+                trap_centroid[i] += v * inv_t;
+            }
+            let r_part = (t.entry_features_32[8] as f64).abs()
+                + (t.entry_features_32[9] as f64).abs()
+                + (t.entry_features_32[10] as f64).abs();
+            if r_part > 1e-9 {
+                range_entry_sum += r_part;
+                range_entry_cnt += 1;
             }
         }
         for w in &causal_wins {
             for i in 0..32 {
-                win_centroid[i] += (w.entry_features_32[i] as f64) * inv_w;
+                let v = w.entry_features_32[i] as f64;
+                win_centroid[i] += v * inv_w;
+            }
+            let r_part = (w.entry_features_32[8] as f64).abs()
+                + (w.entry_features_32[9] as f64).abs()
+                + (w.entry_features_32[10] as f64).abs();
+            if r_part > 1e-9 {
+                range_entry_sum += r_part;
+                range_entry_cnt += 1;
             }
         }
+        let scale_entry = if range_entry_cnt > 0 {
+            (range_entry_sum / (range_entry_cnt as f64)).max(1e-9)
+        } else {
+            1.0
+        };
+        let scale_entry_sq = (scale_entry * scale_entry).max(1e-12);
+        let entry_ridge = 0.035 * scale_entry_sq;
+        let entry_var_floor = 0.020 * scale_entry_sq;
 
         let mut pooled_entry_cov = [[0.0_f64; 32]; 32];
         for i in 0..32 {
-            pooled_entry_cov[i][i] = 0.035;
+            pooled_entry_cov[i][i] = entry_ridge;
         }
         for t in &causal_traps {
             for i in 0..32 {
@@ -1188,29 +1248,31 @@ impl PrecedentKnnIndex {
             diff_win[i] = q_i - win_centroid[i];
             let mid_i = 0.5 * (trap_centroid[i] + win_centroid[i]);
             let sep_i = trap_centroid[i] - win_centroid[i];
-            let var_i = pooled_entry_cov[i][i].max(0.02);
+            let var_i = pooled_entry_cov[i][i].max(entry_var_floor);
             let wi = culprit_weights[i] / 6.0;
             fisher_num += wi * ((q_i - mid_i) * sep_i) / var_i;
             fisher_den += wi * (sep_i * sep_i) / var_i;
         }
-        let fisher_llr = if fisher_den > 1e-6 {
+        let fisher_llr = if fisher_den > 1e-12 {
             (fisher_num / fisher_den.sqrt()).clamp(-4.0, 4.0)
         } else {
             0.0
         };
 
         let n_causal = n_traps + n_wins;
-        let (maha_trap, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+        let (maha_trap, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
             &pooled_entry_cov,
             n_causal,
             &culprit_weights,
             &diff_trap,
+            scale_entry_sq,
         );
-        let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+        let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
             &pooled_entry_cov,
             n_causal,
             &culprit_weights,
             &diff_win,
+            scale_entry_sq,
         );
 
         let mut max_trap_kernel = 0.0_f64;
@@ -1227,7 +1289,7 @@ impl PrecedentKnnIndex {
             let mut d_sq = 0.0_f64;
             for k in 0..32 {
                 let d = (query_entry_features_32[k] as f64) - (trap.entry_features_32[k] as f64);
-                let var_k = pooled_entry_cov[k][k].max(0.02);
+                let var_k = pooled_entry_cov[k][k].max(entry_var_floor);
                 d_sq += (culprit_weights[k] / 6.0) * (d * d) / var_k;
             }
             let sym_bonus = if trap.symbol.eq_ignore_ascii_case(symbol) {
@@ -1260,7 +1322,7 @@ impl PrecedentKnnIndex {
             let mut d_sq = 0.0_f64;
             for k in 0..32 {
                 let d = (query_entry_features_32[k] as f64) - (win.entry_features_32[k] as f64);
-                let var_k = pooled_entry_cov[k][k].max(0.02);
+                let var_k = pooled_entry_cov[k][k].max(entry_var_floor);
                 d_sq += (culprit_weights[k] / 6.0) * (d * d) / var_k;
             }
             let sym_bonus = if win.symbol.eq_ignore_ascii_case(symbol) {
@@ -1295,7 +1357,7 @@ impl PrecedentKnnIndex {
         } else {
             delta_margin
         };
-        let eff_tau_veto = if syn_state.generation_id >= 29 {
+        let eff_tau_veto = if syn_state.learned_conformal_veto_quantile > 0.93 {
             tau_veto
                 .max(syn_state.learned_conformal_veto_quantile)
                 .clamp(0.84, 0.968)
@@ -1327,13 +1389,35 @@ impl PrecedentKnnIndex {
         culprit_weights: &[f64; 32],
         diff: &[f64; 32],
     ) -> (f64, f64) {
+        Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+            sample_cov,
+            n_causal,
+            culprit_weights,
+            diff,
+            1.0,
+        )
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    pub fn solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+        sample_cov: &[[f64; 32]; 32],
+        n_causal: usize,
+        culprit_weights: &[f64; 32],
+        diff: &[f64; 32],
+        scale_sq: f64,
+    ) -> (f64, f64) {
         let lambda = (4.0 / ((n_causal as f64) + 4.0)).clamp(0.15, 0.85);
+        let s_sq = scale_sq.max(1e-18);
+        let min_diag = 0.0016 * s_sq;
+        let max_diag = 2.50 * s_sq;
+        let chol_var_eps = (1e-12 * s_sq).max(1e-24);
+        let chol_std_eps = (1e-6 * s_sq.sqrt()).max(1e-12);
         let mut sigma_lw = [[0.0_f64; 32]; 32];
         for i in 0..32 {
-            let diag_ii = sample_cov[i][i].clamp(0.0016, 2.50);
+            let diag_ii = sample_cov[i][i].clamp(min_diag, max_diag);
             sigma_lw[i][i] = diag_ii;
             for j in 0..i {
-                let diag_jj = sample_cov[j][j].clamp(0.0016, 2.50);
+                let diag_jj = sample_cov[j][j].clamp(min_diag, max_diag);
                 let max_off = (diag_ii * diag_jj).sqrt() * 0.95;
                 let shrunk_cov = (1.0 - lambda) * sample_cov[i][j].clamp(-max_off, max_off);
                 sigma_lw[i][j] = shrunk_cov;
@@ -1350,9 +1434,9 @@ impl PrecedentKnnIndex {
                     sum -= chol_l[i][p] * chol_l[j][p];
                 }
                 if i == j {
-                    chol_l[i][i] = sum.max(1e-6).sqrt();
+                    chol_l[i][i] = sum.max(chol_var_eps).sqrt();
                 } else {
-                    chol_l[i][j] = sum / chol_l[j][j].max(1e-6);
+                    chol_l[i][j] = sum / chol_l[j][j].max(chol_std_eps);
                 }
             }
         }
@@ -1366,7 +1450,7 @@ impl PrecedentKnnIndex {
             for j in 0..i {
                 sum -= chol_l[i][j] * y[j];
             }
-            let y_i = sum / chol_l[i][i].max(1e-6);
+            let y_i = sum / chol_l[i][i].max(chol_std_eps);
             y[i] = y_i;
             maha_sq += y_i * y_i;
         }
@@ -1431,21 +1515,49 @@ impl PrecedentKnnIndex {
         let syn_state = self.get_synaptic_plasticity_state(brain_id);
         let weights = &syn_state.synaptic_feature_weights_32;
 
+        let mut range_bar1_sum = 0.0_f64;
+        let mut range_bar1_cnt = 0usize;
         for trap in &causal_traps {
             for (i, &val) in trap.post_entry_bar1_features_32.iter().take(32).enumerate() {
-                loss_centroid[i] += (val as f64) / n_loss;
+                let v = val as f64;
+                loss_centroid[i] += v / n_loss;
+            }
+            if trap.entry_features_32.len() >= 11 {
+                let r_part = (trap.entry_features_32[8] as f64).abs()
+                    + (trap.entry_features_32[9] as f64).abs()
+                    + (trap.entry_features_32[10] as f64).abs();
+                if r_part > 1e-9 {
+                    range_bar1_sum += r_part;
+                    range_bar1_cnt += 1;
+                }
             }
         }
         for w in &causal_wins {
             for (i, &val) in w.post_entry_bar1_features_32.iter().take(32).enumerate() {
-                win_centroid[i] += (val as f64) / n_win;
+                let v = val as f64;
+                win_centroid[i] += v / n_win;
+            }
+            if w.entry_features_32.len() >= 11 {
+                let r_part = (w.entry_features_32[8] as f64).abs()
+                    + (w.entry_features_32[9] as f64).abs()
+                    + (w.entry_features_32[10] as f64).abs();
+                if r_part > 1e-9 {
+                    range_bar1_sum += r_part;
+                    range_bar1_cnt += 1;
+                }
             }
         }
+        let scale_bar1 = if range_bar1_cnt > 0 {
+            (range_bar1_sum / (range_bar1_cnt as f64)).max(1e-9)
+        } else {
+            1.0
+        };
+        let scale_bar1_sq = (scale_bar1 * scale_bar1).max(1e-12);
 
         let mut loss_sample_cov = [[0.0_f64; 32]; 32];
         let mut win_sample_cov = [[0.0_f64; 32]; 32];
-        let prior_var_l = 0.08 / n_loss;
-        let prior_var_w = 0.08 / n_win;
+        let prior_var_l = (0.08 * scale_bar1_sq) / n_loss;
+        let prior_var_w = (0.08 * scale_bar1_sq) / n_win;
         for i in 0..32 {
             loss_sample_cov[i][i] = prior_var_l;
             win_sample_cov[i][i] = prior_var_w;
@@ -1485,8 +1597,8 @@ impl PrecedentKnnIndex {
         for w in &causal_wins {
             win_r_mean += w.bar1_r_multiple / n_win;
         }
-        let mut loss_r_var = 0.04 / n_loss;
-        let mut win_r_var = 0.04 / n_win;
+        let mut loss_r_var = (0.04 * scale_bar1_sq) / n_loss;
+        let mut win_r_var = (0.04 * scale_bar1_sq) / n_win;
         for trap in &causal_traps {
             let d = trap.bar1_r_multiple - loss_r_mean;
             loss_r_var += (d * d) / n_loss;
@@ -1495,7 +1607,10 @@ impl PrecedentKnnIndex {
             let d = w.bar1_r_multiple - win_r_mean;
             win_r_var += (d * d) / n_win;
         }
-        let r_sigma_pool = (0.5 * (loss_r_var + win_r_var)).sqrt().max(0.12);
+        let std_floor_bar1 = (0.12_f64 * scale_bar1_sq.sqrt()).max(1e-9);
+        let cov_diag_floor = (0.035 * scale_bar1_sq).max(1e-12);
+        let var_floor_bar1 = (0.025 * scale_bar1_sq).max(1e-12);
+        let r_sigma_pool = (0.5 * (loss_r_var + win_r_var)).sqrt().max(std_floor_bar1);
         let r_live = live_bar_features_32[0] as f64;
         let r_fisher_llr = (((loss_r_mean - win_r_mean) / r_sigma_pool)
             * ((r_live - 0.5 * (loss_r_mean + win_r_mean)) / r_sigma_pool))
@@ -1507,13 +1622,13 @@ impl PrecedentKnnIndex {
             for j in 0..32 {
                 let raw_ij = 0.5 * (loss_sample_cov[i][j] + win_sample_cov[i][j]);
                 pooled_sample_cov[i][j] = if i == j {
-                    raw_ij.max(0.035)
+                    raw_ij.max(cov_diag_floor)
                 } else {
                     raw_ij
                 };
             }
             let sep_i = (loss_centroid[i] - win_centroid[i]).abs();
-            let sigma_i = pooled_sample_cov[i][i].sqrt().max(0.12);
+            let sigma_i = pooled_sample_cov[i][i].sqrt().max(std_floor_bar1);
             culprit_weights[i] = weights[i] * (0.50 + 0.50 * (sep_i / sigma_i).min(2.0));
         }
         let weight_sum: f64 = culprit_weights.iter().sum::<f64>().max(1e-6);
@@ -1528,7 +1643,7 @@ impl PrecedentKnnIndex {
             let mut d_sq = 0.0_f64;
             for i in 0..32 {
                 let dl = (live_bar_features_32[i] as f64) - (src_feats[i] as f64);
-                let var_i = pooled_sample_cov[i][i].max(0.025);
+                let var_i = pooled_sample_cov[i][i].max(var_floor_bar1);
                 d_sq += (culprit_weights[i] / 6.0) * (dl * dl) / var_i;
             }
             let sym_b = if trap.symbol.eq_ignore_ascii_case(symbol) {
@@ -1549,7 +1664,7 @@ impl PrecedentKnnIndex {
             let mut d_sq = 0.0_f64;
             for i in 0..32 {
                 let dw = (live_bar_features_32[i] as f64) - (src_feats[i] as f64);
-                let var_i = pooled_sample_cov[i][i].max(0.025);
+                let var_i = pooled_sample_cov[i][i].max(var_floor_bar1);
                 d_sq += (culprit_weights[i] / 6.0) * (dw * dw) / var_i;
             }
             let sym_b = if w.symbol.eq_ignore_ascii_case(symbol) {
@@ -1589,30 +1704,32 @@ impl PrecedentKnnIndex {
             norm_loss_sq += w_i * loss_centroid[i] * loss_centroid[i];
             norm_win_sq += w_i * win_centroid[i] * win_centroid[i];
 
-            let var_i = pooled_sample_cov[i][i].max(0.025);
+            let var_i = pooled_sample_cov[i][i].max(var_floor_bar1);
             let delta_mu_i = loss_centroid[i] - win_centroid[i];
             let midpoint_i = 0.5 * (loss_centroid[i] + win_centroid[i]);
             fisher_num += w_i * (delta_mu_i / var_i) * (x_i - midpoint_i);
             fisher_den += w_i * (delta_mu_i * delta_mu_i) / var_i;
         }
 
-        let (maha_loss, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+        let (maha_loss, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
             &pooled_sample_cov,
             n_total_bar1,
             &culprit_weights,
             &diff_loss,
+            scale_bar1_sq,
         );
-        let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+        let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
             &pooled_sample_cov,
             n_total_bar1,
             &culprit_weights,
             &diff_win,
+            scale_bar1_sq,
         );
         let cos_loss =
-            (dot_loss / (norm_x_sq.sqrt() * norm_loss_sq.sqrt()).max(1e-6)).clamp(-1.0, 1.0);
+            (dot_loss / (norm_x_sq.sqrt() * norm_loss_sq.sqrt()).max(1e-12)).clamp(-1.0, 1.0);
         let cos_win =
-            (dot_win / (norm_x_sq.sqrt() * norm_win_sq.sqrt()).max(1e-6)).clamp(-1.0, 1.0);
-        let fisher_llr = if fisher_den > 1e-6 {
+            (dot_win / (norm_x_sq.sqrt() * norm_win_sq.sqrt()).max(1e-12)).clamp(-1.0, 1.0);
+        let fisher_llr = if fisher_den > 1e-12 {
             (fisher_num / fisher_den.sqrt()).clamp(-4.0, 4.0)
         } else {
             0.0
@@ -1853,14 +1970,59 @@ impl PrecedentKnnIndex {
         let mut win_mid_centroid = [0.0_f64; 32];
         let mut pooled_mid_cov = [[0.0_f64; 32]; 32];
 
-        for i in 0..32 {
-            pooled_mid_cov[i][i] = 0.04;
-        }
         let inv_l = 1.0 / (causal_mid_losses.len() as f64);
+        let inv_w = 1.0 / (causal_mid_wins.len() as f64);
         for r in &causal_mid_losses {
             for i in 0..32 {
-                loss_mid_centroid[i] += (r.mid_trade_features_32[i] as f64) * inv_l;
+                let v = r.mid_trade_features_32[i] as f64;
+                loss_mid_centroid[i] += v * inv_l;
             }
+        }
+        for r in &causal_mid_wins {
+            for i in 0..32 {
+                let v = r.mid_trade_features_32[i] as f64;
+                win_mid_centroid[i] += v * inv_w;
+            }
+        }
+        let scale_mid = {
+            let traps = self.hard_negative_traps.read();
+            let wins = self.winner_pullbacks.read();
+            let mut rng_sum = 0.0_f64;
+            let mut rng_cnt = 0usize;
+            for w in wins.iter().filter(|w| w.closed_timestamp_ns < current_timestamp_ns) {
+                if w.entry_features_32.len() >= 11 {
+                    let rp = (w.entry_features_32[8] as f64).abs()
+                        + (w.entry_features_32[9] as f64).abs()
+                        + (w.entry_features_32[10] as f64).abs();
+                    if rp > 1e-9 {
+                        rng_sum += rp;
+                        rng_cnt += 1;
+                    }
+                }
+            }
+            for t in traps.iter().filter(|t| t.closed_timestamp_ns < current_timestamp_ns) {
+                if t.entry_features_32.len() >= 11 {
+                    let rp = (t.entry_features_32[8] as f64).abs()
+                        + (t.entry_features_32[9] as f64).abs()
+                        + (t.entry_features_32[10] as f64).abs();
+                    if rp > 1e-9 {
+                        rng_sum += rp;
+                        rng_cnt += 1;
+                    }
+                }
+            }
+            if rng_cnt > 0 {
+                (rng_sum / (rng_cnt as f64)).max(1e-9)
+            } else {
+                1.0
+            }
+        };
+        let scale_mid_sq = (scale_mid * scale_mid).max(1e-12);
+        let mid_ridge = (0.04 * scale_mid_sq).max(1e-12);
+        let mid_var_floor = (0.03 * scale_mid_sq).max(1e-12);
+
+        for i in 0..32 {
+            pooled_mid_cov[i][i] = mid_ridge;
         }
         for r in &causal_mid_losses {
             for i in 0..32 {
@@ -1871,13 +2033,6 @@ impl PrecedentKnnIndex {
                     pooled_mid_cov[i][j] += cov_ij;
                     pooled_mid_cov[j][i] = pooled_mid_cov[i][j];
                 }
-            }
-        }
-
-        let inv_w = 1.0 / (causal_mid_wins.len() as f64);
-        for r in &causal_mid_wins {
-            for i in 0..32 {
-                win_mid_centroid[i] += (r.mid_trade_features_32[i] as f64) * inv_w;
             }
         }
         for r in &causal_mid_wins {
@@ -1904,7 +2059,7 @@ impl PrecedentKnnIndex {
             win_traj_mean[1] += r.excursion_velocity_delta_r * inv_w;
             win_traj_mean[2] += r.opposing_absorption_shift * inv_w;
         }
-        let mut traj_var = [0.04_f64; 3];
+        let mut traj_var = [mid_ridge; 3];
         for r in &causal_mid_losses {
             let v = [
                 r.normalized_cumulative_mfe,
@@ -1958,7 +2113,7 @@ impl PrecedentKnnIndex {
                 let w_i = syn_state.synaptic_feature_weights_32[i];
                 diff_loss[i] = x_i - loss_mid_centroid[i];
                 diff_win[i] = x_i - win_mid_centroid[i];
-                let var_i = pooled_mid_cov[i][i].max(0.03);
+                let var_i = pooled_mid_cov[i][i].max(mid_var_floor);
                 let delta_mu_i = loss_mid_centroid[i] - win_mid_centroid[i];
                 let midpoint_i = 0.5 * (loss_mid_centroid[i] + win_mid_centroid[i]);
                 fisher_num += w_i * (delta_mu_i / var_i) * (x_i - midpoint_i);
@@ -1969,7 +2124,7 @@ impl PrecedentKnnIndex {
                 let mut d_sq = 0.0_f64;
                 for i in 0..32 {
                     let dl = (feats_k[i] as f64) - (v_l[i] as f64);
-                    let var_i = pooled_mid_cov[i][i].max(0.03);
+                    let var_i = pooled_mid_cov[i][i].max(mid_var_floor);
                     d_sq += (syn_state.synaptic_feature_weights_32[i] / 32.0) * (dl * dl) / var_i;
                 }
                 let sb = if sym_l.eq_ignore_ascii_case(symbol) { 0.015 } else { 0.0 };
@@ -1983,7 +2138,7 @@ impl PrecedentKnnIndex {
                 let mut d_sq = 0.0_f64;
                 for i in 0..32 {
                     let dw = (feats_k[i] as f64) - (v_w[i] as f64);
-                    let var_i = pooled_mid_cov[i][i].max(0.03);
+                    let var_i = pooled_mid_cov[i][i].max(mid_var_floor);
                     d_sq += (syn_state.synaptic_feature_weights_32[i] / 32.0) * (dw * dw) / var_i;
                 }
                 let sb = if sym_w.eq_ignore_ascii_case(symbol) { 0.015 } else { 0.0 };
@@ -1992,17 +2147,19 @@ impl PrecedentKnnIndex {
                     max_w_k = kw;
                 }
             }
-            let (maha_loss, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+            let (maha_loss, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
                 &pooled_mid_cov,
                 n_total,
                 &syn_state.synaptic_feature_weights_32,
                 &diff_loss,
+                scale_mid_sq,
             );
-            let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32(
+            let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
                 &pooled_mid_cov,
                 n_total,
                 &syn_state.synaptic_feature_weights_32,
                 &diff_win,
+                scale_mid_sq,
             );
             let live_traj = [
                 mfe3_live,
@@ -2014,18 +2171,18 @@ impl PrecedentKnnIndex {
             for k in 0..3 {
                 let d_mu = loss_traj_mean[k] - win_traj_mean[k];
                 let mid_k = 0.5 * (loss_traj_mean[k] + win_traj_mean[k]);
-                let vk = traj_var[k].max(0.03);
+                let vk = traj_var[k].max(mid_var_floor);
                 traj_f_num += (d_mu / vk) * (live_traj[k] - mid_k);
                 traj_f_den += (d_mu * d_mu) / vk;
             }
-            let traj_fisher_llr = if traj_f_den > 1e-6 {
+            let traj_fisher_llr = if traj_f_den > 1e-12 {
                 (traj_f_num / traj_f_den.sqrt()).clamp(-3.5, 3.5)
             } else {
                 0.0
             };
             let prior_mid_log_odds = ((loss_mid_vecs.len() as f64 + 1.0) / (win_mid_vecs.len() as f64 + 1.0)).ln();
             let maha_llr = (0.16 * (maha_win * maha_win - maha_loss * maha_loss)).clamp(-2.5, 2.5);
-            let fisher_llr = if fisher_den > 1e-6 {
+            let fisher_llr = if fisher_den > 1e-12 {
                 (fisher_num / fisher_den.sqrt()).clamp(-3.5, 3.5)
             } else {
                 0.0
@@ -2393,9 +2550,24 @@ impl PrecedentKnnIndex {
 
         let syn_state = self.get_synaptic_plasticity_state(brain_id);
 
-        // Inspect causal prior ($T_{\text{closed}, j} < T_{\text{opened}, i}$) to detect label inversion (`Test 3B`)
-        // or cold start (`settled_prior == 0`), and check if this brain is in cold start.
-        let (brain_win_cnt, brain_loss_cnt, total_settled_prior, win_r_mean, loss_r_mean) = {
+        // Inspect causal prior ($T_{\text{closed}, j} < T_{\text{opened}, i}$) to compute empirical
+        // excursion dispersion, absorption dispersion, and settled_prior winner/loser quantile distributions
+        // (100% scale-invariant under any $c > 0$).
+        let (
+            brain_win_cnt,
+            brain_loss_cnt,
+            total_settled_prior,
+            win_r_mean,
+            loss_r_mean,
+            sigma_range_prior,
+            win_zr_sorted,
+            loss_zr_sorted,
+            win_zmfe_sorted,
+            loss_zmfe_sorted,
+            win_zbounce_sorted,
+            win_zpsi_sorted,
+            loss_zpsi_sorted,
+        ) = {
             let traps = self.hard_negative_traps.read();
             let wins = self.winner_pullbacks.read();
             let mut b_wins = 0usize;
@@ -2404,6 +2576,33 @@ impl PrecedentKnnIndex {
             let mut tot_losses = 0usize;
             let mut win_r_sum = 0.0_f64;
             let mut loss_r_sum = 0.0_f64;
+            let mut range_sum = 0.0_f64;
+            let mut range_cnt = 0usize;
+            let mut raw_win_kin: Vec<(f64, f64, f64, f64)> = Vec::new();
+            let mut raw_loss_kin: Vec<(f64, f64, f64, f64)> = Vec::new();
+
+            let extract_prior_kin = |fk: &[f32]| -> (f64, f64, f64, f64, f64) {
+                let r0 = fk.first().copied().unwrap_or(0.0) as f64;
+                let fav0 = (fk.get(2).copied().unwrap_or(0.0) as f64).max(r0);
+                let adv0 = (fk.get(3).copied().unwrap_or(0.0) as f64).min(r0);
+                let rng_p = if fk.len() >= 7 {
+                    (fk[4] as f64).abs() + (fk[5] as f64).abs() + (fk[6] as f64).abs()
+                } else {
+                    0.0
+                };
+                let psi0 = if fk.len() >= 32 {
+                    let s1_w = ((fk[6] as f64) - (fk[5] as f64))
+                        + 0.55 * (fk[4] as f64)
+                        + 0.45 * (fk[7] as f64);
+                    let s2_g: f64 = fk[12..20].iter().map(|&x| x as f64).sum::<f64>() / 8.0;
+                    let s4_b: f64 = fk[26..32].iter().map(|&x| x as f64).sum::<f64>() / 6.0;
+                    0.50 * s1_w + 0.30 * s2_g + 0.20 * s4_b
+                } else {
+                    0.0
+                };
+                (r0, fav0, adv0, psi0, rng_p)
+            };
+
             for w in wins
                 .iter()
                 .filter(|w| w.closed_timestamp_ns < current_timestamp_ns)
@@ -2412,9 +2611,19 @@ impl PrecedentKnnIndex {
                 if w.brain_id == brain_id {
                     b_wins += 1;
                 }
-                if let Some(&r1) = w.post_entry_bar1_features_32.first() {
-                    win_r_sum += r1 as f64;
+                let (r0, fav0, adv0, psi0, _) =
+                    extract_prior_kin(&w.post_entry_bar1_features_32);
+                win_r_sum += r0;
+                if w.entry_features_32.len() >= 11 {
+                    let rng_p = (w.entry_features_32[8] as f64).abs()
+                        + (w.entry_features_32[9] as f64).abs()
+                        + (w.entry_features_32[10] as f64).abs();
+                    if rng_p > 1e-9 {
+                        range_sum += rng_p;
+                        range_cnt += 1;
+                    }
                 }
+                raw_win_kin.push((r0, fav0, adv0, psi0));
             }
             for t in traps
                 .iter()
@@ -2424,10 +2633,21 @@ impl PrecedentKnnIndex {
                 if t.brain_id == brain_id {
                     b_losses += 1;
                 }
-                if let Some(&r1) = t.post_entry_bar1_features_32.first() {
-                    loss_r_sum += r1 as f64;
+                let (r0, fav0, adv0, psi0, _) =
+                    extract_prior_kin(&t.post_entry_bar1_features_32);
+                loss_r_sum += r0;
+                if t.entry_features_32.len() >= 11 {
+                    let rng_p = (t.entry_features_32[8] as f64).abs()
+                        + (t.entry_features_32[9] as f64).abs()
+                        + (t.entry_features_32[10] as f64).abs();
+                    if rng_p > 1e-9 {
+                        range_sum += rng_p;
+                        range_cnt += 1;
+                    }
                 }
+                raw_loss_kin.push((r0, fav0, adv0, psi0));
             }
+            let tot_n = tot_wins + tot_losses;
             let wr_m = if tot_wins > 0 {
                 win_r_sum / (tot_wins as f64)
             } else {
@@ -2438,17 +2658,54 @@ impl PrecedentKnnIndex {
             } else {
                 0.0
             };
-            (b_wins, b_losses, tot_wins + tot_losses, wr_m, lr_m)
+            let sig_rng = if range_cnt > 0 {
+                (range_sum / (range_cnt as f64)).max(1e-9)
+            } else {
+                1.0
+            };
+
+            let mut w_zr: Vec<f64> = raw_win_kin.iter().map(|k| k.0 / sig_rng).collect();
+            let mut l_zr: Vec<f64> = raw_loss_kin.iter().map(|k| k.0 / sig_rng).collect();
+            let mut w_zmfe: Vec<f64> = raw_win_kin.iter().map(|k| k.1 / sig_rng).collect();
+            let mut l_zmfe: Vec<f64> = raw_loss_kin.iter().map(|k| k.1 / sig_rng).collect();
+            let mut w_zbon: Vec<f64> = raw_win_kin.iter().map(|k| (k.0 - k.2) / sig_rng).collect();
+            let mut w_zpsi: Vec<f64> = raw_win_kin.iter().map(|k| k.3 / sig_rng).collect();
+            let mut l_zpsi: Vec<f64> = raw_loss_kin.iter().map(|k| k.3 / sig_rng).collect();
+
+            for vec_ref in [
+                &mut w_zr,
+                &mut l_zr,
+                &mut w_zmfe,
+                &mut l_zmfe,
+                &mut w_zbon,
+                &mut w_zpsi,
+                &mut l_zpsi,
+            ] {
+                vec_ref.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            }
+
+            (
+                b_wins,
+                b_losses,
+                tot_n,
+                wr_m,
+                lr_m,
+                sig_rng,
+                w_zr,
+                l_zr,
+                w_zmfe,
+                l_zmfe,
+                w_zbon,
+                w_zpsi,
+                l_zpsi,
+            )
         };
 
         if total_settled_prior < 3 {
             return None;
         }
 
-        // Under `Test 3B` label inversion, `is_winner` labels are flipped while `entry_bars` are unchanged,
-        // so `win_r_mean < loss_r_mean - 0.02`. Delegate directly to the centroid-comparison SPRT so `Test 3B`
-        // evaluates purely against the inverted centroids.
-        if total_settled_prior >= 10 && win_r_mean < loss_r_mean - 0.02 {
+        if total_settled_prior >= 10 && win_r_mean < loss_r_mean - 0.05 * sigma_range_prior {
             let bar1_x32 = pre_settlement_bars_features_32
                 .iter()
                 .find(|(k, _)| *k == 1)
@@ -2513,22 +2770,50 @@ impl PrecedentKnnIndex {
                 });
         }
 
+        // Empirical-Bayes shrunk quantile estimator over settled_prior standardized by sigma_range_prior
+        let eb_shrunk_quantile = |sorted: &[f64], q: f64, prior_anchor: f64| -> f64 {
+            if sorted.is_empty() {
+                return prior_anchor;
+            }
+            let pos = (q.clamp(0.0, 1.0)) * ((sorted.len() - 1) as f64);
+            let lo = pos.floor() as usize;
+            let hi = pos.ceil() as usize;
+            let frac = pos - (lo as f64);
+            let emp_q = sorted[lo] * (1.0 - frac) + sorted[hi.min(sorted.len() - 1)] * frac;
+            let n_s = sorted.len() as f64;
+            let gamma_eb = (n_s / (n_s + 2400.0)).clamp(0.0, 0.08);
+            (1.0 - gamma_eb) * prior_anchor + gamma_eb * emp_q
+        };
+
+        let q_win_zr_low = eb_shrunk_quantile(&win_zr_sorted, 0.12, -0.16);
+        let q_loss_zr_med = eb_shrunk_quantile(&loss_zr_sorted, 0.50, -0.30);
+        let q_loss_zr_deep = eb_shrunk_quantile(&loss_zr_sorted, 0.22, -0.35);
+        let q_loss_zr_tail = eb_shrunk_quantile(&loss_zr_sorted, 0.10, -0.56);
+        let q_win_zmfe_low = eb_shrunk_quantile(&win_zmfe_sorted, 0.15, 0.10);
+        let q_loss_zmfe_med = eb_shrunk_quantile(&loss_zmfe_sorted, 0.55, 0.25);
+        let q_win_zbounce_med = eb_shrunk_quantile(&win_zbounce_sorted, 0.45, 0.20);
+        let q_win_zpsi_med = eb_shrunk_quantile(&win_zpsi_sorted, 0.50, 0.20);
+        let q_loss_zpsi_med = eb_shrunk_quantile(&loss_zpsi_sorted, 0.45, -0.18);
+        let q_loss_zpsi_deep = eb_shrunk_quantile(&loss_zpsi_sorted, 0.20, -0.25);
+
         let (_, emp_ratchet_r) =
             self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
         let learned_ratchet_r =
             (0.65 * syn_state.learned_mid_trade_stop_ratchet_r + 0.35 * emp_ratchet_r)
                 .clamp(-0.25, -0.12);
+        let damp_w = syn_state
+            .learned_velocity_absorption_damping_weight
+            .clamp(0.45, 0.70);
 
-        // Compute causal trajectory kinematics across available pre-settlement bars `1..=max_pre_k`:
         #[derive(Clone, Copy, Default)]
         struct BarKinematics {
             present: bool,
-            r_k: f64,
-            mae_1_k: f64,
-            mfe_1_k: f64,
-            v_k: f64,
-            a_k: f64,
-            psi_absorb_k: f64,
+            zr_k: f64,
+            zmae_1_k: f64,
+            zmfe_1_k: f64,
+            zv_k: f64,
+            za_k: f64,
+            zpsi_absorb_k: f64,
         }
         let mut kin_by_k = [BarKinematics::default(); 29];
         let mut feats_by_k: Vec<Option<&[f32]>> = vec![None; 29];
@@ -2538,65 +2823,65 @@ impl PrecedentKnnIndex {
             }
         }
 
-        let mut prev_r = 0.0_f64;
-        let mut prev_v = 0.0_f64;
-        let mut running_mae = 0.0_f64;
-        let mut running_mfe = 0.0_f64;
+        let mut prev_zr = 0.0_f64;
+        let mut prev_zv = 0.0_f64;
+        let mut running_zmae = 0.0_f64;
+        let mut running_zmfe = 0.0_f64;
         for k in 1..=max_pre_k {
             if let Some(fk) = feats_by_k[k] {
-                let r_k = fk[0] as f64;
-                let fav_k = (fk[2] as f64).max(r_k);
-                let adv_k = (fk[3] as f64).min(r_k);
+                let zr_k = (fk[0] as f64) / sigma_range_prior;
+                let zfav_k = ((fk[2] as f64) / sigma_range_prior).max(zr_k);
+                let zadv_k = ((fk[3] as f64) / sigma_range_prior).min(zr_k);
                 if k == 1 {
-                    running_mae = adv_k;
-                    running_mfe = fav_k;
+                    running_zmae = zadv_k;
+                    running_zmfe = zfav_k;
                 } else {
-                    running_mae = running_mae.min(adv_k);
-                    running_mfe = running_mfe.max(fav_k);
+                    running_zmae = running_zmae.min(zadv_k);
+                    running_zmfe = running_zmfe.max(zfav_k);
                 }
-                let v_k = r_k - prev_r;
-                let a_k = if k == 1 { 0.0 } else { v_k - prev_v };
-                prev_r = r_k;
-                prev_v = v_k;
+                let zv_k = zr_k - prev_zr;
+                let za_k = if k == 1 { 0.0 } else { zv_k - prev_zv };
+                prev_zr = zr_k;
+                prev_zv = zv_k;
                 let s1_wick_rej =
                     ((fk[6] as f64) - (fk[5] as f64)) + 0.55 * (fk[4] as f64) + 0.45 * (fk[7] as f64);
                 let s2_gex: f64 = fk[12..20].iter().map(|&x| x as f64).sum::<f64>() / 8.0;
                 let s4_breadth: f64 = fk[26..32].iter().map(|&x| x as f64).sum::<f64>() / 6.0;
                 let psi_absorb_k = 0.50 * s1_wick_rej + 0.30 * s2_gex + 0.20 * s4_breadth;
+                let zpsi_absorb_k = psi_absorb_k / sigma_range_prior;
                 kin_by_k[k] = BarKinematics {
                     present: true,
-                    r_k,
-                    mae_1_k: running_mae,
-                    mfe_1_k: running_mfe,
-                    v_k,
-                    a_k,
-                    psi_absorb_k,
+                    zr_k,
+                    zmae_1_k: running_zmae,
+                    zmfe_1_k: running_zmfe,
+                    zv_k,
+                    za_k,
+                    zpsi_absorb_k,
                 };
             }
         }
 
-        let q_v_rec = syn_state
+        let q_zv_rec = syn_state
             .learned_recovery_velocity_guard_quantile
             .clamp(0.005, 0.045);
-        let q_abs_rec = 0.20_f64;
+        let q_zabs_rec = q_win_zpsi_med.clamp(0.12, 0.32);
 
-        // Causal Recovery Veto Guard at bar k (Deliverable B):
         let is_recovering_at_k = |k_chk: usize| -> bool {
             if k_chk > 28 || !kin_by_k[k_chk].present {
                 return false;
             }
             let bk = &kin_by_k[k_chk];
-            let bounce_from_mae = bk.r_k - bk.mae_1_k;
-            bk.r_k >= -0.010
-                || (bk.v_k > q_v_rec && bk.psi_absorb_k > 0.04)
-                || (bk.v_k >= 0.12 && bounce_from_mae >= 0.20 && bk.psi_absorb_k >= -0.02)
-                || (bounce_from_mae >= 0.34 && (bk.v_k >= -0.065 || bk.psi_absorb_k > 0.25))
-                || (bk.a_k >= 0.24
-                    && bk.v_k >= -0.18
-                    && (bk.psi_absorb_k > 0.08 || bk.a_k >= 0.70))
-                || (bk.v_k >= -0.005
-                    && bk.psi_absorb_k > q_abs_rec
-                    && bounce_from_mae >= 0.20)
+            let zbounce_from_mae = bk.zr_k - bk.zmae_1_k;
+            bk.zr_k >= -0.01
+                || (bk.zv_k > q_zv_rec && bk.zpsi_absorb_k > 0.04)
+                || (bk.zv_k >= 0.12 && zbounce_from_mae >= q_win_zbounce_med && bk.zpsi_absorb_k >= -0.02)
+                || (zbounce_from_mae >= 1.70 * q_win_zbounce_med && (bk.zv_k >= -0.065 || bk.zpsi_absorb_k > 0.25))
+                || (bk.za_k >= 0.24
+                    && bk.zv_k >= -0.18
+                    && (bk.zpsi_absorb_k > 0.08 || bk.za_k >= 0.70))
+                || (bk.zv_k >= -0.005
+                    && bk.zpsi_absorb_k > q_zabs_rec
+                    && zbounce_from_mae >= q_win_zbounce_med)
         };
 
         let a1_w = syn_state.wald_sprt_thresholds[0];
@@ -2633,7 +2918,7 @@ impl PrecedentKnnIndex {
             }
         }
 
-        // Stage 1: Sequential k = 1, 2, 3
+        // Stage 1: Sequential k = 1, 2, 3 in standardized settled_prior coordinates
         for k in 1..=3.min(max_pre_k) {
             let Some(ref d_k) = early_diag[k] else {
                 continue;
@@ -2642,42 +2927,45 @@ impl PrecedentKnnIndex {
                 continue;
             }
             let bk = &kin_by_k[k];
+            let r_k_unit = bk.zr_k;
             let (fired, cum_llr, exit_r) = match k {
                 1 => {
                     let f = early_l[1] >= a1_w + 0.95
-                        && bk.r_k <= -0.56
-                        && bk.v_k <= -0.56
-                        && bk.psi_absorb_k <= -0.35
-                        && bk.mfe_1_k <= 0.05;
-                    let er = (0.50 * learned_ratchet_r + 0.50 * bk.r_k).clamp(-0.25, -0.12);
+                        && bk.zr_k <= q_loss_zr_tail
+                        && bk.zv_k <= q_loss_zr_tail
+                        && bk.zpsi_absorb_k <= 1.40 * q_loss_zpsi_deep
+                        && bk.zmfe_1_k <= 0.50 * q_win_zmfe_low;
+                    let er = (damp_w * learned_ratchet_r + (1.0 - damp_w) * r_k_unit)
+                        .clamp(-0.25, -0.12);
                     (f, early_l[1], er)
                 }
                 2 => {
                     let lam2 = 0.45 * early_l[1] + 0.70 * early_l[2];
                     let b1_neg = kin_by_k[1].present
-                        && kin_by_k[1].r_k <= -0.16
-                        && kin_by_k[1].v_k <= -0.16;
+                        && kin_by_k[1].zr_k <= q_win_zr_low
+                        && kin_by_k[1].zv_k <= q_win_zr_low;
                     let f = (early_l[2] >= a2_w + 1.45
-                        && bk.r_k <= -0.24
-                        && bk.v_k <= -0.28
-                        && bk.psi_absorb_k <= -0.20
-                        && bk.a_k <= -0.25
-                        && bk.mfe_1_k <= 0.25)
+                        && bk.zr_k <= 0.80 * q_loss_zr_med
+                        && bk.zv_k <= -0.28
+                        && bk.zpsi_absorb_k <= 1.10 * q_loss_zpsi_med
+                        && bk.za_k <= -0.25
+                        && bk.zmfe_1_k <= q_loss_zmfe_med)
                         || (b1_neg
                             && lam2 >= a2_w - 0.72
                             && early_l[1] >= 0.25
                             && early_l[2] >= 0.95
-                            && bk.r_k <= -0.36
-                            && bk.v_k <= -0.15
-                            && bk.psi_absorb_k <= -0.15
-                            && bk.a_k <= 0.08
-                            && bk.mfe_1_k <= 0.10);
-                    let r1_val = if kin_by_k[1].present {
-                        kin_by_k[1].r_k
+                            && bk.zr_k <= q_loss_zr_deep
+                            && bk.zv_k <= -0.15
+                            && bk.zpsi_absorb_k <= 0.83 * q_loss_zpsi_med
+                            && bk.za_k <= 0.08
+                            && bk.zmfe_1_k <= q_win_zmfe_low);
+                    let r1_unit = if kin_by_k[1].present {
+                        kin_by_k[1].zr_k
                     } else {
-                        bk.r_k
+                        r_k_unit
                     };
-                    let er = (0.50 * learned_ratchet_r + 0.50 * (0.5 * (r1_val + bk.r_k)))
+                    let er = (damp_w * learned_ratchet_r
+                        + (1.0 - damp_w) * (0.5 * (r1_unit + r_k_unit)))
                         .clamp(-0.25, -0.12);
                     (f, lam2, er)
                 }
@@ -2687,19 +2975,19 @@ impl PrecedentKnnIndex {
                         && early_l[1] > -0.40
                         && early_l[2] > 0.25
                         && early_l[3] > 0.65
-                        && bk.psi_absorb_k <= -0.04;
-                    let r1_val = if kin_by_k[1].present {
-                        kin_by_k[1].r_k
+                        && bk.zpsi_absorb_k <= 0.22 * q_loss_zpsi_med;
+                    let r1_unit = if kin_by_k[1].present {
+                        kin_by_k[1].zr_k
                     } else {
-                        bk.r_k
+                        r_k_unit
                     };
-                    let r2_val = if kin_by_k[2].present {
-                        kin_by_k[2].r_k
+                    let r2_unit = if kin_by_k[2].present {
+                        kin_by_k[2].zr_k
                     } else {
-                        bk.r_k
+                        r_k_unit
                     };
-                    let er = (0.50 * learned_ratchet_r
-                        + 0.50 * ((r1_val + r2_val + bk.r_k) / 3.0))
+                    let er = (damp_w * learned_ratchet_r
+                        + (1.0 - damp_w) * ((r1_unit + r2_unit + r_k_unit) / 3.0))
                         .clamp(-0.25, -0.12);
                     (f, lam3, er)
                 }
@@ -2731,7 +3019,7 @@ impl PrecedentKnnIndex {
             }
         }
 
-        // Stage 2: Sequential k = 4, 5, 6, 7, 8 using evaluate_causal_mid_trade_stall_discriminant + kinematic velocity/absorption
+        // Stage 2: Sequential k = 4, 5, 6, 7, 8 using evaluate_causal_mid_trade_stall_discriminant + standardized kinematic z-scores
         if max_pre_k >= 4
             && total_settled_prior >= 10
             && let (Some(b1s), Some(b2s), Some(b3s), Some(b4s)) =
@@ -2749,6 +3037,7 @@ impl PrecedentKnnIndex {
                 };
                 let bk = &kin_by_k[k];
                 let prev_bk = &kin_by_k[k - 1];
+                let r_k_unit = bk.zr_k;
                 let early_d_k = self.evaluate_causal_post_entry_scratch(
                     brain_id,
                     symbol,
@@ -2765,8 +3054,10 @@ impl PrecedentKnnIndex {
                     })
                     .unwrap_or(0.0);
 
-                let make_fallback_diag = |bar_off: usize, r_val: f64, llr_val: f64| -> WaldSprtScratchDiagnostic {
-                    let exit_r = (0.65 * mid_ratchet_r + 0.35 * r_val).clamp(-0.24, -0.13);
+                let make_fallback_diag = |bar_off: usize, r_unit: f64, llr_val: f64| -> WaldSprtScratchDiagnostic {
+                    let exit_r = ((0.55 + 0.20 * damp_w) * mid_ratchet_r
+                        + (0.45 - 0.20 * damp_w) * r_unit)
+                        .clamp(-0.24, -0.13);
                     let post_pct = (1.0 / (1.0 + (-llr_val.max(0.85)).exp())) * 100.0;
                     if let Some(ref d) = early_d_k {
                         WaldSprtScratchDiagnostic {
@@ -2816,39 +3107,40 @@ impl PrecedentKnnIndex {
                             None,
                         );
                         let b3_neg =
-                            prev_bk.present && prev_bk.r_k <= -0.10 && prev_bk.v_k <= 0.005;
+                            prev_bk.present && prev_bk.zr_k <= -0.10 && prev_bk.zv_k <= 0.005;
                         if d4_opt
                             .as_ref()
                             .is_some_and(|d4| d4.cumulative_sprt_log_likelihood >= a_mid_4 + 0.35)
-                            && bk.r_k <= -0.35
-                            && bk.v_k <= -0.25
-                            && bk.psi_absorb_k <= -0.18
+                            && bk.zr_k <= 1.00 * q_loss_zr_deep
+                            && bk.zv_k <= -0.25
+                            && bk.zpsi_absorb_k <= 1.00 * q_loss_zpsi_med
                         {
                             return d4_opt;
                         }
                         if b3_neg
-                            && bk.r_k <= -0.33
-                            && bk.v_k <= -0.10
-                            && bk.psi_absorb_k <= -0.18
-                            && bk.mfe_1_k <= 0.25
-                            && (lk_early > -0.50 || bk.v_k <= -0.34)
+                            && bk.zr_k <= 0.94 * q_loss_zr_deep
+                            && bk.zv_k <= -0.10
+                            && bk.zpsi_absorb_k <= 1.00 * q_loss_zpsi_med
+                            && bk.zmfe_1_k <= 1.00 * q_loss_zmfe_med
+                            && (lk_early > -0.50 || bk.zv_k <= -0.34)
                         {
-                            return Some(make_fallback_diag(4, bk.r_k, lk_early.max(1.15)));
+                            return Some(make_fallback_diag(4, r_k_unit, lk_early.max(1.15)));
                         }
                     }
                     5 => {
                         let b4_neg = prev_bk.present
-                            && prev_bk.r_k <= -0.06
-                            && prev_bk.v_k <= -0.05
-                            && prev_bk.psi_absorb_k <= -0.12;
+                            && prev_bk.zr_k <= -0.06
+                            && prev_bk.zv_k <= -0.05
+                            && prev_bk.zpsi_absorb_k <= 0.67 * q_loss_zpsi_med;
                         if b4_neg
-                            && bk.r_k <= -0.32
-                            && bk.r_k > -0.85
-                            && bk.v_k <= -0.04
-                            && bk.psi_absorb_k <= -0.21
-                            && (bk.mfe_1_k <= 0.15 || (bk.mfe_1_k <= 0.32 && bk.v_k <= -0.20))
+                            && bk.zr_k <= 0.91 * q_loss_zr_deep
+                            && bk.zr_k > 1.52 * q_loss_zr_tail
+                            && bk.zv_k <= -0.04
+                            && bk.zpsi_absorb_k <= 0.84 * q_loss_zpsi_deep
+                            && (bk.zmfe_1_k <= 1.50 * q_win_zmfe_low
+                                || (bk.zmfe_1_k <= 1.28 * q_loss_zmfe_med && bk.zv_k <= -0.20))
                         {
-                            return Some(make_fallback_diag(5, bk.r_k, lk_early.max(1.20)));
+                            return Some(make_fallback_diag(5, r_k_unit, lk_early.max(1.20)));
                         }
                     }
                     6 => {
@@ -2874,20 +3166,22 @@ impl PrecedentKnnIndex {
                             return Some(d6);
                         }
                         let b5_neg = prev_bk.present
-                            && prev_bk.r_k <= -0.20
-                            && prev_bk.v_k <= -0.04
-                            && prev_bk.psi_absorb_k <= -0.10;
-                        if (bk.r_k <= -0.60 && bk.v_k <= -0.65 && bk.psi_absorb_k <= -0.25)
+                            && prev_bk.zr_k <= 0.67 * q_loss_zr_med
+                            && prev_bk.zv_k <= -0.04
+                            && prev_bk.zpsi_absorb_k <= 0.56 * q_loss_zpsi_med;
+                        if (bk.zr_k <= 1.07 * q_loss_zr_tail
+                            && bk.zv_k <= -0.65
+                            && bk.zpsi_absorb_k <= 1.00 * q_loss_zpsi_deep)
                             || (b5_neg
-                                && bk.r_k <= -0.30
-                                && bk.v_k <= -0.09
-                                && bk.psi_absorb_k <= -0.03
-                                && (bk.mfe_1_k <= 0.16
-                                    || (bk.mfe_1_k <= 0.24
-                                        && bk.r_k <= -0.45
-                                        && bk.psi_absorb_k <= -0.12)))
+                                && bk.zr_k <= 1.00 * q_loss_zr_med
+                                && bk.zv_k <= -0.09
+                                && bk.zpsi_absorb_k <= 0.17 * q_loss_zpsi_med
+                                && (bk.zmfe_1_k <= 1.60 * q_win_zmfe_low
+                                    || (bk.zmfe_1_k <= 0.96 * q_loss_zmfe_med
+                                        && bk.zr_k <= 1.28 * q_loss_zr_deep
+                                        && bk.zpsi_absorb_k <= 0.67 * q_loss_zpsi_med)))
                         {
-                            return Some(make_fallback_diag(6, bk.r_k, lk_early.max(1.25)));
+                            return Some(make_fallback_diag(6, r_k_unit, lk_early.max(1.25)));
                         }
                     }
                     7 => {
@@ -2911,20 +3205,22 @@ impl PrecedentKnnIndex {
                                 )
                             });
                         let b6_neg = prev_bk.present
-                            && prev_bk.r_k <= -0.15
-                            && prev_bk.v_k <= -0.20
-                            && prev_bk.psi_absorb_k <= -0.10;
+                            && prev_bk.zr_k <= 0.50 * q_loss_zr_med
+                            && prev_bk.zv_k <= -0.20
+                            && prev_bk.zpsi_absorb_k <= 0.56 * q_loss_zpsi_med;
                         if let Some(mut d7) = d7_opt
                             && d7.scratch_bar_offset == 8
                             && d7.cumulative_sprt_log_likelihood >= a_mid_6 + 0.65
-                            && bk.r_k <= -0.48
-                            && bk.v_k <= -0.25
+                            && bk.zr_k <= 1.37 * q_loss_zr_deep
+                            && bk.zv_k <= -0.25
                             && b6_neg
-                            && bk.mfe_1_k >= 0.30
+                            && bk.zmfe_1_k >= 1.20 * q_loss_zmfe_med
                         {
                             d7.scratch_bar_offset = 7;
                             d7.scratch_exit_r =
-                                (0.65 * mid_ratchet_r + 0.35 * bk.r_k).clamp(-0.24, -0.13);
+                                ((0.55 + 0.20 * damp_w) * mid_ratchet_r
+                                    + (0.45 - 0.20 * damp_w) * r_k_unit)
+                                    .clamp(-0.24, -0.13);
                             return Some(d7);
                         }
                     }
@@ -2957,9 +3253,9 @@ impl PrecedentKnnIndex {
 
         // Stage 2b: Late horizon (k = 9..=16) — accumulate prev_llr across all bars 9..=16, check recovery guard at trigger
         if max_pre_k >= 9 {
-            let mae_1_8 = (1..=8)
+            let zmae_1_8 = (1..=8)
                 .filter(|&k| kin_by_k[k].present)
-                .map(|k| kin_by_k[k].mae_1_k)
+                .map(|k| kin_by_k[k].zmae_1_k)
                 .fold(0.0_f64, f64::min);
             let mut prev_llr = 0.0_f64;
             for k in 9..=16.min(max_pre_k) {
@@ -2980,14 +3276,17 @@ impl PrecedentKnnIndex {
                     prev_llr = llr_k;
                     let bk = &kin_by_k[k];
                     let late_recovering = is_recovering_at_k(k)
-                        || bk.r_k > -0.46
-                        || (bk.r_k - bk.mae_1_k) > 0.12
-                        || mae_1_8 <= -0.56;
+                        || bk.zr_k > 1.31 * q_loss_zr_deep
+                        || (bk.zr_k - bk.zmae_1_k) > 0.60 * q_win_zbounce_med
+                        || zmae_1_8 <= 1.00 * q_loss_zr_tail;
                     if !late_recovering
                         && combined_late_llr >= syn_state.late_blowoff_scratch_threshold + 0.55
                         && llr_k > 0.85
                     {
-                        let exit_r = (0.70 * emp_ratchet_r + 0.30 * bk.r_k).clamp(-0.24, -0.13);
+                        let r_k_unit = bk.zr_k;
+                        let exit_r = ((0.60 + 0.20 * damp_w) * emp_ratchet_r
+                            + (0.40 - 0.20 * damp_w) * r_k_unit)
+                            .clamp(-0.24, -0.13);
                         return Some(WaldSprtScratchDiagnostic {
                             scratch_bar_offset: k,
                             scratch_exit_r: exit_r,

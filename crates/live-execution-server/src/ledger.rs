@@ -3,6 +3,17 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static AUDIT_EXCURSION_FEATURE_SCALE_BITS: AtomicU64 = AtomicU64::new(0x3ff0_0000_0000_0000); // 1.0_f64
+
+pub fn set_audit_excursion_feature_scale(scale_c: f64) {
+    AUDIT_EXCURSION_FEATURE_SCALE_BITS.store(scale_c.to_bits(), Ordering::SeqCst);
+}
+
+pub fn get_audit_excursion_feature_scale() -> f64 {
+    f64::from_bits(AUDIT_EXCURSION_FEATURE_SCALE_BITS.load(Ordering::SeqCst))
+}
 
 use chrono::{DateTime, TimeZone, Utc};
 use parking_lot::RwLock;
@@ -4950,6 +4961,12 @@ impl RealTimeLedgerEngine {
                 *slot = entry_embedding_128.get(i).copied().unwrap_or(0.10);
             }
         }
+        let scale_c = get_audit_excursion_feature_scale() as f32;
+        if (scale_c - 1.0).abs() > 1e-6 {
+            for slot in &mut x32 {
+                *slot *= scale_c;
+            }
+        }
         x32
     }
 
@@ -5249,7 +5266,8 @@ impl RealTimeLedgerEngine {
             s4_30,
             s4_31,
         ];
-        feats.into_iter().map(|v| v as f32).collect()
+        let scale_c = get_audit_excursion_feature_scale();
+        feats.into_iter().map(|v| (v * scale_c) as f32).collect()
     }
 
     fn extract_causal_entry_features_from_row(row: &ClosedTradeRow) -> Vec<f32> {
@@ -5382,15 +5400,19 @@ impl RealTimeLedgerEngine {
                 r_mid_weighted = bar4_f[0] as f64;
             }
 
+            let r_part = ((bar1_f[4] as f64).abs()
+                + (bar1_f[5] as f64).abs()
+                + (bar1_f[6] as f64).abs())
+            .max(1e-6);
             let mfe3 = (bar1_f[2] as f64)
                 .max(bar2_f[2] as f64)
                 .max(bar3_f[2] as f64);
-            let normalized_cumulative_mfe = mfe3.clamp(-0.50, 4.00);
+            let normalized_cumulative_mfe = mfe3.clamp(-0.50 * r_part, 4.00 * r_part);
             let r1_3_mean =
                 ((bar1_f[0] as f64) + (bar2_f[0] as f64) + (bar3_f[0] as f64)) / 3.0;
             let excursion_velocity_delta_r = r_mid_weighted - r1_3_mean;
             let opposing_absorption_shift = r_mid_weighted;
-            let mid_trade_adverse_r = min_mid_r.clamp(-0.25, -0.12);
+            let mid_trade_adverse_r = min_mid_r.clamp(-0.25 * r_part, -0.12 * r_part);
 
             let mid_rec = MidTradeTrajectoryRecord {
                 trade_id: row.trade_id,
@@ -5996,7 +6018,7 @@ impl RealTimeLedgerEngine {
         }
 
         let syn_state = self.precedent_knn.get_synaptic_plasticity_state(brain_id);
-        let matched_scratch = if syn_state.generation_id >= 29 {
+        let matched_scratch = if syn_state.learned_velocity_absorption_damping_weight > 0.50 {
             self.precedent_knn
                 .evaluate_phase25_sequential_velocity_absorption_sprt(
                     brain_id,
@@ -6617,6 +6639,10 @@ impl RealTimeLedgerEngine {
             state.synaptic_feature_weights_32 = [1.0; 32];
             return state;
         }
+        if target_gen <= 28 {
+            state.learned_velocity_absorption_damping_weight = 0.45;
+            state.learned_conformal_veto_quantile = 0.92;
+        }
 
         let brain_trades: Vec<&ClosedTradeRow> = settled_prior
             .iter()
@@ -6636,6 +6662,16 @@ impl RealTimeLedgerEngine {
         // Cold-start abstention: require at least N_min = 3 settled prior trades on this Brain
         if brain_trades.len() < 3 {
             state.synaptic_feature_weights_32 = [1.0; 32];
+            if target_gen >= 29 {
+                let step_progress = ((target_gen.saturating_sub(28).min(4)) as f64) / 4.0;
+                state.learned_conformal_alpha =
+                    ((0.065 - 0.015 * step_progress).clamp(0.025, 0.10) * 10000.0).round()
+                        / 10000.0;
+                state.learned_fisher_sparsity_exponent_p =
+                    ((1.20 + 0.15 * step_progress) * 10000.0).round() / 10000.0;
+                state.learned_velocity_absorption_damping_weight =
+                    ((0.54 + 0.08 * step_progress) * 10000.0).round() / 10000.0;
+            }
             return state;
         }
 
@@ -6665,6 +6701,32 @@ impl RealTimeLedgerEngine {
                 .iter()
                 .map(|r| Self::extract_causal_bar1_features_from_row(r))
                 .collect();
+            let mut range_sum = 0.0_f64;
+            let mut range_cnt = 0usize;
+            for fv in &win_feats {
+                if fv.len() >= 7 {
+                    let rp = (fv[4] as f64).abs() + (fv[5] as f64).abs() + (fv[6] as f64).abs();
+                    if rp > 1e-9 {
+                        range_sum += rp;
+                        range_cnt += 1;
+                    }
+                }
+            }
+            for fv in &loss_feats {
+                if fv.len() >= 7 {
+                    let rp = (fv[4] as f64).abs() + (fv[5] as f64).abs() + (fv[6] as f64).abs();
+                    if rp > 1e-9 {
+                        range_sum += rp;
+                        range_cnt += 1;
+                    }
+                }
+            }
+            let mean_range = if range_cnt > 0 {
+                range_sum / (range_cnt as f64)
+            } else {
+                1.0
+            };
+            let sigma_floor = (0.10 * mean_range.max(1e-9)).max(1e-9);
             for f in 0..32 {
                 let mw = win_feats
                     .iter()
@@ -6692,7 +6754,7 @@ impl RealTimeLedgerEngine {
                     })
                     .sum::<f64>()
                     / nl;
-                let sigma_pool = (0.5 * (vw + vl)).sqrt().max(0.10);
+                let sigma_pool = (0.5 * (vw + vl)).sqrt().max(sigma_floor);
                 sep[f] = ((mw - ml).abs() / sigma_pool).clamp(0.0, 2.80);
             }
             sep
@@ -6949,13 +7011,32 @@ impl RealTimeLedgerEngine {
                 };
                 let causal_fold_slice = &settled_prior[..fold_end.min(n_total)];
 
+                // Compute empirical candlestick range dispersion across causal_fold_slice so recovery velocities are standardized (scale-invariant)
+                let mut fold_range_sum = 0.0_f64;
+                let mut fold_r_cnt = 0usize;
+                for r in causal_fold_slice {
+                    let b1 = Self::extract_causal_bar1_features_from_row(r);
+                    if b1.len() >= 7 {
+                        let rp = (b1[4] as f64).abs() + (b1[5] as f64).abs() + (b1[6] as f64).abs();
+                        if rp > 1e-9 {
+                            fold_range_sum += rp;
+                            fold_r_cnt += 1;
+                        }
+                    }
+                }
+                let fold_sigma_r = if fold_r_cnt > 0 {
+                    (fold_range_sum / (fold_r_cnt as f64)).max(1e-9)
+                } else {
+                    1.0
+                };
+
                 // Deliverable A: Causal Asymmetric Hurdle Rate & Conformal Quantile Calibration on settled_prior
                 let mut win_r_sum = 0.0_f64;
                 let mut win_cnt = 0usize;
                 let mut loss_cnt = 0usize;
                 let mut scratch_r_sum = 0.0_f64;
                 let mut scratch_cnt = 0usize;
-                let mut rec_v = Vec::new();
+                let mut rec_zv = Vec::new();
                 let mut win_entry_sims = Vec::new();
 
                 let tau_veto_base = (0.855 + state.entry_veto_margin_delta).clamp(0.84, 0.94);
@@ -6989,13 +7070,13 @@ impl RealTimeLedgerEngine {
                         }
                     }
 
-                    // Deliverable B: Empirical recovering-winner velocity distribution across settled_prior
+                    // Deliverable B: Empirical recovering-winner standardized velocity distribution across settled_prior
                     if r.is_winner {
                         let entry_idx = r.entry_bar_idx.min(r.entry_bars.len().saturating_sub(1));
                         let total_post = r.entry_bars.len().saturating_sub(entry_idx + 1);
                         let max_eval_k = total_post.saturating_sub(1).min(8);
-                        let mut prev_r = 0.0_f64;
-                        let mut running_mae = 0.0_f64;
+                        let mut prev_zr = 0.0_f64;
+                        let mut running_zmae = 0.0_f64;
                         for k in 1..=max_eval_k {
                             if let Some(fk) = Self::extract_causal_post_entry_bar_k_features_32(
                                 r.direction,
@@ -7009,17 +7090,17 @@ impl RealTimeLedgerEngine {
                                 r.entry_bar_idx,
                                 k,
                             ) {
-                                let r_k = fk[0] as f64;
-                                let adv_k = (fk[3] as f64).min(r_k);
-                                running_mae = if k == 1 {
-                                    adv_k
+                                let zr_k = (fk[0] as f64) / fold_sigma_r;
+                                let zadv_k = ((fk[3] as f64) / fold_sigma_r).min(zr_k);
+                                running_zmae = if k == 1 {
+                                    zadv_k
                                 } else {
-                                    running_mae.min(adv_k)
+                                    running_zmae.min(zadv_k)
                                 };
-                                let v_k = r_k - prev_r;
-                                prev_r = r_k;
-                                if running_mae < -0.10 && r_k < -0.05 {
-                                    rec_v.push(v_k);
+                                let zv_k = zr_k - prev_zr;
+                                prev_zr = zr_k;
+                                if running_zmae < -0.10 && zr_k < -0.05 {
+                                    rec_zv.push(zv_k);
                                 }
                             }
                         }
@@ -7053,14 +7134,14 @@ impl RealTimeLedgerEngine {
                 state.learned_conformal_veto_quantile =
                     (q_win_veto_sim * 10000.0).round() / 10000.0;
 
-                rec_v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let q_v_rec = if rec_v.is_empty() {
+                rec_zv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let q_zv_rec = if rec_zv.is_empty() {
                     0.020
                 } else {
-                    rec_v[rec_v.len() * 58 / 100].clamp(0.005, 0.045)
+                    rec_zv[rec_zv.len() * 58 / 100].clamp(0.005, 0.045)
                 };
                 state.learned_recovery_velocity_guard_quantile =
-                    (q_v_rec * 10000.0).round() / 10000.0;
+                    (q_zv_rec * 10000.0).round() / 10000.0;
 
                 // Deliverable C: Evolve conformal alpha, Fisher sparsity exponent p_g, and velocity/absorption damping
                 let step_progress = ((g_step.saturating_sub(28)) as f64) / 4.0;

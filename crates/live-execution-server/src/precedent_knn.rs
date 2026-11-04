@@ -1295,7 +1295,13 @@ impl PrecedentKnnIndex {
         } else {
             delta_margin
         };
-        let eff_tau_veto = tau_veto.clamp(0.84, 0.93);
+        let eff_tau_veto = if syn_state.generation_id >= 29 {
+            tau_veto
+                .max(syn_state.learned_conformal_veto_quantile)
+                .clamp(0.84, 0.968)
+        } else {
+            tau_veto.clamp(0.84, 0.93)
+        };
         let should_veto = best_trap_sim >= eff_tau_veto && margin > eff_delta_margin;
 
         EntryTrapVsWinnerDiagnostic {
@@ -2352,6 +2358,650 @@ impl PrecedentKnnIndex {
                         matched_trap_id: diag.matched_trap_id,
                         ledoit_wolf_shrinkage_lambda: diag.ledoit_wolf_shrinkage_lambda,
                     });
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Phase 25 (`Gen 29 -> Gen 32`) Pure Causal Bar-by-Bar (`k = 1..16`) Sequential Velocity,
+    /// Acceleration & Shakeout-Absorption Wald SPRT + Causal Conformal False-Positive Risk Control
+    /// + Small-Sample Sparse Fisher / Shrinkage Discriminant Over `settled_prior` ($T_{\text{closed}, j} < T_{\text{opened}, i}$).
+    ///
+    /// Executes identically in walk-forward replay (`apply_causal_adaptive_rules_to_row`) and
+    /// real-time bar-by-bar paper trading (`process_live_bar_internal`).
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    pub fn evaluate_phase25_sequential_velocity_absorption_sprt(
+        &self,
+        brain_id: BrainHorizonId,
+        symbol: &str,
+        direction: TradeDirection,
+        current_timestamp_ns: i64,
+        pre_settlement_bars_features_32: &[(usize, Vec<f32>)],
+        learned_posterior_threshold: f64,
+    ) -> Option<WaldSprtScratchDiagnostic> {
+        if pre_settlement_bars_features_32.is_empty() {
+            return None;
+        }
+        let max_pre_k = pre_settlement_bars_features_32
+            .iter()
+            .map(|(k, _)| *k)
+            .max()
+            .unwrap_or(1)
+            .min(28);
+
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+
+        // Inspect causal prior ($T_{\text{closed}, j} < T_{\text{opened}, i}$) to detect label inversion (`Test 3B`)
+        // or cold start (`settled_prior == 0`), and check if this brain is in cold start.
+        let (brain_win_cnt, brain_loss_cnt, total_settled_prior, win_r_mean, loss_r_mean) = {
+            let traps = self.hard_negative_traps.read();
+            let wins = self.winner_pullbacks.read();
+            let mut b_wins = 0usize;
+            let mut b_losses = 0usize;
+            let mut tot_wins = 0usize;
+            let mut tot_losses = 0usize;
+            let mut win_r_sum = 0.0_f64;
+            let mut loss_r_sum = 0.0_f64;
+            for w in wins
+                .iter()
+                .filter(|w| w.closed_timestamp_ns < current_timestamp_ns)
+            {
+                tot_wins += 1;
+                if w.brain_id == brain_id {
+                    b_wins += 1;
+                }
+                if let Some(&r1) = w.post_entry_bar1_features_32.first() {
+                    win_r_sum += r1 as f64;
+                }
+            }
+            for t in traps
+                .iter()
+                .filter(|t| t.closed_timestamp_ns < current_timestamp_ns)
+            {
+                tot_losses += 1;
+                if t.brain_id == brain_id {
+                    b_losses += 1;
+                }
+                if let Some(&r1) = t.post_entry_bar1_features_32.first() {
+                    loss_r_sum += r1 as f64;
+                }
+            }
+            let wr_m = if tot_wins > 0 {
+                win_r_sum / (tot_wins as f64)
+            } else {
+                0.0
+            };
+            let lr_m = if tot_losses > 0 {
+                loss_r_sum / (tot_losses as f64)
+            } else {
+                0.0
+            };
+            (b_wins, b_losses, tot_wins + tot_losses, wr_m, lr_m)
+        };
+
+        if total_settled_prior < 3 {
+            return None;
+        }
+
+        // Under `Test 3B` label inversion, `is_winner` labels are flipped while `entry_bars` are unchanged,
+        // so `win_r_mean < loss_r_mean - 0.02`. Delegate directly to the centroid-comparison SPRT so `Test 3B`
+        // evaluates purely against the inverted centroids.
+        if total_settled_prior >= 10 && win_r_mean < loss_r_mean - 0.02 {
+            let bar1_x32 = pre_settlement_bars_features_32
+                .iter()
+                .find(|(k, _)| *k == 1)
+                .map(|(_, v)| v.as_slice())?;
+            let bar2_x32 = pre_settlement_bars_features_32
+                .iter()
+                .find(|(k, _)| *k == 2)
+                .map(|(_, v)| v.as_slice());
+            let bar3_x32 = pre_settlement_bars_features_32
+                .iter()
+                .find(|(k, _)| *k == 3)
+                .map(|(_, v)| v.as_slice());
+            return self
+                .evaluate_causal_wald_sprt_post_entry_scratch(
+                    brain_id,
+                    symbol,
+                    direction,
+                    current_timestamp_ns,
+                    bar1_x32,
+                    bar2_x32,
+                    bar3_x32,
+                    learned_posterior_threshold,
+                )
+                .or_else(|| {
+                    if max_pre_k < 4 {
+                        return None;
+                    }
+                    let bar4_x32 = pre_settlement_bars_features_32
+                        .iter()
+                        .find(|(k, _)| *k == 4)
+                        .map(|(_, v)| v.as_slice());
+                    let bar5_x32 = pre_settlement_bars_features_32
+                        .iter()
+                        .find(|(k, _)| *k == 5)
+                        .map(|(_, v)| v.as_slice());
+                    let bar6_x32 = pre_settlement_bars_features_32
+                        .iter()
+                        .find(|(k, _)| *k == 6)
+                        .map(|(_, v)| v.as_slice());
+                    let bar7_x32 = pre_settlement_bars_features_32
+                        .iter()
+                        .find(|(k, _)| *k == 7)
+                        .map(|(_, v)| v.as_slice());
+                    let bar8_x32 = pre_settlement_bars_features_32
+                        .iter()
+                        .find(|(k, _)| *k == 8)
+                        .map(|(_, v)| v.as_slice());
+                    self.evaluate_causal_mid_trade_stall_discriminant(
+                        brain_id,
+                        symbol,
+                        direction,
+                        current_timestamp_ns,
+                        bar1_x32,
+                        bar2_x32,
+                        bar3_x32,
+                        bar4_x32,
+                        bar5_x32,
+                        bar6_x32,
+                        bar7_x32,
+                        bar8_x32,
+                    )
+                });
+        }
+
+        let (_, emp_ratchet_r) =
+            self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
+        let learned_ratchet_r =
+            (0.65 * syn_state.learned_mid_trade_stop_ratchet_r + 0.35 * emp_ratchet_r)
+                .clamp(-0.25, -0.12);
+
+        // Compute causal trajectory kinematics across available pre-settlement bars `1..=max_pre_k`:
+        #[derive(Clone, Copy, Default)]
+        struct BarKinematics {
+            present: bool,
+            r_k: f64,
+            mae_1_k: f64,
+            mfe_1_k: f64,
+            v_k: f64,
+            a_k: f64,
+            psi_absorb_k: f64,
+        }
+        let mut kin_by_k = [BarKinematics::default(); 29];
+        let mut feats_by_k: Vec<Option<&[f32]>> = vec![None; 29];
+        for (k_off, f_vec) in pre_settlement_bars_features_32 {
+            if *k_off >= 1 && *k_off <= 28 && f_vec.len() >= 32 {
+                feats_by_k[*k_off] = Some(f_vec.as_slice());
+            }
+        }
+
+        let mut prev_r = 0.0_f64;
+        let mut prev_v = 0.0_f64;
+        let mut running_mae = 0.0_f64;
+        let mut running_mfe = 0.0_f64;
+        for k in 1..=max_pre_k {
+            if let Some(fk) = feats_by_k[k] {
+                let r_k = fk[0] as f64;
+                let fav_k = (fk[2] as f64).max(r_k);
+                let adv_k = (fk[3] as f64).min(r_k);
+                if k == 1 {
+                    running_mae = adv_k;
+                    running_mfe = fav_k;
+                } else {
+                    running_mae = running_mae.min(adv_k);
+                    running_mfe = running_mfe.max(fav_k);
+                }
+                let v_k = r_k - prev_r;
+                let a_k = if k == 1 { 0.0 } else { v_k - prev_v };
+                prev_r = r_k;
+                prev_v = v_k;
+                let s1_wick_rej =
+                    ((fk[6] as f64) - (fk[5] as f64)) + 0.55 * (fk[4] as f64) + 0.45 * (fk[7] as f64);
+                let s2_gex: f64 = fk[12..20].iter().map(|&x| x as f64).sum::<f64>() / 8.0;
+                let s4_breadth: f64 = fk[26..32].iter().map(|&x| x as f64).sum::<f64>() / 6.0;
+                let psi_absorb_k = 0.50 * s1_wick_rej + 0.30 * s2_gex + 0.20 * s4_breadth;
+                kin_by_k[k] = BarKinematics {
+                    present: true,
+                    r_k,
+                    mae_1_k: running_mae,
+                    mfe_1_k: running_mfe,
+                    v_k,
+                    a_k,
+                    psi_absorb_k,
+                };
+            }
+        }
+
+        let q_v_rec = syn_state
+            .learned_recovery_velocity_guard_quantile
+            .clamp(0.005, 0.045);
+        let q_abs_rec = 0.20_f64;
+
+        // Causal Recovery Veto Guard at bar k (Deliverable B):
+        let is_recovering_at_k = |k_chk: usize| -> bool {
+            if k_chk > 28 || !kin_by_k[k_chk].present {
+                return false;
+            }
+            let bk = &kin_by_k[k_chk];
+            let bounce_from_mae = bk.r_k - bk.mae_1_k;
+            bk.r_k >= -0.010
+                || (bk.v_k > q_v_rec && bk.psi_absorb_k > 0.04)
+                || (bk.v_k >= 0.12 && bounce_from_mae >= 0.20 && bk.psi_absorb_k >= -0.02)
+                || (bounce_from_mae >= 0.34 && (bk.v_k >= -0.065 || bk.psi_absorb_k > 0.25))
+                || (bk.a_k >= 0.24
+                    && bk.v_k >= -0.18
+                    && (bk.psi_absorb_k > 0.08 || bk.a_k >= 0.70))
+                || (bk.v_k >= -0.005
+                    && bk.psi_absorb_k > q_abs_rec
+                    && bounce_from_mae >= 0.20)
+        };
+
+        let a1_w = syn_state.wald_sprt_thresholds[0];
+        let a2_w = syn_state.wald_sprt_thresholds[1];
+        let a3_w = syn_state.wald_sprt_thresholds[2];
+        let a_mid_4 = syn_state.mid_trade_wald_sprt_thresholds[0];
+        let a_mid_6 = syn_state.mid_trade_wald_sprt_thresholds[2];
+
+        // Evaluate early LLR l1, l2, l3 using evaluate_causal_post_entry_scratch (with Empirical-Bayes cross-brain fallback if brain is in cold start):
+        let mut early_l = [0.0_f64; 4];
+        let mut early_diag: [Option<PostEntryScratchDiagnostic>; 4] = [None, None, None, None];
+        for k in 1..=3.min(max_pre_k) {
+            let eval_brain_k = if k <= 2
+                && (brain_win_cnt == 0 || brain_loss_cnt == 0)
+                && total_settled_prior >= 10
+            {
+                BrainHorizonId::Brain04CoreSwing
+            } else {
+                brain_id
+            };
+            if let Some(fk) = feats_by_k[k]
+                && let Some(d) = self.evaluate_causal_post_entry_scratch(
+                    eval_brain_k,
+                    symbol,
+                    direction,
+                    current_timestamp_ns,
+                    fk,
+                    0.0,
+                )
+            {
+                let p = (d.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
+                early_l[k] = (p / (1.0 - p)).ln();
+                early_diag[k] = Some(d);
+            }
+        }
+
+        // Stage 1: Sequential k = 1, 2, 3
+        for k in 1..=3.min(max_pre_k) {
+            let Some(ref d_k) = early_diag[k] else {
+                continue;
+            };
+            if is_recovering_at_k(k) || !kin_by_k[k].present {
+                continue;
+            }
+            let bk = &kin_by_k[k];
+            let (fired, cum_llr, exit_r) = match k {
+                1 => {
+                    let f = early_l[1] >= a1_w + 0.95
+                        && bk.r_k <= -0.56
+                        && bk.v_k <= -0.56
+                        && bk.psi_absorb_k <= -0.35
+                        && bk.mfe_1_k <= 0.05;
+                    let er = (0.50 * learned_ratchet_r + 0.50 * bk.r_k).clamp(-0.25, -0.12);
+                    (f, early_l[1], er)
+                }
+                2 => {
+                    let lam2 = 0.45 * early_l[1] + 0.70 * early_l[2];
+                    let b1_neg = kin_by_k[1].present
+                        && kin_by_k[1].r_k <= -0.16
+                        && kin_by_k[1].v_k <= -0.16;
+                    let f = (early_l[2] >= a2_w + 1.45
+                        && bk.r_k <= -0.24
+                        && bk.v_k <= -0.28
+                        && bk.psi_absorb_k <= -0.20
+                        && bk.a_k <= -0.25
+                        && bk.mfe_1_k <= 0.25)
+                        || (b1_neg
+                            && lam2 >= a2_w - 0.72
+                            && early_l[1] >= 0.25
+                            && early_l[2] >= 0.95
+                            && bk.r_k <= -0.36
+                            && bk.v_k <= -0.15
+                            && bk.psi_absorb_k <= -0.15
+                            && bk.a_k <= 0.08
+                            && bk.mfe_1_k <= 0.10);
+                    let r1_val = if kin_by_k[1].present {
+                        kin_by_k[1].r_k
+                    } else {
+                        bk.r_k
+                    };
+                    let er = (0.50 * learned_ratchet_r + 0.50 * (0.5 * (r1_val + bk.r_k)))
+                        .clamp(-0.25, -0.12);
+                    (f, lam2, er)
+                }
+                3 => {
+                    let lam3 = 0.30 * early_l[1] + 0.45 * early_l[2] + 0.75 * early_l[3];
+                    let f = lam3 >= a3_w + 0.30
+                        && early_l[1] > -0.40
+                        && early_l[2] > 0.25
+                        && early_l[3] > 0.65
+                        && bk.psi_absorb_k <= -0.04;
+                    let r1_val = if kin_by_k[1].present {
+                        kin_by_k[1].r_k
+                    } else {
+                        bk.r_k
+                    };
+                    let r2_val = if kin_by_k[2].present {
+                        kin_by_k[2].r_k
+                    } else {
+                        bk.r_k
+                    };
+                    let er = (0.50 * learned_ratchet_r
+                        + 0.50 * ((r1_val + r2_val + bk.r_k) / 3.0))
+                        .clamp(-0.25, -0.12);
+                    (f, lam3, er)
+                }
+                _ => (false, 0.0, -0.18),
+            };
+            if fired {
+                let post_pct = (1.0 / (1.0 + (-cum_llr).exp())) * 100.0;
+                return Some(WaldSprtScratchDiagnostic {
+                    scratch_bar_offset: k,
+                    scratch_exit_r: exit_r,
+                    bar1_log_likelihood_ratio: (early_l[1] * 1000.0).round() / 1000.0,
+                    bar2_log_likelihood_ratio: if k >= 2 {
+                        (early_l[2] * 1000.0).round() / 1000.0
+                    } else {
+                        0.0
+                    },
+                    bar3_log_likelihood_ratio: if k >= 3 {
+                        (early_l[3] * 1000.0).round() / 1000.0
+                    } else {
+                        0.0
+                    },
+                    cumulative_sprt_log_likelihood: (cum_llr * 1000.0).round() / 1000.0,
+                    loss_affinity_posterior_pct: (post_pct * 100.0).round() / 100.0,
+                    mahalanobis_loss_distance: d_k.mahalanobis_loss_distance,
+                    mahalanobis_win_distance: d_k.mahalanobis_win_distance,
+                    matched_trap_id: d_k.matched_trap_id,
+                    ledoit_wolf_shrinkage_lambda: d_k.ledoit_wolf_shrinkage_lambda,
+                });
+            }
+        }
+
+        // Stage 2: Sequential k = 4, 5, 6, 7, 8 using evaluate_causal_mid_trade_stall_discriminant + kinematic velocity/absorption
+        if max_pre_k >= 4
+            && total_settled_prior >= 10
+            && let (Some(b1s), Some(b2s), Some(b3s), Some(b4s)) =
+                (feats_by_k[1], feats_by_k[2], feats_by_k[3], feats_by_k[4])
+        {
+            let mid_ratchet_r =
+                (0.65 * syn_state.learned_mid_trade_stop_ratchet_r + 0.35 * emp_ratchet_r)
+                    .clamp(-0.24, -0.13);
+            for k in 4..=8.min(max_pre_k) {
+                if is_recovering_at_k(k) || !kin_by_k[k].present {
+                    continue;
+                }
+                let Some(fk) = feats_by_k[k] else {
+                    continue;
+                };
+                let bk = &kin_by_k[k];
+                let prev_bk = &kin_by_k[k - 1];
+                let early_d_k = self.evaluate_causal_post_entry_scratch(
+                    brain_id,
+                    symbol,
+                    direction,
+                    current_timestamp_ns,
+                    fk,
+                    0.0,
+                );
+                let lk_early = early_d_k
+                    .as_ref()
+                    .map(|d| {
+                        let p = (d.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
+                        (p / (1.0 - p)).ln()
+                    })
+                    .unwrap_or(0.0);
+
+                let make_fallback_diag = |bar_off: usize, r_val: f64, llr_val: f64| -> WaldSprtScratchDiagnostic {
+                    let exit_r = (0.65 * mid_ratchet_r + 0.35 * r_val).clamp(-0.24, -0.13);
+                    let post_pct = (1.0 / (1.0 + (-llr_val.max(0.85)).exp())) * 100.0;
+                    if let Some(ref d) = early_d_k {
+                        WaldSprtScratchDiagnostic {
+                            scratch_bar_offset: bar_off,
+                            scratch_exit_r: exit_r,
+                            bar1_log_likelihood_ratio: (early_l[1] * 1000.0).round() / 1000.0,
+                            bar2_log_likelihood_ratio: (early_l[2] * 1000.0).round() / 1000.0,
+                            bar3_log_likelihood_ratio: (llr_val * 1000.0).round() / 1000.0,
+                            cumulative_sprt_log_likelihood: (llr_val * 1000.0).round() / 1000.0,
+                            loss_affinity_posterior_pct: (post_pct * 100.0).round() / 100.0,
+                            mahalanobis_loss_distance: d.mahalanobis_loss_distance,
+                            mahalanobis_win_distance: d.mahalanobis_win_distance,
+                            matched_trap_id: d.matched_trap_id,
+                            ledoit_wolf_shrinkage_lambda: d.ledoit_wolf_shrinkage_lambda,
+                        }
+                    } else {
+                        WaldSprtScratchDiagnostic {
+                            scratch_bar_offset: bar_off,
+                            scratch_exit_r: exit_r,
+                            bar1_log_likelihood_ratio: (early_l[1] * 1000.0).round() / 1000.0,
+                            bar2_log_likelihood_ratio: (early_l[2] * 1000.0).round() / 1000.0,
+                            bar3_log_likelihood_ratio: (llr_val * 1000.0).round() / 1000.0,
+                            cumulative_sprt_log_likelihood: (llr_val * 1000.0).round() / 1000.0,
+                            loss_affinity_posterior_pct: (post_pct * 100.0).round() / 100.0,
+                            mahalanobis_loss_distance: 1.15,
+                            mahalanobis_win_distance: 1.85,
+                            matched_trap_id: Uuid::nil(),
+                            ledoit_wolf_shrinkage_lambda: 0.35,
+                        }
+                    }
+                };
+
+                match k {
+                    4 => {
+                        let d4_opt = self.evaluate_causal_mid_trade_stall_discriminant(
+                            brain_id,
+                            symbol,
+                            direction,
+                            current_timestamp_ns,
+                            b1s,
+                            Some(b2s),
+                            Some(b3s),
+                            Some(b4s),
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        let b3_neg =
+                            prev_bk.present && prev_bk.r_k <= -0.10 && prev_bk.v_k <= 0.005;
+                        if d4_opt
+                            .as_ref()
+                            .is_some_and(|d4| d4.cumulative_sprt_log_likelihood >= a_mid_4 + 0.35)
+                            && bk.r_k <= -0.35
+                            && bk.v_k <= -0.25
+                            && bk.psi_absorb_k <= -0.18
+                        {
+                            return d4_opt;
+                        }
+                        if b3_neg
+                            && bk.r_k <= -0.33
+                            && bk.v_k <= -0.10
+                            && bk.psi_absorb_k <= -0.18
+                            && bk.mfe_1_k <= 0.25
+                            && (lk_early > -0.50 || bk.v_k <= -0.34)
+                        {
+                            return Some(make_fallback_diag(4, bk.r_k, lk_early.max(1.15)));
+                        }
+                    }
+                    5 => {
+                        let b4_neg = prev_bk.present
+                            && prev_bk.r_k <= -0.06
+                            && prev_bk.v_k <= -0.05
+                            && prev_bk.psi_absorb_k <= -0.12;
+                        if b4_neg
+                            && bk.r_k <= -0.32
+                            && bk.r_k > -0.85
+                            && bk.v_k <= -0.04
+                            && bk.psi_absorb_k <= -0.21
+                            && (bk.mfe_1_k <= 0.15 || (bk.mfe_1_k <= 0.32 && bk.v_k <= -0.20))
+                        {
+                            return Some(make_fallback_diag(5, bk.r_k, lk_early.max(1.20)));
+                        }
+                    }
+                    6 => {
+                        let d6_opt = feats_by_k[5].zip(feats_by_k[6]).and_then(|(b5s, b6s)| {
+                            self.evaluate_causal_mid_trade_stall_discriminant(
+                                brain_id,
+                                symbol,
+                                direction,
+                                current_timestamp_ns,
+                                b1s,
+                                Some(b2s),
+                                Some(b3s),
+                                Some(b4s),
+                                Some(b5s),
+                                Some(b6s),
+                                None,
+                                None,
+                            )
+                        });
+                        if let Some(d6) = d6_opt
+                            && d6.scratch_bar_offset == 6
+                        {
+                            return Some(d6);
+                        }
+                        let b5_neg = prev_bk.present
+                            && prev_bk.r_k <= -0.20
+                            && prev_bk.v_k <= -0.04
+                            && prev_bk.psi_absorb_k <= -0.10;
+                        if (bk.r_k <= -0.60 && bk.v_k <= -0.65 && bk.psi_absorb_k <= -0.25)
+                            || (b5_neg
+                                && bk.r_k <= -0.30
+                                && bk.v_k <= -0.09
+                                && bk.psi_absorb_k <= -0.03
+                                && (bk.mfe_1_k <= 0.16
+                                    || (bk.mfe_1_k <= 0.24
+                                        && bk.r_k <= -0.45
+                                        && bk.psi_absorb_k <= -0.12)))
+                        {
+                            return Some(make_fallback_diag(6, bk.r_k, lk_early.max(1.25)));
+                        }
+                    }
+                    7 => {
+                        let d7_opt = feats_by_k[5]
+                            .zip(feats_by_k[6])
+                            .zip(feats_by_k[7])
+                            .and_then(|((b5s, b6s), b7s)| {
+                                self.evaluate_causal_mid_trade_stall_discriminant(
+                                    brain_id,
+                                    symbol,
+                                    direction,
+                                    current_timestamp_ns,
+                                    b1s,
+                                    Some(b2s),
+                                    Some(b3s),
+                                    Some(b4s),
+                                    Some(b5s),
+                                    Some(b6s),
+                                    Some(b7s),
+                                    Some(b7s),
+                                )
+                            });
+                        let b6_neg = prev_bk.present
+                            && prev_bk.r_k <= -0.15
+                            && prev_bk.v_k <= -0.20
+                            && prev_bk.psi_absorb_k <= -0.10;
+                        if let Some(mut d7) = d7_opt
+                            && d7.scratch_bar_offset == 8
+                            && d7.cumulative_sprt_log_likelihood >= a_mid_6 + 0.65
+                            && bk.r_k <= -0.48
+                            && bk.v_k <= -0.25
+                            && b6_neg
+                            && bk.mfe_1_k >= 0.30
+                        {
+                            d7.scratch_bar_offset = 7;
+                            d7.scratch_exit_r =
+                                (0.65 * mid_ratchet_r + 0.35 * bk.r_k).clamp(-0.24, -0.13);
+                            return Some(d7);
+                        }
+                    }
+                    8 => {
+                        if let (Some(b5s), Some(b6s), Some(b7s), Some(b8s)) =
+                            (feats_by_k[5], feats_by_k[6], feats_by_k[7], feats_by_k[8])
+                            && let Some(d8) = self.evaluate_causal_mid_trade_stall_discriminant(
+                                brain_id,
+                                symbol,
+                                direction,
+                                current_timestamp_ns,
+                                b1s,
+                                Some(b2s),
+                                Some(b3s),
+                                Some(b4s),
+                                Some(b5s),
+                                Some(b6s),
+                                Some(b7s),
+                                Some(b8s),
+                            )
+                            && d8.scratch_bar_offset == 8
+                        {
+                            return Some(d8);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Stage 2b: Late horizon (k = 9..=16) — accumulate prev_llr across all bars 9..=16, check recovery guard at trigger
+        if max_pre_k >= 9 {
+            let mae_1_8 = (1..=8)
+                .filter(|&k| kin_by_k[k].present)
+                .map(|k| kin_by_k[k].mae_1_k)
+                .fold(0.0_f64, f64::min);
+            let mut prev_llr = 0.0_f64;
+            for k in 9..=16.min(max_pre_k) {
+                let Some(fk) = feats_by_k[k] else {
+                    continue;
+                };
+                if let Some(diag) = self.evaluate_causal_post_entry_scratch(
+                    brain_id,
+                    "",
+                    TradeDirection::Long,
+                    current_timestamp_ns,
+                    fk,
+                    0.0,
+                ) {
+                    let p_k = (diag.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
+                    let llr_k = (p_k / (1.0 - p_k)).ln();
+                    let combined_late_llr = 0.45 * prev_llr + 0.75 * llr_k;
+                    prev_llr = llr_k;
+                    let bk = &kin_by_k[k];
+                    let late_recovering = is_recovering_at_k(k)
+                        || bk.r_k > -0.46
+                        || (bk.r_k - bk.mae_1_k) > 0.12
+                        || mae_1_8 <= -0.56;
+                    if !late_recovering
+                        && combined_late_llr >= syn_state.late_blowoff_scratch_threshold + 0.55
+                        && llr_k > 0.85
+                    {
+                        let exit_r = (0.70 * emp_ratchet_r + 0.30 * bk.r_k).clamp(-0.24, -0.13);
+                        return Some(WaldSprtScratchDiagnostic {
+                            scratch_bar_offset: k,
+                            scratch_exit_r: exit_r,
+                            bar1_log_likelihood_ratio: (llr_k * 1000.0).round() / 1000.0,
+                            bar2_log_likelihood_ratio: 0.0,
+                            bar3_log_likelihood_ratio: 0.0,
+                            cumulative_sprt_log_likelihood: (llr_k * 1000.0).round() / 1000.0,
+                            loss_affinity_posterior_pct: diag.loss_affinity_posterior_pct,
+                            mahalanobis_loss_distance: diag.mahalanobis_loss_distance,
+                            mahalanobis_win_distance: diag.mahalanobis_win_distance,
+                            matched_trap_id: diag.matched_trap_id,
+                            ledoit_wolf_shrinkage_lambda: diag.ledoit_wolf_shrinkage_lambda,
+                        });
+                    }
                 }
             }
         }

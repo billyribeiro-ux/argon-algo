@@ -138,11 +138,47 @@ fn default_occ_tims_sigma_shock_pct() -> f64 {
     0.115
 }
 
+fn default_asymmetric_hurdle_prob_p_star() -> f64 {
+    0.56
+}
+
+fn default_asymmetric_hurdle_llr_lambda_star() -> f64 {
+    0.88
+}
+
+fn default_conformal_alpha() -> f64 {
+    0.05
+}
+
+fn default_conformal_veto_quantile() -> f64 {
+    0.958
+}
+
+fn default_conformal_early_scratch_quantile() -> f64 {
+    1.46
+}
+
+fn default_conformal_mid_scratch_quantile() -> f64 {
+    1.44
+}
+
+fn default_fisher_sparsity_exponent_p() -> f64 {
+    1.35
+}
+
+fn default_velocity_absorption_damping_weight() -> f64 {
+    0.62
+}
+
+fn default_recovery_velocity_guard_quantile() -> f64 {
+    0.020
+}
+
 fn default_pareto_gate_passed() -> bool {
     true
 }
 
-/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 24`).
+/// Per-Brain evolving synaptic weight & boundary plasticity state (`Phase 18`..`Phase 25`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainSynapticPlasticityState {
     pub brain_id: BrainHorizonId,
@@ -224,6 +260,33 @@ pub struct BrainSynapticPlasticityState {
     /// Phase 24 Upgrade 3: Self-learned OCC TIMS scenario base volatility shock $\hat{\sigma}_{\text{LW}, b, 0..t}$ from $32 \times 32$ Ledoit-Wolf covariance
     #[serde(default = "default_occ_tims_sigma_shock_pct")]
     pub learned_occ_tims_sigma_shock_pct: f64,
+    /// Phase 25 Deliverable A: Causal Asymmetric Hurdle Probability $p_{\text{hurdle}, b, t}^{\star}$
+    #[serde(default = "default_asymmetric_hurdle_prob_p_star")]
+    pub learned_asymmetric_hurdle_prob_p_star: f64,
+    /// Phase 25 Deliverable A: Causal Asymmetric Hurdle Log-Likelihood Ratio $\Lambda_{\text{hurdle}, b, t}^{\star}$
+    #[serde(default = "default_asymmetric_hurdle_llr_lambda_star")]
+    pub learned_asymmetric_hurdle_llr_lambda_star: f64,
+    /// Phase 25 Deliverable A: Mirror-Descent Conformal False-Positive Risk Level $\alpha_g$
+    #[serde(default = "default_conformal_alpha")]
+    pub learned_conformal_alpha: f64,
+    /// Phase 25 Deliverable A: Conformal Stage 0 Veto Upper Quantile $Q_{1 - \alpha_g}(\mathcal{W}_{b, 0..t})$
+    #[serde(default = "default_conformal_veto_quantile")]
+    pub learned_conformal_veto_quantile: f64,
+    /// Phase 25 Deliverable A: Conformal Stage 1 Early Scratch Upper Quantile
+    #[serde(default = "default_conformal_early_scratch_quantile")]
+    pub learned_conformal_early_scratch_quantile: f64,
+    /// Phase 25 Deliverable A: Conformal Stage 2 Mid-Trade Scratch Upper Quantile
+    #[serde(default = "default_conformal_mid_scratch_quantile")]
+    pub learned_conformal_mid_scratch_quantile: f64,
+    /// Phase 25 Deliverable C: Sparse Fisher-Mahalanobis SNR Exponent $p_g$
+    #[serde(default = "default_fisher_sparsity_exponent_p")]
+    pub learned_fisher_sparsity_exponent_p: f64,
+    /// Phase 25 Deliverable B/C: Sequential Velocity/Absorption Damping Weight
+    #[serde(default = "default_velocity_absorption_damping_weight")]
+    pub learned_velocity_absorption_damping_weight: f64,
+    /// Phase 25 Deliverable B: Recovering-Winner Velocity Guard Quantile $q_{v, \text{rec}, b, t}$
+    #[serde(default = "default_recovery_velocity_guard_quantile")]
+    pub learned_recovery_velocity_guard_quantile: f64,
     pub top_boosted_warning_features: Vec<SynapticFeatureMutation>,
     pub top_slashed_deceiver_features: Vec<SynapticFeatureMutation>,
 }
@@ -270,6 +333,15 @@ impl BrainSynapticPlasticityState {
             learned_charm_vanna_pin_quantile: 0.32,
             learned_charm_vanna_unpin_quantile: 0.68,
             learned_occ_tims_sigma_shock_pct: 0.115,
+            learned_asymmetric_hurdle_prob_p_star: 0.56,
+            learned_asymmetric_hurdle_llr_lambda_star: 0.88,
+            learned_conformal_alpha: 0.05,
+            learned_conformal_veto_quantile: 0.958,
+            learned_conformal_early_scratch_quantile: 1.46,
+            learned_conformal_mid_scratch_quantile: 1.44,
+            learned_fisher_sparsity_exponent_p: 1.35,
+            learned_velocity_absorption_damping_weight: 0.62,
+            learned_recovery_velocity_guard_quantile: 0.020,
             top_boosted_warning_features: Vec::new(),
             top_slashed_deceiver_features: Vec::new(),
         }

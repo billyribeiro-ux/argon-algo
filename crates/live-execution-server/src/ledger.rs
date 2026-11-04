@@ -3797,7 +3797,7 @@ impl RealTimeLedgerEngine {
             entry_idx,
         );
         let syn_state = self.precedent_knn.get_synaptic_plasticity_state(sig.brain_id);
-        let tau_veto = 0.880;
+        let tau_veto = (0.855 + syn_state.entry_veto_margin_delta).clamp(0.84, 0.94);
         let delta_margin = syn_state.entry_veto_margin_delta.clamp(0.005, 0.05);
         let diag = self
             .precedent_knn
@@ -5961,11 +5961,18 @@ impl RealTimeLedgerEngine {
             .saturating_sub(entry_idx + 1)
             .min(max_eval_bar_offset)
             .min(64);
-        let max_pre_settlement_k = entry_bars
-            .len()
-            .saturating_sub(entry_idx + 2)
-            .min(max_eval_bar_offset)
-            .min(28);
+        let max_pre_settlement_k = if max_eval_bar_offset >= 64 {
+            entry_bars
+                .len()
+                .saturating_sub(entry_idx + 2)
+                .max(1)
+                .min(28)
+        } else {
+            max_eval_bar_offset
+                .min(entry_bars.len().saturating_sub(entry_idx + 1))
+                .max(1)
+                .min(28)
+        };
         let mut pre_settlement_bars_x32: Vec<(usize, Vec<f32>)> = Vec::new();
         let mut all_post_entry_bars_x32: Vec<(usize, Vec<f32>)> = Vec::new();
         for k in 1..=post_entry_total {
@@ -5988,69 +5995,81 @@ impl RealTimeLedgerEngine {
             }
         }
 
-        let matched_scratch = self
-            .precedent_knn
-            .evaluate_causal_wald_sprt_post_entry_scratch(
-                brain_id,
-                symbol,
-                direction,
-                opened_timestamp_ns,
-                &bar1_features_32,
-                bar2_x32.as_deref(),
-                bar3_x32.as_deref(),
-                tau_scratch,
-            )
-            .or_else(|| {
-                if max_eval_bar_offset < 4 {
-                    return None;
-                }
-                let bar4_x32 = all_post_entry_bars_x32
-                    .iter()
-                    .find(|(k, _)| *k == 4)
-                    .map(|(_, v)| v.as_slice());
-                let bar5_x32 = all_post_entry_bars_x32
-                    .iter()
-                    .find(|(k, _)| *k == 5)
-                    .map(|(_, v)| v.as_slice());
-                let bar6_x32 = all_post_entry_bars_x32
-                    .iter()
-                    .find(|(k, _)| *k == 6)
-                    .map(|(_, v)| v.as_slice());
-                let bar7_x32 = all_post_entry_bars_x32
-                    .iter()
-                    .find(|(k, _)| *k == 7)
-                    .map(|(_, v)| v.as_slice());
-                let bar8_x32 = all_post_entry_bars_x32
-                    .iter()
-                    .find(|(k, _)| *k == 8)
-                    .map(|(_, v)| v.as_slice());
-                self.precedent_knn
-                    .evaluate_causal_mid_trade_stall_discriminant(
-                        brain_id,
-                        symbol,
-                        direction,
-                        opened_timestamp_ns,
-                        &bar1_features_32,
-                        bar2_x32.as_deref(),
-                        bar3_x32.as_deref(),
-                        bar4_x32,
-                        bar5_x32,
-                        bar6_x32,
-                        bar7_x32,
-                        bar8_x32,
-                    )
-            })
-            .or_else(|| {
-                if max_eval_bar_offset < 9 {
-                    return None;
-                }
-                self.precedent_knn
-                    .evaluate_causal_late_horizon_blowoff_scratch(
-                        brain_id,
-                        opened_timestamp_ns,
-                        &pre_settlement_bars_x32,
-                    )
-            });
+        let syn_state = self.precedent_knn.get_synaptic_plasticity_state(brain_id);
+        let matched_scratch = if syn_state.generation_id >= 29 {
+            self.precedent_knn
+                .evaluate_phase25_sequential_velocity_absorption_sprt(
+                    brain_id,
+                    symbol,
+                    direction,
+                    opened_timestamp_ns,
+                    &pre_settlement_bars_x32,
+                    tau_scratch,
+                )
+        } else {
+            self.precedent_knn
+                .evaluate_causal_wald_sprt_post_entry_scratch(
+                    brain_id,
+                    symbol,
+                    direction,
+                    opened_timestamp_ns,
+                    &bar1_features_32,
+                    bar2_x32.as_deref(),
+                    bar3_x32.as_deref(),
+                    tau_scratch,
+                )
+                .or_else(|| {
+                    if max_eval_bar_offset < 4 {
+                        return None;
+                    }
+                    let bar4_x32 = all_post_entry_bars_x32
+                        .iter()
+                        .find(|(k, _)| *k == 4)
+                        .map(|(_, v)| v.as_slice());
+                    let bar5_x32 = all_post_entry_bars_x32
+                        .iter()
+                        .find(|(k, _)| *k == 5)
+                        .map(|(_, v)| v.as_slice());
+                    let bar6_x32 = all_post_entry_bars_x32
+                        .iter()
+                        .find(|(k, _)| *k == 6)
+                        .map(|(_, v)| v.as_slice());
+                    let bar7_x32 = all_post_entry_bars_x32
+                        .iter()
+                        .find(|(k, _)| *k == 7)
+                        .map(|(_, v)| v.as_slice());
+                    let bar8_x32 = all_post_entry_bars_x32
+                        .iter()
+                        .find(|(k, _)| *k == 8)
+                        .map(|(_, v)| v.as_slice());
+                    self.precedent_knn
+                        .evaluate_causal_mid_trade_stall_discriminant(
+                            brain_id,
+                            symbol,
+                            direction,
+                            opened_timestamp_ns,
+                            &bar1_features_32,
+                            bar2_x32.as_deref(),
+                            bar3_x32.as_deref(),
+                            bar4_x32,
+                            bar5_x32,
+                            bar6_x32,
+                            bar7_x32,
+                            bar8_x32,
+                        )
+                })
+                .or_else(|| {
+                    if max_eval_bar_offset < 9 {
+                        return None;
+                    }
+                    self.precedent_knn
+                        .evaluate_causal_late_horizon_blowoff_scratch(
+                            brain_id,
+                            opened_timestamp_ns,
+                            &pre_settlement_bars_x32,
+                        )
+                })
+        };
 
         let mut giveback_ratchet = None;
         let mut house_money_scale_in = None;
@@ -6916,6 +6935,146 @@ impl RealTimeLedgerEngine {
                         Some(&state.synaptic_feature_weights_32),
                         g_step,
                     );
+            }
+        }
+
+        if target_gen >= 29 {
+            let n_total = settled_prior.len();
+            for g_step in 29..=target_gen.min(32) {
+                let fold_end = match g_step {
+                    29 => (n_total / 4).max(1),
+                    30 => (n_total / 2).max(1),
+                    31 => ((n_total * 3) / 4).max(1),
+                    _ => n_total,
+                };
+                let causal_fold_slice = &settled_prior[..fold_end.min(n_total)];
+
+                // Deliverable A: Causal Asymmetric Hurdle Rate & Conformal Quantile Calibration on settled_prior
+                let mut win_r_sum = 0.0_f64;
+                let mut win_cnt = 0usize;
+                let mut loss_cnt = 0usize;
+                let mut scratch_r_sum = 0.0_f64;
+                let mut scratch_cnt = 0usize;
+                let mut rec_v = Vec::new();
+                let mut win_entry_sims = Vec::new();
+
+                let tau_veto_base = (0.855 + state.entry_veto_margin_delta).clamp(0.84, 0.94);
+                let delta_margin_base = state.entry_veto_margin_delta.clamp(0.005, 0.05);
+
+                for r in causal_fold_slice {
+                    if r.brain_id == brain_id {
+                        if r.is_winner {
+                            win_cnt += 1;
+                            win_r_sum += r.realized_r_multiple.max(0.25);
+                            let wf32 = Self::extract_causal_entry_features_from_row(r);
+                            let w_diag = self
+                                .precedent_knn
+                                .evaluate_causal_entry_trap_vs_winner_discriminant(
+                                    r.brain_id,
+                                    &r.symbol,
+                                    r.direction,
+                                    r.opened_timestamp_ns,
+                                    &r.entry_embedding_128,
+                                    &wf32,
+                                    tau_veto_base,
+                                    delta_margin_base,
+                                );
+                            win_entry_sims.push(w_diag.trap_similarity_score);
+                        } else {
+                            loss_cnt += 1;
+                            if r.was_scratched_by_loss_autopsy {
+                                scratch_cnt += 1;
+                                scratch_r_sum += r.adaptive_scratch_exit_r;
+                            }
+                        }
+                    }
+
+                    // Deliverable B: Empirical recovering-winner velocity distribution across settled_prior
+                    if r.is_winner {
+                        let entry_idx = r.entry_bar_idx.min(r.entry_bars.len().saturating_sub(1));
+                        let total_post = r.entry_bars.len().saturating_sub(entry_idx + 1);
+                        let max_eval_k = total_post.saturating_sub(1).min(8);
+                        let mut prev_r = 0.0_f64;
+                        let mut running_mae = 0.0_f64;
+                        for k in 1..=max_eval_k {
+                            if let Some(fk) = Self::extract_causal_post_entry_bar_k_features_32(
+                                r.direction,
+                                r.entry_price,
+                                r.initial_structural_stop,
+                                r.target_1_price,
+                                r.ai_confidence_pct,
+                                r.precedent_win_rate_pct,
+                                &r.entry_embedding_128,
+                                &r.entry_bars,
+                                r.entry_bar_idx,
+                                k,
+                            ) {
+                                let r_k = fk[0] as f64;
+                                let adv_k = (fk[3] as f64).min(r_k);
+                                running_mae = if k == 1 {
+                                    adv_k
+                                } else {
+                                    running_mae.min(adv_k)
+                                };
+                                let v_k = r_k - prev_r;
+                                prev_r = r_k;
+                                if running_mae < -0.10 && r_k < -0.05 {
+                                    rec_v.push(v_k);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mu_r_plus = if win_cnt > 0 {
+                    (win_r_sum / (win_cnt as f64)).clamp(0.85, 3.50)
+                } else {
+                    1.65
+                };
+                let mu_r_scratch = if scratch_cnt > 0 {
+                    (scratch_r_sum / (scratch_cnt as f64)).clamp(-0.35, -0.12)
+                } else {
+                    -0.19
+                };
+                let p_star = ((mu_r_plus - mu_r_scratch) / (mu_r_plus + 1.0)).clamp(0.52, 0.88);
+                let pi_loss = (loss_cnt as f64 + 1.0) / ((win_cnt + loss_cnt) as f64 + 2.0);
+                let pi_win = (1.0 - pi_loss).max(0.05);
+                let lambda_star = ((p_star / (1.0 - p_star)).ln() - (pi_loss / pi_win).ln())
+                    .clamp(0.45, 2.25);
+
+                state.learned_asymmetric_hurdle_prob_p_star =
+                    (p_star * 10000.0).round() / 10000.0;
+                state.learned_asymmetric_hurdle_llr_lambda_star =
+                    (lambda_star * 10000.0).round() / 10000.0;
+
+                win_entry_sims.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let q_win_veto_sim =
+                    (win_entry_sims.last().copied().unwrap_or(0.955) + 0.004).clamp(0.958, 0.968);
+                state.learned_conformal_veto_quantile =
+                    (q_win_veto_sim * 10000.0).round() / 10000.0;
+
+                rec_v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let q_v_rec = if rec_v.is_empty() {
+                    0.020
+                } else {
+                    rec_v[rec_v.len() * 58 / 100].clamp(0.005, 0.045)
+                };
+                state.learned_recovery_velocity_guard_quantile =
+                    (q_v_rec * 10000.0).round() / 10000.0;
+
+                // Deliverable C: Evolve conformal alpha, Fisher sparsity exponent p_g, and velocity/absorption damping
+                let step_progress = ((g_step.saturating_sub(28)) as f64) / 4.0;
+                state.learned_conformal_alpha =
+                    ((0.065 - 0.015 * step_progress).clamp(0.025, 0.10) * 10000.0).round()
+                        / 10000.0;
+                state.learned_conformal_early_scratch_quantile =
+                    ((lambda_star.max(1.38) + 0.08 * step_progress) * 10000.0).round() / 10000.0;
+                state.learned_conformal_mid_scratch_quantile =
+                    ((lambda_star.max(1.36) + 0.08 * step_progress) * 10000.0).round() / 10000.0;
+                state.learned_fisher_sparsity_exponent_p =
+                    ((1.20 + 0.15 * step_progress) * 10000.0).round() / 10000.0;
+                state.learned_velocity_absorption_damping_weight =
+                    ((0.54 + 0.08 * step_progress) * 10000.0).round() / 10000.0;
             }
         }
 
@@ -8538,7 +8697,7 @@ impl RealTimeLedgerEngine {
             .map(|r| r.generation_id)
             .max()
             .unwrap_or(0);
-        if current_max_gen >= 28 {
+        if current_max_gen >= 32 {
             return self.multi_gen_evolution_snapshot();
         }
         let next_gen = current_max_gen + 1;
@@ -8558,14 +8717,25 @@ impl RealTimeLedgerEngine {
         // Re-evaluate all trades in strict expanding-window causal order at generation `next_gen`
         self.reconcile_causal_adaptive_immunity_ledger();
 
-        let mutations_summary = vec![
-            format!(
-                "Gen-{next_gen} Expanding-Window Empirical-Bayes Mirror-Descent on settled precedents (T_{{closed, j}} < T_{{opened, i}})"
-            ),
-            format!(
-                "Updated continuous Mahalanobis/Fisher/RBF discriminants, Almgren-Chriss execution slicer, and OCC TIMS PM at Gen {next_gen}"
-            ),
-        ];
+        let mutations_summary = if next_gen >= 29 {
+            vec![
+                format!(
+                    "Gen-{next_gen} Phase 25 Causal Conformal Risk Control (Q_{{1-alpha}} on settled_prior winners) + Asymmetric Payoff Hurdle p* calibration"
+                ),
+                format!(
+                    "Gen-{next_gen} Bar-by-Bar (k=1..8) Sequential Velocity/Acceleration/Shakeout-Absorption Wald SPRT & Sparse Fisher-Mahalanobis Projection"
+                ),
+            ]
+        } else {
+            vec![
+                format!(
+                    "Gen-{next_gen} Expanding-Window Empirical-Bayes Mirror-Descent on settled precedents (T_{{closed, j}} < T_{{opened, i}})"
+                ),
+                format!(
+                    "Updated continuous Mahalanobis/Fisher/RBF discriminants, Almgren-Chriss execution slicer, and OCC TIMS PM at Gen {next_gen}"
+                ),
+            ]
+        };
 
         let prev_best_fitness = self
             .evolution_generations_history
@@ -8616,7 +8786,7 @@ impl RealTimeLedgerEngine {
         settled_row: &ClosedTradeRow,
     ) -> Option<EvolutionGenerationRecord> {
         self.sync_closed_row_to_precedent_knn(settled_row);
-        if self.evolution_generations_history.read().len() < 29 {
+        if self.evolution_generations_history.read().len() < 33 {
             let _ = self.run_autonomous_evolution_generation();
         }
         self.evolution_generations_history
@@ -8634,8 +8804,8 @@ impl RealTimeLedgerEngine {
         self.reconcile_causal_adaptive_immunity_ledger();
     }
 
-    /// Automatically runs `Gen 0 -> Gen 4 -> Gen 8 -> Gen 12 -> Gen 16 -> Gen 20 -> Gen 24 -> Gen 28` recursive offensive, defensive, microstructure & portfolio-margin evolution cycles.
-    pub fn run_multi_generation_evolution_to_gen28(&self) -> MultiGenEvolutionResponse {
+    /// Automatically runs `Gen 0 -> .. -> Gen 28 -> Gen 32` recursive causal conformal risk control, bar-by-bar sequential velocity/absorption SPRT & sparse Fisher-Mahalanobis evolution cycles.
+    pub fn run_multi_generation_evolution_to_gen32(&self) -> MultiGenEvolutionResponse {
         self.evolution_generations_history.write().clear();
         self.precedent_knn.reset_synaptic_plasticity_states_to_gen0();
         if self.closed_ledger.read().len() < 173 {
@@ -8647,15 +8817,20 @@ impl RealTimeLedgerEngine {
                 BrainHorizonId::Brain04CoreSwing,
                 BrainHorizonId::Brain05LongTermWealth,
             ] {
-                let st = self.compute_causal_plasticity_state_for_prefix(b, &settled_snap, 28);
+                let st = self.compute_causal_plasticity_state_for_prefix(b, &settled_snap, 32);
                 self.precedent_knn.set_synaptic_plasticity_state(st);
             }
             return self.multi_gen_evolution_snapshot();
         }
-        for _ in 0..28 {
+        for _ in 0..32 {
             let _ = self.run_autonomous_evolution_generation();
         }
         self.multi_gen_evolution_snapshot()
+    }
+
+    /// Automatically runs `Gen 0 -> Gen 4 -> Gen 8 -> Gen 12 -> Gen 16 -> Gen 20 -> Gen 24 -> Gen 28 -> Gen 32` recursive evolution cycles.
+    pub fn run_multi_generation_evolution_to_gen28(&self) -> MultiGenEvolutionResponse {
+        self.run_multi_generation_evolution_to_gen32()
     }
 
     /// Automatically runs `Gen 0 -> Gen 4 -> Gen 8 -> Gen 12 -> Gen 16 -> Gen 20 -> Gen 24 -> Gen 28` recursive offensive, defensive & microstructure evolution cycles.
@@ -8761,14 +8936,14 @@ impl RealTimeLedgerEngine {
             }
         }
         if !parsed.synaptic_plasticity_states.is_empty()
-            && parsed.evolution_generations_history.len() >= 29
+            && parsed.evolution_generations_history.len() >= 33
         {
             self.precedent_knn
                 .restore_synaptic_plasticity_states(parsed.synaptic_plasticity_states);
             *self.evolution_generations_history.write() = parsed.evolution_generations_history;
             self.reconcile_causal_adaptive_immunity_ledger();
         } else if !self.closed_ledger.read().is_empty() {
-            let _ = self.run_multi_generation_evolution_to_gen28();
+            let _ = self.run_multi_generation_evolution_to_gen32();
         } else {
             self.reconcile_causal_adaptive_immunity_ledger();
         }

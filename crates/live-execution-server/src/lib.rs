@@ -1152,13 +1152,13 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen28();
+        let evo = engine.run_multi_generation_evolution_to_gen32();
         assert_eq!(
             evo.generations_history.len(),
-            29,
-            "Expected Gen 0..Gen 28 (29 generation records)"
+            33,
+            "Expected Gen 0..Gen 32 (33 generation records)"
         );
-        assert_eq!(evo.current_champion_generation, 28);
+        assert_eq!(evo.current_champion_generation, 32);
 
         for g in &evo.generations_history {
             println!(
@@ -1263,7 +1263,28 @@ mod tests {
         );
         let _ = (gen4, gen8, gen12, gen16, gen20, gen24);
 
-        let _ = engine.save_to_disk(std::path::Path::new("../../data/ledger_state.json"));
+        let snap32 = engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        let mut tp_bars = [0usize; 17];
+        let mut fp_bars = [0usize; 17];
+        for r in &snap32.closed_trades {
+            if r.was_scratched_by_loss_autopsy {
+                let k = (r.scratch_bar_offset as usize).clamp(1, 16);
+                if r.is_winner {
+                    fp_bars[k] += 1;
+                } else {
+                    tp_bars[k] += 1;
+                }
+            }
+        }
+        println!(
+            "[PHASE 25 GEN-32 BAR-BY-BAR SCRATCH DISTRIBUTION] TP by bar (1..8): {:?} (9..16): {:?} | FP by bar (1..8): {:?} (9..16): {:?}",
+            &tp_bars[1..=8],
+            &tp_bars[9..=16],
+            &fp_bars[1..=8],
+            &fp_bars[9..=16]
+        );
+
+        let _ = engine.save_to_disk(ledger_path);
     }
 
     #[test]
@@ -1283,12 +1304,12 @@ mod tests {
         );
 
         let evo = engine.run_multi_generation_evolution_to_gen24();
-        assert_eq!(evo.generations_history.len(), 29);
-        assert_eq!(evo.current_champion_generation, 28);
+        assert_eq!(evo.generations_history.len(), 33);
+        assert_eq!(evo.current_champion_generation, 32);
 
         let gen16 = &evo.generations_history[16];
         let gen20 = &evo.generations_history[20];
-        let gen24 = &evo.generations_history[28];
+        let gen24 = &evo.generations_history[32];
 
         // 1. Verify honest out-of-sample expanding-window metrics across Gen 16..Gen 28
         for g in [gen16, gen20, gen24] {
@@ -1437,8 +1458,8 @@ mod tests {
         );
 
         let evo = engine.run_multi_generation_evolution_to_gen24();
-        assert_eq!(evo.generations_history.len(), 29);
-        assert_eq!(evo.current_champion_generation, 28);
+        assert_eq!(evo.generations_history.len(), 33);
+        assert_eq!(evo.current_champion_generation, 32);
 
         let gen20 = &evo.generations_history[20];
         let gen21 = &evo.generations_history[21];
@@ -1531,7 +1552,7 @@ mod tests {
         let champ = engine
             .on_live_trade_settled_continual_plasticity(&sample_closed)
             .expect("Continual plasticity daemon hook must return active Pareto champion");
-        assert_eq!(champ.generation_id, 28);
+        assert_eq!(champ.generation_id, 32);
         assert!(champ.pareto_gate_passed);
 
         // Persist canonical Gen 0..Gen 28 state to data/ledger_state.json
@@ -1560,8 +1581,8 @@ mod tests {
         );
 
         let evo = engine.run_multi_generation_evolution_to_gen28();
-        assert_eq!(evo.generations_history.len(), 29);
-        assert_eq!(evo.current_champion_generation, 28);
+        assert_eq!(evo.generations_history.len(), 33);
+        assert_eq!(evo.current_champion_generation, 32);
 
         let gen24 = &evo.generations_history[24];
         let gen25 = &evo.generations_history[25];
@@ -1911,7 +1932,7 @@ mod tests {
 
         for &(label, run_expanding_plasticity) in &[
             ("3A-1: Cold-Start Uniform Weights (Gen 0, Zero Era-1 Seeds)", false),
-            ("3A-2: Cold-Start Expanding-Window Plasticity (Gen 28, Zero Era-1 Seeds)", true),
+            ("3A-2: Cold-Start Expanding-Window Plasticity (Gen 32, Zero Era-1 Seeds)", true),
         ] {
             let cold_engine = RealTimeLedgerEngine::new();
             // Wipe ALL pre-seeded Era-1 prototypes, traps, pullbacks, and trajectories
@@ -1969,7 +1990,7 @@ mod tests {
                     let causal_state = cold_engine.compute_causal_plasticity_state_for_prefix(
                         candidate.brain_id,
                         &settled_prior,
-                        28,
+                        32,
                     );
                     cold_engine
                         .precedent_knn()
@@ -2024,13 +2045,13 @@ mod tests {
             if run_expanding_plasticity {
                 let verify_engine = RealTimeLedgerEngine::new();
                 assert!(verify_engine.load_from_disk(ledger_path));
-                let evo = verify_engine.run_multi_generation_evolution_to_gen28();
+                let evo = verify_engine.run_multi_generation_evolution_to_gen32();
                 let verify_snap = verify_engine.query_filtered_snapshot(&HyperFilterQuery::default());
                 let sb = &verify_snap.scoreboard;
-                let g28 = &evo.generations_history[28];
+                let g32 = &evo.generations_history[32];
                 println!(
                     "  [3A-2 Main Engine Parity] Gen={} | TP_V={} FP_V={} TP_S={} FP_S={} | WinPres={}/116 | StopsElim={}/57 | RemLoss={} | BasePF={:.2}->AdapPF={:.2} | BaseDD=${:.2}->AdapDD=${:.2} | FixedPnL=${:.2} | KellyPnL=${:.2}",
-                    g28.generation_id,
+                    g32.generation_id,
                     sb.true_positive_losses_vetoed,
                     sb.false_positive_winners_vetoed,
                     sb.true_positive_losses_scratched,
@@ -2264,10 +2285,20 @@ mod tests {
             for s in &settled_prior {
                 paper_engine.sync_closed_row_to_precedent_knn(s);
             }
+            if brain_id != BrainHorizonId::Brain04CoreSwing {
+                let b4_state = paper_engine.compute_causal_plasticity_state_for_prefix(
+                    BrainHorizonId::Brain04CoreSwing,
+                    &settled_prior,
+                    32,
+                );
+                paper_engine
+                    .precedent_knn()
+                    .set_synaptic_plasticity_state(b4_state);
+            }
             let causal_state = paper_engine.compute_causal_plasticity_state_for_prefix(
                 brain_id,
                 &settled_prior,
-                28,
+                32,
             );
             paper_engine
                 .precedent_knn()

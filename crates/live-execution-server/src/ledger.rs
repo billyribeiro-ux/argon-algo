@@ -7001,15 +7001,8 @@ impl RealTimeLedgerEngine {
         }
 
         if target_gen >= 29 {
-            let n_total = settled_prior.len();
             for g_step in 29..=target_gen.min(32) {
-                let fold_end = match g_step {
-                    29 => (n_total / 4).max(1),
-                    30 => (n_total / 2).max(1),
-                    31 => ((n_total * 3) / 4).max(1),
-                    _ => n_total,
-                };
-                let causal_fold_slice = &settled_prior[..fold_end.min(n_total)];
+                let causal_fold_slice = settled_prior;
 
                 // Compute empirical candlestick range dispersion across causal_fold_slice so recovery velocities are standardized (scale-invariant)
                 let mut fold_range_sum = 0.0_f64;
@@ -7135,10 +7128,10 @@ impl RealTimeLedgerEngine {
                     (q_win_veto_sim * 10000.0).round() / 10000.0;
 
                 rec_zv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let q_zv_rec = if rec_zv.is_empty() {
+                let q_zv_rec = if rec_zv.len() < 12 {
                     0.020
                 } else {
-                    rec_zv[rec_zv.len() * 58 / 100].clamp(0.005, 0.045)
+                    rec_zv[rec_zv.len() * 68 / 100].clamp(0.018, 0.045)
                 };
                 state.learned_recovery_velocity_guard_quantile =
                     (q_zv_rec * 10000.0).round() / 10000.0;
@@ -7181,17 +7174,16 @@ impl RealTimeLedgerEngine {
 
         let mut closed = self.closed_ledger.write();
         self.vetoed_repeat_traps.write().clear();
-        let snapshot = closed.clone();
 
         // Sort indices by opened_timestamp_ns for strict chronological expanding-window evaluation
         let mut indices: Vec<usize> = (0..closed.len()).collect();
         indices.sort_by_key(|&i| closed[i].opened_timestamp_ns);
 
-        // Sort a copy of snapshot by closed_timestamp_ns so we can incrementally insert settled trades in O(N)
-        let mut settled_by_close_ts = snapshot.clone();
-        settled_by_close_ts.sort_by_key(|r| r.closed_timestamp_ns);
+        // Sort indices by closed_timestamp_ns so we incrementally insert settled trades using their current-generation causal state
+        let mut settled_indices_by_close_ts: Vec<usize> = (0..closed.len()).collect();
+        settled_indices_by_close_ts.sort_by_key(|&i| closed[i].closed_timestamp_ns);
         let mut settled_cursor = 0usize;
-        let mut settled_prior: Vec<ClosedTradeRow> = Vec::with_capacity(snapshot.len());
+        let mut settled_prior: Vec<ClosedTradeRow> = Vec::with_capacity(closed.len());
         let mut last_settled_len_per_brain = [usize::MAX; 5];
 
         for idx in indices {
@@ -7199,10 +7191,11 @@ impl RealTimeLedgerEngine {
             let row_brain = closed[idx].brain_id;
             let row_dir = closed[idx].direction;
 
-            while settled_cursor < settled_by_close_ts.len()
-                && settled_by_close_ts[settled_cursor].closed_timestamp_ns < row_open_ts
+            while settled_cursor < settled_indices_by_close_ts.len()
+                && closed[settled_indices_by_close_ts[settled_cursor]].closed_timestamp_ns < row_open_ts
             {
-                let settled_trade = settled_by_close_ts[settled_cursor].clone();
+                let s_idx = settled_indices_by_close_ts[settled_cursor];
+                let settled_trade = closed[s_idx].clone();
                 self.sync_closed_row_to_precedent_knn(&settled_trade);
                 settled_prior.push(settled_trade);
                 settled_cursor += 1;
@@ -7234,8 +7227,9 @@ impl RealTimeLedgerEngine {
         }
 
         // After evaluating all historical trades, sync remaining settled trades and update terminal plasticity states
-        while settled_cursor < settled_by_close_ts.len() {
-            let settled_trade = settled_by_close_ts[settled_cursor].clone();
+        while settled_cursor < settled_indices_by_close_ts.len() {
+            let s_idx = settled_indices_by_close_ts[settled_cursor];
+            let settled_trade = closed[s_idx].clone();
             self.sync_closed_row_to_precedent_knn(&settled_trade);
             settled_prior.push(settled_trade);
             settled_cursor += 1;

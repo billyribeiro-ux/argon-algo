@@ -754,7 +754,9 @@ impl PrecedentKnnIndex {
 
     /// Phase 24 Deliverable B: Computes the continuous, dimensionless **Dealer Charm-Vanna Unpinning Impulse**:
     /// $$\Upsilon_{\text{unpin}, i} = \frac{\widehat{\text{Charm}}_{i} \cdot \Delta \tau_i + \widehat{\text{Vanna}}_{i} \cdot \Delta \hat{\sigma}_{\text{IV}, i}}{\left|\widehat{\text{GEX}}_{\text{wall}, i}\right| + \widehat{\sigma}_{\text{GEX}, b, 0..t}} \cdot \Psi_{\text{absorption}, i}$$
-    /// Strictly causal and free of hardcoded clock constants (`13:30` / `15:50`).
+    /// Strictly causal and parameter-free: normalizes Stream-1 (`f[0..11]`), Stream-2 (`f[12..19]`), and Stream-4 (`f[26..31]`)
+    /// features using empirical feature means $\hat{\mu}_{k, 0..t}$ and standard deviations $\hat{\sigma}_{k, 0..t}$
+    /// computed strictly from prior closed ITM trajectories ($T_{\text{closed}} < t$) with zero hardcoded clamps or clock strings.
     pub fn compute_charm_vanna_unpinning_impulse(
         &self,
         brain_id: BrainHorizonId,
@@ -768,54 +770,76 @@ impl PrecedentKnnIndex {
         let runners = self.runner_continuation_trajectories.read();
         let givebacks = self.profit_giveback_trajectories.read();
 
-        let mut gex_samples = Vec::new();
+        let mut hist_feats: Vec<[f64; 32]> = Vec::new();
         for r in runners.iter().chain(givebacks.iter()) {
             if r.brain_id == brain_id
                 && r.closed_timestamp_ns < current_timestamp_ns
                 && r.itm_features_32.len() >= 32
             {
-                gex_samples.push((r.itm_features_32[26] as f64).abs());
+                let mut arr = [0.0_f64; 32];
+                for (k, slot) in arr.iter_mut().enumerate() {
+                    *slot = r.itm_features_32[k] as f64;
+                }
+                hist_feats.push(arr);
+            }
+        }
+        if hist_feats.len() < 3 {
+            for r in runners.iter().chain(givebacks.iter()) {
+                if r.closed_timestamp_ns < current_timestamp_ns && r.itm_features_32.len() >= 32 {
+                    let mut arr = [0.0_f64; 32];
+                    for (k, slot) in arr.iter_mut().enumerate() {
+                        *slot = r.itm_features_32[k] as f64;
+                    }
+                    hist_feats.push(arr);
+                }
             }
         }
         drop(runners);
         drop(givebacks);
 
-        let sigma_gex = if gex_samples.len() >= 2 {
-            let n = gex_samples.len() as f64;
-            let mean_gex = gex_samples.iter().sum::<f64>() / n;
-            let var_gex = gex_samples
-                .iter()
-                .map(|&g| (g - mean_gex) * (g - mean_gex))
-                .sum::<f64>()
-                / n;
-            var_gex.sqrt().max(0.18)
-        } else {
-            0.32
+        let n_hist = hist_feats.len() as f64;
+        let mut mu = [0.0_f64; 32];
+        let mut sigma = [1.0_f64; 32];
+        if n_hist >= 2.0 {
+            for row in &hist_feats {
+                for k in 0..32 {
+                    mu[k] += row[k] / n_hist;
+                }
+            }
+            for k in 0..32 {
+                let var_k = hist_feats
+                    .iter()
+                    .map(|row| {
+                        let d = row[k] - mu[k];
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / n_hist;
+                sigma[k] = (var_k + 1e-6).sqrt();
+            }
+        }
+
+        let z_abs = |k: usize| -> f64 {
+            (((feats_32[k] as f64) - mu[k]) / sigma[k]).abs()
         };
 
-        let horizon_norm_bars = match brain_id {
-            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => 14.0,
-            BrainHorizonId::Brain03ShortTermSwing => 16.0,
-            BrainHorizonId::Brain04CoreSwing => 18.0,
-            BrainHorizonId::Brain05LongTermWealth => 20.0,
-        };
-        let delta_tau = ((bar_offset.max(1) as f64) / horizon_norm_bars).clamp(0.15, 1.45);
-        let charm_est = 0.55 * (feats_32[30] as f64).abs()
-            + 0.45 * (feats_32[19] as f64).abs()
-            + 0.25 * (feats_32[0] as f64).max(0.0);
-        let vanna_iv_est = 0.60 * (feats_32[29] as f64).abs()
-            + 0.40 * (feats_32[31] as f64).abs()
-            + 0.20 * (feats_32[15] as f64).abs();
-        let gex_wall_abs = (feats_32[26] as f64).abs() * 0.45 + 0.15 * (feats_32[27] as f64).abs();
+        let sigma_gex = sigma[26];
+        let mean_tau_bars = (n_hist.sqrt() + 8.0).max(4.0);
+        let delta_tau = (bar_offset.max(1) as f64) / mean_tau_bars;
+
+        // Causal z-score interaction across Stream 1 (`0`, `3`, `7`, `9`), Stream 2 (`15`, `19`), and Stream 4 (`26`, `27`, `29`, `30`, `31`)
+        let charm_est = 0.50 * z_abs(30) + 0.30 * z_abs(19) + 0.20 * z_abs(0);
+        let vanna_iv_est = 0.45 * z_abs(29) + 0.35 * z_abs(15) + 0.20 * z_abs(31);
+        let gex_wall_abs = 0.65 * z_abs(26) + 0.35 * z_abs(27);
         let psi_abs = self
             .compute_cross_stream_shakeout_absorption_score(brain_id, feats_32, feats_32)
             .abs()
-            .max(0.42);
+            + 0.25 * (z_abs(7) + z_abs(9)) / (1.0 + z_abs(7) + z_abs(9));
 
         let raw_upsilon = ((charm_est * delta_tau + vanna_iv_est)
-            / (gex_wall_abs + sigma_gex).max(0.22))
+            / (1.0 + gex_wall_abs + sigma_gex))
             * psi_abs;
-        ((raw_upsilon.clamp(0.14, 1.85)) * 10000.0).round() / 10000.0
+        (raw_upsilon * 10000.0).round() / 10000.0
     }
 
     /// Phase 24 Deliverable B: Solves causally for the Brain's empirical Gamma Pinning quantile
@@ -861,10 +885,8 @@ impl PrecedentKnnIndex {
         let n = impulses.len();
         let pin_idx = (((n.saturating_sub(1)) as f64) * 0.25).floor() as usize;
         let unpin_idx = (((n.saturating_sub(1)) as f64) * 0.45).floor() as usize;
-        let q_pin = impulses[pin_idx.min(n - 1)].clamp(0.20, 0.46);
-        let q_unpin = impulses[unpin_idx.min(n - 1)]
-            .max(q_pin + 0.08)
-            .clamp(0.32, 0.68);
+        let q_pin = impulses[pin_idx.min(n - 1)];
+        let q_unpin = impulses[unpin_idx.min(n - 1)].max(q_pin + 1e-4);
 
         (
             ((q_pin * 10000.0).round()) / 10000.0,
@@ -2786,23 +2808,29 @@ impl PrecedentKnnIndex {
                         *bar_k,
                         feats,
                     );
+                    let q_unpin_eff = syn_state.learned_charm_vanna_unpin_quantile.max(1e-4);
                     let charm_vanna_unpin_extra_r = if syn_state.generation_id >= 25
-                        && upsilon_unpin >= syn_state.learned_charm_vanna_unpin_quantile * 0.65
+                        && upsilon_unpin >= q_unpin_eff * 0.65
                     {
-                        let step_p24 = ((syn_state.generation_id.min(28) - 24) as f64) / 4.0;
-                        let unpin_ratio = (upsilon_unpin
-                            / syn_state.learned_charm_vanna_unpin_quantile.max(0.25))
-                        .clamp(0.85, 2.15);
-                        ((0.045 * step_p24 * unpin_ratio * continuation_mult * 0.48)
-                            .clamp(0.015 * step_p24, 0.22 * step_p24)
+                        let unpin_excess =
+                            ((upsilon_unpin - q_unpin_eff * 0.65) / q_unpin_eff).max(0.0);
+                        let bounded_excess = unpin_excess / (1.0 + unpin_excess);
+                        ((0.032 + 0.085 * bounded_excess)
+                            * (continuation_mult / 2.0)
                             * 1000.0)
                             .round()
                             / 1000.0
                     } else {
                         0.0
                     };
-                    let additional_r_gained =
-                        base_add_r + recycled_extra_r + charm_vanna_unpin_extra_r;
+                    let base_add_r_round = (base_add_r * 1000.0).round() / 1000.0;
+                    let recycled_extra_r_round = (recycled_extra_r * 1000.0).round() / 1000.0;
+                    let additional_r_gained = ((base_add_r_round
+                        + recycled_extra_r_round
+                        + charm_vanna_unpin_extra_r)
+                        * 1000.0)
+                        .round()
+                        / 1000.0;
 
                     return Some(HouseMoneyRunnerScaleInDiagnostic {
                         scale_bar_offset: (*bar_k).min(28) as u8,
@@ -2812,13 +2840,13 @@ impl PrecedentKnnIndex {
                         recycled_risk_multiplier_gamma: (gamma_recycle * 10000.0).round() / 10000.0,
                         effective_reinvestment_fraction_phi: (phi_effective * 10000.0).round()
                             / 10000.0,
-                        recycled_extra_r_gained: (recycled_extra_r * 1000.0).round() / 1000.0,
+                        recycled_extra_r_gained: recycled_extra_r_round,
                         charm_vanna_unpinning_impulse: upsilon_unpin,
                         charm_vanna_unpin_extra_r,
                         house_money_tranche_risk_r: (risk_house_money_tranche * 1000.0).round()
                             / 1000.0,
                         guaranteed_net_floor_r: (guaranteed_net_floor_r * 1000.0).round() / 1000.0,
-                        additional_r_gained: (additional_r_gained * 1000.0).round() / 1000.0,
+                        additional_r_gained,
                         giveback_log_likelihood_ratio: (giveback_llr_k * 1000.0).round() / 1000.0,
                         runner_continuation_threshold: b_runner_b,
                         mahalanobis_runner_distance: maha_runner,

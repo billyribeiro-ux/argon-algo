@@ -304,12 +304,13 @@ mod tests {
             .run_real_yahoo_walk_forward_backfill()
             .await
             .expect("Real Yahoo walk-forward backfill succeeds");
-        if Path::new("../../data").exists() {
-            state
-                .ledger
-                .save_to_disk(Path::new("../../data/ledger_state.json"))
-                .expect("save updated Phase 14 ledger_state.json to disk");
-        }
+        let tmp_backfill_path =
+            std::env::temp_dir().join("argon_test_walk_forward_backfill_state.json");
+        state
+            .ledger
+            .save_to_disk(&tmp_backfill_path)
+            .expect("save updated Phase 14 ledger_state.json to temp disk");
+        let _ = std::fs::remove_file(&tmp_backfill_path);
 
         assert!(
             !snap.positions_opened.is_empty(),
@@ -1790,5 +1791,204 @@ mod tests {
         clean_engine
             .save_to_disk(ledger_path)
             .expect("Persist Gen 0..Gen 28 state to data/ledger_state.json");
+    }
+
+    #[test]
+    fn test_phase24_1_zero_generation_id_staircase_and_true_ledoit_wolf_cov() {
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+
+        let engine = RealTimeLedgerEngine::new();
+        assert!(
+            engine.load_from_disk(ledger_path),
+            "Failed to load data/ledger_state.json"
+        );
+        let evo = engine.run_multi_generation_evolution_to_gen28();
+        let snap = engine.query_filtered_snapshot(&HyperFilterQuery::default());
+
+        // 1. Verify zero synthetic `generation_id` staircase multipliers across Gen 25 vs Gen 28
+        //    when given the exact same input state and sample history!
+        let prev_w = [0.27, 0.29, 0.26, 0.18];
+        let mean_m4 = [0.51, 0.48, 0.53, 0.89];
+        let (w_25, tox_25) = CrossVenueSmartRouter::evolve_mirror_descent_venue_simplex(
+            &prev_w, &mean_m4, 42, 0.025, 25,
+        );
+        let (w_28, tox_28) = CrossVenueSmartRouter::evolve_mirror_descent_venue_simplex(
+            &prev_w, &mean_m4, 42, 0.025, 28,
+        );
+        assert_eq!(
+            w_25, w_28,
+            "Mirror-Descent venue simplex must NOT depend on generation_id (25 vs 28) for identical inputs!"
+        );
+        assert_eq!(
+            tox_25.to_bits(),
+            tox_28.to_bits(),
+            "Post-fill markout toxicity must NOT depend on generation_id (25 vs 28) for identical inputs!"
+        );
+
+        let sample_s1: Vec<f64> = snap.closed_trades[0]
+            .entry_embedding_128
+            .iter()
+            .take(32)
+            .map(|&v| v as f64)
+            .collect();
+        let plan_25 = AlmgrenChrissExecutionSlicer::compute_slice_plan(
+            &sample_s1,
+            200.0,
+            4,
+            125.0,
+            25_000.0,
+            0.52,
+            w_25,
+            25,
+            1.0,
+        );
+        let plan_28 = AlmgrenChrissExecutionSlicer::compute_slice_plan(
+            &sample_s1,
+            200.0,
+            4,
+            125.0,
+            25_000.0,
+            0.52,
+            w_25,
+            28,
+            1.0,
+        );
+        assert_eq!(
+            plan_25.realized_almgren_chriss_slippage_bps.to_bits(),
+            plan_28.realized_almgren_chriss_slippage_bps.to_bits(),
+            "Almgren-Chriss + SOR slippage must be identical for generation_id = 25 vs 28 when given the same learned state!"
+        );
+        assert_eq!(
+            plan_25.expected_post_fill_markout_toxicity_bps.to_bits(),
+            plan_28.expected_post_fill_markout_toxicity_bps.to_bits(),
+            "Almgren-Chriss + SOR markout toxicity must be identical for generation_id = 25 vs 28 when given the same learned state!"
+        );
+
+        let b2_weights = evo.synaptic_plasticity_states[1].synaptic_feature_weights_32;
+        let shock_25 =
+            crate::ledger::OccTimsPortfolioMarginEngine::compute_causal_ledoit_wolf_tims_shock_bound(
+                &snap.closed_trades,
+                Some(BrainHorizonId::Brain02IntradayDayTrade),
+                Some(&b2_weights),
+                25,
+            );
+        let shock_28 =
+            crate::ledger::OccTimsPortfolioMarginEngine::compute_causal_ledoit_wolf_tims_shock_bound(
+                &snap.closed_trades,
+                Some(BrainHorizonId::Brain02IntradayDayTrade),
+                Some(&b2_weights),
+                28,
+            );
+        assert_eq!(
+            shock_25.to_bits(),
+            shock_28.to_bits(),
+            "Ledoit-Wolf TIMS shock bound must be identical for generation_id = 25 vs 28 on the same sample history!"
+        );
+
+        // 2. Prove 32x32 Ledoit-Wolf shrunk covariance matrix actually computes all 992 off-diagonal
+        //    cross-stream covariance terms S_{p, q} (p != q):
+        //    Construct two synthetic closed-trade histories with IDENTICAL 1D `abs_returns` (`mfe_pct`, `mae_pct`)
+        //    and IDENTICAL per-feature means and diagonal variances S_{p,p}, but OPPOSITE off-diagonal
+        //    cross-stream correlations (positively correlated vs anti-correlated features).
+        let mut pos_corr_rows = Vec::new();
+        let mut neg_corr_rows = Vec::new();
+        for idx in 0..24 {
+            let base_row = &snap.closed_trades[idx];
+            let sign_i = if idx % 2 == 0 { 1.0_f32 } else { -1.0_f32 };
+            let mag = 0.35_f32 + 0.02_f32 * ((idx % 5) as f32);
+
+            let mut r_pos = base_row.clone();
+            r_pos.was_vetoed_by_loss_autopsy = false;
+            r_pos.mfe_pct = 8.5;
+            r_pos.mae_pct = 2.5;
+            r_pos.entry_embedding_128 = vec![sign_i * mag; 32];
+            pos_corr_rows.push(r_pos);
+
+            let mut r_neg = base_row.clone();
+            r_neg.was_vetoed_by_loss_autopsy = false;
+            r_neg.mfe_pct = 8.5;
+            r_neg.mae_pct = 2.5;
+            let mut emb_neg = vec![0.0_f32; 32];
+            for (d, slot) in emb_neg.iter_mut().enumerate() {
+                // Flip sign on odd features: preserves mean=0 and diagonal variance S_{d,d} identically,
+                // while flipping off-diagonal covariance S_{p,q} for p+q odd!
+                let flip = if d % 2 == 0 { 1.0_f32 } else { -1.0_f32 };
+                *slot = sign_i * flip * mag;
+            }
+            r_neg.entry_embedding_128 = emb_neg;
+            neg_corr_rows.push(r_neg);
+        }
+
+        let uniform_w = [1.0_f64; 32];
+        let shock_pos_corr =
+            crate::ledger::OccTimsPortfolioMarginEngine::compute_causal_ledoit_wolf_tims_shock_bound(
+                &pos_corr_rows,
+                None,
+                Some(&uniform_w),
+                28,
+            );
+        let shock_neg_corr =
+            crate::ledger::OccTimsPortfolioMarginEngine::compute_causal_ledoit_wolf_tims_shock_bound(
+                &neg_corr_rows,
+                None,
+                Some(&uniform_w),
+                28,
+            );
+        assert!(
+            shock_pos_corr > shock_neg_corr,
+            "True 32x32 Ledoit-Wolf quadratic form w^T Sigma_LW w MUST be strictly larger under positive cross-feature correlation ({shock_pos_corr}) than under negative off-diagonal cancellation ({shock_neg_corr}) when 1D returns and diagonal variances are identical!"
+        );
+
+        // 3. Verify unified CrossVenueSmartRouter simplex state between ledger snapshot and execution tickets
+        let tickets = engine.execution_tickets_snapshot();
+        for t in &tickets.tickets {
+            let brain_state = evo
+                .synaptic_plasticity_states
+                .iter()
+                .find(|s| s.brain_id == t.brain_id)
+                .expect("Brain state must exist");
+            assert_eq!(
+                t.sor_venue_weights_4,
+                brain_state.learned_sor_venue_weights_4,
+                "Execution ticket sor_venue_weights_4 for {} ({}) must exactly match Brain's learned_sor_venue_weights_4!",
+                t.symbol,
+                t.brain_id.as_str()
+            );
+        }
+
+        // 4. Verify Trade-Level vs Portfolio-Level R-multiple additive reconciliation on all scaled runners
+        let mut sum_unpin_r = 0.0_f64;
+        for row in &snap.closed_trades {
+            if !row.was_vetoed_by_loss_autopsy && row.was_scaled_with_house_money {
+                let base_r_round = (row.realized_r_multiple * 1000.0).round() / 1000.0;
+                let expected_total_r =
+                    ((base_r_round + row.house_money_additional_r_gained) * 1000.0).round()
+                        / 1000.0;
+                assert!(
+                    (row.adaptive_scratch_exit_r - expected_total_r).abs() < 1e-6,
+                    "Trade {} ({}) R-multiple mismatch: adaptive_scratch_exit_r ({}) != base_r_round ({}) + house_money_additional_r_gained ({})",
+                    row.trade_id,
+                    row.symbol,
+                    row.adaptive_scratch_exit_r,
+                    base_r_round,
+                    row.house_money_additional_r_gained
+                );
+                sum_unpin_r += row.charm_vanna_unpin_extra_r;
+            }
+        }
+        let expected_portfolio_unpin_r = (sum_unpin_r * 100.0).round() / 100.0;
+        assert!(
+            (snap.scoreboard.charm_vanna_additional_r_gained - expected_portfolio_unpin_r).abs()
+                < 1e-6,
+            "Portfolio charm_vanna_additional_r_gained ({}) must equal rounded sum of trade charm_vanna_unpin_extra_r ({})",
+            snap.scoreboard.charm_vanna_additional_r_gained,
+            expected_portfolio_unpin_r
+        );
     }
 }

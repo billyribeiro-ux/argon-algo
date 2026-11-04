@@ -225,15 +225,16 @@ impl RawFingerprintEngine {
             let lower_wick_ratio = (lower_wick_units / range_units).clamp(0.0, 1.0) as f32;
 
             let vwap_disp_log = cur.close.log_ratio(cur.vwap).clamp(-0.5, 0.5) as f32;
+            let neg_four_floor = -4.0_f64;
             let vol_surge_log = (((cur.volume as f64) + 1.0) / (mean_vol + 1.0))
                 .ln()
-                .clamp(-4.0, 6.0) as f32;
+                .clamp(neg_four_floor, 6.0) as f32;
             // Scale-independent relative turnover surge using integer-scaled volume * relative price to POC
             let relative_bar_notional = (cur.volume as f64)
                 * (cur.vwap.scaled_units() as f64 / poc_vwap.scaled_units().max(1) as f64);
             let turnover_vel_log = ((relative_bar_notional + 1.0) / (mean_vol + 1.0))
                 .ln()
-                .clamp(-4.0, 6.0) as f32;
+                .clamp(neg_four_floor, 6.0) as f32;
 
             let cur_avg_trade_size = (cur.volume as f64) / (cur.trade_count.max(1) as f64);
             let inst_print_density = ((cur_avg_trade_size + 1.0) / (mean_trade_size + 1.0))

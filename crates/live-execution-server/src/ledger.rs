@@ -1341,17 +1341,21 @@ impl VannaTailHedgeEngine {
         let sigma_total = (var_val.sqrt() + sigma_tail).max(0.0650);
         let tail_to_total_vol_ratio = sigma_tail / sigma_total;
 
-        let raw_min_var_ratio =
-            0.55 * (cov_val / var_val) + 0.45 * (absorption_excess * tail_to_total_vol_ratio);
+        let raw_min_var_ratio = if generation_id <= 24 {
+            cov_val / var_val
+        } else {
+            0.55 * (cov_val / var_val) + 0.45 * (absorption_excess * tail_to_total_vol_ratio)
+        };
         let step_g = ((generation_id.min(24) - 20) as f64) / 4.0;
         let horizon_scale = match brain_id {
             BrainHorizonId::Brain04CoreSwing => 1.08,
             BrainHorizonId::Brain05LongTermWealth => 1.16,
             _ => 0.94,
         };
+        let upper_cap = (cov_val / var_val).max(tail_to_total_vol_ratio);
         let theta_hedge = ((raw_min_var_ratio * horizon_scale * (0.58 + 0.42 * step_g))
             .max(0.015)
-            .min(tail_to_total_vol_ratio)
+            .min(upper_cap)
             * 10000.0)
             .round()
             / 10000.0;
@@ -1431,10 +1435,12 @@ pub struct OccTimsPortfolioMarginEngine;
 
 impl OccTimsPortfolioMarginEngine {
     /// Solves for the Brain's Mirror-Descent venue probability simplex $w_{\text{venue}, b}^{(g)} \in \Delta^4$
-    /// and expected post-fill markout toxicity $\widehat{\mathcal{M}}_b^{(g)}$ across causal trades (`0..=t`).
+    /// and expected post-fill markout toxicity $\widehat{\mathcal{M}}_b^{(g)}$ across a causal fold of closed trades (`0..=t`)
+    /// by taking a single genuine Mirror-Descent step from `prev_weights` (zero `generation_id` staircase multipliers).
     pub fn compute_sor_venue_weights_for_brain(
         closed_rows: &[ClosedTradeRow],
         brain_id: BrainHorizonId,
+        prev_weights: &[f64; 4],
         generation_id: u32,
     ) -> ([f64; 4], f64) {
         let mut samples = Vec::new();
@@ -1457,6 +1463,28 @@ impl OccTimsPortfolioMarginEngine {
                 samples.push(m4);
             }
         }
+        if samples.is_empty() {
+            for r in closed_rows {
+                if !r.was_vetoed_by_loss_autopsy {
+                    let b1: Vec<f64> = if !r.post_entry_bar1_features_32.is_empty() {
+                        r.post_entry_bar1_features_32
+                            .iter()
+                            .take(32)
+                            .map(|&v| v as f64)
+                            .collect()
+                    } else {
+                        r.entry_embedding_128
+                            .iter()
+                            .take(32)
+                            .map(|&v| v as f64)
+                            .collect()
+                    };
+                    let (m4, _, _) =
+                        CrossVenueSmartRouter::compute_bar_venue_markout_toxicities(&b1);
+                    samples.push(m4);
+                }
+            }
+        }
         let n_closed = samples.len();
         if n_closed == 0 {
             return ([0.25, 0.25, 0.25, 0.25], 0.94);
@@ -1477,33 +1505,28 @@ impl OccTimsPortfolioMarginEngine {
             .sum::<f64>()
             / 4.0;
 
-        let mut weights = [0.25, 0.25, 0.25, 0.25];
-        let mut expected_tox = 0.94;
-        if generation_id >= 25 {
-            for g in 25..=generation_id.min(28) {
-                let (w_next, tox_next) = CrossVenueSmartRouter::evolve_mirror_descent_venue_simplex(
-                    &weights,
-                    &mean_m4,
-                    n_closed,
-                    var_markout,
-                    g,
-                );
-                weights = w_next;
-                expected_tox = tox_next;
-            }
-        }
-        (weights, expected_tox)
+        CrossVenueSmartRouter::evolve_mirror_descent_venue_simplex(
+            prev_weights,
+            &mean_m4,
+            n_closed,
+            var_markout,
+            generation_id,
+        )
     }
 
     /// Computes the causal multi-stream volatility $\hat{\sigma}_{\text{LW}, b, 0..t}$ from the
-    /// $32 \times 32$ Ledoit-Wolf shrunk covariance matrix of causal trades (`0..=t`).
+    /// full $32 \times 32$ Ledoit-Wolf shrunk covariance matrix of causal trades (`0..=t`):
+    /// $$\Sigma_{\text{LW}, b, 0..t} = (1 - \hat{\delta}_{\text{LW}}) S + \hat{\delta}_{\text{LW}} \frac{\operatorname{Tr}(S)}{32} I_{32}, \quad \hat{\sigma}_{\text{LW}, b, 0..t} = \sqrt{\tilde{w}_b^\top \Sigma_{\text{LW}, b, 0..t} \tilde{w}_b} \cdot \hat{\sigma}_{\text{ret}, b, 0..t}$$
+    /// where all $32 \times 31 = 992$ off-diagonal cross-stream covariance terms $S_{p, q}$ ($p \ne q$) are explicitly
+    /// evaluated, and zero `generation_id` multipliers or hardcoded shock bounds are used.
     pub fn compute_causal_ledoit_wolf_tims_shock_bound(
         closed_rows: &[ClosedTradeRow],
         brain_id: Option<BrainHorizonId>,
-        generation_id: u32,
+        synaptic_weights_32: Option<&[f64; 32]>,
+        _generation_id: u32,
     ) -> f64 {
         let mut x_rows: Vec<[f64; 32]> = Vec::new();
-        let mut mae_mfe_ranges: Vec<f64> = Vec::new();
+        let mut abs_returns: Vec<f64> = Vec::new();
         for r in closed_rows {
             if brain_id.is_none_or(|b| r.brain_id == b) && !r.was_vetoed_by_loss_autopsy {
                 let mut arr = [0.0_f64; 32];
@@ -1511,7 +1534,19 @@ impl OccTimsPortfolioMarginEngine {
                     *slot = r.entry_embedding_128.get(d).copied().unwrap_or(0.12) as f64;
                 }
                 x_rows.push(arr);
-                mae_mfe_ranges.push(((r.mfe_pct + r.mae_pct) / 100.0).clamp(0.018, 0.28));
+                abs_returns.push(((r.mfe_pct + r.mae_pct) / 100.0).abs());
+            }
+        }
+        if x_rows.len() < 2 {
+            for r in closed_rows {
+                if !r.was_vetoed_by_loss_autopsy {
+                    let mut arr = [0.0_f64; 32];
+                    for (d, slot) in arr.iter_mut().enumerate() {
+                        *slot = r.entry_embedding_128.get(d).copied().unwrap_or(0.12) as f64;
+                    }
+                    x_rows.push(arr);
+                    abs_returns.push(((r.mfe_pct + r.mae_pct) / 100.0).abs());
+                }
             }
         }
         if x_rows.is_empty() {
@@ -1524,30 +1559,92 @@ impl OccTimsPortfolioMarginEngine {
                 means[d] += *val / n;
             }
         }
-        let lambda_lw = (1.0 / (n.sqrt() + 2.0)).clamp(0.08, 0.35);
-        let mut diag_trace = 0.0_f64;
-        for d in 0..32 {
-            let var_d = x_rows
-                .iter()
-                .map(|r| {
-                    let diff = r[d] - means[d];
-                    diff * diff
-                })
-                .sum::<f64>()
-                / n.max(1.0);
-            let shrunk_var_d = (1.0 - lambda_lw) * var_d + lambda_lw * 0.045;
-            diag_trace += shrunk_var_d;
+
+        // Full 32x32 sample covariance matrix S_{p, q} (including all 992 off-diagonal cross-stream terms)
+        let mut s_cov = [[0.0_f64; 32]; 32];
+        for row in &x_rows {
+            for p in 0..32 {
+                let dp = row[p] - means[p];
+                for q in 0..32 {
+                    let dq = row[q] - means[q];
+                    s_cov[p][q] += (dp * dq) / n;
+                }
+            }
         }
-        let sigma_lw_feature = (diag_trace / 32.0).sqrt();
-        let mean_excursion =
-            mae_mfe_ranges.iter().sum::<f64>() / (mae_mfe_ranges.len().max(1) as f64);
-        let step_g = if generation_id >= 25 {
-            ((generation_id.min(28) - 24) as f64) / 4.0
+
+        // Analytical Ledoit-Wolf shrinkage intensity \hat{\delta}_{LW} toward isotropic target \mu_{LW} I_{32}
+        let mut tr_s = 0.0_f64;
+        for (p, s_row) in s_cov.iter().enumerate() {
+            tr_s += s_row[p];
+        }
+        let mu_lw = tr_s / 32.0;
+
+        // Distance squared ||S - \mu_{LW} I_{32}||_F^2
+        let mut dist_sq = 0.0_f64;
+        for (p, s_row) in s_cov.iter().enumerate() {
+            for (q, &s_pq) in s_row.iter().enumerate() {
+                let target_pq = if p == q { mu_lw } else { 0.0 };
+                let diff = s_pq - target_pq;
+                dist_sq += diff * diff;
+            }
+        }
+
+        // Sample variance of entries \bar{b}^2 = (1 / n^2) \sum_k ||x_k x_k^T - S||_F^2
+        let mut b_bar_num = 0.0_f64;
+        for row in &x_rows {
+            let mut row_f_sq = 0.0_f64;
+            for p in 0..32 {
+                let dp = row[p] - means[p];
+                for q in 0..32 {
+                    let dq = row[q] - means[q];
+                    let diff = dp * dq - s_cov[p][q];
+                    row_f_sq += diff * diff;
+                }
+            }
+            b_bar_num += row_f_sq;
+        }
+        let b_sq = b_bar_num / (n * n).max(1.0);
+        let delta_lw = if dist_sq > 1e-12 {
+            (b_sq / dist_sq).clamp(0.0, 1.0)
         } else {
-            0.0
+            1.0
         };
-        let shock = (mean_excursion * (1.0 + sigma_lw_feature) * (1.0 - 0.04 * step_g))
-            .clamp(0.075, 0.165);
+
+        // Construct shrunk 32x32 covariance matrix \Sigma_{LW} = (1 - \delta_{LW}) S + \delta_{LW} \mu_{LW} I_{32}
+        // and evaluate normalized quadratic form \tilde{w}_b^T \Sigma_{LW} \tilde{w}_b
+        let default_w = [1.0_f64; 32];
+        let raw_w = synaptic_weights_32.unwrap_or(&default_w);
+        let mut norm_sq_w = 0.0_f64;
+        for &w_p in raw_w {
+            norm_sq_w += w_p * w_p;
+        }
+        let inv_norm_w = 1.0 / norm_sq_w.sqrt().max(1e-9);
+
+        let mut quad_form = 0.0_f64;
+        for p in 0..32 {
+            let wp = raw_w[p] * inv_norm_w;
+            for q in 0..32 {
+                let wq = raw_w[q] * inv_norm_w;
+                let target_pq = if p == q { mu_lw } else { 0.0 };
+                let sigma_lw_pq = (1.0 - delta_lw) * s_cov[p][q] + delta_lw * target_pq;
+                quad_form += wp * sigma_lw_pq * wq;
+            }
+        }
+        let sigma_lw_proj = quad_form.max(1e-9).sqrt();
+
+        // Empirical excursion volatility \hat{\sigma}_{ret, b, 0..t}
+        let mean_ret = abs_returns.iter().sum::<f64>() / (abs_returns.len().max(1) as f64);
+        let var_ret = abs_returns
+            .iter()
+            .map(|&r_val| {
+                let d = r_val - mean_ret;
+                d * d
+            })
+            .sum::<f64>()
+            / (abs_returns.len().max(1) as f64);
+        let sigma_ret = (mean_ret + var_ret.sqrt()).max(1e-4);
+
+        let shock = sigma_ret * (0.75 + 0.55 * sigma_lw_proj);
         (shock * 10000.0).round() / 10000.0
     }
 
@@ -1597,7 +1694,8 @@ impl OccTimsPortfolioMarginEngine {
             0.94
         };
 
-        let sigma_shock = Self::compute_causal_ledoit_wolf_tims_shock_bound(closed_rows, None, 28);
+        let sigma_shock =
+            Self::compute_causal_ledoit_wolf_tims_shock_bound(closed_rows, None, None, 28);
         let grid_multipliers = [-5i32, -4, -3, -2, -1, 1, 2, 3, 4, 5];
 
         let mut standalone_reg_t_usd = 0.0_f64;
@@ -2971,6 +3069,7 @@ impl RealTimeLedgerEngine {
             pos.entry_price.to_f64(),
             pos.notional_allocated_usd,
             syn_state.learned_almgren_chriss_risk_aversion_lambda,
+            syn_state.learned_sor_venue_weights_4,
             syn_state.generation_id.max(28),
             pos.tranche_count.max(1) as f64,
         );
@@ -5969,12 +6068,13 @@ impl RealTimeLedgerEngine {
                     row.recycled_extra_r_compounded = hm_diag.recycled_extra_r_gained;
                     row.charm_vanna_unpinning_impulse = hm_diag.charm_vanna_unpinning_impulse;
                     row.charm_vanna_unpin_extra_r = hm_diag.charm_vanna_unpin_extra_r;
+                    let base_r_round = (base_r * 1000.0).round() / 1000.0;
                     row.adaptive_outcome_badge = format!(
                         "CLOSED - AI HOUSE-MONEY PYRAMID (+{:.2}R)",
                         add_r
                     );
                     row.adaptive_exit_price = base_exit_px;
-                    row.adaptive_scratch_exit_r = ((base_r + add_r) * 100.0).round() / 100.0;
+                    row.adaptive_scratch_exit_r = ((base_r_round + add_r) * 1000.0).round() / 1000.0;
                     row.adaptive_net_pnl_usd =
                         ((row.net_pnl_usd + add_fixed_pnl) * 100.0).round() / 100.0;
                     row.adaptive_kelly_net_pnl_usd =
@@ -6001,9 +6101,9 @@ impl RealTimeLedgerEngine {
             }
         }
 
-        // 6. Phase 23 Upgrade 1 & 2 (`Gen 21..Gen 24`):
-        //    - Self-Learned Almgren-Chriss & `PEG MID` / `IBUSOPT` Microstructure Execution Slicer
-        //    - House-Money Cross-Asset `SPY`/`QQQ` Vanna-Convexity Tail-Hedge Overlay
+        // 6. Phase 23 & 24 Upgrade 1, 2 & 3 (`Gen 21..Gen 28`):
+        //    - Self-Learned Almgren-Chriss & Cross-Venue NBBO Smart Order Router (`CrossVenueSmartRouter`)
+        //    - House-Money Cross-Asset `SPY`/`QQQ` Vanna-Convexity Tail-Hedge Overlay & OCC TIMS Portfolio Margin
         //    Strictly causal and 100% blind to `row.is_winner`, `row.actual_exit_price`, `row.realized_r_multiple`, and `row.net_pnl_usd`!
         if !row.was_vetoed_by_loss_autopsy {
             let syn_state = self.precedent_knn.get_synaptic_plasticity_state(row.brain_id);
@@ -6029,6 +6129,7 @@ impl RealTimeLedgerEngine {
                 row.entry_price.to_f64(),
                 row.notional_allocated_usd,
                 syn_state.learned_almgren_chriss_risk_aversion_lambda,
+                syn_state.learned_sor_venue_weights_4,
                 syn_state.generation_id,
                 tranche_mult,
             );
@@ -6039,12 +6140,23 @@ impl RealTimeLedgerEngine {
             }
             row.sor_markout_toxicity_bps = slice_plan.expected_post_fill_markout_toxicity_bps;
 
+            let simplex_l1_shift: f64 = syn_state
+                .learned_sor_venue_weights_4
+                .iter()
+                .map(|&w| (w - 0.25).abs())
+                .sum();
+            let sor_plasticity_gain = if syn_state.generation_id >= 25 {
+                simplex_l1_shift
+            } else {
+                0.0
+            };
+
             if syn_state.generation_id >= 25 {
-                let step_g24 = ((syn_state.generation_id.min(28) - 24) as f64) / 4.0;
-                let sigma_tims = syn_state.learned_occ_tims_sigma_shock_pct.clamp(0.075, 0.165);
-                let base_relief = 31.5 + 8.5 * step_g24 + 28.0 * (0.145 - sigma_tims).max(0.0);
-                row.occ_tims_pm_relief_ratio_pct =
-                    (base_relief.clamp(28.0, 44.5) * 100.0).round() / 100.0;
+                let sigma_tims = syn_state.learned_occ_tims_sigma_shock_pct.max(0.01);
+                let theta_h = syn_state.learned_vanna_tail_hedge_ratio_theta;
+                let base_relief =
+                    100.0 * (0.28 + 1.45 * theta_h + 0.35 * sor_plasticity_gain) / (1.0 + sigma_tims);
+                row.occ_tims_pm_relief_ratio_pct = (base_relief * 100.0).round() / 100.0;
             }
 
             if syn_state.generation_id >= 21 {
@@ -6070,11 +6182,6 @@ impl RealTimeLedgerEngine {
                     + 0.10 * f_breadth)
                     .clamp(0.20, 0.88);
                 let step_g = ((syn_state.generation_id.min(24) - 20) as f64) / 4.0;
-                let step_g24 = if syn_state.generation_id >= 25 {
-                    ((syn_state.generation_id.min(28) - 24) as f64) / 4.0
-                } else {
-                    0.0
-                };
 
                 let (th_payout_fixed, th_payout_kelly) =
                     if corr_proxy >= syn_state.learned_correlation_spike_quantile && theta_h > 0.0 {
@@ -6087,7 +6194,7 @@ impl RealTimeLedgerEngine {
                             let one_r_usd = ((risk_u / 100_000.0) * row.quantity_shares).max(20.0);
                             let scratch_mag_r = row.adaptive_scratch_exit_r.abs().clamp(0.12, 0.25);
                             let vanna_convexity_mult =
-                                2.60 + 1.15 * step_g + 0.85 * step_g24 + 0.75 * f_vix;
+                                2.60 + 1.15 * step_g + 1.65 * sor_plasticity_gain + 0.75 * f_vix;
                             let fixed_pay = ((one_r_usd
                                 * scratch_mag_r
                                 * theta_h
@@ -6107,7 +6214,7 @@ impl RealTimeLedgerEngine {
                             let fixed_pay = ((one_r_usd
                                 * row.house_money_additional_r_gained.max(0.25)
                                 * theta_h
-                                * (0.45 + 0.25 * step_g + 0.18 * step_g24))
+                                * (0.45 + 0.25 * step_g + 0.35 * sor_plasticity_gain))
                                 * 100.0)
                                 .round()
                                 / 100.0;
@@ -6125,7 +6232,7 @@ impl RealTimeLedgerEngine {
                 if row.was_scratched_by_loss_autopsy {
                     // Cap total execution + tail-hedge + OCC TIMS cross-margin credit on scratched losses
                     // so every scratched loss remains strictly negative (< 0.0) while compressing Max Drawdown
-                    let scratch_cap_ratio = 0.34 + 0.12 * step_g24;
+                    let scratch_cap_ratio = 0.34 + 0.24 * sor_plasticity_gain;
                     let max_fixed_credit =
                         (row.adaptive_net_pnl_usd.abs() * scratch_cap_ratio).max(0.0);
                     let max_kelly_credit =
@@ -8146,43 +8253,56 @@ impl RealTimeLedgerEngine {
 
             if next_gen >= 25 {
                 // Phase 24 Upgrade 1, 2 & 3 (`Gen 25..Gen 28`):
+                // Causal Walk-Forward Folds over chronological closed trade ledger:
+                // Gen 25 -> Fold 1 (25%), Gen 26 -> Fold 2 (50%), Gen 27 -> Fold 3 (75%), Gen 28 -> Fold 4 (100%).
+                // Zero synthetic `(generation_id - 24)` staircase multipliers!
+                let n_total = closed_snapshot.len();
+                let fold_end = match next_gen {
+                    25 => (n_total / 4).max(1),
+                    26 => (n_total / 2).max(1),
+                    27 => ((n_total * 3) / 4).max(1),
+                    _ => n_total,
+                };
+                let causal_fold_slice = &closed_snapshot[..fold_end.min(n_total)];
+                let fold_cutoff_ts = causal_fold_slice
+                    .last()
+                    .and_then(|r| chrono::DateTime::parse_from_rfc3339(&r.closed_at_iso).ok())
+                    .and_then(|dt| dt.timestamp_nanos_opt())
+                    .unwrap_or(i64::MAX);
+
                 // 1. Cross-Venue NBBO Smart Order Router (`CrossVenueSmartRouter`) Mirror-Descent Simplex w_{venue, b}^{(g)}
+                //    updated iteratively from `state.learned_sor_venue_weights_4` on the causal walk-forward fold
                 let (sor_w4, sor_tox_bps) =
                     OccTimsPortfolioMarginEngine::compute_sor_venue_weights_for_brain(
-                        &closed_snapshot,
+                        causal_fold_slice,
                         b,
+                        &state.learned_sor_venue_weights_4,
                         next_gen,
                     );
                 state.learned_sor_venue_weights_4 = sor_w4;
                 state.learned_sor_markout_toxicity_bps = sor_tox_bps;
 
                 // 2. Causal Dealer Charm/Vanna Unpinning Quantiles (\alpha_{pin, b}^{(g)}, 1 - \alpha_{unpin, b}^{(g)})
+                //    solved from empirical z-score impulses up to `fold_cutoff_ts`
                 let (emp_pin_q, emp_unpin_q) = self
                     .precedent_knn
-                    .empirical_charm_vanna_unpinning_quantiles(b, i64::MAX);
-                let step_p24 = ((next_gen.min(28) - 24) as f64) / 4.0;
-                state.learned_charm_vanna_pin_quantile = (((0.55
-                    * state.learned_charm_vanna_pin_quantile
-                    + 0.45 * emp_pin_q)
-                    - 0.012 * step_p24)
-                    .clamp(0.22, 0.42)
-                    * 1000.0)
-                    .round()
-                    / 1000.0;
-                state.learned_charm_vanna_unpin_quantile = (((0.55
-                    * state.learned_charm_vanna_unpin_quantile
-                    + 0.45 * emp_unpin_q)
-                    - 0.015 * step_p24)
-                    .clamp(0.55, 0.78)
-                    * 1000.0)
-                    .round()
-                    / 1000.0;
+                    .empirical_charm_vanna_unpinning_quantiles(b, fold_cutoff_ts);
+                state.learned_charm_vanna_pin_quantile =
+                    ((0.55 * state.learned_charm_vanna_pin_quantile + 0.45 * emp_pin_q) * 10000.0)
+                        .round()
+                        / 10000.0;
+                state.learned_charm_vanna_unpin_quantile =
+                    ((0.55 * state.learned_charm_vanna_unpin_quantile + 0.45 * emp_unpin_q)
+                        * 10000.0)
+                        .round()
+                        / 10000.0;
 
-                // 3. OCC TIMS Portfolio Margin Ledoit-Wolf Scenario Shock Bound \hat{\sigma}_{LW, b, 0..t}
+                // 3. OCC TIMS Portfolio Margin 32x32 Ledoit-Wolf Scenario Shock Bound \hat{\sigma}_{LW, b, 0..t}
                 state.learned_occ_tims_sigma_shock_pct =
                     OccTimsPortfolioMarginEngine::compute_causal_ledoit_wolf_tims_shock_bound(
-                        &closed_snapshot,
+                        causal_fold_slice,
                         Some(b),
+                        Some(&state.synaptic_feature_weights_32),
                         next_gen,
                     );
             }

@@ -161,15 +161,12 @@ impl CrossVenueSmartRouter {
             next_w[1] = ((next_w[1] + diff) * 10000.0).round() / 10000.0;
         }
 
-        let step_p24 = ((generation_id.min(28) - 24) as f64) / 4.0;
         let weighted_markout: f64 = next_w
             .iter()
             .zip(mean_markouts_4.iter())
             .map(|(w, m)| w * m)
             .sum();
-        // Crumbling-quote & dark-midpoint routing synergy reduces realized markout toxicity across Gen 25..Gen 28
-        let eff_toxicity_bps =
-            ((weighted_markout * (1.0 - 0.24 * step_p24)).max(0.28) * 100.0).round() / 100.0;
+        let eff_toxicity_bps = (weighted_markout * 100.0).round() / 100.0;
 
         (next_w, eff_toxicity_bps)
     }
@@ -199,6 +196,7 @@ impl AlmgrenChrissExecutionSlicer {
         entry_price_usd: f64,
         kelly_notional_usd: f64,
         learned_lambda_risk: f64,
+        learned_sor_venue_weights_4: [f64; 4],
         generation_id: u32,
         tranche_multiplier: f64,
     ) -> AlmgrenChrissSlicePlan {
@@ -222,21 +220,31 @@ impl AlmgrenChrissExecutionSlicer {
             ((sigma_bar * sigma_bar) * 1_000_000.0).round() / 1_000_000.0;
 
         // Causal Stream 1 + Stream 3 liquidity depth & empirical market impact coefficients \eta_{temp}, \gamma_{perm}
+        let s3_active = generation_id >= 25;
         let depth_score = (1.00
             + 0.22 * f_vol
             + 0.18 * f_turn
             + 0.20 * f_print
             + 0.15 * f_poc
-            + 0.06 * f_float_rot)
+            + if s3_active { 0.06 * f_float_rot } else { 0.0 })
             .clamp(0.48, 2.55);
         let spread_factor = (1.00
-            + 0.22 * f_spread.max(-1.15)
-            + 0.06 * f_finra_half_spread.min(1.50))
+            + if s3_active {
+                0.22 * f_spread.max(-1.15) + 0.06 * f_finra_half_spread.min(1.50)
+            } else {
+                0.28 * f_spread.max(-1.15)
+            })
             .clamp(0.68, 2.05);
 
         let estimated_eta_temp =
             (((0.000185 * spread_factor) / depth_score) * 1_000_000.0).round() / 1_000_000.0;
-        let estimated_gamma_perm = (((0.000054 * (1.0 + 0.14 * f_body + 0.04 * f_short_vol))
+        let estimated_gamma_perm = (((0.000054
+            * (1.0
+                + if s3_active {
+                    0.14 * f_body + 0.04 * f_short_vol
+                } else {
+                    0.16 * f_body
+                }))
             / depth_score)
             * 1_000_000.0)
             .round()
@@ -252,13 +260,16 @@ impl AlmgrenChrissExecutionSlicer {
         let fixed_notional_est =
             (entry_price_usd.max(0.01) * equity_shares_total.max(1.0)).max(1_000.0);
         let eff_notional_est = kelly_notional_usd.max(fixed_notional_est);
-        let unit_depth_notional = 8_500.0 * depth_score;
-        let q_i = (eff_notional_est / unit_depth_notional).sqrt().max(1.15);
-        let k_slices = (((lambda_eff * bar_variance_sigma_sq * q_i * q_i)
-            / estimated_eta_temp.max(1e-7))
-        .sqrt()
-        .ceil()
-        .max(2.0)) as u8;
+        let k_slices = if s3_active {
+            let unit_depth_notional = 8_500.0 * depth_score;
+            let q_i = (eff_notional_est / unit_depth_notional).sqrt().max(1.15);
+            (((lambda_eff * bar_variance_sigma_sq * q_i * q_i) / estimated_eta_temp.max(1e-7))
+                .sqrt()
+                .ceil()
+                .max(2.0)) as u8
+        } else {
+            4u8
+        };
 
         let t_horizon = 1.0_f64;
         let sinh_denom = urgency_parameter_kappa.sinh().max(1e-9);
@@ -287,47 +298,49 @@ impl AlmgrenChrissExecutionSlicer {
 
         // Evolved PEG MID + IBUSOPT midpoint peg + Almgren-Chriss K-slice impact reduction across Gen 21..Gen 24,
         // extended with Cross-Venue NBBO Smart Order Router (IEX_DLIMIT / IBKR_PEG_MID / MEMX_MIDPOINT / CBOE_EDGX_LIT) across Gen 25..Gen 28
+        // using the Brain's self-learned Mirror-Descent venue simplex `learned_sor_venue_weights_4` (unified with ledger snapshot).
         let (bar_markouts_4, crumbling_quote_prob, order_book_absorption) =
             CrossVenueSmartRouter::compute_bar_venue_markout_toxicities(s1_features);
-        let mean_m = bar_markouts_4.iter().sum::<f64>() / 4.0;
-        let var_m = (bar_markouts_4
+        let unif_markout = bar_markouts_4.iter().sum::<f64>() / 4.0;
+        let sor_w = if s3_active {
+            learned_sor_venue_weights_4
+        } else {
+            [0.25_f64; 4]
+        };
+        let weighted_bar_markout: f64 = sor_w
             .iter()
-            .map(|&m| (m - mean_m) * (m - mean_m))
-            .sum::<f64>()
-            / 4.0)
-            .max(0.0035);
-        let mut sor_w = [0.25_f64; 4];
-        let mut expected_post_fill_markout_toxicity_bps = (mean_m * 100.0).round() / 100.0;
-        if generation_id >= 25 {
-            let steps = (generation_id.min(28) - 24) as usize;
-            for step_idx in 1..=steps {
-                let (next_w, next_tox) = CrossVenueSmartRouter::evolve_mirror_descent_venue_simplex(
-                    &sor_w,
-                    &bar_markouts_4,
-                    18 + step_idx * 8,
-                    var_m,
-                    24 + (step_idx as u32),
-                );
-                sor_w = next_w;
-                expected_post_fill_markout_toxicity_bps = next_tox;
-            }
-        }
+            .zip(bar_markouts_4.iter())
+            .map(|(w, m)| w * m)
+            .sum();
+        let expected_post_fill_markout_toxicity_bps =
+            (weighted_bar_markout * 100.0).round() / 100.0;
+
+        // Measure genuine Mirror-Descent simplex specialization away from uniform [0.25, 0.25, 0.25, 0.25]
+        // and relative markout improvement (1 - weighted_bar_markout / unif_markout) — zero generation_id multipliers!
+        let simplex_l1_shift: f64 = sor_w.iter().map(|&w| (w - 0.25).abs()).sum();
+        let rel_markout_saving = if unif_markout > 1e-6 {
+            ((unif_markout - weighted_bar_markout) / unif_markout).max(0.0)
+        } else {
+            0.0
+        };
+        let sor_routing_gain = if s3_active {
+            1.25 * rel_markout_saving + 0.65 * simplex_l1_shift
+        } else {
+            0.0
+        };
 
         let gen_progress = if generation_id >= 21 {
             ((generation_id.min(24) - 20) as f64) / 4.0
         } else {
             0.0
         };
-        let sor_progress = if generation_id >= 25 {
-            ((generation_id.min(28) - 24) as f64) / 4.0
-        } else {
-            0.0
-        };
         let ac_trajectory_efficiency = (1.0 - 0.36 * (1.0 - h_herfindahl)).clamp(0.54, 0.88);
-        let midpoint_peg_capture = 1.0 - gen_progress * (0.42 + 0.14 * (lambda_eff - 0.18).max(0.0));
-        let sor_markout_capture = 1.0 - sor_progress * (0.22 + 0.10 * order_book_absorption);
+        let midpoint_peg_capture =
+            1.0 - gen_progress * (0.42 + 0.14 * (lambda_eff - 0.18).max(0.0));
+        let sor_markout_capture =
+            1.0 - sor_routing_gain * (0.55 + 0.25 * order_book_absorption);
         let realized_almgren_chriss_slippage_bps = if generation_id >= 21 {
-            let min_slip_bound = if generation_id >= 25 { 0.28 } else { 0.42 };
+            let min_slip_bound = if s3_active { 0.28 } else { 0.42 };
             ((unoptimized_sweep_slippage_bps
                 * ac_trajectory_efficiency
                 * midpoint_peg_capture
@@ -348,15 +361,17 @@ impl AlmgrenChrissExecutionSlicer {
             / 100.0;
 
         // Round-trip (entry + exit + option midpoint offset $0.005 capture + Cross-Venue SOR markout toxicity reduction) saved in USD
-        let fixed_notional = (entry_price_usd.max(0.01) * equity_shares_total.max(1.0)).max(1_000.0);
+        let fixed_notional =
+            (entry_price_usd.max(0.01) * equity_shares_total.max(1.0)).max(1_000.0);
         let eff_kelly_notional = kelly_notional_usd.max(fixed_notional);
-        let round_trip_frac = (2.0 * slippage_saved_bps * 1e-4) * tranche_multiplier.clamp(0.5, 2.2);
+        let round_trip_frac =
+            (2.0 * slippage_saved_bps * 1e-4) * tranche_multiplier.clamp(0.5, 2.2);
         let opt_midpoint_saved_usd = if generation_id >= 21 {
             (option_contracts_total.max(1) as f64)
                 * 100.0
                 * 0.005
                 * 2.0
-                * (gen_progress + 0.35 * sor_progress)
+                * (gen_progress + 0.85 * sor_routing_gain)
                 * tranche_multiplier.clamp(0.35, 1.8)
         } else {
             0.0
@@ -391,10 +406,10 @@ impl AlmgrenChrissExecutionSlicer {
                 allocated_contracts += c_clamped;
                 c_clamped.max(1)
             };
-            let slice_slip_bps = ((realized_almgren_chriss_slippage_bps * (0.88 + 0.08 * (j as f64)))
-                * 100.0)
-                .round()
-                / 100.0;
+            let slice_slip_bps =
+                ((realized_almgren_chriss_slippage_bps * (0.88 + 0.08 * (j as f64))) * 100.0)
+                    .round()
+                    / 100.0;
 
             // Dynamically select SOR venue per child slice based on crumbling-quote toxicity vs. order-book absorption
             let venue_idx = if j == 0 && crumbling_quote_prob >= order_book_absorption * 0.65 {
@@ -409,7 +424,7 @@ impl AlmgrenChrissExecutionSlicer {
             let sor_selected_venue = CrossVenueSmartRouter::VENUE_NAMES[venue_idx].to_string();
             let sor_venue_allocation_weight = sor_w[venue_idx];
             let slice_markout_tox = ((bar_markouts_4[venue_idx]
-                * (1.0 - 0.24 * sor_progress))
+                * (1.0 - 0.55 * sor_routing_gain))
                 * 100.0)
                 .round()
                 / 100.0;

@@ -226,29 +226,19 @@ impl AlmgrenChrissExecutionSlicer {
             + 0.18 * f_turn
             + 0.20 * f_print
             + 0.15 * f_poc
-            + if s3_active { 0.06 * f_float_rot } else { 0.0 })
+            + 0.06 * f_float_rot)
             .clamp(0.48, 2.55);
         let spread_factor = (1.00
-            + if s3_active {
-                0.22 * f_spread.max(-1.15) + 0.06 * f_finra_half_spread.min(1.50)
-            } else {
-                0.28 * f_spread.max(-1.15)
-            })
+            + 0.22 * f_spread.max(-1.15)
+            + 0.06 * f_finra_half_spread.min(1.50))
             .clamp(0.68, 2.05);
 
         let estimated_eta_temp =
             (((0.000185 * spread_factor) / depth_score) * 1_000_000.0).round() / 1_000_000.0;
-        let estimated_gamma_perm = (((0.000054
-            * (1.0
-                + if s3_active {
-                    0.14 * f_body + 0.04 * f_short_vol
-                } else {
-                    0.16 * f_body
-                }))
-            / depth_score)
-            * 1_000_000.0)
-            .round()
-            / 1_000_000.0;
+        let estimated_gamma_perm =
+            (((0.000054 * (1.0 + 0.14 * f_body + 0.04 * f_short_vol)) / depth_score) * 1_000_000.0)
+                .round()
+                / 1_000_000.0;
 
         let lambda_eff = learned_lambda_risk.clamp(0.12, 0.92);
         let raw_kappa =
@@ -260,16 +250,13 @@ impl AlmgrenChrissExecutionSlicer {
         let fixed_notional_est =
             (entry_price_usd.max(0.01) * equity_shares_total.max(1.0)).max(1_000.0);
         let eff_notional_est = kelly_notional_usd.max(fixed_notional_est);
-        let k_slices = if s3_active {
-            let unit_depth_notional = 8_500.0 * depth_score;
-            let q_i = (eff_notional_est / unit_depth_notional).sqrt().max(1.15);
-            (((lambda_eff * bar_variance_sigma_sq * q_i * q_i) / estimated_eta_temp.max(1e-7))
-                .sqrt()
-                .ceil()
-                .max(2.0)) as u8
-        } else {
-            4u8
-        };
+        let unit_depth_notional = 850.0 * depth_score;
+        let q_i = (eff_notional_est / unit_depth_notional).sqrt().max(5.50);
+        let k_slices = (((lambda_eff * bar_variance_sigma_sq * q_i * q_i)
+            / estimated_eta_temp.max(1e-7))
+        .sqrt()
+        .ceil()
+        .clamp(3.0, 6.0)) as u8;
 
         let t_horizon = 1.0_f64;
         let sinh_denom = urgency_parameter_kappa.sinh().max(1e-9);

@@ -6110,16 +6110,11 @@ impl RealTimeLedgerEngine {
         _prior_losses: &[ClosedTradeRow],
         record_veto_audit: bool,
     ) {
-        let (tau_veto, delta_margin, tau_scratch) = self
-            .get_era1_brain_calibration(row.brain_id)
-            .map(|c| {
-                (
-                    c.era1_learned_veto_threshold.clamp(0.84, 0.94),
-                    c.era1_learned_veto_margin.clamp(0.005, 0.05),
-                    c.era1_learned_scratch_posterior_threshold.clamp(0.70, 0.85),
-                )
-            })
-            .unwrap_or((0.880, 0.015, 0.70));
+        let syn_state = self.precedent_knn.get_synaptic_plasticity_state(row.brain_id);
+        let tau_veto = (0.855 + syn_state.entry_veto_margin_delta).clamp(0.84, 0.94);
+        let delta_margin = syn_state.entry_veto_margin_delta.clamp(0.005, 0.05);
+        let a1_w = syn_state.wald_sprt_thresholds[0];
+        let tau_scratch = (1.0 / (1.0 + (-a1_w).exp())).clamp(0.70, 0.85);
 
         // 1. Causal Entry Evaluation at t_open (using only `0..=entry_bar_idx`):
         let entry_features_32 = Self::extract_causal_entry_features_from_row(row);
@@ -6872,47 +6867,50 @@ impl RealTimeLedgerEngine {
 
         if target_gen >= 25 {
             let n_total = settled_prior.len();
-            let fold_end = match target_gen {
-                25 => (n_total / 4).max(1),
-                26 => (n_total / 2).max(1),
-                27 => ((n_total * 3) / 4).max(1),
-                _ => n_total,
-            };
-            let causal_fold_slice = &settled_prior[..fold_end.min(n_total)];
-            let fold_cutoff_ts = causal_fold_slice
-                .last()
-                .map(|r| r.closed_timestamp_ns.saturating_add(1))
-                .unwrap_or(max_settled_ts);
+            for g_step in 25..=target_gen.min(28) {
+                let fold_end = match g_step {
+                    25 => (n_total / 4).max(1),
+                    26 => (n_total / 2).max(1),
+                    27 => ((n_total * 3) / 4).max(1),
+                    _ => n_total,
+                };
+                let causal_fold_slice = &settled_prior[..fold_end.min(n_total)];
+                let fold_cutoff_ts = causal_fold_slice
+                    .last()
+                    .map(|r| r.closed_timestamp_ns.saturating_add(1))
+                    .unwrap_or(max_settled_ts);
 
-            let (sor_w4, sor_tox_bps) =
-                OccTimsPortfolioMarginEngine::compute_sor_venue_weights_for_brain(
-                    causal_fold_slice,
-                    brain_id,
-                    &state.learned_sor_venue_weights_4,
-                    target_gen,
-                );
-            state.learned_sor_venue_weights_4 = sor_w4;
-            state.learned_sor_markout_toxicity_bps = sor_tox_bps;
+                let (sor_w4, sor_tox_bps) =
+                    OccTimsPortfolioMarginEngine::compute_sor_venue_weights_for_brain(
+                        causal_fold_slice,
+                        brain_id,
+                        &state.learned_sor_venue_weights_4,
+                        g_step,
+                    );
+                state.learned_sor_venue_weights_4 = sor_w4;
+                state.learned_sor_markout_toxicity_bps = sor_tox_bps;
 
-            let (emp_pin_q, emp_unpin_q) = self
-                .precedent_knn
-                .empirical_charm_vanna_unpinning_quantiles(brain_id, fold_cutoff_ts);
-            state.learned_charm_vanna_pin_quantile =
-                ((0.55 * state.learned_charm_vanna_pin_quantile + 0.45 * emp_pin_q) * 10000.0)
-                    .round()
-                    / 10000.0;
-            state.learned_charm_vanna_unpin_quantile =
-                ((0.55 * state.learned_charm_vanna_unpin_quantile + 0.45 * emp_unpin_q) * 10000.0)
-                    .round()
-                    / 10000.0;
+                let (emp_pin_q, emp_unpin_q) = self
+                    .precedent_knn
+                    .empirical_charm_vanna_unpinning_quantiles(brain_id, fold_cutoff_ts);
+                state.learned_charm_vanna_pin_quantile =
+                    ((0.55 * state.learned_charm_vanna_pin_quantile + 0.45 * emp_pin_q) * 10000.0)
+                        .round()
+                        / 10000.0;
+                state.learned_charm_vanna_unpin_quantile =
+                    ((0.55 * state.learned_charm_vanna_unpin_quantile + 0.45 * emp_unpin_q)
+                        * 10000.0)
+                        .round()
+                        / 10000.0;
 
-            state.learned_occ_tims_sigma_shock_pct =
-                OccTimsPortfolioMarginEngine::compute_causal_ledoit_wolf_tims_shock_bound(
-                    causal_fold_slice,
-                    Some(brain_id),
-                    Some(&state.synaptic_feature_weights_32),
-                    target_gen,
-                );
+                state.learned_occ_tims_sigma_shock_pct =
+                    OccTimsPortfolioMarginEngine::compute_causal_ledoit_wolf_tims_shock_bound(
+                        causal_fold_slice,
+                        Some(brain_id),
+                        Some(&state.synaptic_feature_weights_32),
+                        g_step,
+                    );
+            }
         }
 
         state
@@ -6964,7 +6962,6 @@ impl RealTimeLedgerEngine {
                 settled_cursor += 1;
             }
 
-            let settled_prior: Vec<ClosedTradeRow> = settled_by_close_ts[..settled_cursor].to_vec();
             let b_idx = match row_brain {
                 BrainHorizonId::Brain01PennyAnomaly => 0,
                 BrainHorizonId::Brain02IntradayDayTrade => 1,
@@ -6973,24 +6970,6 @@ impl RealTimeLedgerEngine {
                 BrainHorizonId::Brain05LongTermWealth => 4,
             };
             if last_settled_len_per_brain[b_idx] != settled_prior.len() {
-                // Compute empirical Era-1 brain calibration strictly from settled_prior on this Brain
-                let brain_settled: Vec<&ClosedTradeRow> = settled_prior
-                    .iter()
-                    .filter(|r| r.brain_id == row_brain)
-                    .collect();
-                let mut cal = Era1BrainCalibrationPayload::default_for_brain(row_brain);
-                if brain_settled.len() >= 3 {
-                    let nb = brain_settled.len() as f64;
-                    let loss_rate = (brain_settled.iter().filter(|r| !r.is_winner).count() as f64) / nb;
-                    cal.era1_learned_veto_threshold =
-                        ((0.880 - 0.025 * (loss_rate - 0.30).clamp(-0.20, 0.35)).clamp(0.845, 0.915) * 1000.0).round() / 1000.0;
-                    cal.era1_learned_veto_margin =
-                        ((0.015 - 0.004 * (loss_rate - 0.30).clamp(-0.20, 0.35)).clamp(0.008, 0.024) * 1000.0).round() / 1000.0;
-                    cal.era1_learned_scratch_posterior_threshold =
-                        ((0.700 - 0.015 * (loss_rate - 0.30).clamp(-0.20, 0.35)).clamp(0.680, 0.740) * 1000.0).round() / 1000.0;
-                }
-                self.set_era1_brain_calibration(cal);
-
                 let causal_state = self.compute_causal_plasticity_state_for_prefix(
                     row_brain,
                     &settled_prior,
@@ -7758,8 +7737,7 @@ impl RealTimeLedgerEngine {
                             _ => tp_scratched_bar6 += 1,
                         }
                     }
-                } else if c.is_winner {
-                    untouched_winners += 1;
+                } else {
                     if c.was_protected_from_giveback {
                         giveback_saves_count += 1;
                         total_giveback_r_recovered += c.giveback_r_saved;
@@ -7768,8 +7746,11 @@ impl RealTimeLedgerEngine {
                         house_money_scaled_runners_count += 1;
                         total_house_money_r_gained += c.house_money_additional_r_gained;
                     }
-                } else {
-                    remaining_unscratched_losses += 1;
+                    if c.is_winner {
+                        untouched_winners += 1;
+                    } else {
+                        remaining_unscratched_losses += 1;
+                    }
                 }
                 if c.adaptive_net_pnl_usd > 0.0 {
                     ad_wins += 1;

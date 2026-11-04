@@ -44,8 +44,7 @@ use crate::ledger::{
 };
 use crate::onnx_engine::{LiveBrainInferenceOutput, OnnxMultiBrainEngine};
 use crate::precedent_knn::{
-    HardNegativeTrapRecord, HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMatchSummary,
-    WinnerPullbackRecord,
+    HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMatchSummary,
 };
 use crate::webhooks::{WebhookChannelConfig, WebhookDispatchRecord, WebhookStatusResponse};
 
@@ -2501,7 +2500,7 @@ async fn scanner_candidates_handler(
         .filter(|cand| {
             !vetoed_traps
                 .iter()
-                .any(|v| v.symbol.eq_ignore_ascii_case(&cand.symbol) && v.trap_similarity_score >= 0.90)
+                .any(|v| v.symbol.eq_ignore_ascii_case(&cand.snapshot.symbol) && v.trap_similarity_score >= 0.90)
         })
         .cloned()
         .collect();
@@ -2885,10 +2884,13 @@ async fn evaluate_symbol_handler(
         )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let stage0_diag = state
-        .ledger
-        .evaluate_live_entry_stage0_gate(&inference, &precedents, &raw_bars);
-    if stage0_diag.should_veto && state.ledger.enforce_hard_veto_on_live_scanner() {
+    let stage0_diag = state.ledger.evaluate_live_entry_stage0_gate(
+        &inference,
+        precedents.win_rate_pct,
+        &raw_bars,
+        false,
+    );
+    if stage0_diag.should_veto {
         return Err((
             StatusCode::CONFLICT,
             format!(

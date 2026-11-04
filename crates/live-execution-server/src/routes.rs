@@ -1182,94 +1182,6 @@ impl AppState {
                     }
                 }
                 era1_win_hold_bars.push(peak_bar_offset.max(trace_horizon));
-                if idx % 6 == 0
-                    && inf.signal.ai_confidence_pct >= 62.0
-                    && inf.signal.latent_embedding_128.len() >= 32
-                    && !cal_outcome.is_empty()
-                {
-                    let closed_ts_ns = cal_outcome.last().unwrap().timestamp_ns;
-                    let mut id_bytes = [0u8; 16];
-                    for (bi, bval) in symbol.as_bytes().iter().take(6).enumerate() {
-                        id_bytes[bi] = *bval;
-                    }
-                    id_bytes[6] = (brain_id as u8) ^ 0x80;
-                    id_bytes[7] = (idx & 0xFF) as u8;
-                    id_bytes[8..16].copy_from_slice(&closed_ts_ns.to_be_bytes());
-                    let era1_win_id = Uuid::from_bytes(id_bytes);
-                    self.precedent_knn
-                        .insert_winner_pullback(WinnerPullbackRecord {
-                            win_trade_id: era1_win_id,
-                            brain_id,
-                            symbol: symbol.to_uppercase(),
-                            closed_timestamp_ns: closed_ts_ns,
-                            direction: inf.signal.direction,
-                            embedding_128: inf.signal.latent_embedding_128.clone(),
-                            entry_features_32: entry_x32.clone(),
-                            post_entry_bar1_features_32: bar1_post_x32.clone(),
-                            bar1_r_multiple: bar1_r,
-                            realized_r_multiple: sim_r,
-                        });
-                }
-            } else if sim_r < -0.25
-                && idx % 6 == 0
-                && inf.signal.ai_confidence_pct >= 62.0
-                && inf.signal.latent_embedding_128.len() >= 32
-                && !cal_outcome.is_empty()
-            {
-                // Phase 15/16 Upgrade 1: Causal Era-1 Hard-Negative Trap & Post-Entry Loss-Centroid Seeding
-                // (`closed_timestamp_ns = cal_outcome.last().timestamp_ns < raw_bars[calibration_end].timestamp_ns`)
-                let mut culprit_weights_32 = vec![0.05_f32; 32];
-                let mut indexed_devs: Vec<(usize, f32)> = (0..32)
-                    .map(|f_i| {
-                        let v = *bar1_post_x32.get(f_i).unwrap_or(&0.0);
-                        let dev = match f_i {
-                            0 | 3 | 7 => (0.20 - v).max(0.05) * 2.2,
-                            4 | 5 => v.abs() * 2.4,
-                            _ => v.abs().max(0.05),
-                        };
-                        (f_i, dev)
-                    })
-                    .collect();
-                indexed_devs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                for (f_i, dev) in &indexed_devs {
-                    culprit_weights_32[*f_i] = (*dev).clamp(0.05, 3.5);
-                }
-                let culprit_indices = [
-                    indexed_devs[0].0,
-                    indexed_devs[1].0,
-                    indexed_devs[2].0,
-                ];
-                let culprit_signs = [
-                    if bar1_post_x32[culprit_indices[0]] >= 0.0 { 1.0 } else { -1.0 },
-                    if bar1_post_x32[culprit_indices[1]] >= 0.0 { 1.0 } else { -1.0 },
-                    if bar1_post_x32[culprit_indices[2]] >= 0.0 { 1.0 } else { -1.0 },
-                ];
-                let closed_ts_ns = cal_outcome.last().unwrap().timestamp_ns;
-                let mut id_bytes = [0u8; 16];
-                for (bi, bval) in symbol.as_bytes().iter().take(6).enumerate() {
-                    id_bytes[bi] = *bval;
-                }
-                id_bytes[6] = brain_id as u8;
-                id_bytes[7] = (idx & 0xFF) as u8;
-                id_bytes[8..16].copy_from_slice(&closed_ts_ns.to_be_bytes());
-                let era1_trap_id = Uuid::from_bytes(id_bytes);
-
-                self.precedent_knn.insert_hard_negative_trap(HardNegativeTrapRecord {
-                    loss_trade_id: era1_trap_id,
-                    brain_id,
-                    symbol: symbol.to_uppercase(),
-                    direction: inf.signal.direction,
-                    closed_timestamp_ns: closed_ts_ns,
-                    root_cause_category: "EXHAUSTION_WICK_LIQUIDITY_TRAP".to_string(),
-                    culprit_feature_indices: culprit_indices,
-                    culprit_feature_signs: culprit_signs,
-                    realized_loss_usd: 350.0,
-                    embedding_128: inf.signal.latent_embedding_128.clone(),
-                    entry_features_32: entry_x32,
-                    post_entry_bar1_features_32: bar1_post_x32,
-                    bar1_r_multiple: bar1_r,
-                    culprit_anomaly_weights_32: culprit_weights_32,
-                });
             }
             if inf.signal.latent_embedding_128.len() >= 32 {
                 let mut x_raw = [0.0_f64; 32];
@@ -2581,7 +2493,18 @@ pub struct ScannerCandidatesResponse {
 async fn scanner_candidates_handler(
     State(state): State<AppState>,
 ) -> Result<Json<ScannerCandidatesResponse>, (StatusCode, String)> {
-    let candidates = state.scanner_candidates.read().clone();
+    let vetoed_traps = state.ledger.vetoed_repeat_traps();
+    let candidates: Vec<PromotedScannerCandidate> = state
+        .scanner_candidates
+        .read()
+        .iter()
+        .filter(|cand| {
+            !vetoed_traps
+                .iter()
+                .any(|v| v.symbol.eq_ignore_ascii_case(&cand.symbol) && v.trap_similarity_score >= 0.90)
+        })
+        .cloned()
+        .collect();
     let internals = state
         .data_bus
         .fetch_market_internals_with_failover()
@@ -2961,6 +2884,23 @@ async fn evaluate_symbol_handler(
             Some(&emp_dist),
         )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let stage0_diag = state
+        .ledger
+        .evaluate_live_entry_stage0_gate(&inference, &precedents, &raw_bars);
+    if stage0_diag.should_veto && state.ledger.enforce_hard_veto_on_live_scanner() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "STAGE_0_HARD_NEGATIVE_TRAP_VETO: {} ({}) vetoed by settled trap {:?} (score {:.4} > winner {:.4})",
+                symbol,
+                brain_id.as_str(),
+                stage0_diag.matched_trap_id,
+                stage0_diag.trap_similarity_score,
+                stage0_diag.winner_similarity_score
+            ),
+        ));
+    }
 
     let opened_position = state.ledger.open_position_with_bars(
         exchange_idx,

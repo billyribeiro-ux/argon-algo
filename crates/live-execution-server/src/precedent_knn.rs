@@ -1277,11 +1277,13 @@ impl PrecedentKnnIndex {
         drop(traps);
         drop(wins);
 
-        // Continuous Antisymmetric Bayesian Entry Log-Likelihood Ratio combining Ledoit-Wolf Mahalanobis,
-        // standardized Fisher centroid projection, and nearest-neighbor RBF kernel affinity:
-        let maha_llr = (0.28 * (maha_win * maha_win - maha_trap * maha_trap)).clamp(-3.5, 3.5);
-        let kernel_llr = 5.50 * (max_trap_kernel - max_win_kernel);
-        let entry_llr = (maha_llr + 0.75 * fisher_llr + kernel_llr).clamp(-12.0, 12.0);
+        // Continuous Antisymmetric Bayesian Entry Log-Likelihood Ratio combining empirical prior log-odds,
+        // Ledoit-Wolf Mahalanobis, standardized Fisher centroid projection, and nearest-neighbor RBF kernel affinity:
+        let prior_log_odds = ((n_traps as f64 + 1.0) / (n_wins as f64 + 1.0)).ln();
+        let maha_llr = (0.22 * (maha_win * maha_win - maha_trap * maha_trap)).clamp(-3.0, 3.0);
+        let kernel_llr = 6.20 * (max_trap_kernel - max_win_kernel);
+        let entry_llr =
+            (0.45 * prior_log_odds + maha_llr + 0.85 * fisher_llr + kernel_llr).clamp(-12.0, 12.0);
         let p_trap = 1.0 / (1.0 + (-entry_llr).exp());
 
         let best_trap_sim = (0.50 + 0.48 * p_trap).clamp(0.05, 0.995);
@@ -1469,20 +1471,44 @@ impl PrecedentKnnIndex {
             }
         }
 
+        let mut loss_r_mean = 0.0_f64;
+        let mut win_r_mean = 0.0_f64;
+        for trap in &causal_traps {
+            loss_r_mean += trap.bar1_r_multiple / n_loss;
+        }
+        for w in &causal_wins {
+            win_r_mean += w.bar1_r_multiple / n_win;
+        }
+        let mut loss_r_var = 0.04 / n_loss;
+        let mut win_r_var = 0.04 / n_win;
+        for trap in &causal_traps {
+            let d = trap.bar1_r_multiple - loss_r_mean;
+            loss_r_var += (d * d) / n_loss;
+        }
+        for w in &causal_wins {
+            let d = w.bar1_r_multiple - win_r_mean;
+            win_r_var += (d * d) / n_win;
+        }
+        let r_sigma_pool = (0.5 * (loss_r_var + win_r_var)).sqrt().max(0.12);
+        let r_live = live_bar_features_32[0] as f64;
+        let r_fisher_llr = (((loss_r_mean - win_r_mean) / r_sigma_pool)
+            * ((r_live - 0.5 * (loss_r_mean + win_r_mean)) / r_sigma_pool))
+            .clamp(-3.5, 3.5);
+
         let mut pooled_sample_cov = [[0.0_f64; 32]; 32];
         let mut culprit_weights = [0.0_f64; 32];
         for i in 0..32 {
             for j in 0..32 {
                 let raw_ij = 0.5 * (loss_sample_cov[i][j] + win_sample_cov[i][j]);
                 pooled_sample_cov[i][j] = if i == j {
-                    raw_ij.max(0.025)
+                    raw_ij.max(0.035)
                 } else {
                     raw_ij
                 };
             }
             let sep_i = (loss_centroid[i] - win_centroid[i]).abs();
-            let sigma_i = pooled_sample_cov[i][i].sqrt().max(0.10);
-            culprit_weights[i] = weights[i] * (0.40 + (sep_i / sigma_i).min(2.5));
+            let sigma_i = pooled_sample_cov[i][i].sqrt().max(0.12);
+            culprit_weights[i] = weights[i] * (0.50 + 0.50 * (sep_i / sigma_i).min(2.0));
         }
         let weight_sum: f64 = culprit_weights.iter().sum::<f64>().max(1e-6);
         for w in &mut culprit_weights {
@@ -1587,10 +1613,15 @@ impl PrecedentKnnIndex {
         };
         let kernel_llr = 4.20 * (max_loss_kernel - max_win_kernel);
 
-        // Continuous Antisymmetric Bayesian + Fisher + RBF Kernel Log-Likelihood Ratio Posterior:
-        let llr = (0.30 * (maha_win * maha_win - maha_loss * maha_loss)
-            + 0.65 * fisher_llr
-            + kernel_llr)
+        // Continuous Antisymmetric Bayesian + Fisher + RBF Kernel Log-Likelihood Ratio Posterior
+        // incorporating empirical prior log-odds ln((N_loss + 1)/(N_win + 1)) and Bar+1 excursion Fisher projection:
+        let prior_log_odds = ((n_loss + 1.0) / (n_win + 1.0)).ln();
+        let maha_llr = (0.16 * (maha_win * maha_win - maha_loss * maha_loss)).clamp(-2.5, 2.5);
+        let llr = (0.70 * prior_log_odds
+            + maha_llr
+            + 0.70 * fisher_llr
+            + 0.65 * r_fisher_llr
+            + 0.75 * kernel_llr)
             .clamp(-20.0, 20.0);
         let posterior = 1.0 / (1.0 + (-llr).exp());
 
@@ -1646,10 +1677,13 @@ impl PrecedentKnnIndex {
         let l1 = (p1 / (1.0 - p1)).ln();
         let r1 = bar1_features_32[0] as f64;
 
-        // Step k = 1 (Bar +1): Continuous Wald boundary A_1
-        let a1_thresh = syn_state.wald_sprt_thresholds[0]
+        // Step k = 1 (Bar +1): Only trigger on Bar +1 alone if no Bar +2 exists (1-bar breakdown)
+        // or if Bar +1 is an extreme unabsorbed crash; otherwise evaluate sequential Shakeout Absorption on Bar +2..+3.
+        let a1_thresh = (syn_state.wald_sprt_thresholds[0] + 0.35)
             .max((learned_posterior_threshold / (1.0 - learned_posterior_threshold.min(0.95))).ln());
-        if l1 >= a1_thresh {
+        let has_bar2 = bar2_features_32.is_some_and(|f| f.len() >= 32);
+        let has_bar3 = bar3_features_32.is_some_and(|f| f.len() >= 32);
+        if !has_bar2 && l1 >= a1_thresh {
             let post1 = (1.0 / (1.0 + (-l1).exp())) * 100.0;
             let exit_r_1 = (0.50 * learned_ratchet_r + 0.50 * r1).clamp(-0.25, -0.12);
             return Some(WaldSprtScratchDiagnostic {
@@ -1659,7 +1693,7 @@ impl PrecedentKnnIndex {
                 bar2_log_likelihood_ratio: 0.0,
                 bar3_log_likelihood_ratio: 0.0,
                 cumulative_sprt_log_likelihood: (l1 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post1 * 100.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post1 * 100.0).round() / 100.0,
                 mahalanobis_loss_distance: base_bar1_diag.mahalanobis_loss_distance,
                 mahalanobis_win_distance: base_bar1_diag.mahalanobis_win_distance,
                 matched_trap_id: base_bar1_diag.matched_trap_id,
@@ -1679,11 +1713,11 @@ impl PrecedentKnnIndex {
         )?;
         let p2 = (bar2_diag.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
         let l2 = (p2 / (1.0 - p2)).ln();
-        let lambda2 = 0.55 * l1 + 0.75 * l2;
+        let lambda2 = 0.45 * l1 + 0.70 * l2;
         let r2 = b2_feats[0] as f64;
-        let a2_thresh = syn_state.wald_sprt_thresholds[1];
+        let a2_thresh = syn_state.wald_sprt_thresholds[1] + 0.30;
 
-        if lambda2 >= a2_thresh && l2 > 0.25 {
+        if !has_bar3 && lambda2 >= a2_thresh && l1 > 0.15 && l2 > 0.55 {
             let post2 = (1.0 / (1.0 + (-lambda2).exp())) * 100.0;
             let exit_r_2 = (0.50 * learned_ratchet_r + 0.50 * (0.5 * (r1 + r2))).clamp(-0.25, -0.12);
             return Some(WaldSprtScratchDiagnostic {
@@ -1693,7 +1727,7 @@ impl PrecedentKnnIndex {
                 bar2_log_likelihood_ratio: (l2 * 1000.0).round() / 1000.0,
                 bar3_log_likelihood_ratio: 0.0,
                 cumulative_sprt_log_likelihood: (lambda2 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post2 * 100.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post2 * 100.0).round() / 100.0,
                 mahalanobis_loss_distance: bar2_diag.mahalanobis_loss_distance,
                 mahalanobis_win_distance: bar2_diag.mahalanobis_win_distance,
                 matched_trap_id: bar2_diag.matched_trap_id,
@@ -1701,7 +1735,7 @@ impl PrecedentKnnIndex {
             });
         }
 
-        // Step k = 3 (Bar +3): Continuous sequential LLR evaluation on Bar +3
+        // Step k = 3 (Bar +3): Continuous sequential LLR evaluation on Bar +3 (with Shakeout Absorption if l3 < 0.45)
         let b3_feats = bar3_features_32.filter(|f| f.len() >= 32)?;
         let bar3_diag = self.evaluate_causal_post_entry_scratch(
             brain_id,
@@ -1713,11 +1747,11 @@ impl PrecedentKnnIndex {
         )?;
         let p3 = (bar3_diag.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
         let l3 = (p3 / (1.0 - p3)).ln();
-        let lambda3 = 0.40 * l1 + 0.55 * l2 + 0.85 * l3;
+        let lambda3 = 0.30 * l1 + 0.45 * l2 + 0.75 * l3;
         let r3 = b3_feats[0] as f64;
-        let a3_thresh = syn_state.wald_sprt_thresholds[2];
+        let a3_thresh = syn_state.wald_sprt_thresholds[2] + 0.30;
 
-        if lambda3 >= a3_thresh && l3 > 0.20 {
+        if lambda3 >= a3_thresh && l2 > 0.25 && l3 > 0.65 {
             let post3 = (1.0 / (1.0 + (-lambda3).exp())) * 100.0;
             let exit_r_3 =
                 (0.50 * learned_ratchet_r + 0.50 * ((r1 + r2 + r3) / 3.0)).clamp(-0.25, -0.12);
@@ -1728,7 +1762,7 @@ impl PrecedentKnnIndex {
                 bar2_log_likelihood_ratio: (l2 * 1000.0).round() / 1000.0,
                 bar3_log_likelihood_ratio: (l3 * 1000.0).round() / 1000.0,
                 cumulative_sprt_log_likelihood: (lambda3 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post3 * 100.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post3 * 100.0).round() / 100.0,
                 mahalanobis_loss_distance: bar3_diag.mahalanobis_loss_distance,
                 mahalanobis_win_distance: bar3_diag.mahalanobis_win_distance,
                 matched_trap_id: bar3_diag.matched_trap_id,
@@ -1852,6 +1886,42 @@ impl PrecedentKnnIndex {
             }
         }
 
+        let mut loss_traj_mean = [0.0_f64; 3];
+        let mut win_traj_mean = [0.0_f64; 3];
+        for r in &causal_mid_losses {
+            loss_traj_mean[0] += r.normalized_cumulative_mfe * inv_l;
+            loss_traj_mean[1] += r.excursion_velocity_delta_r * inv_l;
+            loss_traj_mean[2] += r.opposing_absorption_shift * inv_l;
+        }
+        for r in &causal_mid_wins {
+            win_traj_mean[0] += r.normalized_cumulative_mfe * inv_w;
+            win_traj_mean[1] += r.excursion_velocity_delta_r * inv_w;
+            win_traj_mean[2] += r.opposing_absorption_shift * inv_w;
+        }
+        let mut traj_var = [0.04_f64; 3];
+        for r in &causal_mid_losses {
+            let v = [
+                r.normalized_cumulative_mfe,
+                r.excursion_velocity_delta_r,
+                r.opposing_absorption_shift,
+            ];
+            for k in 0..3 {
+                let d = v[k] - loss_traj_mean[k];
+                traj_var[k] += 0.5 * (d * d) * inv_l;
+            }
+        }
+        for r in &causal_mid_wins {
+            let v = [
+                r.normalized_cumulative_mfe,
+                r.excursion_velocity_delta_r,
+                r.opposing_absorption_shift,
+            ];
+            for k in 0..3 {
+                let d = v[k] - win_traj_mean[k];
+                traj_var[k] += 0.5 * (d * d) * inv_w;
+            }
+        }
+
         let loss_mid_vecs: Vec<(String, Vec<f32>)> = causal_mid_losses
             .iter()
             .map(|r| (r.symbol.clone(), r.mid_trade_features_32.clone()))
@@ -1862,6 +1932,9 @@ impl PrecedentKnnIndex {
             .collect();
         drop(mid_losses);
         drop(mid_wins);
+
+        let mfe3_live = (b1[2] as f64).max(b2[2] as f64).max(b3[2] as f64);
+        let r1_3_mean_live = ((b1[0] as f64) + (b2[0] as f64) + (b3[0] as f64)) / 3.0;
 
         let (_, emp_stop_ratchet_r) =
             self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
@@ -1925,20 +1998,42 @@ impl PrecedentKnnIndex {
                 &syn_state.synaptic_feature_weights_32,
                 &diff_win,
             );
-            let maha_llr = (0.30 * (maha_win * maha_win - maha_loss * maha_loss)).clamp(-2.5, 2.5);
+            let live_traj = [
+                mfe3_live,
+                (feats_k[0] as f64) - r1_3_mean_live,
+                feats_k[0] as f64,
+            ];
+            let mut traj_f_num = 0.0_f64;
+            let mut traj_f_den = 0.0_f64;
+            for k in 0..3 {
+                let d_mu = loss_traj_mean[k] - win_traj_mean[k];
+                let mid_k = 0.5 * (loss_traj_mean[k] + win_traj_mean[k]);
+                let vk = traj_var[k].max(0.03);
+                traj_f_num += (d_mu / vk) * (live_traj[k] - mid_k);
+                traj_f_den += (d_mu * d_mu) / vk;
+            }
+            let traj_fisher_llr = if traj_f_den > 1e-6 {
+                (traj_f_num / traj_f_den.sqrt()).clamp(-3.5, 3.5)
+            } else {
+                0.0
+            };
+            let prior_mid_log_odds = ((loss_mid_vecs.len() as f64 + 1.0) / (win_mid_vecs.len() as f64 + 1.0)).ln();
+            let maha_llr = (0.16 * (maha_win * maha_win - maha_loss * maha_loss)).clamp(-2.5, 2.5);
             let fisher_llr = if fisher_den > 1e-6 {
                 (fisher_num / fisher_den.sqrt()).clamp(-3.5, 3.5)
             } else {
                 0.0
             };
-            let kernel_llr = 4.0 * (max_l_k - max_w_k);
-            (0.40 * maha_llr + 0.65 * fisher_llr + kernel_llr, maha_loss, maha_win, lw_lambda)
+            let kernel_llr = 3.2 * (max_l_k - max_w_k);
+            (0.70 * prior_mid_log_odds + 0.30 * maha_llr + 0.55 * fisher_llr + 0.65 * traj_fisher_llr + 0.75 * kernel_llr, maha_loss, maha_win, lw_lambda)
         };
 
         let _ = (b2, b3);
         let (l4, maha_loss_4, maha_win_4, lw_lambda_4) = evaluate_bar_k_llr(b4);
-        let a_mid_4 = syn_state.mid_trade_wald_sprt_thresholds[0];
-        if l4 >= a_mid_4 {
+        let a_mid_4 = syn_state.mid_trade_wald_sprt_thresholds[0] + 0.35;
+        let has_b5 = bar5_features_32.is_some_and(|f| f.len() >= 32);
+        let has_b6 = bar6_features_32.is_some_and(|f| f.len() >= 32);
+        if !has_b5 && l4 >= a_mid_4 {
             let post_mid_4 = (1.0 / (1.0 + (-l4).exp())) * 100.0;
             let r4 = b4[0] as f64;
             let exit_r_4 = (0.65 * learned_ratchet_r + 0.35 * r4).clamp(-0.24, -0.13);
@@ -1949,7 +2044,7 @@ impl PrecedentKnnIndex {
                 bar2_log_likelihood_ratio: 0.0,
                 bar3_log_likelihood_ratio: 0.0,
                 cumulative_sprt_log_likelihood: (l4 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post_mid_4 * 100.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post_mid_4 * 100.0).round() / 100.0,
                 mahalanobis_loss_distance: maha_loss_4,
                 mahalanobis_win_distance: maha_win_4,
                 matched_trap_id,
@@ -1959,9 +2054,9 @@ impl PrecedentKnnIndex {
 
         let b5 = bar5_features_32.filter(|f| f.len() >= 32)?;
         let (l5, maha_loss_5, maha_win_5, lw_lambda_5) = evaluate_bar_k_llr(b5);
-        let lambda_mid_5 = 0.45 * l4 + 0.75 * l5;
-        let a_mid_5 = syn_state.mid_trade_wald_sprt_thresholds[1];
-        if lambda_mid_5 >= a_mid_5 && l5 > 0.20 {
+        let lambda_mid_5 = 0.50 * l4 + 0.65 * l5;
+        let a_mid_5 = syn_state.mid_trade_wald_sprt_thresholds[1] + 0.35;
+        if !has_b6 && lambda_mid_5 >= a_mid_5 && l4 > 0.20 && l5 > 0.65 {
             let post_mid_5 = (1.0 / (1.0 + (-lambda_mid_5).exp())) * 100.0;
             let r5 = b5[0] as f64;
             let exit_r_5 = (0.65 * learned_ratchet_r + 0.35 * r5).clamp(-0.24, -0.13);
@@ -1972,7 +2067,7 @@ impl PrecedentKnnIndex {
                 bar2_log_likelihood_ratio: (l5 * 1000.0).round() / 1000.0,
                 bar3_log_likelihood_ratio: 0.0,
                 cumulative_sprt_log_likelihood: (lambda_mid_5 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post_mid_5 * 100.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post_mid_5 * 100.0).round() / 100.0,
                 mahalanobis_loss_distance: maha_loss_5,
                 mahalanobis_win_distance: maha_win_5,
                 matched_trap_id,
@@ -1982,9 +2077,9 @@ impl PrecedentKnnIndex {
 
         let b6 = bar6_features_32.filter(|f| f.len() >= 32)?;
         let (l6, maha_loss_6, maha_win_6, lw_lambda_6) = evaluate_bar_k_llr(b6);
-        let lambda_mid_6 = 0.30 * l4 + 0.45 * l5 + 0.75 * l6;
-        let a_mid_6 = syn_state.mid_trade_wald_sprt_thresholds[2];
-        if lambda_mid_6 >= a_mid_6 && l6 > 0.20 {
+        let lambda_mid_6 = 0.35 * l4 + 0.45 * l5 + 0.70 * l6;
+        let a_mid_6 = syn_state.mid_trade_wald_sprt_thresholds[2] + 0.35;
+        if lambda_mid_6 >= a_mid_6 && l5 > 0.25 && l6 > 0.65 {
             let post_mid_6 = (1.0 / (1.0 + (-lambda_mid_6).exp())) * 100.0;
             let r6 = b6[0] as f64;
             let exit_r_6 = (0.65 * learned_ratchet_r + 0.35 * r6).clamp(-0.24, -0.13);
@@ -1995,7 +2090,7 @@ impl PrecedentKnnIndex {
                 bar2_log_likelihood_ratio: (l5 * 1000.0).round() / 1000.0,
                 bar3_log_likelihood_ratio: (l6 * 1000.0).round() / 1000.0,
                 cumulative_sprt_log_likelihood: (lambda_mid_6 * 1000.0).round() / 1000.0,
-                loss_affinity_posterior_pct: (post_mid_6 * 100.0).round() / 1000.0,
+                loss_affinity_posterior_pct: (post_mid_6 * 100.0).round() / 100.0,
                 mahalanobis_loss_distance: maha_loss_6,
                 mahalanobis_win_distance: maha_win_6,
                 matched_trap_id,
@@ -2007,8 +2102,8 @@ impl PrecedentKnnIndex {
             let b7 = bar7_features_32.unwrap_or(b8);
             let (l7, _, _, _) = evaluate_bar_k_llr(b7);
             let (l8, maha_loss_8, maha_win_8, lw_lambda_8) = evaluate_bar_k_llr(b8);
-            let lambda_mid_8 = 0.25 * l6 + 0.35 * l7 + 0.80 * l8;
-            if lambda_mid_8 >= a_mid_6 && l8 > 0.20 {
+            let lambda_mid_8 = 0.30 * l6 + 0.40 * l7 + 0.75 * l8;
+            if lambda_mid_8 >= a_mid_6 && l7 > 0.25 && l8 > 0.65 {
                 let post_mid_8 = (1.0 / (1.0 + (-lambda_mid_8).exp())) * 100.0;
                 let r8 = b8[0] as f64;
                 let exit_r_8 = (0.65 * learned_ratchet_r + 0.35 * r8).clamp(-0.24, -0.13);
@@ -2019,7 +2114,7 @@ impl PrecedentKnnIndex {
                     bar2_log_likelihood_ratio: (l7 * 1000.0).round() / 1000.0,
                     bar3_log_likelihood_ratio: (l8 * 1000.0).round() / 1000.0,
                     cumulative_sprt_log_likelihood: (lambda_mid_8 * 1000.0).round() / 1000.0,
-                    loss_affinity_posterior_pct: (post_mid_8 * 100.0).round() / 1000.0,
+                    loss_affinity_posterior_pct: (post_mid_8 * 100.0).round() / 100.0,
                     mahalanobis_loss_distance: maha_loss_8,
                     mahalanobis_win_distance: maha_win_8,
                     matched_trap_id,
@@ -2224,6 +2319,7 @@ impl PrecedentKnnIndex {
         let (_, learned_ratchet_r) =
             self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
 
+        let mut prev_llr = 0.0_f64;
         for (bar_k, feats) in pre_settlement_bars_features_32 {
             if *bar_k < 9 || *bar_k > 16 || feats.len() < 32 {
                 continue;
@@ -2238,7 +2334,9 @@ impl PrecedentKnnIndex {
             ) {
                 let p_k = (diag.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99);
                 let llr_k = (p_k / (1.0 - p_k)).ln();
-                if llr_k >= syn_state.late_blowoff_scratch_threshold {
+                let combined_late_llr = 0.45 * prev_llr + 0.75 * llr_k;
+                prev_llr = llr_k;
+                if combined_late_llr >= syn_state.late_blowoff_scratch_threshold + 0.55 && llr_k > 0.85 {
                     let r_k = feats[0] as f64;
                     let exit_r = (0.70 * learned_ratchet_r + 0.30 * r_k).clamp(-0.24, -0.13);
                     return Some(WaldSprtScratchDiagnostic {

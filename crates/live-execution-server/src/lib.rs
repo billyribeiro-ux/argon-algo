@@ -2041,6 +2041,12 @@ mod tests {
             let mut fp_veto = 0usize;
             let mut tp_scratch = 0usize;
             let mut fp_scratch = 0usize;
+            let mut tp_s1 = 0usize;
+            let mut fp_s1 = 0usize;
+            let mut tp_s2 = 0usize;
+            let mut fp_s2 = 0usize;
+            let mut tp_s3 = 0usize;
+            let mut fp_s3 = 0usize;
             let mut untouched_winners = 0usize;
             let mut unscratched_losses = 0usize;
 
@@ -2057,22 +2063,23 @@ mod tests {
                 let mut settled_prior: Vec<crate::ledger::ClosedTradeRow> = Vec::new();
                 for j in 0..i {
                     if chronological_trades[j].closed_timestamp_ns < entry_ts {
-                        cold_engine.sync_closed_row_to_precedent_knn(&chronological_trades[j]);
                         settled_prior.push(chronological_trades[j].clone());
                     }
                 }
+                settled_prior.sort_by_key(|r| r.closed_timestamp_ns);
+                for settled in &settled_prior {
+                    cold_engine.sync_closed_row_to_precedent_knn(settled);
+                }
 
                 if run_expanding_plasticity {
-                    cold_engine.replace_closed_trades_for_audit(settled_prior.clone());
-                    let _ = cold_engine.run_multi_generation_evolution_to_gen28();
-                    // Re-ensure zero Era-1 warmup seeds were injected during evolution
-                    cold_engine.precedent_knn().clear_all_hard_negative_traps();
-                    cold_engine.precedent_knn().clear_all_winner_pullbacks();
-                    cold_engine.precedent_knn().clear_all_mid_trade_trajectories();
-                    cold_engine.precedent_knn().clear_all_runner_giveback_trajectories();
-                    for settled in &settled_prior {
-                        cold_engine.sync_closed_row_to_precedent_knn(settled);
-                    }
+                    let causal_state = cold_engine.compute_causal_plasticity_state_for_prefix(
+                        candidate.brain_id,
+                        &settled_prior,
+                        28,
+                    );
+                    cold_engine
+                        .precedent_knn()
+                        .set_synaptic_plasticity_state(causal_state);
                 }
 
                 let prior_losses: Vec<_> = settled_prior
@@ -2094,10 +2101,13 @@ mod tests {
                         tp_veto += 1;
                     }
                 } else if candidate.was_scratched_by_loss_autopsy {
+                    let off = candidate.scratch_bar_offset;
                     if candidate.is_winner {
                         fp_scratch += 1;
+                        if off <= 3 { fp_s1 += 1; } else if off <= 8 { fp_s2 += 1; } else { fp_s3 += 1; }
                     } else {
                         tp_scratch += 1;
+                        if off <= 3 { tp_s1 += 1; } else if off <= 8 { tp_s2 += 1; } else { tp_s3 += 1; }
                     }
                 } else if candidate.is_winner {
                     untouched_winners += 1;
@@ -2107,16 +2117,49 @@ mod tests {
             }
 
             println!(
-                "\n[TRAP 3 — {}]\n  TP Vetoes: {} | FP Vetoes: {} | TP Scratches: {} | FP Scratches: {} | Winners Preserved: {} / 116 | Full Stops Eliminated: {} / 57 (Remaining Unscratched Losses: {})",
+                "\n[TRAP 3 — {}]\n  TP Vetoes: {} | FP Vetoes: {} | TP Scratches: {} (S1={}, S2={}, S3={}) | FP Scratches: {} (S1={}, S2={}, S3={}) | Winners Preserved: {} / 116 | Full Stops Eliminated: {} / 57 (Remaining Unscratched Losses: {})",
                 label,
                 tp_veto,
                 fp_veto,
-                tp_scratch,
-                fp_scratch,
+                tp_scratch, tp_s1, tp_s2, tp_s3,
+                fp_scratch, fp_s1, fp_s2, fp_s3,
                 untouched_winners,
                 tp_veto + tp_scratch,
                 unscratched_losses
             );
+            if run_expanding_plasticity {
+                let verify_engine = RealTimeLedgerEngine::new();
+                assert!(verify_engine.load_from_disk(ledger_path));
+                let evo = verify_engine.run_multi_generation_evolution_to_gen28();
+                let verify_snap = verify_engine.query_filtered_snapshot(&HyperFilterQuery::default());
+                let sb = &verify_snap.scoreboard;
+                let g28 = &evo.generations_history[28];
+                println!(
+                    "  [3A-2 Main Engine Parity] Gen={} | TP_V={} FP_V={} TP_S={} FP_S={} | WinPres={}/116 | StopsElim={}/57 | RemLoss={} | BasePF={:.2}->AdapPF={:.2} | BaseDD=${:.2}->AdapDD=${:.2} | FixedPnL=${:.2} | KellyPnL=${:.2}",
+                    g28.generation_id,
+                    sb.true_positive_losses_vetoed,
+                    sb.false_positive_winners_vetoed,
+                    sb.true_positive_losses_scratched,
+                    sb.false_positive_winners_scratched,
+                    sb.confusion_matrix.untouched_winners_count,
+                    sb.true_positive_losses_vetoed + sb.true_positive_losses_scratched,
+                    sb.confusion_matrix.remaining_unscratched_losses,
+                    sb.profit_factor,
+                    sb.adaptive_profit_factor,
+                    sb.max_drawdown_usd,
+                    sb.adaptive_max_drawdown_usd,
+                    sb.adaptive_realized_net_profit_usd,
+                    sb.adaptive_kelly_net_profit_usd,
+                );
+                assert_eq!(sb.true_positive_losses_vetoed, tp_veto);
+                assert_eq!(sb.false_positive_winners_vetoed, fp_veto);
+                assert_eq!(sb.true_positive_losses_scratched, tp_scratch);
+                assert_eq!(sb.false_positive_winners_scratched, fp_scratch);
+                assert_eq!(sb.confusion_matrix.untouched_winners_count, untouched_winners);
+                assert_eq!(sb.confusion_matrix.remaining_unscratched_losses, unscratched_losses);
+                assert!(sb.adaptive_profit_factor > sb.profit_factor);
+                assert!(sb.adaptive_max_drawdown_usd < sb.max_drawdown_usd);
+            }
         }
 
         // =========================================================================

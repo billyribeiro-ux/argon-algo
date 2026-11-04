@@ -1955,9 +1955,9 @@ mod tests {
                 cold_engine.precedent_knn().clear_all_runner_giveback_trajectories();
 
                 let mut settled_prior: Vec<crate::ledger::ClosedTradeRow> = Vec::new();
-                for j in 0..i {
-                    if chronological_trades[j].closed_timestamp_ns < entry_ts {
-                        settled_prior.push(chronological_trades[j].clone());
+                for prior in chronological_trades.iter().take(i) {
+                    if prior.closed_timestamp_ns < entry_ts {
+                        settled_prior.push(prior.clone());
                     }
                 }
                 settled_prior.sort_by_key(|r| r.closed_timestamp_ns);

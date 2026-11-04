@@ -5001,6 +5001,7 @@ impl RealTimeLedgerEngine {
     /// - `Stream 2 (f[12..19])`: CBOE Options Delta/Gamma/Vanna/GEX/OI-Turnover dynamically anchored to `bar.close`, realized bar volatility, and volume surge.
     /// - `Stream 3 (f[20..25])`: FINRA RegSHO short-volume & float-rotation physics dynamically scaled by cumulative session volume and bar range/volume imbalance.
     /// - `Stream 4 (f[26..31])`: Cross-sectional macro internals computed causally from synchronized timestamp bars.
+    ///
     /// 100% blind to `is_winner`, `actual_exit_price`, `realized_r_multiple`, and `contract_delta`.
     #[allow(clippy::too_many_arguments)]
     pub fn extract_causal_bar1_features_32(

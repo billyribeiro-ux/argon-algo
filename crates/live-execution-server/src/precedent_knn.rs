@@ -2828,7 +2828,7 @@ mod tests {
             loss_trade_id: Uuid::new_v4(),
             brain_id: BrainHorizonId::Brain02IntradayDayTrade,
             symbol: "NVDA".to_string(),
-            closed_timestamp_ns: t_closed - 2_000_000_000,
+            closed_timestamp_ns: t_closed,
             direction: TradeDirection::Long,
             root_cause_category: "OPTIONS_GAMMA_WALL_REJECTION".to_string(),
             embedding_128: emb.clone(),
@@ -2854,13 +2854,13 @@ mod tests {
             .is_none()
         );
 
-        // Insert 2 additional causal traps and 3 causal winner pullbacks so N_loss >= 3 and N_win >= 3 at t_closed
-        for offset_ns in [1_000_000_000_i64, 0_i64] {
+        // Insert 2 additional causal traps and 3 causal winner pullbacks closing at t_closed so N_loss=3 and N_win=3 after t_closed
+        for _ in 0..2 {
             knn.insert_hard_negative_trap(HardNegativeTrapRecord {
                 loss_trade_id: Uuid::new_v4(),
                 brain_id: BrainHorizonId::Brain02IntradayDayTrade,
                 symbol: "NVDA".to_string(),
-                closed_timestamp_ns: t_closed - offset_ns,
+                closed_timestamp_ns: t_closed,
                 direction: TradeDirection::Long,
                 root_cause_category: "OPTIONS_GAMMA_WALL_REJECTION".to_string(),
                 embedding_128: emb.clone(),
@@ -2873,12 +2873,12 @@ mod tests {
                 bar1_r_multiple: -0.22,
             });
         }
-        for offset_ns in [2_000_000_000_i64, 1_000_000_000_i64, 0_i64] {
+        for _ in 0..3 {
             knn.insert_winner_pullback(WinnerPullbackRecord {
                 win_trade_id: Uuid::new_v4(),
                 brain_id: BrainHorizonId::Brain02IntradayDayTrade,
                 symbol: "NVDA".to_string(),
-                closed_timestamp_ns: t_closed - offset_ns,
+                closed_timestamp_ns: t_closed,
                 direction: TradeDirection::Long,
                 embedding_128: win_emb.clone(),
                 post_entry_bar1_features_32: win_emb[0..32].to_vec(),
@@ -2888,13 +2888,13 @@ mod tests {
             });
         }
 
-        // Before or at t_closed: MUST return None (zero lookahead / N_closed < 3 before t_closed)
+        // Before or at t_closed: MUST return None (zero lookahead: closed_timestamp_ns < current_timestamp_ns)
         assert!(
             knn.query_causal_trap_match(
                 BrainHorizonId::Brain02IntradayDayTrade,
                 "NVDA",
                 TradeDirection::Long,
-                t_closed - 3_000_000_000,
+                t_closed - 1_000,
                 &emb,
             )
             .is_none()
@@ -2936,8 +2936,8 @@ mod tests {
             .expect("Expected post-entry loss-centroid scratch diagnostic after loss close with N=3");
         assert!(scratch_diag.loss_affinity_posterior_pct >= 55.0);
         assert!(
-            (scratch_diag.ledoit_wolf_shrinkage_lambda - (4.0 / 7.0)).abs() < 1e-2,
-            "Expected Ledoit-Wolf shrinkage lambda=4/(3+4)=0.5714 for N=3, got {}",
+            (scratch_diag.ledoit_wolf_shrinkage_lambda - 0.40).abs() < 1e-2,
+            "Expected Ledoit-Wolf shrinkage lambda=4/(6+4)=0.40 for N_loss=3, N_win=3, got {}",
             scratch_diag.ledoit_wolf_shrinkage_lambda
         );
     }

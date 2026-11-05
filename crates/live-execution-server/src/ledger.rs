@@ -6092,7 +6092,9 @@ impl RealTimeLedgerEngine {
         }
 
         let syn_state = self.precedent_knn.get_synaptic_plasticity_state(brain_id);
-        let matched_scratch = if syn_state.learned_velocity_absorption_damping_weight > 0.50 {
+        let matched_scratch = if syn_state.learned_velocity_absorption_damping_weight > 0.0
+            && syn_state.learned_fisher_sparsity_exponent_p > 0.0
+        {
             self.precedent_knn
                 .evaluate_phase25_sequential_velocity_absorption_sprt(
                     brain_id,
@@ -6714,8 +6716,12 @@ impl RealTimeLedgerEngine {
             return state;
         }
         if target_gen <= 28 {
-            state.learned_velocity_absorption_damping_weight = 0.45;
+            state.learned_velocity_absorption_damping_weight = 0.0;
+            state.learned_fisher_sparsity_exponent_p = 0.0;
             state.learned_conformal_veto_quantile = 0.92;
+        } else {
+            state.learned_velocity_absorption_damping_weight = 0.50;
+            state.learned_fisher_sparsity_exponent_p = 1.0;
         }
 
         let brain_trades: Vec<&ClosedTradeRow> = settled_prior
@@ -7129,24 +7135,17 @@ impl RealTimeLedgerEngine {
                 }
             }
 
-            let mu_r_plus = if win_cnt > 0 { win_r_sum / (win_cnt as f64) } else if pool_win_cnt > 0 { pool_win_r_sum / (pool_win_cnt as f64) } else { state.learned_itm_mfe_activation_r };
-            let mu_r_loss = if loss_cnt > 0 { loss_r_sum / (loss_cnt as f64) } else if pool_loss_cnt > 0 { pool_loss_r_sum / (pool_loss_cnt as f64) } else { state.learned_itm_mfe_activation_r };
-            let mu_r_scratch = if scratch_cnt > 0 { scratch_r_sum / (scratch_cnt as f64) } else if pool_scratch_cnt > 0 { pool_scratch_r_sum / (pool_scratch_cnt as f64) } else { state.learned_mid_trade_stop_ratchet_r };
+            let mu_r_plus = if win_cnt + pool_win_cnt > 0 { (win_r_sum + pool_win_r_sum) / ((win_cnt + pool_win_cnt) as f64) } else { state.learned_itm_mfe_activation_r };
+            let mu_r_loss = if loss_cnt + pool_loss_cnt > 0 { (loss_r_sum + pool_loss_r_sum) / ((loss_cnt + pool_loss_cnt) as f64) } else { state.learned_itm_mfe_activation_r };
+            let mu_r_scratch = if scratch_cnt + pool_scratch_cnt > 0 { (scratch_r_sum + pool_scratch_r_sum) / ((scratch_cnt + pool_scratch_cnt) as f64) } else { state.learned_mid_trade_stop_ratchet_r };
             let c_scratch = mu_r_scratch.abs();
             let p_star = (mu_r_plus + c_scratch) / (mu_r_plus + mu_r_loss + 2.0 * c_scratch);
-            let pi_loss = ((loss_cnt + pool_loss_cnt + 1) as f64)
-                / ((win_cnt + loss_cnt + pool_win_cnt + pool_loss_cnt + 2) as f64);
-            let pi_win = 1.0 - pi_loss;
-            let raw_llr = (p_star / (1.0 - p_star)).ln() - (pi_loss / pi_win).ln();
-            let lambda_star = (1.0 + raw_llr.exp()).ln() + p_star;
+            let h_base = (1.0 / (1.0 - p_star)).sqrt();
+            let lambda_star = h_base * (1.0 + 0.35 * c_scratch * (1.0 - p_star) * (1.0 - p_star));
             state.learned_asymmetric_hurdle_prob_p_star = (p_star * 10000.0).round() / 10000.0;
             state.learned_asymmetric_hurdle_llr_lambda_star = (lambda_star * 10000.0).round() / 10000.0;
 
-            let eval_rows: Vec<&ClosedTradeRow> = if win_cnt >= 2 && loss_cnt >= 2 {
-                causal_fold_slice.iter().filter(|r| r.brain_id == brain_id).collect()
-            } else {
-                causal_fold_slice.iter().collect()
-            };
+            let eval_rows: Vec<&ClosedTradeRow> = causal_fold_slice.iter().collect();
             let extract_kin6 = |fk: &[f32], prev_zr: f64, prev_mae: f64, prev_mfe: f64| -> [f64; 6] {
                 let zr = (fk[0] as f64) / fold_sigma_r;
                 let mae = prev_mae.min(((fk[3] as f64) / fold_sigma_r).min(zr));
@@ -7163,30 +7162,36 @@ impl RealTimeLedgerEngine {
             for r in &eval_rows {
                 let b1 = Self::extract_causal_bar1_features_from_row(r);
                 if b1.len() < 32 { continue; }
-                let k1 = extract_kin6(&b1, (b1[1] as f64) / fold_sigma_r, f64::INFINITY, f64::NEG_INFINITY);
-                let b2 = Self::extract_causal_post_entry_bar_k_features_from_row(r, 2).unwrap_or_else(|| b1.clone());
-                let k2 = extract_kin6(if b2.len() >= 32 { &b2 } else { &b1 }, k1[0], k1[1], k1[2]);
+                let mut kins = [[0.0_f64; 6]; 8];
+                kins[0] = extract_kin6(&b1, (b1[1] as f64) / fold_sigma_r, f64::INFINITY, f64::NEG_INFINITY);
+                for k in 2..=8 {
+                    let prev = kins[k - 2];
+                    kins[k - 1] = match Self::extract_causal_post_entry_bar_k_features_from_row(r, k) {
+                        Some(bk) if bk.len() >= 32 => extract_kin6(&bk, prev[0], prev[1], prev[2]),
+                        _ => prev,
+                    };
+                }
                 let r_act = if r.is_winner { r.realized_r_multiple.abs() } else { -r.realized_r_multiple.abs() };
                 let r_scr = if r.was_scratched_by_loss_autopsy { r.adaptive_scratch_exit_r } else { -c_scratch };
-                fold_trajs.push((r.is_winner, r_scr - r_act, k1, k2));
+                fold_trajs.push((r.is_winner, r_act, r_scr, kins));
             }
 
             let n_ft = (fold_trajs.len().max(1)) as f64;
-            let m_z1 = fold_trajs.iter().map(|(_, _, k1, _)| k1[0]).sum::<f64>() / n_ft;
-            let m_z2 = fold_trajs.iter().map(|(_, _, _, k2)| k2[0]).sum::<f64>() / n_ft;
+            let m_z1 = fold_trajs.iter().map(|(_, _, _, ks)| ks[0][0]).sum::<f64>() / n_ft;
+            let m_z2 = fold_trajs.iter().map(|(_, _, _, ks)| ks[1][0]).sum::<f64>() / n_ft;
             let m_dz = m_z2 - m_z1;
-            let var_z1 = fold_trajs.iter().map(|(_, _, k1, _)| (k1[0] - m_z1).powi(2)).sum::<f64>() / n_ft;
-            let var_z2 = fold_trajs.iter().map(|(_, _, _, k2)| (k2[0] - m_z2).powi(2)).sum::<f64>() / n_ft;
-            let var_dz = fold_trajs.iter().map(|(_, _, k1, k2)| ((k2[0] - k1[0]) - m_dz).powi(2)).sum::<f64>() / n_ft;
+            let var_z1 = fold_trajs.iter().map(|(_, _, _, ks)| (ks[0][0] - m_z1).powi(2)).sum::<f64>() / n_ft;
+            let var_z2 = fold_trajs.iter().map(|(_, _, _, ks)| (ks[1][0] - m_z2).powi(2)).sum::<f64>() / n_ft;
+            let var_dz = fold_trajs.iter().map(|(_, _, _, ks)| ((ks[1][0] - ks[0][0]) - m_dz).powi(2)).sum::<f64>() / n_ft;
             let nw_f = fold_trajs.iter().filter(|(w, _, _, _)| *w).count().max(1) as f64;
             let nl_f = fold_trajs.iter().filter(|(w, _, _, _)| !*w).count().max(1) as f64;
             let mut snr_d = [0.0_f64; 6];
             for d in 0..6 {
-                let mw = fold_trajs.iter().filter(|(w, _, _, _)| *w).map(|(_, _, k1, k2)| 0.5 * (k1[d] + k2[d])).sum::<f64>() / nw_f;
-                let ml = fold_trajs.iter().filter(|(w, _, _, _)| !*w).map(|(_, _, k1, k2)| 0.5 * (k1[d] + k2[d])).sum::<f64>() / nl_f;
-                let vw = fold_trajs.iter().filter(|(w, _, _, _)| *w).map(|(_, _, k1, k2)| (0.5 * (k1[d] + k2[d]) - mw).powi(2)).sum::<f64>() / nw_f;
-                let vl = fold_trajs.iter().filter(|(w, _, _, _)| !*w).map(|(_, _, k1, k2)| (0.5 * (k1[d] + k2[d]) - ml).powi(2)).sum::<f64>() / nl_f;
-                snr_d[d] = (ml - mw).abs() / (vw + vl).max(1e-6).sqrt();
+                let mw = fold_trajs.iter().filter(|(w, _, _, _)| *w).map(|(_, _, _, ks)| 0.5 * (ks[0][d] + ks[1][d])).sum::<f64>() / nw_f;
+                let ml = fold_trajs.iter().filter(|(w, _, _, _)| !*w).map(|(_, _, _, ks)| 0.5 * (ks[0][d] + ks[1][d])).sum::<f64>() / nl_f;
+                let vw = fold_trajs.iter().filter(|(w, _, _, _)| *w).map(|(_, _, _, ks)| (0.5 * (ks[0][d] + ks[1][d]) - mw).powi(2)).sum::<f64>() / nw_f;
+                let vl = fold_trajs.iter().filter(|(w, _, _, _)| !*w).map(|(_, _, _, ks)| (0.5 * (ks[0][d] + ks[1][d]) - ml).powi(2)).sum::<f64>() / nl_f;
+                snr_d[d] = ((ml - mw).abs() / (vw + vl).max(1e-6).sqrt()).powf(1.0 + p_star);
             }
             let mean_snr = (snr_d.iter().sum::<f64>() / 6.0).max(1e-6);
             let max_snr = snr_d.iter().copied().fold(mean_snr, f64::max);
@@ -7195,77 +7200,94 @@ impl RealTimeLedgerEngine {
             let mut d_opt = var_dz / (var_z1 + var_z2 + var_dz).max(1e-9);
             let mut p_opt = max_snr / mean_snr;
             let mut h_opt = lambda_star;
+            let a_base = (1.0 - p_star) / ((nw_f + 1.0).sqrt() + ((pool_win_cnt as f64) + 1.0).ln());
+            let p_base = p_opt * (1.0 + a_base * d_opt);
 
             let eval_loo_net_r = |alpha_c: f64, damp_c: f64, p_c: f64, hurdle_c: f64| -> f64 {
-                let (mut nw, mut nl) = (0.0_f64, 0.0_f64);
-                let (mut sum_w1, mut sum_l1, mut sum_w2, mut sum_l2) = ([0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6]);
-                for &(is_w, _, ref k1, ref k2) in &fold_trajs {
-                    let psi2 = (1.0 - damp_c) * k1[5] + damp_c * k2[5];
-                    if is_w {
-                        nw += 1.0;
-                        for d in 0..6 { sum_w1[d] += k1[d]; sum_w2[d] += if d == 5 { psi2 } else { k2[d] }; }
-                    } else {
-                        nl += 1.0;
-                        for d in 0..6 { sum_l1[d] += k1[d]; sum_l2[d] += if d == 5 { psi2 } else { k2[d] }; }
-                    }
-                }
-                if nw < 1.0 || nl < 1.0 { return 0.0; }
-                let (mut vw1, mut vl1, mut vw2, mut vl2, mut f1, mut f2) = ([0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6]);
-                for &(is_w, _, ref k1, ref k2) in &fold_trajs {
-                    let psi2 = (1.0 - damp_c) * k1[5] + damp_c * k2[5];
-                    for d in 0..6 {
-                        let v2 = if d == 5 { psi2 } else { k2[d] };
-                        if is_w {
-                            vw1[d] += (k1[d] - sum_w1[d] / nw).powi(2) / nw;
-                            vw2[d] += (v2 - sum_w2[d] / nw).powi(2) / nw;
-                        } else {
-                            vl1[d] += (k1[d] - sum_l1[d] / nl).powi(2) / nl;
-                            vl2[d] += (v2 - sum_l2[d] / nl).powi(2) / nl;
+                if nw_f < 1.0 || nl_f < 1.0 { return 0.0; }
+                let (mut sum_w, mut sum_l) = ([[0.0_f64; 6]; 8], [[0.0_f64; 6]; 8]);
+                for &(is_w, _, _, ref ks) in &fold_trajs {
+                    let mut ema_psi = ks[0][5];
+                    for k in 0..8 {
+                        if k > 0 { ema_psi = (1.0 - damp_c) * ema_psi + damp_c * ks[k][5]; }
+                        for d in 0..6 {
+                            let val = if d == 5 { ema_psi } else { ks[k][d] };
+                            if is_w { sum_w[k][d] += val; } else { sum_l[k][d] += val; }
                         }
                     }
                 }
-                for d in 0..6 {
-                    let (s1, s2) = ((vw1[d] + vl1[d]).max(1e-6), (vw2[d] + vl2[d]).max(1e-6));
-                    f1[d] = ((sum_l1[d] / nl - sum_w1[d] / nw).powi(2) / s1).powf(p_c);
-                    f2[d] = ((sum_l2[d] / nl - sum_w2[d] / nw).powi(2) / s2).powf(p_c);
-                }
-                let (fs1, fs2) = (f1.iter().sum::<f64>().max(1e-9), f2.iter().sum::<f64>().max(1e-9));
-                let (mut lams, mut w_lams) = (Vec::with_capacity(fold_trajs.len()), Vec::new());
-                for &(is_w, dr, ref k1, ref k2) in &fold_trajs {
-                    let psi2 = (1.0 - damp_c) * k1[5] + damp_c * k2[5];
-                    let (mut ell1, mut ell2) = (0.0_f64, 0.0_f64);
-                    for d in 0..6 {
-                        let v2 = if d == 5 { psi2 } else { k2[d] };
-                        let mw1 = if is_w && nw > 1.0 { (sum_w1[d] - k1[d]) / (nw - 1.0) } else { sum_w1[d] / nw };
-                        let ml1 = if !is_w && nl > 1.0 { (sum_l1[d] - k1[d]) / (nl - 1.0) } else { sum_l1[d] / nl };
-                        let mw2 = if is_w && nw > 1.0 { (sum_w2[d] - v2) / (nw - 1.0) } else { sum_w2[d] / nw };
-                        let ml2 = if !is_w && nl > 1.0 { (sum_l2[d] - v2) / (nl - 1.0) } else { sum_l2[d] / nl };
-                        ell1 += (f1[d] / fs1) * (ml1 - mw1).signum() * (k1[d] - 0.5 * (ml1 + mw1)) / (0.5 * (vw1[d] + vl1[d])).max(1e-6).sqrt();
-                        ell2 += (f2[d] / fs2) * (ml2 - mw2).signum() * (v2 - 0.5 * (ml2 + mw2)) / (0.5 * (vw2[d] + vl2[d])).max(1e-6).sqrt();
+                let (mut vw, mut vl, mut fw, mut f_sum) = ([[0.0_f64; 6]; 8], [[0.0_f64; 6]; 8], [[0.0_f64; 6]; 8], [0.0_f64; 8]);
+                for &(is_w, _, _, ref ks) in &fold_trajs {
+                    let mut ema_psi = ks[0][5];
+                    for k in 0..8 {
+                        if k > 0 { ema_psi = (1.0 - damp_c) * ema_psi + damp_c * ks[k][5]; }
+                        for d in 0..6 {
+                            let val = if d == 5 { ema_psi } else { ks[k][d] };
+                            if is_w {
+                                vw[k][d] += (val - sum_w[k][d] / nw_f).powi(2) / nw_f;
+                            } else {
+                                vl[k][d] += (val - sum_l[k][d] / nl_f).powi(2) / nl_f;
+                            }
+                        }
                     }
-                    let lam2 = (1.0 - damp_c) * ell1 + ell2;
-                    if is_w { w_lams.push(lam2); }
-                    lams.push((is_w, dr, ell1, lam2));
                 }
-                w_lams.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let q_pos = (1.0 - alpha_c).clamp(0.0, 1.0) * ((w_lams.len().saturating_sub(1)) as f64);
-                let q_w = w_lams[q_pos.floor() as usize] * (1.0 - q_pos.fract())
-                    + w_lams[(q_pos.ceil() as usize).min(w_lams.len() - 1)] * q_pos.fract();
-                let sig_lam = (lams.iter().map(|(_, _, _, l2)| l2 * l2).sum::<f64>() / (lams.len() as f64).sqrt()).sqrt().max(1e-4);
+                for k in 0..8 {
+                    for d in 0..6 {
+                        let sk = (vw[k][d] + vl[k][d]).max(1e-6);
+                        fw[k][d] = ((sum_l[k][d] / nl_f - sum_w[k][d] / nw_f).powi(2) / sk).powf(p_c);
+                    }
+                    f_sum[k] = fw[k].iter().sum::<f64>().max(1e-9);
+                }
+                let kalman_var = (1.0 - damp_c).powi(2) * var_dz + damp_c.powi(2) * (var_z1 + var_z2 + var_dz / (nw_f + nl_f).sqrt());
+                let fisher_var = mean_snr * (p_c + (p_base * p_base) / p_c.max(1e-6));
+                let eta_proj = (mean_snr + max_snr + var_dz) / (fisher_var + kalman_var).max(1e-6);
+                let mut lams = Vec::with_capacity(fold_trajs.len());
+                let mut w_lams_by_k: [Vec<f64>; 8] = std::array::from_fn(|_| Vec::new());
+                for &(is_w, r_act, r_scr, ref ks) in &fold_trajs {
+                    let (mut ema_psi, mut lam_k, mut path_lam) = (ks[0][5], 0.0_f64, [0.0_f64; 8]);
+                    for k in 0..8 {
+                        if k > 0 { ema_psi = (1.0 - damp_c) * ema_psi + damp_c * ks[k][5]; }
+                        let mut ell_k = 0.0_f64;
+                        for d in 0..6 {
+                            let val = if d == 5 { ema_psi } else { ks[k][d] };
+                            let mwk = if is_w && nw_f > 1.0 { (sum_w[k][d] - val) / (nw_f - 1.0) } else { sum_w[k][d] / nw_f };
+                            let mlk = if !is_w && nl_f > 1.0 { (sum_l[k][d] - val) / (nl_f - 1.0) } else { sum_l[k][d] / nl_f };
+                            ell_k += eta_proj * (fw[k][d] / f_sum[k]) * (mlk - mwk).signum() * (val - 0.5 * (mlk + mwk)) / (0.5 * (vw[k][d] + vl[k][d])).max(1e-6).sqrt();
+                        }
+                        lam_k = (1.0 - damp_c) * lam_k + ell_k;
+                        path_lam[k] = lam_k;
+                        if is_w { w_lams_by_k[k].push(lam_k); }
+                    }
+                    lams.push((is_w, r_act, r_scr, ks, path_lam));
+                }
+                let (mut q_emp_k, mut sig_lam_k) = ([0.0_f64; 8], [1.0_f64; 8]);
+                for k in 0..8 {
+                    w_lams_by_k[k].sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let n_wk = w_lams_by_k[k].len().max(1);
+                    let q_pos = (1.0 - alpha_c).clamp(0.0, 1.0) * (n_wk.saturating_sub(1) as f64);
+                    q_emp_k[k] = w_lams_by_k[k][q_pos.floor() as usize] * (1.0 - q_pos.fract())
+                        + w_lams_by_k[k][(q_pos.ceil() as usize).min(n_wk - 1)] * q_pos.fract();
+                    sig_lam_k[k] = (lams.iter().map(|(_, _, _, _, pl)| pl[k] * pl[k]).sum::<f64>() / (lams.len() as f64).sqrt()).sqrt().max(1e-4);
+                }
+                let e_conf = alpha_c + (a_base * a_base) / alpha_c.max(1e-6);
                 let mut net_r = 0.0_f64;
-                for &(is_w, dr, l1, l2) in &lams {
-                    let p_conf = 1.0 / (1.0 + (-(l2 - q_w) / sig_lam).exp());
-                    let p_hurd = 1.0 / (1.0 + (-(0.5 * (l1 + l2) - hurdle_c) / sig_lam).exp());
-                    let w_bal = if is_w { 1.0 / nw } else { 1.0 / nl };
-                    net_r += w_bal * dr * p_conf * p_hurd;
+                for &(is_w, r_act, r_scr, ref ks, ref pl) in &lams {
+                    let mut surv = 1.0_f64;
+                    let w_bal = if is_w { 1.0 / nw_f } else { 1.0 / nl_f };
+                    for k in 0..8 {
+                        let e_hurd = (((k + 1) as f64) / 4.0).sqrt() * (hurdle_c + (h_base * h_base) / hurdle_c.max(1e-6));
+                        let p_stop_k = if is_w {
+                            let num_w = e_conf + 0.15 * e_hurd;
+                            (num_w / (8.0 * (1.0 + ((q_emp_k[k] - pl[k]) / sig_lam_k[k]).clamp(-8.0, 8.0).exp() + num_w))).clamp(0.0, 0.95)
+                        } else {
+                            (eta_proj / (8.0 * (1.0 + (-(pl[k] - q_emp_k[k]) / sig_lam_k[k]).clamp(-8.0, 8.0).exp() + eta_proj))).clamp(0.0, 0.95)
+                        };
+                        let dr_k = (r_scr - 0.04 * (k as f64) * ks[k][0].abs() * c_scratch) - r_act;
+                        net_r += w_bal * surv * p_stop_k * dr_k;
+                        surv *= 1.0 - p_stop_k;
+                    }
                 }
-                let a_star = (1.0 - p_star) / ((nw + 1.0).sqrt() + ((pool_win_cnt as f64) + 1.0).ln());
-                let reg_a = mu_r_plus * (alpha_c + (a_star * a_star) / alpha_c.max(1e-6));
-                let reg_d = (1.0 - damp_c).powi(2) * var_dz + damp_c.powi(2) * (var_z1 + var_z2 + var_dz / (nw + nl).sqrt());
-                let reg_p = mean_snr * p_c + max_snr / p_c.max(1e-6);
-                let h_wald = lambda_star / (1.0 + c_scratch * (1.0 - p_star));
-                let reg_h = mu_r_loss * (hurdle_c + (h_wald * h_wald) / hurdle_c.max(1e-6));
-                (net_r / (nw + nl)) - (reg_a + reg_d + reg_p + reg_h)
+                net_r
             };
 
             if fold_trajs.len() >= 4 {
@@ -7304,11 +7326,13 @@ impl RealTimeLedgerEngine {
             pool_win_entry_sims.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             if pool_win_entry_sims.len() >= 5 {
                 let n_pool = pool_win_entry_sims.len();
-                let k_ord = (((1.0 - state.learned_conformal_alpha).clamp(0.0, 1.0) * ((n_pool + 1) as f64)).ceil() as usize)
+                let eff_pool_alpha = state.learned_conformal_alpha
+                    * (((win_cnt.max(1) + 1) as f64) / ((n_pool + win_cnt + 1) as f64)).sqrt();
+                let k_ord = (((1.0 - eff_pool_alpha).clamp(0.0, 1.0) * ((n_pool + 1) as f64)).ceil() as usize)
                     .saturating_sub(1)
                     .min(n_pool - 1);
                 let s_upper = pool_win_entry_sims[n_pool - 1];
-                let q_win_veto_sim = s_upper - state.learned_conformal_alpha * (s_upper - pool_win_entry_sims[k_ord]);
+                let q_win_veto_sim = s_upper - eff_pool_alpha * (s_upper - pool_win_entry_sims[k_ord]);
                 state.learned_conformal_veto_quantile = (q_win_veto_sim * 10000.0).round() / 10000.0;
             }
         }

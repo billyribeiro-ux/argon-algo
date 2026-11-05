@@ -2418,6 +2418,19 @@ mod tests {
         assert!(rel_dd > 5.0, "damping_weight relative shift must exceed 5%, got {:.2}%", rel_dd);
         assert!(rel_dp > 5.0, "fisher_p relative shift must exceed 5%, got {:.2}%", rel_dp);
         assert!(rel_dh > 5.0, "early_hurdle_q relative shift must exceed 5%, got {:.2}%", rel_dh);
+        assert_ne!(state_a_g29.learned_conformal_alpha, state_a.learned_conformal_alpha);
+        assert_ne!(
+            state_a_g29.learned_velocity_absorption_damping_weight,
+            state_a.learned_velocity_absorption_damping_weight
+        );
+        assert_ne!(
+            state_a_g29.learned_fisher_sparsity_exponent_p,
+            state_a.learned_fisher_sparsity_exponent_p
+        );
+        assert_ne!(
+            state_a_g29.learned_conformal_early_scratch_quantile,
+            state_a.learned_conformal_early_scratch_quantile
+        );
     }
 
     #[test]

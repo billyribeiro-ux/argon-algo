@@ -2328,20 +2328,16 @@ mod tests {
         let mut settled_prior_b = settled_prior_a.clone();
         for (idx, r) in settled_prior_b.iter_mut().enumerate() {
             if r.is_winner {
-                r.realized_r_multiple = if idx % 2 == 0 {
-                    r.realized_r_multiple * 2.85 + 1.40
-                } else {
-                    (r.realized_r_multiple * 0.35).max(0.15)
-                };
+                r.realized_r_multiple = (r.realized_r_multiple * 0.38).max(0.18);
             } else {
-                r.realized_r_multiple = if idx % 3 == 0 {
-                    r.realized_r_multiple * 2.40 - 0.90
-                } else {
-                    r.realized_r_multiple * 0.45
-                };
-                if r.post_entry_bar1_features_32.len() >= 32 {
-                    r.post_entry_bar1_features_32[0] *= if idx % 2 == 0 { 1.75 } else { 0.45 };
-                    r.post_entry_bar1_features_32[4] *= if idx % 2 == 0 { 1.60 } else { -0.55 };
+                r.realized_r_multiple = r.realized_r_multiple * 2.60 - 1.10;
+                let e_idx = r.entry_bar_idx.min(r.entry_bars.len().saturating_sub(1));
+                if let Some(bar2) = r.entry_bars.get_mut(e_idx + 2) {
+                    let shift = if idx % 2 == 0 { 104 } else { 96 };
+                    bar2.close = SubPennyPrice::from_scaled_units(
+                        (bar2.close.scaled_units() * shift) / 100,
+                    )
+                    .unwrap_or(bar2.close);
                 }
             }
         }
@@ -2355,6 +2351,11 @@ mod tests {
             .count();
         assert_eq!(n_b_a, n_b_b, "n_b_fold must be identical between Prior A and Prior B");
 
+        let state_a_g29 = base_engine.compute_causal_plasticity_state_for_prefix(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &settled_prior_a,
+            29,
+        );
         let state_a = base_engine.compute_causal_plasticity_state_for_prefix(
             BrainHorizonId::Brain02IntradayDayTrade,
             &settled_prior_a,
@@ -2365,9 +2366,37 @@ mod tests {
             &settled_prior_b,
             36,
         );
+        let rel_da = (state_a.learned_conformal_alpha - state_b.learned_conformal_alpha).abs()
+            / state_a.learned_conformal_alpha.abs().max(1e-6)
+            * 100.0;
+        let rel_dd = (state_a.learned_velocity_absorption_damping_weight
+            - state_b.learned_velocity_absorption_damping_weight)
+            .abs()
+            / state_a
+                .learned_velocity_absorption_damping_weight
+                .abs()
+                .max(1e-6)
+            * 100.0;
+        let rel_dp = (state_a.learned_fisher_sparsity_exponent_p
+            - state_b.learned_fisher_sparsity_exponent_p)
+            .abs()
+            / state_a.learned_fisher_sparsity_exponent_p.abs().max(1e-6)
+            * 100.0;
+        let rel_dh = (state_a.learned_conformal_early_scratch_quantile
+            - state_b.learned_conformal_early_scratch_quantile)
+            .abs()
+            / state_a
+                .learned_conformal_early_scratch_quantile
+                .abs()
+                .max(1e-6)
+            * 100.0;
         println!(
-            "[TRAP 3 — 3D: Plasticity Sensitivity to Settled Prior Outcomes (Constant n_b_fold = {})]\n  Prior A (Baseline Outcomes): alpha={:.4} | damping_weight={:.4} | fisher_p={:.4} | early_hurdle_q={:.4} | p*={:.4} | lambda*={:.4}\n  Prior B (Perturbed Outcomes): alpha={:.4} | damping_weight={:.4} | fisher_p={:.4} | early_hurdle_q={:.4} | p*={:.4} | lambda*={:.4}\n",
+            "[TRAP 3 — 3D: Plasticity Sensitivity to Settled Prior Outcomes (Constant n_b_fold = {})]\n  Prior A (Gen 29): alpha={:.4} | damping_weight={:.4} | fisher_p={:.4} | early_hurdle_q={:.4}\n  Prior A (Gen 36 Baseline):  alpha={:.4} | damping_weight={:.4} | fisher_p={:.4} | early_hurdle_q={:.4} | p*={:.4} | lambda*={:.4}\n  Prior B (Gen 36 Perturbed): alpha={:.4} | damping_weight={:.4} | fisher_p={:.4} | early_hurdle_q={:.4} | p*={:.4} | lambda*={:.4}\n  Relative Shifts (A vs B): d_alpha={:.2}% | d_damping={:.2}% | d_fisher_p={:.2}% | d_hurdle_q={:.2}%\n",
             n_b_a,
+            state_a_g29.learned_conformal_alpha,
+            state_a_g29.learned_velocity_absorption_damping_weight,
+            state_a_g29.learned_fisher_sparsity_exponent_p,
+            state_a_g29.learned_conformal_early_scratch_quantile,
             state_a.learned_conformal_alpha,
             state_a.learned_velocity_absorption_damping_weight,
             state_a.learned_fisher_sparsity_exponent_p,
@@ -2380,21 +2409,15 @@ mod tests {
             state_b.learned_conformal_early_scratch_quantile,
             state_b.learned_asymmetric_hurdle_prob_p_star,
             state_b.learned_asymmetric_hurdle_llr_lambda_star,
+            rel_da,
+            rel_dd,
+            rel_dp,
+            rel_dh,
         );
-        assert_ne!(
-            state_a.learned_conformal_alpha, state_b.learned_conformal_alpha,
-            "learned_conformal_alpha must respond to settled_prior R-multiples/trajectories at constant n_b_fold"
-        );
-        assert_ne!(
-            state_a.learned_velocity_absorption_damping_weight,
-            state_b.learned_velocity_absorption_damping_weight,
-            "learned_velocity_absorption_damping_weight must respond to settled_prior R-multiples/trajectories at constant n_b_fold"
-        );
-        assert_ne!(
-            state_a.learned_fisher_sparsity_exponent_p,
-            state_b.learned_fisher_sparsity_exponent_p,
-            "learned_fisher_sparsity_exponent_p must respond to settled_prior R-multiples/trajectories at constant n_b_fold"
-        );
+        assert!(rel_da > 5.0, "alpha relative shift must exceed 5%, got {:.2}%", rel_da);
+        assert!(rel_dd > 5.0, "damping_weight relative shift must exceed 5%, got {:.2}%", rel_dd);
+        assert!(rel_dp > 5.0, "fisher_p relative shift must exceed 5%, got {:.2}%", rel_dp);
+        assert!(rel_dh > 5.0, "early_hurdle_q relative shift must exceed 5%, got {:.2}%", rel_dh);
     }
 
     #[test]

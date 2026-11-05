@@ -2734,7 +2734,7 @@ impl PrecedentKnnIndex {
             let (s_k, kin_llr_k, ell_k, next_lam) = step_recurrence(lambda_k, xi_k, *lm_k);
             if k <= 3 { bar_llrs[k] = ell_k; }
             lambda_k = next_lam;
-            if (k >= 2 || k == max_pre_k) && lambda_k > q_win_upper_k && kin_llr_k > 0.0 && s_k[0] > 0.0 && s_k[1] > 0.0 && s_k[3] > 0.0 && s_k[4] > 0.0 && (s_k[2] > 0.0 || (k >= 4 && s_k[0] > s_k[3])) && *lm_k > 0.0 {
+            if (k >= 2 || k == max_pre_k) && lambda_k > q_win_upper_k && kin_llr_k > 0.0 && s_k[0] > 0.0 && s_k[1] > 0.0 && s_k[3] > 0.0 && s_k[4] > 0.0 && (s_k[2] > 0.0 || s_k[0] > s_k[3]) && *lm_k > 0.0 {
                 let exit_r = (0.5 * (learned_ratchet_r + xi_k[0])).max(loss_r_bounds.0).min(loss_r_bounds.1);
                 let post_pct = (1.0 / (1.0 + (-lambda_k).exp())) * 100.0;
                 return Some(WaldSprtScratchDiagnostic {

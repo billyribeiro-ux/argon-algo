@@ -7082,9 +7082,6 @@ impl RealTimeLedgerEngine {
                 (0.0_f64, 0usize, 0.0_f64, 0usize, 0.0_f64, 0usize);
             let mut win_entry_sims = Vec::new();
             let mut pool_win_entry_sims = Vec::new();
-            let tau_veto_base = 0.855 + state.entry_veto_margin_delta;
-            let delta_margin_base = state.entry_veto_margin_delta;
-
             for r in causal_fold_slice {
                 let r_abs = r.realized_r_multiple.abs();
                 if r.is_winner {
@@ -7093,13 +7090,18 @@ impl RealTimeLedgerEngine {
                     let wf32 = Self::extract_causal_entry_features_from_row(r);
                     let w_diag = self.precedent_knn.evaluate_causal_entry_trap_vs_winner_discriminant(
                         r.brain_id, &r.symbol, r.direction, r.opened_timestamp_ns,
-                        &r.entry_embedding_128, &wf32, tau_veto_base, delta_margin_base,
+                        &r.entry_embedding_128, &wf32, state.learned_conformal_veto_quantile, state.entry_veto_margin_delta,
                     );
-                    pool_win_entry_sims.push(w_diag.trap_similarity_score);
+                    if w_diag.matched_trap_id.is_some() {
+                        let w_conf_sim = w_diag.trap_similarity_score.max(w_diag.winner_similarity_score);
+                        pool_win_entry_sims.push(w_conf_sim);
+                        if r.brain_id == brain_id {
+                            win_entry_sims.push(w_conf_sim);
+                        }
+                    }
                     if r.brain_id == brain_id {
                         win_cnt += 1;
                         win_r_sum += r_abs;
-                        win_entry_sims.push(w_diag.trap_similarity_score);
                     }
                 } else {
                     pool_loss_cnt += 1;
@@ -7126,7 +7128,8 @@ impl RealTimeLedgerEngine {
             let mu_r_scratch = if scratch_cnt > 0 { scratch_r_sum / (scratch_cnt as f64) } else if pool_scratch_cnt > 0 { pool_scratch_r_sum / (pool_scratch_cnt as f64) } else { state.learned_mid_trade_stop_ratchet_r };
             let c_scratch = mu_r_scratch.abs();
             let p_star = (mu_r_plus + c_scratch) / (mu_r_plus + mu_r_loss + 2.0 * c_scratch);
-            let pi_loss = (loss_cnt as f64 + 1.0) / ((win_cnt + loss_cnt) as f64 + 2.0);
+            let pi_loss = ((loss_cnt + pool_loss_cnt + 1) as f64)
+                / ((win_cnt + loss_cnt + pool_win_cnt + pool_loss_cnt + 2) as f64);
             let pi_win = 1.0 - pi_loss;
             let lambda_star = (p_star / (1.0 - p_star)).ln() - (pi_loss / pi_win).ln();
             state.learned_asymmetric_hurdle_prob_p_star = (p_star * 10000.0).round() / 10000.0;
@@ -7160,6 +7163,31 @@ impl RealTimeLedgerEngine {
                 let r_scr = if r.was_scratched_by_loss_autopsy { r.adaptive_scratch_exit_r } else { -c_scratch };
                 fold_trajs.push((r.is_winner, r_scr - r_act, k1, k2));
             }
+
+            let n_ft = (fold_trajs.len().max(1)) as f64;
+            let m_z1 = fold_trajs.iter().map(|(_, _, k1, _)| k1[0]).sum::<f64>() / n_ft;
+            let m_z2 = fold_trajs.iter().map(|(_, _, _, k2)| k2[0]).sum::<f64>() / n_ft;
+            let m_dz = m_z2 - m_z1;
+            let var_z1 = fold_trajs.iter().map(|(_, _, k1, _)| (k1[0] - m_z1).powi(2)).sum::<f64>() / n_ft;
+            let var_z2 = fold_trajs.iter().map(|(_, _, _, k2)| (k2[0] - m_z2).powi(2)).sum::<f64>() / n_ft;
+            let var_dz = fold_trajs.iter().map(|(_, _, k1, k2)| ((k2[0] - k1[0]) - m_dz).powi(2)).sum::<f64>() / n_ft;
+            let nw_f = fold_trajs.iter().filter(|(w, _, _, _)| *w).count().max(1) as f64;
+            let nl_f = fold_trajs.iter().filter(|(w, _, _, _)| !*w).count().max(1) as f64;
+            let mut snr_d = [0.0_f64; 6];
+            for d in 0..6 {
+                let mw = fold_trajs.iter().filter(|(w, _, _, _)| *w).map(|(_, _, k1, k2)| 0.5 * (k1[d] + k2[d])).sum::<f64>() / nw_f;
+                let ml = fold_trajs.iter().filter(|(w, _, _, _)| !*w).map(|(_, _, k1, k2)| 0.5 * (k1[d] + k2[d])).sum::<f64>() / nl_f;
+                let vw = fold_trajs.iter().filter(|(w, _, _, _)| *w).map(|(_, _, k1, k2)| (0.5 * (k1[d] + k2[d]) - mw).powi(2)).sum::<f64>() / nw_f;
+                let vl = fold_trajs.iter().filter(|(w, _, _, _)| !*w).map(|(_, _, k1, k2)| (0.5 * (k1[d] + k2[d]) - ml).powi(2)).sum::<f64>() / nl_f;
+                snr_d[d] = (ml - mw).abs() / (vw + vl).max(1e-6).sqrt();
+            }
+            let mean_snr = (snr_d.iter().sum::<f64>() / 6.0).max(1e-6);
+            let max_snr = snr_d.iter().copied().fold(mean_snr, f64::max);
+
+            let mut a_opt = (1.0 - p_star) / ((win_cnt.max(1) as f64) + 1.0).sqrt();
+            let mut d_opt = var_dz / (var_z1 + var_z2 + var_dz).max(1e-9);
+            let mut p_opt = max_snr / mean_snr;
+            let mut h_opt = lambda_star;
 
             let eval_loo_net_r = |alpha_c: f64, damp_c: f64, p_c: f64, hurdle_c: f64| -> f64 {
                 let (mut nw, mut nl) = (0.0_f64, 0.0_f64);
@@ -7210,45 +7238,65 @@ impl RealTimeLedgerEngine {
                     }
                     let lam2 = (1.0 - damp_c) * ell1 + ell2;
                     if is_w { w_lams.push(lam2); }
-                    lams.push((dr, ell1, lam2));
+                    lams.push((is_w, dr, ell1, lam2));
                 }
                 w_lams.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let q_pos = (1.0 - alpha_c) * ((w_lams.len().saturating_sub(1)) as f64);
+                let q_pos = (1.0 - alpha_c).clamp(0.0, 1.0) * ((w_lams.len().saturating_sub(1)) as f64);
                 let q_w = w_lams[q_pos.floor() as usize] * (1.0 - q_pos.fract())
                     + w_lams[(q_pos.ceil() as usize).min(w_lams.len() - 1)] * q_pos.fract();
-                let sig_lam = (lams.iter().map(|(_, _, l2)| l2 * l2).sum::<f64>() / (lams.len() as f64)).sqrt().max(1e-4);
+                let sig_lam = (lams.iter().map(|(_, _, _, l2)| l2 * l2).sum::<f64>() / (lams.len() as f64).sqrt()).sqrt().max(1e-4);
                 let mut net_r = 0.0_f64;
-                for &(dr, l1, l2) in &lams {
+                for &(is_w, dr, l1, l2) in &lams {
                     let p_conf = 1.0 / (1.0 + (-(l2 - q_w) / sig_lam).exp());
                     let p_hurd = 1.0 / (1.0 + (-(0.5 * (l1 + l2) - hurdle_c) / sig_lam).exp());
-                    net_r += dr * p_conf * p_hurd;
+                    let w_bal = if is_w { 1.0 / nw } else { 1.0 / nl };
+                    net_r += w_bal * dr * p_conf * p_hurd;
                 }
-                net_r / (lams.len() as f64)
+                net_r
             };
 
-            let (mut a_opt, mut d_opt, mut p_opt, mut h_opt) = (0.0560_f64, 0.5900_f64, 1.2950_f64, 1.3750_f64);
             if fold_trajs.len() >= 4 {
-                let da = (eval_loo_net_r(a_opt + 0.002, d_opt, p_opt, h_opt) - eval_loo_net_r(a_opt - 0.002, d_opt, p_opt, h_opt)) / 0.004;
-                let dd = (eval_loo_net_r(a_opt, d_opt + 0.015, p_opt, h_opt) - eval_loo_net_r(a_opt, d_opt - 0.015, p_opt, h_opt)) / 0.030;
-                let dp = (eval_loo_net_r(a_opt, d_opt, p_opt + 0.025, h_opt) - eval_loo_net_r(a_opt, d_opt, p_opt - 0.025, h_opt)) / 0.050;
-                let dh = (eval_loo_net_r(a_opt, d_opt, p_opt, h_opt + 0.020) - eval_loo_net_r(a_opt, d_opt, p_opt, h_opt - 0.020)) / 0.040;
-                a_opt += 0.0025 * (da / (1.0 + da.abs()));
-                d_opt += 0.0180 * (dd / (1.0 + dd.abs()));
-                p_opt += 0.0280 * (dp / (1.0 + dp.abs()));
-                h_opt += 0.0220 * (dh / (1.0 + dh.abs())) + 0.0150 * (lambda_star / (1.0 + lambda_star.abs()));
+                let mut best_net_r = eval_loo_net_r(a_opt, d_opt, p_opt, h_opt);
+                for g_step in 29..=target_gen.min(36) {
+                    let step = 1.0 / ((g_step - 27) as f64 + 2.0);
+                    for mult in [1.0 - step, 1.0 + step] {
+                        let cand_a = a_opt * mult;
+                        let r_a = eval_loo_net_r(cand_a, d_opt, p_opt, h_opt);
+                        if r_a > best_net_r { a_opt = cand_a; best_net_r = r_a; }
+                    }
+                    for mult in [1.0 - step, 1.0 + step] {
+                        let cand_d = d_opt * mult;
+                        let r_d = eval_loo_net_r(a_opt, cand_d, p_opt, h_opt);
+                        if r_d > best_net_r { d_opt = cand_d; best_net_r = r_d; }
+                    }
+                    for mult in [1.0 - step, 1.0 + step] {
+                        let cand_p = p_opt * mult;
+                        let r_p = eval_loo_net_r(a_opt, d_opt, cand_p, h_opt);
+                        if r_p > best_net_r { p_opt = cand_p; best_net_r = r_p; }
+                    }
+                    for mult in [1.0 - step, 1.0 + step] {
+                        let cand_h = h_opt * mult;
+                        let r_h = eval_loo_net_r(a_opt, d_opt, p_opt, cand_h);
+                        if r_h > best_net_r { h_opt = cand_h; best_net_r = r_h; }
+                    }
+                }
             }
             state.learned_conformal_alpha = (a_opt * 10000.0).round() / 10000.0;
             state.learned_velocity_absorption_damping_weight = (d_opt * 10000.0).round() / 10000.0;
             state.learned_fisher_sparsity_exponent_p = (p_opt * 10000.0).round() / 10000.0;
             state.learned_conformal_early_scratch_quantile = (h_opt * 10000.0).round() / 10000.0;
-            state.learned_conformal_mid_scratch_quantile = ((h_opt - 0.02) * 10000.0).round() / 10000.0;
+            state.learned_conformal_mid_scratch_quantile = ((h_opt / (1.0 + a_opt)) * 10000.0).round() / 10000.0;
 
-            pool_win_entry_sims.extend(win_entry_sims);
             pool_win_entry_sims.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let s_max = pool_win_entry_sims.last().copied().unwrap_or(0.0);
-            let p_conf = 0.50 + 0.48 * (1.0 - state.learned_conformal_alpha);
-            let q_win_veto_sim = s_max.max(p_conf) + state.learned_conformal_alpha * (1.0 - s_max);
-            state.learned_conformal_veto_quantile = (q_win_veto_sim * 10000.0).round() / 10000.0;
+            if pool_win_entry_sims.len() >= 5 {
+                let n_pool = pool_win_entry_sims.len();
+                let k_ord = (((1.0 - state.learned_conformal_alpha).clamp(0.0, 1.0) * ((n_pool + 1) as f64)).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(n_pool - 1);
+                let s_upper = pool_win_entry_sims[n_pool - 1];
+                let q_win_veto_sim = s_upper - state.learned_conformal_alpha * (s_upper - pool_win_entry_sims[k_ord]);
+                state.learned_conformal_veto_quantile = (q_win_veto_sim * 10000.0).round() / 10000.0;
+            }
         }
 
         state

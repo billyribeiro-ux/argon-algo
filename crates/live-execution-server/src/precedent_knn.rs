@@ -2609,7 +2609,8 @@ impl PrecedentKnnIndex {
         if !pre_settlement_bars_features_32.first().is_some_and(|(_, f)| f.len() >= 32) { return None; }
         let max_pre_k = pre_settlement_bars_features_32.iter().map(|(k, _)| *k).max().unwrap_or(1).min(16);
         let syn_state = self.get_synaptic_plasticity_state(brain_id);
-        let lambda_decay = syn_state.learned_velocity_absorption_damping_weight;
+        let r_var = syn_state.learned_velocity_absorption_damping_weight.clamp(1e-4, 0.9999);
+        let lambda_decay = (1.0 + r_var) / (2.0 + 0.5 * r_var);
         let alpha_g = syn_state.learned_conformal_alpha;
         let p_exp = syn_state.learned_fisher_sparsity_exponent_p;
         let (_, emp_ratchet_r) = self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
@@ -2725,7 +2726,8 @@ impl PrecedentKnnIndex {
             }
             let mut sorted_w_lam = if active_w_lam.len() >= 3 { active_w_lam } else { prior_win_lambdas.clone() };
             sorted_w_lam.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let q_pos = ((1.0 - alpha_g).clamp(0.0, 1.0)) * ((sorted_w_lam.len() - 1) as f64);
+            let eff_alpha = (alpha_g * ((raw_wins.len() + 1) as f64).sqrt()) / (6.0 + 2.0 * (p_exp + lambda_decay));
+            let q_pos = ((1.0 - eff_alpha).clamp(0.0, 1.0)) * ((sorted_w_lam.len() - 1) as f64);
             let q_emp_k = sorted_w_lam[q_pos.floor() as usize] * (1.0 - q_pos.fract())
                 + sorted_w_lam[(q_pos.ceil() as usize).min(sorted_w_lam.len() - 1)] * q_pos.fract();
             let hurdle_k = k_sqrt * syn_state.learned_conformal_early_scratch_quantile;
@@ -2734,7 +2736,7 @@ impl PrecedentKnnIndex {
             let (s_k, kin_llr_k, ell_k, next_lam) = step_recurrence(lambda_k, xi_k, *lm_k);
             if k <= 3 { bar_llrs[k] = ell_k; }
             lambda_k = next_lam;
-            if (k >= 2 || k == max_pre_k) && lambda_k > q_win_upper_k && kin_llr_k > 0.0 && s_k[0] > 0.0 && s_k[1] > 0.0 && s_k[3] > 0.0 && s_k[4] > 0.0 && (s_k[2] > 0.0 || (hurdle_k > q_emp_k && s_k[0] > s_k[3])) && *lm_k > 0.0 {
+            if (k >= 2 || k == max_pre_k) && lambda_k > q_win_upper_k && kin_llr_k > 0.0 && s_k[0] > 0.0 && s_k[1] > 0.0 && s_k[3] > 0.0 && s_k[4] > 0.0 && (s_k[2] > 0.0 || (k_sqrt > 1.0 + lambda_decay + lambda_decay * (1.0 - lambda_decay) && s_k[0] > s_k[3])) && *lm_k > 0.0 {
                 let exit_r = (0.5 * (learned_ratchet_r + xi_k[0])).max(loss_r_bounds.0).min(loss_r_bounds.1);
                 let post_pct = (1.0 / (1.0 + (-lambda_k).exp())) * 100.0;
                 return Some(WaldSprtScratchDiagnostic {

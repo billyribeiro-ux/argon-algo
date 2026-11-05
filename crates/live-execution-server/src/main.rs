@@ -26,22 +26,30 @@ async fn main() -> anyhow::Result<()> {
         None
     });
 
-    // Seed initial real Yahoo Finance walk-forward ledger & active open positions on boot
-    match state.run_real_yahoo_walk_forward_backfill().await {
-        Ok(snap) => {
-            info!(
-                "Real Yahoo Finance walk-forward backfill complete: {} open positions, {} closed trades, realized net P&L: ${:.2}",
-                snap.positions_opened.len(),
-                snap.closed_trades.len(),
-                snap.scoreboard.realized_net_profit_usd
-            );
-        }
-        Err(e) => {
-            warn!("Yahoo live backfill returned warning ({e}); checking persisted disk state");
-            if !state
-                .ledger
-                .load_from_disk(Path::new("data/ledger_state.json"))
-            {
+    // Load canonical persisted ledger state from data/ledger_state.json first; fallback to Yahoo walk-forward backfill if missing
+    if state.ledger.load_from_disk(Path::new("data/ledger_state.json")) {
+        let snap = state
+            .ledger
+            .query_filtered_snapshot(&HyperFilterQuery::default());
+        info!(
+            "Loaded canonical ledger state from data/ledger_state.json: {} open positions, {} closed trades, realized net P&L: ${:.2}, Kelly net P&L: ${:.2}",
+            snap.positions_opened.len(),
+            snap.closed_trades.len(),
+            snap.scoreboard.realized_net_profit_usd,
+            snap.scoreboard.kelly_realized_net_profit_usd
+        );
+    } else {
+        match state.run_real_yahoo_walk_forward_backfill().await {
+            Ok(snap) => {
+                info!(
+                    "Real Yahoo Finance walk-forward backfill complete: {} open positions, {} closed trades, realized net P&L: ${:.2}",
+                    snap.positions_opened.len(),
+                    snap.closed_trades.len(),
+                    snap.scoreboard.realized_net_profit_usd
+                );
+            }
+            Err(e) => {
+                warn!("Yahoo live backfill returned warning ({e}); running historical replay fallback");
                 let _ = state.run_historical_replay_simulation().await;
             }
         }

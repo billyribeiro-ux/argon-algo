@@ -799,9 +799,9 @@ impl AppState {
                 .await;
         }
 
-        let _ = self.ledger.run_multi_generation_evolution_to_gen8();
+        let _ = self.ledger.run_multi_generation_evolution_to_gen36();
         let _ = self.ledger.run_autopsy_and_tournament(false);
-        if !Path::new("../../Cargo.toml").exists() {
+        if !Path::new("../../Cargo.toml").exists() && !Path::new(LEDGER_DISK_PATH).exists() {
             let _ = self.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
         }
 
@@ -858,9 +858,9 @@ impl AppState {
             )
             .await?;
 
-        let _ = self.ledger.run_multi_generation_evolution_to_gen8();
+        let _ = self.ledger.run_multi_generation_evolution_to_gen36();
         let _ = self.ledger.run_autopsy_and_tournament(false);
-        if !Path::new("../../Cargo.toml").exists() {
+        if !Path::new("../../Cargo.toml").exists() && !Path::new(LEDGER_DISK_PATH).exists() {
             let _ = self.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
         }
 

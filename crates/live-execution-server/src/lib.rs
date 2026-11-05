@@ -1152,13 +1152,13 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen32();
+        let evo = engine.run_multi_generation_evolution_to_gen36();
         assert_eq!(
             evo.generations_history.len(),
-            33,
-            "Expected Gen 0..Gen 32 (33 generation records)"
+            37,
+            "Expected Gen 0..Gen 36 (37 generation records)"
         );
-        assert_eq!(evo.current_champion_generation, 32);
+        assert_eq!(evo.current_champion_generation, 36);
 
         for g in &evo.generations_history {
             println!(
@@ -1303,13 +1303,13 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen24();
-        assert_eq!(evo.generations_history.len(), 33);
-        assert_eq!(evo.current_champion_generation, 32);
+        let evo = engine.run_multi_generation_evolution_to_gen36();
+        assert_eq!(evo.generations_history.len(), 37);
+        assert_eq!(evo.current_champion_generation, 36);
 
         let gen16 = &evo.generations_history[16];
         let gen20 = &evo.generations_history[20];
-        let gen24 = &evo.generations_history[32];
+        let gen24 = &evo.generations_history[36];
 
         // 1. Verify honest out-of-sample expanding-window metrics across Gen 16..Gen 28
         for g in [gen16, gen20, gen24] {
@@ -1457,9 +1457,9 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen24();
-        assert_eq!(evo.generations_history.len(), 33);
-        assert_eq!(evo.current_champion_generation, 32);
+        let evo = engine.run_multi_generation_evolution_to_gen36();
+        assert_eq!(evo.generations_history.len(), 37);
+        assert_eq!(evo.current_champion_generation, 36);
 
         let gen20 = &evo.generations_history[20];
         let gen21 = &evo.generations_history[21];
@@ -1552,16 +1552,16 @@ mod tests {
         let champ = engine
             .on_live_trade_settled_continual_plasticity(&sample_closed)
             .expect("Continual plasticity daemon hook must return active Pareto champion");
-        assert_eq!(champ.generation_id, 32);
+        assert_eq!(champ.generation_id, 36);
         assert!(champ.pareto_gate_passed);
 
-        // Persist canonical Gen 0..Gen 28 state to data/ledger_state.json
+        // Persist canonical Gen 0..Gen 36 state to data/ledger_state.json
         let clean_engine = RealTimeLedgerEngine::new();
         assert!(clean_engine.load_from_disk(ledger_path));
-        let _ = clean_engine.run_multi_generation_evolution_to_gen28();
+        let _ = clean_engine.run_multi_generation_evolution_to_gen36();
         clean_engine
             .save_to_disk(ledger_path)
-            .expect("Persist Gen 0..Gen 28 state to data/ledger_state.json");
+            .expect("Persist Gen 0..Gen 36 state to data/ledger_state.json");
     }
 
     #[test]
@@ -1580,9 +1580,9 @@ mod tests {
             "Failed to load data/ledger_state.json"
         );
 
-        let evo = engine.run_multi_generation_evolution_to_gen28();
-        assert_eq!(evo.generations_history.len(), 33);
-        assert_eq!(evo.current_champion_generation, 32);
+        let evo = engine.run_multi_generation_evolution_to_gen36();
+        assert_eq!(evo.generations_history.len(), 37);
+        assert_eq!(evo.current_champion_generation, 36);
 
         let gen24 = &evo.generations_history[24];
         let gen25 = &evo.generations_history[25];
@@ -1590,20 +1590,24 @@ mod tests {
         let gen27 = &evo.generations_history[27];
         let gen28 = &evo.generations_history[28];
 
-        // 1. Verify Honest Out-of-Sample Dominance across Gen 24 -> Gen 25 -> Gen 26 -> Gen 27 -> Gen 28 -> Gen 29 -> Gen 30 -> Gen 31 -> Gen 32
+        // 1. Verify Honest Out-of-Sample Dominance across Gen 24 -> Gen 25 -> Gen 26 -> Gen 27 -> Gen 28 -> Gen 29 -> Gen 30 -> Gen 31 -> Gen 32 -> Gen 33 -> Gen 34 -> Gen 35 -> Gen 36
         let gen29 = &evo.generations_history[29];
         let gen30 = &evo.generations_history[30];
         let gen31 = &evo.generations_history[31];
         let gen32 = &evo.generations_history[32];
-        for g in [gen24, gen25, gen26, gen27, gen28, gen29, gen30, gen31, gen32] {
+        let gen33 = &evo.generations_history[33];
+        let gen34 = &evo.generations_history[34];
+        let gen35 = &evo.generations_history[35];
+        let gen36 = &evo.generations_history[36];
+        for g in [gen24, gen25, gen26, gen27, gen28, gen29, gen30, gen31, gen32, gen33, gen34, gen35, gen36] {
             assert!(g.pareto_gate_passed);
             assert!(g.untouched_winners_count >= 90 && g.untouched_winners_count < 116);
             assert!(g.tp_losses_scratched >= 20 && g.remaining_unscratched_losses > 0);
             assert!(g.profit_factor > 2.50);
             assert!(g.max_drawdown_usd < 2_000.0);
         }
-        println!("\n[PHASE 25.1 PARETO MONOTONICITY SCOREBOARD (Gen 0 -> Gen 28 -> Gen 29 -> Gen 30 -> Gen 31 -> Gen 32)]");
-        for &gid in &[0usize, 24, 28, 29, 30, 31, 32] {
+        println!("\n[PHASE 26 PARETO MONOTONICITY SCOREBOARD (Gen 0 -> Gen 24 -> Gen 28 -> Gen 32 -> Gen 33 -> Gen 34 -> Gen 35 -> Gen 36)]");
+        for &gid in &[0usize, 24, 28, 29, 30, 31, 32, 33, 34, 35, 36] {
             let g = &evo.generations_history[gid];
             println!(
                 "  Gen {:02} | Vetoes: {}/{} | Scratches: {}/{} | WinPres: {}/116 | StopsElim: {}/57 | PF: {:.2} | Fixed P&L: +${:.2} | Kelly P&L: +${:.2} | MaxDD: ${:.2} | Fitness: {:.4}",
@@ -1621,7 +1625,7 @@ mod tests {
                 g.composite_fitness_score,
             );
         }
-        for pair in [gen28, gen29, gen30, gen31, gen32].windows(2) {
+        for pair in [gen28, gen29, gen30, gen31, gen32, gen33, gen34, gen35, gen36].windows(2) {
             let prev = pair[0];
             let next = pair[1];
             assert!(
@@ -1758,13 +1762,13 @@ mod tests {
             gen24.profit_factor
         );
 
-        // Persist canonical Gen 0..Gen 28 state to data/ledger_state.json
+        // Persist canonical Gen 0..Gen 36 state to data/ledger_state.json
         let clean_engine = RealTimeLedgerEngine::new();
         assert!(clean_engine.load_from_disk(ledger_path));
-        let _ = clean_engine.run_multi_generation_evolution_to_gen28();
+        let _ = clean_engine.run_multi_generation_evolution_to_gen36();
         clean_engine
             .save_to_disk(ledger_path)
-            .expect("Persist Gen 0..Gen 28 state to data/ledger_state.json");
+            .expect("Persist Gen 0..Gen 36 state to data/ledger_state.json");
     }
 
     #[test]
@@ -1991,7 +1995,7 @@ mod tests {
 
         for &(label, run_expanding_plasticity) in &[
             ("3A-1: Cold-Start Uniform Weights (Gen 0, Zero Era-1 Seeds)", false),
-            ("3A-2: Cold-Start Expanding-Window Plasticity (Gen 32, Zero Era-1 Seeds)", true),
+            ("3A-2: Cold-Start Expanding-Window Plasticity (Gen 36, Zero Era-1 Seeds)", true),
         ] {
             let cold_engine = RealTimeLedgerEngine::new();
             // Wipe ALL pre-seeded Era-1 prototypes, traps, pullbacks, and trajectories
@@ -2050,7 +2054,7 @@ mod tests {
                     let causal_state = cold_engine.compute_causal_plasticity_state_for_prefix(
                         candidate.brain_id,
                         &settled_prior,
-                        32,
+                        36,
                     );
                     cold_engine
                         .precedent_knn()
@@ -2106,13 +2110,13 @@ mod tests {
             if run_expanding_plasticity {
                 let verify_engine = RealTimeLedgerEngine::new();
                 assert!(verify_engine.load_from_disk(ledger_path));
-                let evo = verify_engine.run_multi_generation_evolution_to_gen32();
+                let evo = verify_engine.run_multi_generation_evolution_to_gen36();
                 let verify_snap = verify_engine.query_filtered_snapshot(&HyperFilterQuery::default());
                 let sb = &verify_snap.scoreboard;
-                let g32 = &evo.generations_history[32];
+                let g36 = &evo.generations_history[36];
                 println!(
                     "  [3A-2 Main Engine Parity] Gen={} | TP_V={} FP_V={} TP_S={} FP_S={} | WinPres={}/116 | StopsElim={}/57 | RemLoss={} | BasePF={:.2}->AdapPF={:.2} | BaseDD=${:.2}->AdapDD=${:.2} | FixedPnL=${:.2} | KellyPnL=${:.2}",
-                    g32.generation_id,
+                    g36.generation_id,
                     sb.true_positive_losses_vetoed,
                     sb.false_positive_winners_vetoed,
                     sb.true_positive_losses_scratched,
@@ -2163,7 +2167,7 @@ mod tests {
             r.was_scratched_by_loss_autopsy = false;
         }
         inv_engine.replace_closed_trades_for_audit(inverted_trades);
-        let _ = inv_engine.run_multi_generation_evolution_to_gen32();
+        let _ = inv_engine.run_multi_generation_evolution_to_gen36();
         let inv_snap = inv_engine.query_filtered_snapshot(&HyperFilterQuery::default());
 
         // Count against both the inverted labels and the original labels
@@ -2207,7 +2211,7 @@ mod tests {
         // =========================================================================
         let era_engine = RealTimeLedgerEngine::new();
         assert!(era_engine.load_from_disk(ledger_path));
-        let _ = era_engine.run_multi_generation_evolution_to_gen32();
+        let _ = era_engine.run_multi_generation_evolution_to_gen36();
         let era_snap = era_engine.query_filtered_snapshot(&HyperFilterQuery::default());
         let mut era_sorted = era_snap.closed_trades.clone();
         era_sorted.sort_by_key(|r| (r.opened_timestamp_ns, r.closed_timestamp_ns));
@@ -2299,7 +2303,7 @@ mod tests {
             shuffled_trades[i].was_scratched_by_loss_autopsy = false;
         }
         shuf_engine.replace_closed_trades_for_audit(shuffled_trades);
-        let _ = shuf_engine.run_multi_generation_evolution_to_gen28();
+        let _ = shuf_engine.run_multi_generation_evolution_to_gen36();
         let shuf_snap = shuf_engine.query_filtered_snapshot(&HyperFilterQuery::default());
         let shuf_cm = &shuf_snap.scoreboard.confusion_matrix;
 
@@ -2411,7 +2415,7 @@ mod tests {
                 let b4_state = paper_engine.compute_causal_plasticity_state_for_prefix(
                     BrainHorizonId::Brain04CoreSwing,
                     &settled_prior,
-                    32,
+                    36,
                 );
                 paper_engine
                     .precedent_knn()
@@ -2420,7 +2424,7 @@ mod tests {
             let causal_state = paper_engine.compute_causal_plasticity_state_for_prefix(
                 brain_id,
                 &settled_prior,
-                32,
+                36,
             );
             paper_engine
                 .precedent_knn()
@@ -2750,7 +2754,7 @@ mod tests {
                 let causal_state = cold_engine.compute_causal_plasticity_state_for_prefix(
                     candidate.brain_id,
                     &settled_prior,
-                    32,
+                    36,
                 );
                 cold_engine
                     .precedent_knn()

@@ -7258,29 +7258,37 @@ impl RealTimeLedgerEngine {
                     let w_bal = if is_w { 1.0 / nw } else { 1.0 / nl };
                     net_r += w_bal * dr * p_conf * p_hurd;
                 }
-                net_r
+                let a_star = (1.0 - p_star)
+                    / (((nw + (pool_win_cnt as f64) + 1.0) * (mu_r_plus / mu_r_loss.max(1e-6))).sqrt().max(1.0));
+                let reg_a = mu_r_plus * (alpha_c + (a_star * a_star) / alpha_c.max(1e-6));
+                let reg_d = (1.0 - damp_c).powi(2) * (var_z1 + var_dz) + damp_c.powi(2) * var_z2;
+                let hhi_f = f2.iter().map(|&x| (x / fs2).powi(2)).sum::<f64>();
+                let reg_p = hhi_f * p_c + (max_snr / mean_snr) / p_c.max(1e-6);
+                let h_wald = lambda_star.abs() + c_scratch;
+                let reg_h = mu_r_loss * (hurdle_c + (h_wald * h_wald) / hurdle_c.max(1e-6));
+                (net_r / (nw + nl)) - (reg_a + reg_d + reg_p + reg_h)
             };
 
             if fold_trajs.len() >= 4 {
                 let mut best_net_r = eval_loo_net_r(a_opt, d_opt, p_opt, h_opt);
                 for g_step in 29..=target_gen.min(36) {
                     let step = 1.0 / ((g_step - 27) as f64 + 2.0);
-                    for mult in [1.0 - step, 1.0 + step] {
+                    for mult in [1.0 - step, 1.0 - 0.5 * step, 1.0 + 0.5 * step, 1.0 + step] {
                         let cand_a = a_opt * mult;
                         let r_a = eval_loo_net_r(cand_a, d_opt, p_opt, h_opt);
                         if r_a > best_net_r { a_opt = cand_a; best_net_r = r_a; }
                     }
-                    for mult in [1.0 - step, 1.0 + step] {
+                    for mult in [1.0 - step, 1.0 - 0.5 * step, 1.0 + 0.5 * step, 1.0 + step] {
                         let cand_d = d_opt * mult;
                         let r_d = eval_loo_net_r(a_opt, cand_d, p_opt, h_opt);
                         if r_d > best_net_r { d_opt = cand_d; best_net_r = r_d; }
                     }
-                    for mult in [1.0 - step, 1.0 + step] {
+                    for mult in [1.0 - step, 1.0 - 0.5 * step, 1.0 + 0.5 * step, 1.0 + step] {
                         let cand_p = p_opt * mult;
                         let r_p = eval_loo_net_r(a_opt, d_opt, cand_p, h_opt);
                         if r_p > best_net_r { p_opt = cand_p; best_net_r = r_p; }
                     }
-                    for mult in [1.0 - step, 1.0 + step] {
+                    for mult in [1.0 - step, 1.0 - 0.5 * step, 1.0 + 0.5 * step, 1.0 + step] {
                         let cand_h = h_opt * mult;
                         let r_h = eval_loo_net_r(a_opt, d_opt, p_opt, cand_h);
                         if r_h > best_net_r { h_opt = cand_h; best_net_r = r_h; }

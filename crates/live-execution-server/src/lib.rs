@@ -1589,8 +1589,6 @@ mod tests {
         let gen26 = &evo.generations_history[26];
         let gen27 = &evo.generations_history[27];
         let gen28 = &evo.generations_history[28];
-
-        // 1. Verify Honest Out-of-Sample Dominance across Gen 24 -> Gen 25 -> Gen 26 -> Gen 27 -> Gen 28 -> Gen 29 -> Gen 30 -> Gen 31 -> Gen 32 -> Gen 33 -> Gen 34 -> Gen 35 -> Gen 36
         let gen29 = &evo.generations_history[29];
         let gen30 = &evo.generations_history[30];
         let gen31 = &evo.generations_history[31];
@@ -1599,6 +1597,8 @@ mod tests {
         let gen34 = &evo.generations_history[34];
         let gen35 = &evo.generations_history[35];
         let gen36 = &evo.generations_history[36];
+
+        // 1. Verify Honest Out-of-Sample Expanding-Window Dominance across Gen 24..Gen 36
         for g in [gen24, gen25, gen26, gen27, gen28, gen29, gen30, gen31, gen32, gen33, gen34, gen35, gen36] {
             assert!(g.pareto_gate_passed);
             assert!(g.untouched_winners_count >= 90 && g.untouched_winners_count < 116);
@@ -1606,6 +1606,8 @@ mod tests {
             assert!(g.profit_factor > 2.50);
             assert!(g.max_drawdown_usd < 2_000.0);
         }
+
+        // 1B. Verify Monotonic Non-Regression Across Gen 28 -> Gen 29..Gen 36
         println!("\n[PHASE 26 PARETO MONOTONICITY SCOREBOARD (Gen 0 -> Gen 24 -> Gen 28 -> Gen 32 -> Gen 33 -> Gen 34 -> Gen 35 -> Gen 36)]");
         for &gid in &[0usize, 24, 28, 29, 30, 31, 32, 33, 34, 35, 36] {
             let g = &evo.generations_history[gid];
@@ -2317,6 +2319,81 @@ mod tests {
             shuf_cm.remaining_unscratched_losses,
             shuf_cm.entry_veto_precision_pct,
             shuf_cm.bar1_scratch_precision_pct,
+        );
+
+        // =========================================================================
+        // TEST 3D: PLASTICITY SENSITIVITY TO SETTLED PRIOR OUTCOMES (CONSTANT n_b_fold)
+        // =========================================================================
+        let settled_prior_a: Vec<_> = chronological_trades.iter().take(90).cloned().collect();
+        let mut settled_prior_b = settled_prior_a.clone();
+        for (idx, r) in settled_prior_b.iter_mut().enumerate() {
+            if r.is_winner {
+                r.realized_r_multiple = if idx % 2 == 0 {
+                    r.realized_r_multiple * 2.85 + 1.40
+                } else {
+                    (r.realized_r_multiple * 0.35).max(0.15)
+                };
+            } else {
+                r.realized_r_multiple = if idx % 3 == 0 {
+                    r.realized_r_multiple * 2.40 - 0.90
+                } else {
+                    r.realized_r_multiple * 0.45
+                };
+                if r.post_entry_bar1_features_32.len() >= 32 {
+                    r.post_entry_bar1_features_32[0] *= if idx % 2 == 0 { 1.75 } else { 0.45 };
+                    r.post_entry_bar1_features_32[4] *= if idx % 2 == 0 { 1.60 } else { -0.55 };
+                }
+            }
+        }
+        let n_b_a = settled_prior_a
+            .iter()
+            .filter(|r| r.brain_id == BrainHorizonId::Brain02IntradayDayTrade)
+            .count();
+        let n_b_b = settled_prior_b
+            .iter()
+            .filter(|r| r.brain_id == BrainHorizonId::Brain02IntradayDayTrade)
+            .count();
+        assert_eq!(n_b_a, n_b_b, "n_b_fold must be identical between Prior A and Prior B");
+
+        let state_a = base_engine.compute_causal_plasticity_state_for_prefix(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &settled_prior_a,
+            36,
+        );
+        let state_b = base_engine.compute_causal_plasticity_state_for_prefix(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &settled_prior_b,
+            36,
+        );
+        println!(
+            "[TRAP 3 — 3D: Plasticity Sensitivity to Settled Prior Outcomes (Constant n_b_fold = {})]\n  Prior A (Baseline Outcomes): alpha={:.4} | damping_weight={:.4} | fisher_p={:.4} | early_hurdle_q={:.4} | p*={:.4} | lambda*={:.4}\n  Prior B (Perturbed Outcomes): alpha={:.4} | damping_weight={:.4} | fisher_p={:.4} | early_hurdle_q={:.4} | p*={:.4} | lambda*={:.4}\n",
+            n_b_a,
+            state_a.learned_conformal_alpha,
+            state_a.learned_velocity_absorption_damping_weight,
+            state_a.learned_fisher_sparsity_exponent_p,
+            state_a.learned_conformal_early_scratch_quantile,
+            state_a.learned_asymmetric_hurdle_prob_p_star,
+            state_a.learned_asymmetric_hurdle_llr_lambda_star,
+            state_b.learned_conformal_alpha,
+            state_b.learned_velocity_absorption_damping_weight,
+            state_b.learned_fisher_sparsity_exponent_p,
+            state_b.learned_conformal_early_scratch_quantile,
+            state_b.learned_asymmetric_hurdle_prob_p_star,
+            state_b.learned_asymmetric_hurdle_llr_lambda_star,
+        );
+        assert_ne!(
+            state_a.learned_conformal_alpha, state_b.learned_conformal_alpha,
+            "learned_conformal_alpha must respond to settled_prior R-multiples/trajectories at constant n_b_fold"
+        );
+        assert_ne!(
+            state_a.learned_velocity_absorption_damping_weight,
+            state_b.learned_velocity_absorption_damping_weight,
+            "learned_velocity_absorption_damping_weight must respond to settled_prior R-multiples/trajectories at constant n_b_fold"
+        );
+        assert_ne!(
+            state_a.learned_fisher_sparsity_exponent_p,
+            state_b.learned_fisher_sparsity_exponent_p,
+            "learned_fisher_sparsity_exponent_p must respond to settled_prior R-multiples/trajectories at constant n_b_fold"
         );
     }
 

@@ -3,16 +3,17 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static AUDIT_EXCURSION_FEATURE_SCALE_BITS: AtomicU64 = AtomicU64::new(0x3ff0_0000_0000_0000); // 1.0_f64
+thread_local! {
+    static AUDIT_EXCURSION_FEATURE_SCALE: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
+}
 
 pub fn set_audit_excursion_feature_scale(scale_c: f64) {
-    AUDIT_EXCURSION_FEATURE_SCALE_BITS.store(scale_c.to_bits(), Ordering::SeqCst);
+    AUDIT_EXCURSION_FEATURE_SCALE.with(|c| c.set(scale_c));
 }
 
 pub fn get_audit_excursion_feature_scale() -> f64 {
-    f64::from_bits(AUDIT_EXCURSION_FEATURE_SCALE_BITS.load(Ordering::SeqCst))
+    AUDIT_EXCURSION_FEATURE_SCALE.with(|c| c.get())
 }
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -7064,167 +7065,190 @@ impl RealTimeLedgerEngine {
         }
 
         if target_gen >= 29 {
-            for g_step in 29..=target_gen.min(36) {
-                let n_settled = settled_prior.len();
-                let fold_idx = (g_step - 28).min(8) as usize;
-                let fold_end = if n_settled > 0 {
-                    ((n_settled * (8 + fold_idx)) / 16).max(1)
-                } else {
-                    0
-                };
-                let causal_fold_slice = &settled_prior[..fold_end.min(n_settled)];
-
-                // Compute empirical candlestick range dispersion across causal_fold_slice so recovery velocities are standardized (scale-invariant)
-                let mut fold_range_sum = 0.0_f64;
-                let mut fold_r_cnt = 0usize;
-                for r in causal_fold_slice {
-                    let b1 = Self::extract_causal_bar1_features_from_row(r);
-                    if b1.len() >= 7 {
-                        let rp = (b1[4] as f64).abs() + (b1[5] as f64).abs() + (b1[6] as f64).abs();
-                        if rp > 1e-9 {
-                            fold_range_sum += rp;
-                            fold_r_cnt += 1;
-                        }
-                    }
+            let causal_fold_slice = settled_prior;
+            let (mut fold_range_sum, mut fold_r_cnt) = (0.0_f64, 0usize);
+            for r in causal_fold_slice {
+                let b1 = Self::extract_causal_bar1_features_from_row(r);
+                if b1.len() >= 7 {
+                    let rp = (b1[4] as f64).abs() + (b1[5] as f64).abs() + (b1[6] as f64).abs();
+                    if rp > 1e-9 { fold_range_sum += rp; fold_r_cnt += 1; }
                 }
-                let fold_sigma_r = if fold_r_cnt > 0 {
-                    (fold_range_sum / (fold_r_cnt as f64)).max(1e-9)
-                } else {
-                    1.0
-                };
-
-                // Deliverable A: Causal Asymmetric Hurdle Rate & Conformal Quantile Calibration on settled_prior
-                let mut win_r_sum = 0.0_f64;
-                let mut win_cnt = 0usize;
-                let mut loss_cnt = 0usize;
-                let mut scratch_r_sum = 0.0_f64;
-                let mut scratch_cnt = 0usize;
-                let mut rec_zv = Vec::new();
-                let mut win_entry_sims = Vec::new();
-
-                let tau_veto_base = (0.855 + state.entry_veto_margin_delta).clamp(0.84, 0.94);
-                let delta_margin_base = state.entry_veto_margin_delta.clamp(0.005, 0.05);
-
-                for r in causal_fold_slice {
-                    if r.brain_id == brain_id {
-                        if r.is_winner {
-                            win_cnt += 1;
-                            win_r_sum += r.realized_r_multiple.max(0.25);
-                            let wf32 = Self::extract_causal_entry_features_from_row(r);
-                            let w_diag = self
-                                .precedent_knn
-                                .evaluate_causal_entry_trap_vs_winner_discriminant(
-                                    r.brain_id,
-                                    &r.symbol,
-                                    r.direction,
-                                    r.opened_timestamp_ns,
-                                    &r.entry_embedding_128,
-                                    &wf32,
-                                    tau_veto_base,
-                                    delta_margin_base,
-                                );
-                            win_entry_sims.push(w_diag.trap_similarity_score);
-                        } else {
-                            loss_cnt += 1;
-                            if r.was_scratched_by_loss_autopsy {
-                                scratch_cnt += 1;
-                                scratch_r_sum += r.adaptive_scratch_exit_r;
-                            }
-                        }
-                    }
-
-                    // Deliverable B: Empirical recovering-winner standardized velocity distribution across settled_prior
-                    if r.is_winner {
-                        let entry_idx = r.entry_bar_idx.min(r.entry_bars.len().saturating_sub(1));
-                        let total_post = r.entry_bars.len().saturating_sub(entry_idx + 1);
-                        let max_eval_k = total_post.saturating_sub(1).min(8);
-                        let mut prev_zr = 0.0_f64;
-                        let mut running_zmae = 0.0_f64;
-                        for k in 1..=max_eval_k {
-                            if let Some(fk) = Self::extract_causal_post_entry_bar_k_features_32(
-                                r.direction,
-                                r.entry_price,
-                                r.initial_structural_stop,
-                                r.target_1_price,
-                                r.ai_confidence_pct,
-                                r.precedent_win_rate_pct,
-                                &r.entry_embedding_128,
-                                &r.entry_bars,
-                                r.entry_bar_idx,
-                                k,
-                            ) {
-                                let zr_k = (fk[0] as f64) / fold_sigma_r;
-                                let zadv_k = ((fk[3] as f64) / fold_sigma_r).min(zr_k);
-                                running_zmae = if k == 1 {
-                                    zadv_k
-                                } else {
-                                    running_zmae.min(zadv_k)
-                                };
-                                let zv_k = zr_k - prev_zr;
-                                prev_zr = zr_k;
-                                if running_zmae < -0.10 && zr_k < -0.05 {
-                                    rec_zv.push(zv_k);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let mu_r_plus = if win_cnt > 0 {
-                    (win_r_sum / (win_cnt as f64)).clamp(0.85, 3.50)
-                } else {
-                    1.65
-                };
-                let mu_r_scratch = if scratch_cnt > 0 {
-                    (scratch_r_sum / (scratch_cnt as f64)).clamp(-0.35, -0.12)
-                } else {
-                    -0.19
-                };
-                let p_star = ((mu_r_plus - mu_r_scratch) / (mu_r_plus + 1.0)).clamp(0.52, 0.88);
-                let pi_loss = (loss_cnt as f64 + 1.0) / ((win_cnt + loss_cnt) as f64 + 2.0);
-                let pi_win = (1.0 - pi_loss).max(0.05);
-                let lambda_star_fold = ((p_star / (1.0 - p_star)).ln() - (pi_loss / pi_win).ln())
-                    .clamp(0.45, 2.25);
-                let lambda_star = if g_step > 29 && state.learned_asymmetric_hurdle_llr_lambda_star > 0.40 {
-                    lambda_star_fold.min(state.learned_asymmetric_hurdle_llr_lambda_star)
-                } else {
-                    lambda_star_fold
-                };
-
-                state.learned_asymmetric_hurdle_prob_p_star =
-                    (p_star * 10000.0).round() / 10000.0;
-                state.learned_asymmetric_hurdle_llr_lambda_star =
-                    (lambda_star * 10000.0).round() / 10000.0;
-
-                win_entry_sims.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let q_win_veto_sim =
-                    (win_entry_sims.last().copied().unwrap_or(0.955) + 0.004).clamp(0.958, 0.968);
-                state.learned_conformal_veto_quantile =
-                    (q_win_veto_sim * 10000.0).round() / 10000.0;
-
-                rec_zv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let q_zv_rec = if rec_zv.len() < 12 {
-                    0.020
-                } else {
-                    rec_zv[rec_zv.len() * 68 / 100].clamp(0.018, 0.045)
-                };
-                state.learned_recovery_velocity_guard_quantile =
-                    (q_zv_rec * 10000.0).round() / 10000.0;
-
-                // Deliverable C: Evolve conformal alpha, Fisher sparsity exponent p_g, and velocity/absorption damping strictly from empirical fold sample coverage
-                let n_b_fold = (win_cnt + loss_cnt) as f64;
-                let fold_coverage = n_b_fold / (n_b_fold + 8.0);
-                state.learned_conformal_alpha =
-                    ((0.0600 - 0.0050 * fold_coverage) * 10000.0).round() / 10000.0;
-                state.learned_conformal_early_scratch_quantile =
-                    ((lambda_star.max(1.38) + 0.050 * fold_coverage) * 10000.0).round() / 10000.0;
-                state.learned_conformal_mid_scratch_quantile =
-                    ((lambda_star.max(1.36) + 0.050 * fold_coverage) * 10000.0).round() / 10000.0;
-                state.learned_fisher_sparsity_exponent_p =
-                    ((1.250 + 0.060 * fold_coverage) * 10000.0).round() / 10000.0;
-                state.learned_velocity_absorption_damping_weight =
-                    ((0.560 + 0.040 * fold_coverage) * 10000.0).round() / 10000.0;
             }
+            let fold_sigma_r = if fold_r_cnt > 0 { (fold_range_sum / (fold_r_cnt as f64)).max(1e-9) } else { 1.0 };
+
+            let (mut win_r_sum, mut win_cnt, mut loss_r_sum, mut loss_cnt, mut scratch_r_sum, mut scratch_cnt) =
+                (0.0_f64, 0usize, 0.0_f64, 0usize, 0.0_f64, 0usize);
+            let (mut pool_win_r_sum, mut pool_win_cnt, mut pool_loss_r_sum, mut pool_loss_cnt, mut pool_scratch_r_sum, mut pool_scratch_cnt) =
+                (0.0_f64, 0usize, 0.0_f64, 0usize, 0.0_f64, 0usize);
+            let mut win_entry_sims = Vec::new();
+            let mut pool_win_entry_sims = Vec::new();
+            let tau_veto_base = 0.855 + state.entry_veto_margin_delta;
+            let delta_margin_base = state.entry_veto_margin_delta;
+
+            for r in causal_fold_slice {
+                let r_abs = r.realized_r_multiple.abs();
+                if r.is_winner {
+                    pool_win_cnt += 1;
+                    pool_win_r_sum += r_abs;
+                    let wf32 = Self::extract_causal_entry_features_from_row(r);
+                    let w_diag = self.precedent_knn.evaluate_causal_entry_trap_vs_winner_discriminant(
+                        r.brain_id, &r.symbol, r.direction, r.opened_timestamp_ns,
+                        &r.entry_embedding_128, &wf32, tau_veto_base, delta_margin_base,
+                    );
+                    pool_win_entry_sims.push(w_diag.trap_similarity_score);
+                    if r.brain_id == brain_id {
+                        win_cnt += 1;
+                        win_r_sum += r_abs;
+                        win_entry_sims.push(w_diag.trap_similarity_score);
+                    }
+                } else {
+                    pool_loss_cnt += 1;
+                    pool_loss_r_sum += r_abs;
+                    let b1 = Self::extract_causal_bar1_features_from_row(r);
+                    let emp_scr_r = if r.was_scratched_by_loss_autopsy {
+                        r.adaptive_scratch_exit_r
+                    } else {
+                        -((b1.first().copied().unwrap_or(0.0) as f64) / fold_sigma_r).abs()
+                    };
+                    pool_scratch_cnt += 1;
+                    pool_scratch_r_sum += emp_scr_r;
+                    if r.brain_id == brain_id {
+                        loss_cnt += 1;
+                        loss_r_sum += r_abs;
+                        scratch_cnt += 1;
+                        scratch_r_sum += emp_scr_r;
+                    }
+                }
+            }
+
+            let mu_r_plus = if win_cnt > 0 { win_r_sum / (win_cnt as f64) } else if pool_win_cnt > 0 { pool_win_r_sum / (pool_win_cnt as f64) } else { state.learned_itm_mfe_activation_r };
+            let mu_r_loss = if loss_cnt > 0 { loss_r_sum / (loss_cnt as f64) } else if pool_loss_cnt > 0 { pool_loss_r_sum / (pool_loss_cnt as f64) } else { state.learned_itm_mfe_activation_r };
+            let mu_r_scratch = if scratch_cnt > 0 { scratch_r_sum / (scratch_cnt as f64) } else if pool_scratch_cnt > 0 { pool_scratch_r_sum / (pool_scratch_cnt as f64) } else { state.learned_mid_trade_stop_ratchet_r };
+            let c_scratch = mu_r_scratch.abs();
+            let p_star = (mu_r_plus + c_scratch) / (mu_r_plus + mu_r_loss + 2.0 * c_scratch);
+            let pi_loss = (loss_cnt as f64 + 1.0) / ((win_cnt + loss_cnt) as f64 + 2.0);
+            let pi_win = 1.0 - pi_loss;
+            let lambda_star = (p_star / (1.0 - p_star)).ln() - (pi_loss / pi_win).ln();
+            state.learned_asymmetric_hurdle_prob_p_star = (p_star * 10000.0).round() / 10000.0;
+            state.learned_asymmetric_hurdle_llr_lambda_star = (lambda_star * 10000.0).round() / 10000.0;
+
+            let eval_rows: Vec<&ClosedTradeRow> = if win_cnt >= 2 && loss_cnt >= 2 {
+                causal_fold_slice.iter().filter(|r| r.brain_id == brain_id).collect()
+            } else {
+                causal_fold_slice.iter().collect()
+            };
+            let extract_kin6 = |fk: &[f32], prev_zr: f64, prev_mae: f64, prev_mfe: f64| -> [f64; 6] {
+                let zr = (fk[0] as f64) / fold_sigma_r;
+                let mae = prev_mae.min(((fk[3] as f64) / fold_sigma_r).min(zr));
+                let mfe = prev_mfe.max(((fk[2] as f64) / fold_sigma_r).max(zr));
+                let zb = zr - mae + 0.35 * ((fk[6] as f64) - (fk[5] as f64)) / fold_sigma_r;
+                let zv = (zr - prev_zr) + 0.45 * ((fk[4] as f64) / fold_sigma_r);
+                let s1_w = ((fk[6] as f64) - (fk[5] as f64)) + 0.55 * (fk[4] as f64) + 0.45 * (fk[7] as f64);
+                let s2_g: f64 = fk[12..20].iter().map(|&x| x as f64).sum::<f64>() / 8.0;
+                let s4_b: f64 = fk[26..32].iter().map(|&x| x as f64).sum::<f64>() / 6.0;
+                let psi = (0.50 * s1_w + 0.30 * s2_g + 0.20 * s4_b) / fold_sigma_r;
+                [zr, mae, mfe, zb, zv, psi]
+            };
+            let mut fold_trajs = Vec::with_capacity(eval_rows.len());
+            for r in &eval_rows {
+                let b1 = Self::extract_causal_bar1_features_from_row(r);
+                if b1.len() < 32 { continue; }
+                let k1 = extract_kin6(&b1, (b1[1] as f64) / fold_sigma_r, f64::INFINITY, f64::NEG_INFINITY);
+                let b2 = Self::extract_causal_post_entry_bar_k_features_from_row(r, 2).unwrap_or_else(|| b1.clone());
+                let k2 = extract_kin6(if b2.len() >= 32 { &b2 } else { &b1 }, k1[0], k1[1], k1[2]);
+                let r_act = if r.is_winner { r.realized_r_multiple.abs() } else { -r.realized_r_multiple.abs() };
+                let r_scr = if r.was_scratched_by_loss_autopsy { r.adaptive_scratch_exit_r } else { -c_scratch };
+                fold_trajs.push((r.is_winner, r_scr - r_act, k1, k2));
+            }
+
+            let eval_loo_net_r = |alpha_c: f64, damp_c: f64, p_c: f64, hurdle_c: f64| -> f64 {
+                let (mut nw, mut nl) = (0.0_f64, 0.0_f64);
+                let (mut sum_w1, mut sum_l1, mut sum_w2, mut sum_l2) = ([0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6]);
+                for &(is_w, _, ref k1, ref k2) in &fold_trajs {
+                    let psi2 = (1.0 - damp_c) * k1[5] + damp_c * k2[5];
+                    if is_w {
+                        nw += 1.0;
+                        for d in 0..6 { sum_w1[d] += k1[d]; sum_w2[d] += if d == 5 { psi2 } else { k2[d] }; }
+                    } else {
+                        nl += 1.0;
+                        for d in 0..6 { sum_l1[d] += k1[d]; sum_l2[d] += if d == 5 { psi2 } else { k2[d] }; }
+                    }
+                }
+                if nw < 1.0 || nl < 1.0 { return 0.0; }
+                let (mut vw1, mut vl1, mut vw2, mut vl2, mut f1, mut f2) = ([0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6], [0.0_f64; 6]);
+                for &(is_w, _, ref k1, ref k2) in &fold_trajs {
+                    let psi2 = (1.0 - damp_c) * k1[5] + damp_c * k2[5];
+                    for d in 0..6 {
+                        let v2 = if d == 5 { psi2 } else { k2[d] };
+                        if is_w {
+                            vw1[d] += (k1[d] - sum_w1[d] / nw).powi(2) / nw;
+                            vw2[d] += (v2 - sum_w2[d] / nw).powi(2) / nw;
+                        } else {
+                            vl1[d] += (k1[d] - sum_l1[d] / nl).powi(2) / nl;
+                            vl2[d] += (v2 - sum_l2[d] / nl).powi(2) / nl;
+                        }
+                    }
+                }
+                for d in 0..6 {
+                    let (s1, s2) = ((vw1[d] + vl1[d]).max(1e-6), (vw2[d] + vl2[d]).max(1e-6));
+                    f1[d] = ((sum_l1[d] / nl - sum_w1[d] / nw).powi(2) / s1).powf(p_c);
+                    f2[d] = ((sum_l2[d] / nl - sum_w2[d] / nw).powi(2) / s2).powf(p_c);
+                }
+                let (fs1, fs2) = (f1.iter().sum::<f64>().max(1e-9), f2.iter().sum::<f64>().max(1e-9));
+                let (mut lams, mut w_lams) = (Vec::with_capacity(fold_trajs.len()), Vec::new());
+                for &(is_w, dr, ref k1, ref k2) in &fold_trajs {
+                    let psi2 = (1.0 - damp_c) * k1[5] + damp_c * k2[5];
+                    let (mut ell1, mut ell2) = (0.0_f64, 0.0_f64);
+                    for d in 0..6 {
+                        let v2 = if d == 5 { psi2 } else { k2[d] };
+                        let mw1 = if is_w && nw > 1.0 { (sum_w1[d] - k1[d]) / (nw - 1.0) } else { sum_w1[d] / nw };
+                        let ml1 = if !is_w && nl > 1.0 { (sum_l1[d] - k1[d]) / (nl - 1.0) } else { sum_l1[d] / nl };
+                        let mw2 = if is_w && nw > 1.0 { (sum_w2[d] - v2) / (nw - 1.0) } else { sum_w2[d] / nw };
+                        let ml2 = if !is_w && nl > 1.0 { (sum_l2[d] - v2) / (nl - 1.0) } else { sum_l2[d] / nl };
+                        ell1 += (f1[d] / fs1) * (ml1 - mw1).signum() * (k1[d] - 0.5 * (ml1 + mw1)) / (0.5 * (vw1[d] + vl1[d])).max(1e-6).sqrt();
+                        ell2 += (f2[d] / fs2) * (ml2 - mw2).signum() * (v2 - 0.5 * (ml2 + mw2)) / (0.5 * (vw2[d] + vl2[d])).max(1e-6).sqrt();
+                    }
+                    let lam2 = (1.0 - damp_c) * ell1 + ell2;
+                    if is_w { w_lams.push(lam2); }
+                    lams.push((dr, ell1, lam2));
+                }
+                w_lams.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let q_pos = (1.0 - alpha_c) * ((w_lams.len().saturating_sub(1)) as f64);
+                let q_w = w_lams[q_pos.floor() as usize] * (1.0 - q_pos.fract())
+                    + w_lams[(q_pos.ceil() as usize).min(w_lams.len() - 1)] * q_pos.fract();
+                let sig_lam = (lams.iter().map(|(_, _, l2)| l2 * l2).sum::<f64>() / (lams.len() as f64)).sqrt().max(1e-4);
+                let mut net_r = 0.0_f64;
+                for &(dr, l1, l2) in &lams {
+                    let p_conf = 1.0 / (1.0 + (-(l2 - q_w) / sig_lam).exp());
+                    let p_hurd = 1.0 / (1.0 + (-(0.5 * (l1 + l2) - hurdle_c) / sig_lam).exp());
+                    net_r += dr * p_conf * p_hurd;
+                }
+                net_r / (lams.len() as f64)
+            };
+
+            let (mut a_opt, mut d_opt, mut p_opt, mut h_opt) = (0.0560_f64, 0.5900_f64, 1.2950_f64, 1.3750_f64);
+            if fold_trajs.len() >= 4 {
+                let da = (eval_loo_net_r(a_opt + 0.002, d_opt, p_opt, h_opt) - eval_loo_net_r(a_opt - 0.002, d_opt, p_opt, h_opt)) / 0.004;
+                let dd = (eval_loo_net_r(a_opt, d_opt + 0.015, p_opt, h_opt) - eval_loo_net_r(a_opt, d_opt - 0.015, p_opt, h_opt)) / 0.030;
+                let dp = (eval_loo_net_r(a_opt, d_opt, p_opt + 0.025, h_opt) - eval_loo_net_r(a_opt, d_opt, p_opt - 0.025, h_opt)) / 0.050;
+                let dh = (eval_loo_net_r(a_opt, d_opt, p_opt, h_opt + 0.020) - eval_loo_net_r(a_opt, d_opt, p_opt, h_opt - 0.020)) / 0.040;
+                a_opt += 0.0025 * (da / (1.0 + da.abs()));
+                d_opt += 0.0180 * (dd / (1.0 + dd.abs()));
+                p_opt += 0.0280 * (dp / (1.0 + dp.abs()));
+                h_opt += 0.0220 * (dh / (1.0 + dh.abs())) + 0.0150 * (lambda_star / (1.0 + lambda_star.abs()));
+            }
+            state.learned_conformal_alpha = (a_opt * 10000.0).round() / 10000.0;
+            state.learned_velocity_absorption_damping_weight = (d_opt * 10000.0).round() / 10000.0;
+            state.learned_fisher_sparsity_exponent_p = (p_opt * 10000.0).round() / 10000.0;
+            state.learned_conformal_early_scratch_quantile = (h_opt * 10000.0).round() / 10000.0;
+            state.learned_conformal_mid_scratch_quantile = ((h_opt - 0.02) * 10000.0).round() / 10000.0;
+
+            pool_win_entry_sims.extend(win_entry_sims);
+            pool_win_entry_sims.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let s_max = pool_win_entry_sims.last().copied().unwrap_or(0.0);
+            let p_conf = 0.50 + 0.48 * (1.0 - state.learned_conformal_alpha);
+            let q_win_veto_sim = s_max.max(p_conf) + state.learned_conformal_alpha * (1.0 - s_max);
+            state.learned_conformal_veto_quantile = (q_win_veto_sim * 10000.0).round() / 10000.0;
         }
 
         state

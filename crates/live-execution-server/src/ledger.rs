@@ -7082,6 +7082,12 @@ impl RealTimeLedgerEngine {
                 (0.0_f64, 0usize, 0.0_f64, 0usize, 0.0_f64, 0usize);
             let mut win_entry_sims = Vec::new();
             let mut pool_win_entry_sims = Vec::new();
+            let fold_eval_ts = causal_fold_slice
+                .iter()
+                .map(|x| x.closed_timestamp_ns)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
             for r in causal_fold_slice {
                 let r_abs = r.realized_r_multiple.abs();
                 if r.is_winner {
@@ -7089,7 +7095,7 @@ impl RealTimeLedgerEngine {
                     pool_win_r_sum += r_abs;
                     let wf32 = Self::extract_causal_entry_features_from_row(r);
                     let w_diag = self.precedent_knn.evaluate_causal_entry_trap_vs_winner_discriminant(
-                        r.brain_id, &r.symbol, r.direction, r.opened_timestamp_ns,
+                        r.brain_id, &r.symbol, r.direction, fold_eval_ts,
                         &r.entry_embedding_128, &wf32, state.learned_conformal_veto_quantile, state.entry_veto_margin_delta,
                     );
                     if w_diag.matched_trap_id.is_some() {

@@ -2609,62 +2609,64 @@ impl PrecedentKnnIndex {
         if !pre_settlement_bars_features_32.first().is_some_and(|(_, f)| f.len() >= 32) { return None; }
         let max_pre_k = pre_settlement_bars_features_32.iter().map(|(k, _)| *k).max().unwrap_or(1).min(16);
         let syn_state = self.get_synaptic_plasticity_state(brain_id);
-        let r_var = syn_state.learned_velocity_absorption_damping_weight.clamp(1e-4, 0.9999);
-        let lambda_decay = (1.0 + r_var) / (2.0 + 0.5 * r_var);
+        let lambda_decay = syn_state.learned_velocity_absorption_damping_weight.clamp(1e-4, 0.9999);
         let alpha_g = syn_state.learned_conformal_alpha;
         let p_exp = syn_state.learned_fisher_sparsity_exponent_p;
         let (_, emp_ratchet_r) = self.empirical_mid_trade_stall_quantiles(brain_id, current_timestamp_ns);
         let learned_ratchet_r = 0.65 * syn_state.learned_mid_trade_stop_ratchet_r + 0.35 * emp_ratchet_r;
 
-        let (raw_wins, raw_losses, sigma_range_prior, loss_r_bounds) = {
+        let (raw_wins, raw_losses, same_b_wins, sigma_range_prior, loss_r_bounds) = {
             let (traps, wins) = (self.hard_negative_traps.read(), self.winner_pullbacks.read());
+            let b_idx = |b: BrainHorizonId| match b {
+                BrainHorizonId::Brain01PennyAnomaly => 0, BrainHorizonId::Brain02IntradayDayTrade => 1,
+                BrainHorizonId::Brain03ShortTermSwing => 2, BrainHorizonId::Brain04CoreSwing => 3, BrainHorizonId::Brain05LongTermWealth => 4,
+            };
             let same_b_wins = wins.iter().filter(|w| w.brain_id == brain_id && w.closed_timestamp_ns < current_timestamp_ns && w.post_entry_bar1_features_32.len() >= 32).count();
             let same_b_traps = traps.iter().filter(|t| t.brain_id == brain_id && t.closed_timestamp_ns < current_timestamp_ns && t.post_entry_bar1_features_32.len() >= 32).count();
             if same_b_wins == 0 || same_b_traps == 0 || (same_b_wins + same_b_traps) < 3 { return None; }
-            let (mut rng_sum, mut rng_cnt, mut l_rs) = (0.0_f64, 0usize, Vec::new());
-            for w in wins.iter().filter(|w| w.brain_id == brain_id && w.closed_timestamp_ns < current_timestamp_ns && w.entry_features_32.len() >= 11) {
+            let (mut rng_sum, mut rng_cnt, mut l_rs) = ([0.0_f64; 5], [0usize; 5], Vec::new());
+            for w in wins.iter().filter(|w| w.closed_timestamp_ns < current_timestamp_ns && w.entry_features_32.len() >= 11) {
                 let r_p = (w.entry_features_32[8] as f64).abs() + (w.entry_features_32[9] as f64).abs() + (w.entry_features_32[10] as f64).abs();
-                if r_p > 1e-9 { rng_sum += r_p; rng_cnt += 1; }
+                if r_p > 1e-9 { rng_sum[b_idx(w.brain_id)] += r_p; rng_cnt[b_idx(w.brain_id)] += 1; }
             }
-            for t in traps.iter().filter(|t| t.brain_id == brain_id && t.closed_timestamp_ns < current_timestamp_ns && t.entry_features_32.len() >= 11) {
+            for t in traps.iter().filter(|t| t.closed_timestamp_ns < current_timestamp_ns && t.entry_features_32.len() >= 11) {
                 let r_p = (t.entry_features_32[8] as f64).abs() + (t.entry_features_32[9] as f64).abs() + (t.entry_features_32[10] as f64).abs();
-                if r_p > 1e-9 { rng_sum += r_p; rng_cnt += 1; }
-                if t.bar1_r_multiple < 0.0 { l_rs.push(t.bar1_r_multiple); }
+                if r_p > 1e-9 { rng_sum[b_idx(t.brain_id)] += r_p; rng_cnt[b_idx(t.brain_id)] += 1; }
+                if t.brain_id == brain_id && t.bar1_r_multiple < 0.0 { l_rs.push(t.bar1_r_multiple); }
             }
-            let sig_rng = if rng_cnt > 0 { (rng_sum / (rng_cnt as f64)).max(1e-9) } else { 1.0 };
+            let tot_c = rng_cnt.iter().sum::<usize>();
+            let g_sig = if tot_c > 0 { (rng_sum.iter().sum::<f64>() / (tot_c as f64)).max(1e-9) } else { 1.0 };
+            let sig_for = |b: BrainHorizonId| { let bi = b_idx(b); if rng_cnt[bi] > 0 { (rng_sum[bi] / (rng_cnt[bi] as f64)).max(1e-9) } else { g_sig } };
+            let sig_rng = sig_for(brain_id);
             l_rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let r_bounds = if l_rs.len() >= 2 {
-                (l_rs[l_rs.len() / 5].min(learned_ratchet_r), l_rs[(l_rs.len() * 4) / 5].max(learned_ratchet_r))
-            } else {
-                (learned_ratchet_r * 1.15, learned_ratchet_r * 0.65)
-            };
-            let mut rw = Vec::new();
-            for w in wins.iter().filter(|w| w.brain_id == brain_id && w.closed_timestamp_ns < current_timestamp_ns && w.post_entry_bar1_features_32.len() >= 32) {
-                let seq = if w.pre_settlement_bars_features_32.is_empty() { vec![(1usize, w.post_entry_bar1_features_32.clone())] } else { w.pre_settlement_bars_features_32.clone() };
-                rw.push((w.brain_id, w.symbol.clone(), w.direction, seq));
+            let r_bounds = if l_rs.len() >= 2 { (l_rs[l_rs.len() / 5].min(learned_ratchet_r), l_rs[(l_rs.len() * 4) / 5].max(learned_ratchet_r)) } else { (learned_ratchet_r * 1.15, learned_ratchet_r * 0.65) };
+            let to_seq = |seq: &[(usize, Vec<f32>)], b1: &Vec<f32>| if seq.is_empty() { vec![(1usize, b1.clone())] } else { seq.to_vec() };
+            let mut rw: Vec<_> = wins.iter().filter(|w| w.brain_id == brain_id && w.closed_timestamp_ns < current_timestamp_ns && w.post_entry_bar1_features_32.len() >= 32)
+                .map(|w| (w.brain_id, w.symbol.clone(), w.direction, sig_for(w.brain_id), to_seq(&w.pre_settlement_bars_features_32, &w.post_entry_bar1_features_32))).collect();
+            if same_b_wins < 20 {
+                rw.extend(wins.iter().filter(|w| w.brain_id != brain_id && w.closed_timestamp_ns < current_timestamp_ns && w.post_entry_bar1_features_32.len() >= 32).take(20 - same_b_wins)
+                    .map(|w| (w.brain_id, w.symbol.clone(), w.direction, sig_for(w.brain_id), to_seq(&w.pre_settlement_bars_features_32, &w.post_entry_bar1_features_32))));
             }
-            let mut rl = Vec::new();
-            for t in traps.iter().filter(|t| t.brain_id == brain_id && t.closed_timestamp_ns < current_timestamp_ns && t.post_entry_bar1_features_32.len() >= 32) {
-                let seq = if t.pre_settlement_bars_features_32.is_empty() { vec![(1usize, t.post_entry_bar1_features_32.clone())] } else { t.pre_settlement_bars_features_32.clone() };
-                rl.push((t.brain_id, t.symbol.clone(), t.direction, seq));
-            }
-            (rw, rl, sig_rng, r_bounds)
+            let rl: Vec<_> = traps.iter().filter(|t| t.brain_id == brain_id && t.closed_timestamp_ns < current_timestamp_ns && t.post_entry_bar1_features_32.len() >= 32)
+                .map(|t| (t.brain_id, t.symbol.clone(), t.direction, sig_rng, to_seq(&t.pre_settlement_bars_features_32, &t.post_entry_bar1_features_32))).collect();
+            (rw, rl, same_b_wins, sig_rng, r_bounds)
         };
 
-        let build_path_xi = |b_id: BrainHorizonId, sym: &str, dir: TradeDirection, seq: &[(usize, Vec<f32>)]| -> Vec<(usize, [f64; 6], f64, Option<PostEntryScratchDiagnostic>)> {
+        let build_path_xi = |b_id: BrainHorizonId, sym: &str, dir: TradeDirection, sig_p: f64, seq: &[(usize, Vec<f32>)]| -> Vec<(usize, [f64; 6], f64, Option<PostEntryScratchDiagnostic>)> {
             let (mut out, mut prev_zr, mut min_mae, mut max_mfe, mut ema_psi) =
                 (Vec::with_capacity(seq.len()), 0.0_f64, f64::INFINITY, f64::NEG_INFINITY, 0.0_f64);
             for (idx, (k_off, fk)) in seq.iter().filter(|(_, f)| f.len() >= 32).enumerate() {
-                let zr = (fk[0] as f64) / sigma_range_prior;
-                min_mae = min_mae.min(((fk[3] as f64) / sigma_range_prior).min(zr));
-                max_mfe = max_mfe.max(((fk[2] as f64) / sigma_range_prior).max(zr));
-                let zbounce = zr - min_mae + 0.35 * ((fk[6] as f64) - (fk[5] as f64)) / sigma_range_prior;
-                let zv = (if idx == 0 { zr - ((fk[1] as f64) / sigma_range_prior) } else { zr - prev_zr }) + 0.45 * ((fk[4] as f64) / sigma_range_prior);
+                let zr = (fk[0] as f64) / sig_p;
+                min_mae = min_mae.min(((fk[3] as f64) / sig_p).min(zr));
+                let cur_mfe = ((fk[2] as f64) / sig_p).max(zr);
+                max_mfe = if idx == 0 { cur_mfe } else { ((1.0 - 0.5 * lambda_decay) * max_mfe).max(cur_mfe) };
+                let zbounce = zr - min_mae + 0.35 * ((fk[6] as f64) - (fk[5] as f64)) / sig_p;
+                let zv = (if idx == 0 { zr - ((fk[1] as f64) / sig_p) } else { zr - prev_zr }) + 0.45 * ((fk[4] as f64) / sig_p);
                 prev_zr = zr;
                 let s1_w = ((fk[6] as f64) - (fk[5] as f64)) + 0.55 * (fk[4] as f64) + 0.45 * (fk[7] as f64);
                 let s2_g: f64 = fk[12..20].iter().map(|&x| x as f64).sum::<f64>() / 8.0;
                 let s4_b: f64 = fk[26..32].iter().map(|&x| x as f64).sum::<f64>() / 6.0;
-                let psi_m = (0.50 * s1_w + 0.30 * s2_g + 0.20 * s4_b) / sigma_range_prior;
+                let psi_m = (0.50 * s1_w + 0.30 * s2_g + 0.20 * s4_b) / sig_p;
                 ema_psi = if idx == 0 { psi_m } else { (1.0 - lambda_decay) * ema_psi + lambda_decay * psi_m };
                 let diag_k = self.evaluate_causal_post_entry_scratch_at_horizon(b_id, sym, dir, current_timestamp_ns, *k_off, fk, 0.0);
                 let lm = diag_k.as_ref().map(|d| { let p = (d.loss_affinity_posterior_pct / 100.0).clamp(0.01, 0.99); (p / (1.0 - p)).ln() }).unwrap_or(0.0);
@@ -2673,17 +2675,17 @@ impl PrecedentKnnIndex {
             out
         };
 
-        let prior_win_paths: Vec<_> = raw_wins.iter().map(|(b, s, d, seq)| build_path_xi(*b, s, *d, seq)).collect();
-        let prior_loss_paths: Vec<_> = raw_losses.iter().map(|(b, s, d, seq)| build_path_xi(*b, s, *d, seq)).collect();
-        let cand_path = build_path_xi(brain_id, symbol, direction, pre_settlement_bars_features_32);
+        let prior_win_paths: Vec<_> = raw_wins.iter().map(|(b, s, d, sig_p, seq)| build_path_xi(*b, s, *d, *sig_p, seq)).collect();
+        let prior_loss_paths: Vec<_> = raw_losses.iter().map(|(b, s, d, sig_p, seq)| build_path_xi(*b, s, *d, *sig_p, seq)).collect();
+        let cand_path = build_path_xi(brain_id, symbol, direction, sigma_range_prior, pre_settlement_bars_features_32);
         let mut prior_win_lambdas = vec![0.0_f64; prior_win_paths.len()];
         let (mut lambda_k, mut bar_llrs) = (0.0_f64, [0.0_f64; 4]);
         let at_k = |p: &[(usize, [f64; 6], f64, Option<PostEntryScratchDiagnostic>)], k_h: usize| -> Option<([f64; 6], f64)> {
             p.iter().rfind(|(ko, _, _, _)| *ko <= k_h).map(|(_, x, lm, _)| (*x, *lm))
         };
         for k in 1..=max_pre_k {
-            let mut w_xi_k: Vec<[f64; 6]> = prior_win_paths.iter().filter_map(|p| p.iter().find(|(ko, _, _, _)| *ko == k).map(|(_, x, _, _)| *x)).collect();
-            if w_xi_k.len() < 3 { w_xi_k = prior_win_paths.iter().filter_map(|p| at_k(p, k).map(|(x, _)| x)).collect(); }
+            let mut w_xi_k: Vec<[f64; 6]> = prior_win_paths[..same_b_wins].iter().filter_map(|p| p.iter().find(|(ko, _, _, _)| *ko == k).map(|(_, x, _, _)| *x)).collect();
+            if w_xi_k.len() < 3 { w_xi_k = prior_win_paths[..same_b_wins].iter().filter_map(|p| at_k(p, k).map(|(x, _)| x)).collect(); }
             let mut l_xi_k: Vec<[f64; 6]> = prior_loss_paths.iter().filter_map(|p| p.iter().find(|(ko, _, _, _)| *ko == k).map(|(_, x, _, _)| *x)).collect();
             if l_xi_k.len() < 3 { l_xi_k = prior_loss_paths.iter().filter_map(|p| at_k(p, k).map(|(x, _)| x)).collect(); }
             if w_xi_k.is_empty() || l_xi_k.is_empty() { continue; }
@@ -2713,6 +2715,10 @@ impl PrecedentKnnIndex {
                     let q_d = rms_q[d] * z_q / rms_q[d].hypot(z_q);
                     kin_llr += (f_raw[d] / f_sum) * (0.65 * s_vec[d] + 0.35 * q_d);
                 }
+                if s_vec[2] <= 0.0 {
+                    let z_mfe_w = (mu_l[2] - mu_w[2]).signum() * (xi[2] - mu_w[2]) / (0.5 * (var_w[2] + var_l[2])).sqrt();
+                    s_vec[3] = (s_vec[0] - s_vec[3]) + 0.5 * z_mfe_w.min(0.0);
+                }
                 let ell = kin_llr + lm_k;
                 let next_lam = (1.0 - lambda_decay) * prev_lam + ell;
                 (s_vec, kin_llr, ell, next_lam)
@@ -2720,14 +2726,14 @@ impl PrecedentKnnIndex {
             let mut active_w_lam = Vec::with_capacity(prior_win_paths.len());
             for (j, p_w) in prior_win_paths.iter().enumerate() {
                 if let Some((_, x_wj, lm_wj, _)) = p_w.iter().find(|(ko, _, _, _)| *ko == k) {
-                    prior_win_lambdas[j] = step_recurrence(prior_win_lambdas[j], x_wj, *lm_wj).3;
+                    let w_scale = if j < same_b_wins { 1.0 } else { (same_b_wins as f64 / 20.0).sqrt() };
+                    prior_win_lambdas[j] = step_recurrence(prior_win_lambdas[j], x_wj, *lm_wj).3 * w_scale;
                     active_w_lam.push(prior_win_lambdas[j]);
                 }
             }
             let mut sorted_w_lam = if active_w_lam.len() >= 3 { active_w_lam } else { prior_win_lambdas.clone() };
             sorted_w_lam.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let eff_alpha = (alpha_g * ((raw_wins.len() + 1) as f64).sqrt()) / (6.0 + 2.0 * (p_exp + lambda_decay));
-            let q_pos = ((1.0 - eff_alpha).clamp(0.0, 1.0)) * ((sorted_w_lam.len() - 1) as f64);
+            let q_pos = ((1.0 - alpha_g).clamp(0.0, 1.0)) * ((sorted_w_lam.len() - 1) as f64);
             let q_emp_k = sorted_w_lam[q_pos.floor() as usize] * (1.0 - q_pos.fract())
                 + sorted_w_lam[(q_pos.ceil() as usize).min(sorted_w_lam.len() - 1)] * q_pos.fract();
             let hurdle_k = k_sqrt * syn_state.learned_conformal_early_scratch_quantile;
@@ -2736,7 +2742,7 @@ impl PrecedentKnnIndex {
             let (s_k, kin_llr_k, ell_k, next_lam) = step_recurrence(lambda_k, xi_k, *lm_k);
             if k <= 3 { bar_llrs[k] = ell_k; }
             lambda_k = next_lam;
-            if (k >= 2 || k == max_pre_k) && lambda_k > q_win_upper_k && kin_llr_k > 0.0 && s_k[0] > 0.0 && s_k[1] > 0.0 && s_k[3] > 0.0 && s_k[4] > 0.0 && (s_k[2] > 0.0 || (k_sqrt > 1.0 + lambda_decay + lambda_decay * (1.0 - lambda_decay) && s_k[0] > s_k[3])) && *lm_k > 0.0 {
+            if (k >= 2 || k == max_pre_k) && lambda_k > q_win_upper_k && kin_llr_k > 0.0 && s_k[0] > 0.0 && s_k[1] > 0.0 && s_k[3] > 0.0 && s_k[4] > 0.0 && *lm_k > 0.0 {
                 let exit_r = (0.5 * (learned_ratchet_r + xi_k[0])).max(loss_r_bounds.0).min(loss_r_bounds.1);
                 let post_pct = (1.0 / (1.0 + (-lambda_k).exp())) * 100.0;
                 return Some(WaldSprtScratchDiagnostic {

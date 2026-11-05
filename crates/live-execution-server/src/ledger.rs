@@ -6719,9 +6719,6 @@ impl RealTimeLedgerEngine {
             state.learned_velocity_absorption_damping_weight = 0.0;
             state.learned_fisher_sparsity_exponent_p = 0.0;
             state.learned_conformal_veto_quantile = 0.92;
-        } else {
-            state.learned_velocity_absorption_damping_weight = 0.50;
-            state.learned_fisher_sparsity_exponent_p = 1.0;
         }
 
         let brain_trades: Vec<&ClosedTradeRow> = settled_prior
@@ -7119,11 +7116,7 @@ impl RealTimeLedgerEngine {
                     pool_loss_cnt += 1;
                     pool_loss_r_sum += r_abs;
                     let b1 = Self::extract_causal_bar1_features_from_row(r);
-                    let emp_scr_r = if r.was_scratched_by_loss_autopsy {
-                        r.adaptive_scratch_exit_r
-                    } else {
-                        -((b1.first().copied().unwrap_or(0.0) as f64) / fold_sigma_r).abs()
-                    };
+                    let emp_scr_r = -((b1.first().copied().unwrap_or(0.0) as f64) / fold_sigma_r).abs();
                     pool_scratch_cnt += 1;
                     pool_scratch_r_sum += emp_scr_r;
                     if r.brain_id == brain_id {
@@ -7140,8 +7133,7 @@ impl RealTimeLedgerEngine {
             let mu_r_scratch = if scratch_cnt + pool_scratch_cnt > 0 { (scratch_r_sum + pool_scratch_r_sum) / ((scratch_cnt + pool_scratch_cnt) as f64) } else { state.learned_mid_trade_stop_ratchet_r };
             let c_scratch = mu_r_scratch.abs();
             let p_star = (mu_r_plus + c_scratch) / (mu_r_plus + mu_r_loss + 2.0 * c_scratch);
-            let h_base = (1.0 / (1.0 - p_star)).sqrt();
-            let lambda_star = h_base * (1.0 + 0.35 * c_scratch * (1.0 - p_star) * (1.0 - p_star));
+            let lambda_star = (1.0 / (1.0 - p_star)).sqrt() * (1.0 + 0.35 * c_scratch * (1.0 - p_star) * (1.0 - p_star));
             state.learned_asymmetric_hurdle_prob_p_star = (p_star * 10000.0).round() / 10000.0;
             state.learned_asymmetric_hurdle_llr_lambda_star = (lambda_star * 10000.0).round() / 10000.0;
 
@@ -7172,7 +7164,7 @@ impl RealTimeLedgerEngine {
                     };
                 }
                 let r_act = if r.is_winner { r.realized_r_multiple.abs() } else { -r.realized_r_multiple.abs() };
-                let r_scr = if r.was_scratched_by_loss_autopsy { r.adaptive_scratch_exit_r } else { -c_scratch };
+                let r_scr = -(c_scratch + 0.25 * (kins[0][0].abs() + kins[1][0].abs()));
                 fold_trajs.push((r.is_winner, r_act, r_scr, kins));
             }
 
@@ -7191,42 +7183,45 @@ impl RealTimeLedgerEngine {
                 let ml = fold_trajs.iter().filter(|(w, _, _, _)| !*w).map(|(_, _, _, ks)| 0.5 * (ks[0][d] + ks[1][d])).sum::<f64>() / nl_f;
                 let vw = fold_trajs.iter().filter(|(w, _, _, _)| *w).map(|(_, _, _, ks)| (0.5 * (ks[0][d] + ks[1][d]) - mw).powi(2)).sum::<f64>() / nw_f;
                 let vl = fold_trajs.iter().filter(|(w, _, _, _)| !*w).map(|(_, _, _, ks)| (0.5 * (ks[0][d] + ks[1][d]) - ml).powi(2)).sum::<f64>() / nl_f;
-                snr_d[d] = ((ml - mw).abs() / (vw + vl).max(1e-6).sqrt()).powf(1.0 + p_star);
+                snr_d[d] = (ml - mw).abs() / (vw + vl).max(1e-6).sqrt();
             }
             let mean_snr = (snr_d.iter().sum::<f64>() / 6.0).max(1e-6);
             let max_snr = snr_d.iter().copied().fold(mean_snr, f64::max);
 
             let mut a_opt = (1.0 - p_star) / ((win_cnt.max(1) as f64) + 1.0).sqrt();
-            let mut d_opt = var_dz / (var_z1 + var_z2 + var_dz).max(1e-9);
+            let mut d_opt = (var_z1 + var_z2) / (var_z1 + var_z2 + var_dz).max(1e-9);
             let mut p_opt = max_snr / mean_snr;
             let mut h_opt = lambda_star;
-            let a_base = (1.0 - p_star) / ((nw_f + 1.0).sqrt() + ((pool_win_cnt as f64) + 1.0).ln());
-            let p_base = p_opt * (1.0 + a_base * d_opt);
 
-            let eval_loo_net_r = |alpha_c: f64, damp_c: f64, p_c: f64, hurdle_c: f64| -> f64 {
-                if nw_f < 1.0 || nl_f < 1.0 { return 0.0; }
+            let eval_loo_net_r = |slice_trajs: &[(bool, f64, f64, [[f64; 6]; 8])], alpha_c: f64, damp_c: f64, p_c: f64, hurdle_c: f64| -> f64 {
+                if alpha_c <= 0.0 || alpha_c >= 1.0 || damp_c <= 0.0 || damp_c >= 1.0 || p_c <= 0.0 || hurdle_c <= 0.0 {
+                    return -1e9;
+                }
+                let nw_s = slice_trajs.iter().filter(|(w, _, _, _)| *w).count() as f64;
+                let nl_s = slice_trajs.iter().filter(|(w, _, _, _)| !*w).count() as f64;
+                if nw_s < 1.0 || nl_s < 1.0 { return 0.0; }
                 let (mut sum_w, mut sum_l) = ([[0.0_f64; 6]; 8], [[0.0_f64; 6]; 8]);
-                for &(is_w, _, _, ref ks) in &fold_trajs {
+                for &(is_w, _, _, ref ks) in slice_trajs {
                     let mut ema_psi = ks[0][5];
                     for k in 0..8 {
                         if k > 0 { ema_psi = (1.0 - damp_c) * ema_psi + damp_c * ks[k][5]; }
                         for d in 0..6 {
-                            let val = if d == 5 { ema_psi } else { ks[k][d] };
+                            let val = if d == 5 { ema_psi } else if k > 0 && d >= 3 { (1.0 - damp_c) * ks[0][d] + damp_c * ks[k][d] } else { ks[k][d] };
                             if is_w { sum_w[k][d] += val; } else { sum_l[k][d] += val; }
                         }
                     }
                 }
-                let (mut vw, mut vl, mut fw, mut f_sum) = ([[0.0_f64; 6]; 8], [[0.0_f64; 6]; 8], [[0.0_f64; 6]; 8], [0.0_f64; 8]);
-                for &(is_w, _, _, ref ks) in &fold_trajs {
+                let (mut vw, mut vl, mut snr_k, mut fw, mut f_sum) = ([[0.0_f64; 6]; 8], [[0.0_f64; 6]; 8], [[0.0_f64; 6]; 8], [[0.0_f64; 6]; 8], [1.0_f64; 8]);
+                for &(is_w, _, _, ref ks) in slice_trajs {
                     let mut ema_psi = ks[0][5];
                     for k in 0..8 {
                         if k > 0 { ema_psi = (1.0 - damp_c) * ema_psi + damp_c * ks[k][5]; }
                         for d in 0..6 {
-                            let val = if d == 5 { ema_psi } else { ks[k][d] };
+                            let val = if d == 5 { ema_psi } else if k > 0 && d >= 3 { (1.0 - damp_c) * ks[0][d] + damp_c * ks[k][d] } else { ks[k][d] };
                             if is_w {
-                                vw[k][d] += (val - sum_w[k][d] / nw_f).powi(2) / nw_f;
+                                vw[k][d] += (val - sum_w[k][d] / nw_s).powi(2) / nw_s;
                             } else {
-                                vl[k][d] += (val - sum_l[k][d] / nl_f).powi(2) / nl_f;
+                                vl[k][d] += (val - sum_l[k][d] / nl_s).powi(2) / nl_s;
                             }
                         }
                     }
@@ -7234,87 +7229,105 @@ impl RealTimeLedgerEngine {
                 for k in 0..8 {
                     for d in 0..6 {
                         let sk = (vw[k][d] + vl[k][d]).max(1e-6);
-                        fw[k][d] = ((sum_l[k][d] / nl_f - sum_w[k][d] / nw_f).powi(2) / sk).powf(p_c);
+                        snr_k[k][d] = ((sum_l[k][d] / nl_s - sum_w[k][d] / nw_s).abs() / sk.sqrt()).max(1e-4);
+                        fw[k][d] = snr_k[k][d].powf(2.0 * p_c);
                     }
                     f_sum[k] = fw[k].iter().sum::<f64>().max(1e-9);
                 }
-                let kalman_var = (1.0 - damp_c).powi(2) * var_dz + damp_c.powi(2) * (var_z1 + var_z2 + var_dz / (nw_f + nl_f).sqrt());
-                let fisher_var = mean_snr * (p_c + (p_base * p_base) / p_c.max(1e-6));
-                let eta_proj = (mean_snr + max_snr + var_dz) / (fisher_var + kalman_var).max(1e-6);
-                let mut lams = Vec::with_capacity(fold_trajs.len());
+                let mut lams = Vec::with_capacity(slice_trajs.len());
                 let mut w_lams_by_k: [Vec<f64>; 8] = std::array::from_fn(|_| Vec::new());
-                for &(is_w, r_act, r_scr, ref ks) in &fold_trajs {
-                    let (mut ema_psi, mut lam_k, mut path_lam) = (ks[0][5], 0.0_f64, [0.0_f64; 8]);
+                for &(is_w, r_act, r_scr, ref ks) in slice_trajs {
+                    let (mut ema_psi, mut lam_k, mut path_lam, mut dir_ok) = (ks[0][5], 0.0_f64, [0.0_f64; 8], [false; 8]);
                     for k in 0..8 {
                         if k > 0 { ema_psi = (1.0 - damp_c) * ema_psi + damp_c * ks[k][5]; }
-                        let mut ell_k = 0.0_f64;
+                        let (mut ell_k, mut dist_w_sq, mut dist_l_sq, mut s_vec) = (0.0_f64, 0.0_f64, 0.0_f64, [0.0_f64; 6]);
                         for d in 0..6 {
-                            let val = if d == 5 { ema_psi } else { ks[k][d] };
-                            let mwk = if is_w && nw_f > 1.0 { (sum_w[k][d] - val) / (nw_f - 1.0) } else { sum_w[k][d] / nw_f };
-                            let mlk = if !is_w && nl_f > 1.0 { (sum_l[k][d] - val) / (nl_f - 1.0) } else { sum_l[k][d] / nl_f };
-                            ell_k += eta_proj * (fw[k][d] / f_sum[k]) * (mlk - mwk).signum() * (val - 0.5 * (mlk + mwk)) / (0.5 * (vw[k][d] + vl[k][d])).max(1e-6).sqrt();
+                            let val = if d == 5 { ema_psi } else if k > 0 && d >= 3 { (1.0 - damp_c) * ks[0][d] + damp_c * ks[k][d] } else { ks[k][d] };
+                            let mwk = if is_w && nw_s > 1.0 { (sum_w[k][d] - val) / (nw_s - 1.0) } else { sum_w[k][d] / nw_s };
+                            let mlk = if !is_w && nl_s > 1.0 { (sum_l[k][d] - val) / (nl_s - 1.0) } else { sum_l[k][d] / nl_s };
+                            let sk = (vw[k][d] + vl[k][d]).max(1e-6);
+                            s_vec[d] = (mlk - mwk).signum() * (val - 0.5 * (mlk + mwk)) / (0.5 * sk).sqrt();
+                            let d_w = (val - mwk).powi(2) / sk;
+                            let d_l = (val - mlk).powi(2) / sk;
+                            dist_w_sq += (val - mwk).powi(2) / vw[k][d].max(1e-6);
+                            dist_l_sq += (val - mlk).powi(2) / vl[k][d].max(1e-6);
+                            let q_d = (d_w - d_l) / (1.0 + 0.25 * (d_w + d_l));
+                            ell_k += (3.8 + 1.6 * snr_k[k][d]) * (fw[k][d] / f_sum[k]) * (0.65 * s_vec[d] + 0.35 * q_d);
                         }
+                        ell_k += ((k as f64) / 3.0) * (dist_w_sq.sqrt() - 0.35 * dist_l_sq.sqrt());
                         lam_k = (1.0 - damp_c) * lam_k + ell_k;
                         path_lam[k] = lam_k;
+                        dir_ok[k] = s_vec[0] > 0.0 && (s_vec[1] > 0.0 || s_vec[3] > 0.0 || s_vec[4] > 0.0) && ell_k > 0.0;
                         if is_w { w_lams_by_k[k].push(lam_k); }
                     }
-                    lams.push((is_w, r_act, r_scr, ks, path_lam));
+                    lams.push((is_w, r_act, r_scr, path_lam, dir_ok));
                 }
-                let (mut q_emp_k, mut sig_lam_k) = ([0.0_f64; 8], [1.0_f64; 8]);
+                let (mut q_emp_k, mut sig_lam_k, mut nw_dir, mut nl_dir) = ([0.0_f64; 8], [1.0_f64; 8], [1.0_f64; 8], [1.0_f64; 8]);
+                let n_lams = (lams.len().max(1)) as f64;
                 for k in 0..8 {
                     w_lams_by_k[k].sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let n_wk = w_lams_by_k[k].len().max(1);
                     let q_pos = (1.0 - alpha_c).clamp(0.0, 1.0) * (n_wk.saturating_sub(1) as f64);
                     q_emp_k[k] = w_lams_by_k[k][q_pos.floor() as usize] * (1.0 - q_pos.fract())
                         + w_lams_by_k[k][(q_pos.ceil() as usize).min(n_wk - 1)] * q_pos.fract();
-                    sig_lam_k[k] = (lams.iter().map(|(_, _, _, _, pl)| pl[k] * pl[k]).sum::<f64>() / (lams.len() as f64).sqrt()).sqrt().max(1e-4);
+                    let mu_lam_k = lams.iter().map(|(_, _, _, pl, _)| pl[k]).sum::<f64>() / n_lams;
+                    sig_lam_k[k] = (lams.iter().map(|(_, _, _, pl, _)| (pl[k] - mu_lam_k).powi(2)).sum::<f64>() / n_lams).sqrt().max(1e-4);
+                    nw_dir[k] = lams.iter().filter(|(w, _, _, _, d_ok)| *w && d_ok[k]).count().max(1) as f64;
+                    nl_dir[k] = lams.iter().filter(|(w, _, _, _, d_ok)| !*w && d_ok[k]).count().max(1) as f64;
                 }
-                let e_conf = alpha_c + (a_base * a_base) / alpha_c.max(1e-6);
                 let mut net_r = 0.0_f64;
-                for &(is_w, r_act, r_scr, ref ks, ref pl) in &lams {
-                    let mut surv = 1.0_f64;
-                    let w_bal = if is_w { 1.0 / nw_f } else { 1.0 / nl_f };
-                    for k in 0..8 {
-                        let e_hurd = (((k + 1) as f64) / 4.0).sqrt() * (hurdle_c + (h_base * h_base) / hurdle_c.max(1e-6));
-                        let p_stop_k = if is_w {
-                            let num_w = e_conf + 0.15 * e_hurd;
-                            (num_w / (8.0 * (1.0 + ((q_emp_k[k] - pl[k]) / sig_lam_k[k]).clamp(-8.0, 8.0).exp() + num_w))).clamp(0.0, 0.95)
-                        } else {
-                            (eta_proj / (8.0 * (1.0 + (-(pl[k] - q_emp_k[k]) / sig_lam_k[k]).clamp(-8.0, 8.0).exp() + eta_proj))).clamp(0.0, 0.95)
-                        };
-                        let dr_k = (r_scr - 0.04 * (k as f64) * ks[k][0].abs() * c_scratch) - r_act;
-                        net_r += w_bal * surv * p_stop_k * dr_k;
-                        surv *= 1.0 - p_stop_k;
+                for &(is_w, r_act, r_scr, ref pl, ref dir_ok) in &lams {
+                    let mut stopped = false;
+                    for k in 1..8 {
+                        let w_bal = if is_w { 7.0 / nw_dir[k] } else { 1.0 / nl_dir[k] };
+                        let bound_k = q_emp_k[k].max(((k + 1) as f64).sqrt() * hurdle_c) + 1e-3 * ((k + 1) as f64).sqrt() * hurdle_c;
+                        let u_k = (pl[k] - bound_k) / sig_lam_k[k];
+                        let g_k = 0.5 * (-0.5 * u_k * u_k).exp();
+                        let dr_k = (r_scr - 0.04 * (k as f64) * c_scratch) - r_act;
+                        if !stopped && pl[k] > bound_k && dir_ok[k] {
+                            stopped = true;
+                            net_r += w_bal * dr_k * (1.0 - g_k);
+                        } else if !stopped && dir_ok[k] {
+                            net_r += w_bal * dr_k * (g_k / 8.0);
+                        }
                     }
                 }
                 net_r
             };
 
             if fold_trajs.len() >= 4 {
-                let mut best_net_r = eval_loo_net_r(a_opt, d_opt, p_opt, h_opt);
-                for g_step in 29..=target_gen.min(36) {
-                    let g_idx = (g_step - 28) as usize;
-                    let step = 1.0 / ((g_idx * (g_idx + 1) + fold_trajs.len()) as f64);
-                    for mult in [1.0 - step, 1.0 - 0.5 * step, 1.0 + 0.5 * step, 1.0 + step] {
+                for g_idx in 1..=((target_gen.saturating_sub(26)) as usize).min(10) {
+                    let fold_len = ((fold_trajs.len() * (g_idx + 4)) / 12).max(4).min(fold_trajs.len());
+                    let slice_trajs = &fold_trajs[..fold_len];
+                    let step = 0.065 / ((g_idx * g_idx) as f64);
+                    let (mut best_net_r, mut win_a) = (eval_loo_net_r(slice_trajs, a_opt, d_opt, p_opt, h_opt), a_opt);
+                    for mult in [1.0 - 5.5 * step, 1.0 - 2.5 * step, 1.0 + 0.25 * step, 1.0 + 0.50 * step] {
                         let cand_a = a_opt * mult;
-                        let r_a = eval_loo_net_r(cand_a, d_opt, p_opt, h_opt);
-                        if r_a > best_net_r { a_opt = cand_a; best_net_r = r_a; }
+                        let r_a = eval_loo_net_r(slice_trajs, cand_a, d_opt, p_opt, h_opt);
+                        if r_a > best_net_r { win_a = cand_a; best_net_r = r_a; }
                     }
-                    for mult in [1.0 - step, 1.0 - 0.5 * step, 1.0 + 0.5 * step, 1.0 + step] {
+                    a_opt = win_a;
+                    let mut win_d = d_opt;
+                    for mult in [1.0 - 5.5 * step, 1.0 - 2.5 * step, 1.0 + 0.25 * step, 1.0 + 0.50 * step] {
                         let cand_d = d_opt * mult;
-                        let r_d = eval_loo_net_r(a_opt, cand_d, p_opt, h_opt);
-                        if r_d > best_net_r { d_opt = cand_d; best_net_r = r_d; }
+                        let r_d = eval_loo_net_r(slice_trajs, a_opt, cand_d, p_opt, h_opt);
+                        if r_d > best_net_r { win_d = cand_d; best_net_r = r_d; }
                     }
-                    for mult in [1.0 - step, 1.0 - 0.5 * step, 1.0 + 0.5 * step, 1.0 + step] {
+                    d_opt = win_d;
+                    let mut win_p = p_opt;
+                    for mult in [1.0 - 0.6 * step, 1.0 - 0.3 * step, 1.0 + 0.3 * step, 1.0 + 0.6 * step] {
                         let cand_p = p_opt * mult;
-                        let r_p = eval_loo_net_r(a_opt, d_opt, cand_p, h_opt);
-                        if r_p > best_net_r { p_opt = cand_p; best_net_r = r_p; }
+                        let r_p = eval_loo_net_r(slice_trajs, a_opt, d_opt, cand_p, h_opt);
+                        if r_p > best_net_r { win_p = cand_p; best_net_r = r_p; }
                     }
-                    for mult in [1.0 - step, 1.0 - 0.5 * step, 1.0 + 0.5 * step, 1.0 + step] {
+                    p_opt = win_p;
+                    let mut win_h = h_opt;
+                    for mult in [1.0 - 0.04 * step, 1.0 - 0.02 * step, 1.0 + 0.02 * step, 1.0 + 0.04 * step] {
                         let cand_h = h_opt * mult;
-                        let r_h = eval_loo_net_r(a_opt, d_opt, p_opt, cand_h);
-                        if r_h > best_net_r { h_opt = cand_h; best_net_r = r_h; }
+                        let r_h = eval_loo_net_r(slice_trajs, a_opt, d_opt, p_opt, cand_h);
+                        if r_h > best_net_r { win_h = cand_h; best_net_r = r_h; }
                     }
+                    h_opt = win_h;
                 }
             }
             state.learned_conformal_alpha = (a_opt * 10000.0).round() / 10000.0;
@@ -7326,13 +7339,11 @@ impl RealTimeLedgerEngine {
             pool_win_entry_sims.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             if pool_win_entry_sims.len() >= 5 {
                 let n_pool = pool_win_entry_sims.len();
-                let eff_pool_alpha = state.learned_conformal_alpha
-                    * (((win_cnt.max(1) + 1) as f64) / ((n_pool + win_cnt + 1) as f64)).sqrt();
-                let k_ord = (((1.0 - eff_pool_alpha).clamp(0.0, 1.0) * ((n_pool + 1) as f64)).ceil() as usize)
+                let k_ord = (((1.0 - state.learned_conformal_alpha).clamp(0.0, 1.0) * ((n_pool + 1) as f64)).ceil() as usize)
                     .saturating_sub(1)
                     .min(n_pool - 1);
                 let s_upper = pool_win_entry_sims[n_pool - 1];
-                let q_win_veto_sim = s_upper - eff_pool_alpha * (s_upper - pool_win_entry_sims[k_ord]);
+                let q_win_veto_sim = s_upper - state.learned_conformal_alpha * (s_upper - pool_win_entry_sims[k_ord]);
                 state.learned_conformal_veto_quantile = (q_win_veto_sim * 10000.0).round() / 10000.0;
             }
         }
@@ -7356,6 +7367,9 @@ impl RealTimeLedgerEngine {
         self.precedent_knn.clear_all_winner_pullbacks();
         self.precedent_knn.clear_all_mid_trade_trajectories();
         self.precedent_knn.clear_all_runner_giveback_trajectories();
+        if active_gen > 0 {
+            self.precedent_knn.reset_synaptic_plasticity_states_to_gen0();
+        }
 
         let mut closed = self.closed_ledger.write();
         self.vetoed_repeat_traps.write().clear();
@@ -7365,11 +7379,10 @@ impl RealTimeLedgerEngine {
         indices.sort_by_key(|&i| closed[i].opened_timestamp_ns);
 
         // Sort indices by closed_timestamp_ns so we incrementally insert settled trades using their current-generation causal state
-        let mut settled_indices_by_close_ts: Vec<usize> = (0..closed.len()).collect();
+        let mut settled_indices_by_close_ts: Vec<usize> = indices.clone();
         settled_indices_by_close_ts.sort_by_key(|&i| closed[i].closed_timestamp_ns);
         let mut settled_cursor = 0usize;
         let mut settled_prior: Vec<ClosedTradeRow> = Vec::with_capacity(closed.len());
-        let mut last_settled_len_per_brain = [usize::MAX; 5];
 
         for idx in indices {
             let row_open_ts = closed[idx].opened_timestamp_ns;
@@ -7386,21 +7399,13 @@ impl RealTimeLedgerEngine {
                 settled_cursor += 1;
             }
 
-            let b_idx = match row_brain {
-                BrainHorizonId::Brain01PennyAnomaly => 0,
-                BrainHorizonId::Brain02IntradayDayTrade => 1,
-                BrainHorizonId::Brain03ShortTermSwing => 2,
-                BrainHorizonId::Brain04CoreSwing => 3,
-                BrainHorizonId::Brain05LongTermWealth => 4,
-            };
-            if last_settled_len_per_brain[b_idx] != settled_prior.len() {
+            if active_gen > 0 {
                 let causal_state = self.compute_causal_plasticity_state_for_prefix(
                     row_brain,
                     &settled_prior,
                     active_gen,
                 );
                 self.precedent_knn.set_synaptic_plasticity_state(causal_state);
-                last_settled_len_per_brain[b_idx] = settled_prior.len();
             }
 
             let prior_losses: Vec<ClosedTradeRow> = settled_prior

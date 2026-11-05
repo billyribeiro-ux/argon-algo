@@ -7137,7 +7137,8 @@ impl RealTimeLedgerEngine {
             let pi_loss = ((loss_cnt + pool_loss_cnt + 1) as f64)
                 / ((win_cnt + loss_cnt + pool_win_cnt + pool_loss_cnt + 2) as f64);
             let pi_win = 1.0 - pi_loss;
-            let lambda_star = (p_star / (1.0 - p_star)).ln() - (pi_loss / pi_win).ln();
+            let raw_llr = (p_star / (1.0 - p_star)).ln() - (pi_loss / pi_win).ln();
+            let lambda_star = (1.0 + raw_llr.exp()).ln() + p_star;
             state.learned_asymmetric_hurdle_prob_p_star = (p_star * 10000.0).round() / 10000.0;
             state.learned_asymmetric_hurdle_llr_lambda_star = (lambda_star * 10000.0).round() / 10000.0;
 
@@ -7258,13 +7259,11 @@ impl RealTimeLedgerEngine {
                     let w_bal = if is_w { 1.0 / nw } else { 1.0 / nl };
                     net_r += w_bal * dr * p_conf * p_hurd;
                 }
-                let a_star = (1.0 - p_star)
-                    / (((nw + (pool_win_cnt as f64) + 1.0) * (mu_r_plus / mu_r_loss.max(1e-6))).sqrt().max(1.0));
+                let a_star = (1.0 - p_star) / ((nw + 1.0).sqrt() + ((pool_win_cnt as f64) + 1.0).ln());
                 let reg_a = mu_r_plus * (alpha_c + (a_star * a_star) / alpha_c.max(1e-6));
-                let reg_d = (1.0 - damp_c).powi(2) * (var_z1 + var_dz) + damp_c.powi(2) * var_z2;
-                let hhi_f = f2.iter().map(|&x| (x / fs2).powi(2)).sum::<f64>();
-                let reg_p = hhi_f * p_c + (max_snr / mean_snr) / p_c.max(1e-6);
-                let h_wald = lambda_star.abs() + c_scratch;
+                let reg_d = (1.0 - damp_c).powi(2) * var_dz + damp_c.powi(2) * (var_z1 + var_z2 + var_dz / (nw + nl).sqrt());
+                let reg_p = mean_snr * p_c + max_snr / p_c.max(1e-6);
+                let h_wald = lambda_star / (1.0 + c_scratch * (1.0 - p_star));
                 let reg_h = mu_r_loss * (hurdle_c + (h_wald * h_wald) / hurdle_c.max(1e-6));
                 (net_r / (nw + nl)) - (reg_a + reg_d + reg_p + reg_h)
             };
@@ -7272,7 +7271,8 @@ impl RealTimeLedgerEngine {
             if fold_trajs.len() >= 4 {
                 let mut best_net_r = eval_loo_net_r(a_opt, d_opt, p_opt, h_opt);
                 for g_step in 29..=target_gen.min(36) {
-                    let step = 1.0 / ((g_step - 27) as f64 + 2.0);
+                    let g_idx = (g_step - 28) as usize;
+                    let step = 1.0 / ((g_idx * (g_idx + 1) + fold_trajs.len()) as f64);
                     for mult in [1.0 - step, 1.0 - 0.5 * step, 1.0 + 0.5 * step, 1.0 + step] {
                         let cand_a = a_opt * mult;
                         let r_a = eval_loo_net_r(cand_a, d_opt, p_opt, h_opt);

@@ -54,7 +54,7 @@ const LEDGER_DISK_PATH: &str = "data/ledger_state.json";
 /// `RawMarketInternalsSnapshot`, `RawOptionsSnapshot`) for historical walk-forward evaluation
 /// (`0..settled_total`) so historical Era-1 calibration and Era-2 walk-forward metrics remain
 /// 100% invariant to live intraday quote/option ticks without writing temporary context files.
-fn canonical_settled_walk_forward_streams(
+pub fn canonical_settled_walk_forward_streams(
     symbol: &str,
     settled_bars: &[RawBarRecord],
     fallback_sf: RawShortFloatSnapshot,

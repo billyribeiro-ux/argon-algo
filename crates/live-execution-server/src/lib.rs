@@ -25,18 +25,19 @@ pub use exporter::{ExportError, ExportScope, export_to_csv_bytes, export_to_xlsx
 pub use ledger::{
     AutopsyTradeGrade, BrainBreakdownSummary, BrainEvolutionStatus, ChampionChallengerComparison,
     ClosedOutcomeBadge, ClosedTradeRow, ConfusionMatrixRollup, CrossPositionCorrelationCell,
-    ExecutionTicketsSnapshot, FilteredLedgerSnapshot, HyperFilterQuery, KellyAllocationPlan,
-    KellyCapitalAllocator, MasterExecutiveScoreboard, OccTimsPortfolioMarginEngine,
-    OpenPositionRow, PortfolioHeatRiskEngine, PortfolioHeatTelemetry, RealTimeLedgerEngine,
-    StagedBrokerOrderTicket,
+    EngineExecutionMode, ExecutionTicketsSnapshot, FilteredLedgerSnapshot, HyperFilterQuery,
+    KellyAllocationPlan, KellyCapitalAllocator, MasterExecutiveScoreboard,
+    OccTimsPortfolioMarginEngine, OpenPositionRow, PortfolioHeatRiskEngine, PortfolioHeatTelemetry,
+    RealTimeLedgerEngine, StagedBrokerOrderTicket, StrategyArchetype, classify_strategy_archetype,
 };
 pub use onnx_engine::{
     InferenceError, LiveBrainInferenceOutput, LoadedOnnxBrainModel, MatchedOptionExecutionPlan,
     OnnxMultiBrainEngine,
 };
 pub use precedent_knn::{
-    EntryTrapVsWinnerDiagnostic, HistoricalTraceRecord, HouseMoneyRunnerScaleInDiagnostic,
-    PrecedentKnnIndex, PrecedentMatchSummary, WaldSprtScratchDiagnostic, WinnerPullbackRecord,
+    DualEngineLiveEvaluation, EntryTrapVsWinnerDiagnostic, HistoricalTraceRecord,
+    HouseMoneyRunnerScaleInDiagnostic, PrecedentKnnIndex, PrecedentMatchSummary,
+    WaldSprtScratchDiagnostic, WinnerPullbackRecord,
 };
 pub use routes::{
     AppState, CustomBacktestSummaryResponse, LiveChartResponse, ScannerCandidatesResponse,
@@ -2944,5 +2945,372 @@ mod tests {
                 (tp_v, fp_v, tp_s, fp_s)
             );
         }
+    }
+
+    #[test]
+    fn test_phase27_live_scanner_and_dual_engine_truth_audit() {
+        use market_data_bus::{
+            TickerSnapshot, Timeframe, TwoStageMarketFunnel, UniverseScannerConfig,
+            YahooFinanceLiveAdapter, YahooSessionManager,
+        };
+        use raw_fingerprint_core::{
+            RawBarRecord, RawMarketInternalsSnapshot, RawOptionsSnapshot, RawShortFloatSnapshot,
+        };
+
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+
+        let canonical_24_pairs: [(&str, BrainHorizonId, Timeframe); 24] = [
+            // BRAIN-01: Penny / Micro-Cap Anomaly (5m)
+            ("PLUG", BrainHorizonId::Brain01PennyAnomaly, Timeframe::M5),
+            ("CLOV", BrainHorizonId::Brain01PennyAnomaly, Timeframe::M5),
+            ("KULR", BrainHorizonId::Brain01PennyAnomaly, Timeframe::M5),
+            ("SOUN", BrainHorizonId::Brain01PennyAnomaly, Timeframe::M5),
+            // BRAIN-02: Intraday Day-Trading (5m)
+            ("NVDA", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+            ("TSLA", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+            ("SOFI", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+            ("AMD", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+            ("MARA", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+            ("SMCI", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+            // BRAIN-03: Short-Term Swing (1H)
+            ("PLTR", BrainHorizonId::Brain03ShortTermSwing, Timeframe::H1),
+            ("IONQ", BrainHorizonId::Brain03ShortTermSwing, Timeframe::H1),
+            ("COIN", BrainHorizonId::Brain03ShortTermSwing, Timeframe::H1),
+            ("AVGO", BrainHorizonId::Brain03ShortTermSwing, Timeframe::H1),
+            ("MSTR", BrainHorizonId::Brain03ShortTermSwing, Timeframe::H1),
+            // BRAIN-04: Core Swing (1D)
+            ("NVDA", BrainHorizonId::Brain04CoreSwing, Timeframe::D1),
+            ("AMD", BrainHorizonId::Brain04CoreSwing, Timeframe::D1),
+            ("AAPL", BrainHorizonId::Brain04CoreSwing, Timeframe::D1),
+            ("MSFT", BrainHorizonId::Brain04CoreSwing, Timeframe::D1),
+            ("META", BrainHorizonId::Brain04CoreSwing, Timeframe::D1),
+            // BRAIN-05: Long-Term Portfolio & Wealth (1W ISO)
+            ("GS", BrainHorizonId::Brain05LongTermWealth, Timeframe::W1),
+            ("SPY", BrainHorizonId::Brain05LongTermWealth, Timeframe::W1),
+            ("QQQ", BrainHorizonId::Brain05LongTermWealth, Timeframe::W1),
+            ("MSFT", BrainHorizonId::Brain05LongTermWealth, Timeframe::W1),
+        ];
+
+        let models_dir = Path::new("../../models");
+        let onnx_engine = OnnxMultiBrainEngine::new(if models_dir.exists() {
+            Some(models_dir)
+        } else {
+            None
+        });
+
+        let ledger = RealTimeLedgerEngine::new();
+        assert!(ledger.load_from_disk(ledger_path));
+        let snap_initial = ledger.query_filtered_snapshot(&HyperFilterQuery::default());
+        for closed_row in &snap_initial.closed_trades {
+            ledger.sync_closed_row_to_precedent_knn(closed_row);
+        }
+
+        // Load all 24 real cached bar streams from `data/ohlcv_cache/` and build ticker snapshots for the scanner funnel
+        let mut pair_bars: Vec<(&str, BrainHorizonId, Timeframe, Vec<RawBarRecord>)> =
+            Vec::with_capacity(24);
+        let mut unique_snapshots: Vec<TickerSnapshot> = Vec::new();
+
+        for &(symbol, brain_id, tf) in &canonical_24_pairs {
+            let cached_ohlcv = YahooSessionManager::try_load_warm_ohlcv_disk_cache(
+                symbol,
+                tf,
+                24,
+                u64::MAX,
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected real cached OHLCV bars in data/ohlcv_cache/{}_{}.json",
+                    symbol,
+                    tf.as_str()
+                )
+            });
+            let last_close = cached_ohlcv.last().map(|b| b.close).unwrap_or(10.0);
+            let prev_close = cached_ohlcv
+                .get(cached_ohlcv.len().saturating_sub(2))
+                .map(|b| b.close)
+                .unwrap_or(last_close * 0.99);
+            let spread = (last_close * 0.0005).max(0.00001);
+            let unified_bars = YahooFinanceLiveAdapter::map_real_ohlcv_to_unified_bars(
+                symbol,
+                tf,
+                &cached_ohlcv,
+                spread,
+            );
+            let raw_bars: Vec<RawBarRecord> =
+                unified_bars.iter().map(|b| b.to_raw_bar_record()).collect();
+            let window_bars = if raw_bars.len() > 32 {
+                raw_bars[raw_bars.len() - 32..].to_vec()
+            } else {
+                raw_bars.clone()
+            };
+
+            if !unique_snapshots
+                .iter()
+                .any(|s| s.symbol.eq_ignore_ascii_case(symbol))
+            {
+                let (sf, _, _) = crate::routes::canonical_settled_walk_forward_streams(
+                    symbol,
+                    &window_bars,
+                    RawShortFloatSnapshot::default(),
+                    RawMarketInternalsSnapshot::default(),
+                    RawOptionsSnapshot::default(),
+                );
+                let latest_bar = window_bars.last().unwrap();
+                let avg_vol_20 = (window_bars
+                    .iter()
+                    .map(|b| b.volume)
+                    .sum::<u64>()
+                    / (window_bars.len().max(1) as u64))
+                    .max(100_000);
+                let day_vol = sf.cumulative_session_volume.max(latest_bar.volume).max(150_000);
+                unique_snapshots.push(TickerSnapshot {
+                    symbol: symbol.to_string(),
+                    exchange_index: if brain_id == BrainHorizonId::Brain01PennyAnomaly {
+                        "OTC_PENNY".to_string()
+                    } else {
+                        "NASDAQ_100".to_string()
+                    },
+                    sector_etf: "SMH".to_string(),
+                    timestamp_ns: latest_bar.timestamp_ns,
+                    last_price: latest_bar.close,
+                    day_open: latest_bar.open,
+                    day_high: latest_bar.high,
+                    day_low: latest_bar.low,
+                    prev_close: SubPennyPrice::from_f64(prev_close).unwrap_or(latest_bar.open),
+                    vwap: latest_bar.vwap,
+                    bid_ask_spread: latest_bar.bid_ask_spread,
+                    day_volume: day_vol,
+                    avg_daily_volume_20d: avg_vol_20,
+                    day_dollar_turnover: (day_vol as f64) * latest_bar.close.to_f64(),
+                    public_float_shares: sf.public_float_shares.max(1),
+                    shares_outstanding: sf.shares_outstanding.max(1),
+                    short_interest_shares: sf.short_interest_shares,
+                    days_to_cover: sf.days_to_cover,
+                    intraday_short_volume_ratio: sf.intraday_short_volume_ratio,
+                    cost_to_borrow_pct: sf.cost_to_borrow_annual_pct,
+                    is_optionable: true,
+                    is_otc_penny: brain_id == BrainHorizonId::Brain01PennyAnomaly,
+                });
+            }
+
+            pair_bars.push((symbol, brain_id, tf, window_bars));
+        }
+
+        // 1. Run UniverseScannerFunnel across all unique canonical symbols
+        let funnel = TwoStageMarketFunnel::new();
+        let promoted_candidates =
+            funnel.execute_funnel(&unique_snapshots, &UniverseScannerConfig::default());
+        assert_eq!(
+            promoted_candidates.len(),
+            unique_snapshots.len(),
+            "All canonical symbols must pass Stage 1 funnel and rank in Stage 2"
+        );
+
+        // 2. First pass at Gen 0 (`reset_synaptic_plasticity_states_to_gen0`)
+        ledger.precedent_knn().reset_synaptic_plasticity_states_to_gen0();
+        let mut gen0_engine_b_confs = Vec::with_capacity(24);
+        let mut gen0_maha_wins = Vec::with_capacity(24);
+
+        for (symbol, brain_id, _tf, window_bars) in &pair_bars {
+            let (raw_sf, raw_internals, raw_opts) =
+                crate::routes::canonical_settled_walk_forward_streams(
+                    symbol,
+                    window_bars,
+                    RawShortFloatSnapshot::default(),
+                    RawMarketInternalsSnapshot::default(),
+                    RawOptionsSnapshot::default(),
+                );
+            let probe = onnx_engine
+                .evaluate_live_signal(
+                    symbol,
+                    *brain_id,
+                    true,
+                    window_bars,
+                    &raw_opts,
+                    &raw_sf,
+                    &raw_internals,
+                )
+                .expect("probe signal evaluation succeeds");
+            let precedents = ledger.precedent_knn().query_causal_precedents(
+                *brain_id,
+                Some(symbol),
+                i64::MAX,
+                &probe.signal.latent_embedding_128,
+                11,
+            );
+            let emp_dist = precedents.to_empirical_distribution();
+            let inference = onnx_engine
+                .evaluate_live_signal_with_precedents(
+                    symbol,
+                    *brain_id,
+                    true,
+                    window_bars,
+                    &raw_opts,
+                    &raw_sf,
+                    &raw_internals,
+                    Some(&emp_dist),
+                )
+                .expect("live signal with precedents succeeds");
+
+            let dual_gen0 = ledger.evaluate_live_dual_engine_signal_for_entry(
+                &inference,
+                precedents.win_rate_pct,
+                window_bars,
+            );
+            assert_eq!(dual_gen0.generation_id, 0);
+            gen0_engine_b_confs.push(dual_gen0.engine_b_confidence_pct);
+            gen0_maha_wins.push(dual_gen0.mahalanobis_win_distance);
+        }
+
+        // 3. Evolve to Gen 36 (`run_multi_generation_evolution_to_gen36`) and evaluate all 24 canonical pairs
+        let _ = ledger.run_multi_generation_evolution_to_gen36();
+
+        println!("\n==========================================================================================================================================================================");
+        println!("PHASE 27 LIVE SCANNER & DUAL-ENGINE SIGNAL GENERATOR TRUTH AUDIT — 24 CANONICAL PAIRS (REAL CACHED BARS + CBOE/FINRA STATE)");
+        println!("==========================================================================================================================================================================");
+        println!(
+            "{:<6} | {:<8} | {:<5} | {:<13} | {:<25} | {:<9} | {:<28} | {:<11} | {:<22} | {:<16} | {:<18} | {:<26}",
+            "Symbol",
+            "Brain",
+            "Dir",
+            "Engine-A Conf",
+            "Engine-B (Gen0->Gen36 ML)",
+            "Consensus",
+            "Archetype",
+            "Entry Price",
+            "Structural Stop (%)",
+            "Target 1 (R:R)",
+            "Stage 0 Gate",
+            "Maha Win vs Loss Dist"
+        );
+        println!("--------------------------------------------------------------------------------------------------------------------------------------------------------------------------");
+
+        let mut gen36_changed_count = 0usize;
+
+        for (idx, (symbol, brain_id, _tf, window_bars)) in pair_bars.iter().enumerate() {
+            let (raw_sf, raw_internals, raw_opts) =
+                crate::routes::canonical_settled_walk_forward_streams(
+                    symbol,
+                    window_bars,
+                    RawShortFloatSnapshot::default(),
+                    RawMarketInternalsSnapshot::default(),
+                    RawOptionsSnapshot::default(),
+                );
+            let probe = onnx_engine
+                .evaluate_live_signal(
+                    symbol,
+                    *brain_id,
+                    true,
+                    window_bars,
+                    &raw_opts,
+                    &raw_sf,
+                    &raw_internals,
+                )
+                .expect("probe signal evaluation succeeds");
+            let precedents = ledger.precedent_knn().query_causal_precedents(
+                *brain_id,
+                Some(symbol),
+                i64::MAX,
+                &probe.signal.latent_embedding_128,
+                11,
+            );
+            let emp_dist = precedents.to_empirical_distribution();
+            let inference = onnx_engine
+                .evaluate_live_signal_with_precedents(
+                    symbol,
+                    *brain_id,
+                    true,
+                    window_bars,
+                    &raw_opts,
+                    &raw_sf,
+                    &raw_internals,
+                    Some(&emp_dist),
+                )
+                .expect("live signal with precedents succeeds");
+
+            let dual_gen36 = ledger.evaluate_live_dual_engine_signal_for_entry(
+                &inference,
+                precedents.win_rate_pct,
+                window_bars,
+            );
+            assert_eq!(dual_gen36.generation_id, 36);
+
+            let stage0 = ledger.evaluate_live_entry_stage0_gate(
+                &inference,
+                precedents.win_rate_pct,
+                window_bars,
+                false,
+            );
+
+            let exec_mode = match dual_gen36.active_engine_mode.as_str() {
+                "PURE_ML_SELF_LEARNED" => EngineExecutionMode::PureMlSelfLearned,
+                "STRUCTURED_HYBRID_CHAMPION" => EngineExecutionMode::StructuredHybridChampion,
+                _ => EngineExecutionMode::ConsensusBothEngines,
+            };
+            let archetype = classify_strategy_archetype(
+                exec_mode,
+                *brain_id,
+                inference.signal.primary_driver,
+                &inference.signal.stream_weights,
+            );
+
+            let entry_px = inference.signal.entry_price.to_f64();
+            let stop_px = inference.signal.structural_stop_price.to_f64();
+            let t1_px = inference.signal.target_1_price.to_f64();
+            let risk_px = (entry_px - stop_px).abs().max(1e-6);
+            let stop_pct = (risk_px / entry_px.max(1e-6)) * 100.0;
+            let t1_rr = (t1_px - entry_px).abs() / risk_px;
+
+            let gen0_b = gen0_engine_b_confs[idx];
+            let gen36_b = dual_gen36.engine_b_confidence_pct;
+            if (gen36_b - gen0_b).abs() > 1e-4
+                || (dual_gen36.mahalanobis_win_distance - gen0_maha_wins[idx]).abs() > 1e-4
+            {
+                gen36_changed_count += 1;
+            }
+
+            let gate_str = if stage0.should_veto {
+                format!("VETO ({:.2}>{:.2})", stage0.trap_similarity_score, stage0.winner_similarity_score)
+            } else {
+                format!("PASS ({:.2}<{:.2})", stage0.trap_similarity_score, stage0.winner_similarity_score)
+            };
+
+            println!(
+                "{:<6} | {:<8} | {:<5} | {:>12.2}% | {:>6.2}% -> {:>6.2}% ({:+5.2}%) | {:>8.2}% | {:<28} | ${:<10.4} | ${:<9.4} ({:>5.2}%)   | ${:<8.4} ({:>4.2}R) | {:<18} | W:{:>6.3} vs L:{:>6.3}",
+                symbol,
+                brain_id.as_str(),
+                inference.signal.direction.as_str(),
+                dual_gen36.engine_a_confidence_pct,
+                gen0_b,
+                gen36_b,
+                gen36_b - gen0_b,
+                dual_gen36.consensus_confidence_pct,
+                archetype.as_str(),
+                entry_px,
+                stop_px,
+                stop_pct,
+                t1_px,
+                t1_rr,
+                gate_str,
+                dual_gen36.mahalanobis_win_distance,
+                dual_gen36.mahalanobis_loss_distance,
+            );
+        }
+        println!("==========================================================================================================================================================================");
+        println!(
+            "[PHASE 27 SYNAPTIC PLASTICITYSENSITIVITY VERIFIED] Gen 0 -> Gen 36 updated Engine-B ML conviction & Mahalanobis distances on {}/24 canonical pairs\n",
+            gen36_changed_count
+        );
+
+        assert_eq!(
+            gen36_changed_count, 24,
+            "Expected Gen 0 -> Gen 36 SynapticPlasticityState evolution to update Engine-B ML conviction/Mahalanobis metrics across all 24 canonical pairs"
+        );
     }
 }

@@ -3853,6 +3853,45 @@ impl RealTimeLedgerEngine {
         diag
     }
 
+    /// Evaluates the live Dual-Engine (`ENGINE-A`, `ENGINE-B` Synaptic ML, and `CONSENSUS`) telemetry
+    /// on a live bar window using the active `SynapticPlasticityState` (`Gen 0 .. Gen 36`),
+    /// $32 \times 32$ Ledoit-Wolf Cholesky precision matrix, and causal `settled_prior` Mahalanobis distances.
+    pub fn evaluate_live_dual_engine_signal_for_entry(
+        &self,
+        inference: &LiveBrainInferenceOutput,
+        precedent_win_rate_pct: f64,
+        entry_bars: &[RawBarRecord],
+    ) -> crate::precedent_knn::DualEngineLiveEvaluation {
+        let sig = &inference.signal;
+        let bounded_pre: Vec<RawBarRecord> = if entry_bars.len() > 24 {
+            entry_bars[entry_bars.len() - 24..].to_vec()
+        } else {
+            entry_bars.to_vec()
+        };
+        let entry_idx = bounded_pre.len().saturating_sub(1);
+        let entry_features_32 = Self::extract_causal_entry_features_32(
+            &sig.latent_embedding_128,
+            sig.entry_price,
+            sig.structural_stop_price,
+            sig.target_1_price,
+            sig.direction,
+            sig.ai_confidence_pct,
+            precedent_win_rate_pct,
+            &bounded_pre,
+            entry_idx,
+        );
+        self.precedent_knn.evaluate_live_dual_engine_signal(
+            sig.brain_id,
+            &sig.symbol,
+            sig.direction,
+            sig.timestamp_ns,
+            sig.ai_confidence_pct,
+            precedent_win_rate_pct,
+            &sig.latent_embedding_128,
+            &entry_features_32,
+        )
+    }
+
     /// Instantaneously births a new live signal into `POSITIONS OPENED` with its real Yahoo Finance candle slice
     /// and explicit `EngineExecutionMode` (`ENGINE-A`, `ENGINE-B`, or `CONSENSUS_BOTH_ENGINES`).
     pub fn open_position_with_bars_and_engine(

@@ -168,6 +168,24 @@ pub struct EntryTrapVsWinnerDiagnostic {
     pub root_cause_category: String,
 }
 
+/// Phase 27 Live Dual-Engine (`ENGINE-A` Structured Champion vs. `ENGINE-B` Self-Learned Synaptic ML vs. `CONSENSUS`)
+/// evaluation telemetry computed from `SynapticPlasticityState` (`synaptic_feature_weights_32`,
+/// `learned_fisher_sparsity_exponent_p`, $32 \times 32$ Ledoit-Wolf Cholesky precision matrix $\Sigma_{\text{LW}}^{-1}$,
+/// and causal `settled_prior` Mahalanobis win vs. loss log-likelihood ratios).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DualEngineLiveEvaluation {
+    pub generation_id: u32,
+    pub engine_a_confidence_pct: f64,
+    pub engine_b_confidence_pct: f64,
+    pub consensus_confidence_pct: f64,
+    pub active_engine_mode: String,
+    pub mahalanobis_win_distance: f64,
+    pub mahalanobis_loss_distance: f64,
+    pub mahalanobis_llr: f64,
+    pub fisher_llr: f64,
+    pub ledoit_wolf_shrinkage_lambda: f64,
+}
+
 /// Diagnostic returned when a live post-entry bar (`Bar +1`) matches the causal
 /// Post-Entry Loss Breakdown Distribution ($\bar{X}_{\text{loss, bar1}}, \Sigma_{\text{LW}}^{\text{loss}}$)
 /// more closely than the causal Winner Pullback Distribution ($\bar{X}_{\text{win, bar1}}, \Sigma_{\text{LW}}^{\text{win}}$).
@@ -3208,6 +3226,299 @@ impl PrecedentKnnIndex {
             p80_mfe_pct: (p80_mfe_pct * 100.0).round() / 100.0,
             median_hold_duration_ms,
             top_exemplar_symbols: exemplars,
+        }
+    }
+
+    /// Phase 27 Live Dual-Engine (`ENGINE-A` Structured Champion vs. `ENGINE-B` Self-Learned Synaptic ML vs. `CONSENSUS`)
+    /// evaluator wired directly to `SynapticPlasticityState` (`synaptic_feature_weights_32`,
+    /// `learned_fisher_sparsity_exponent_p`, $32 \times 32$ Ledoit-Wolf Cholesky precision matrix $\Sigma_{\text{LW}}^{-1}$,
+    /// and causal `settled_prior` Mahalanobis win vs. loss log-likelihood ratios).
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    pub fn evaluate_live_dual_engine_signal(
+        &self,
+        brain_id: BrainHorizonId,
+        symbol: &str,
+        _direction: TradeDirection,
+        current_timestamp_ns: i64,
+        engine_a_confidence_pct: f64,
+        _precedent_win_rate_pct: f64,
+        query_embedding_128: &[f32],
+        query_entry_features_32: &[f32],
+    ) -> DualEngineLiveEvaluation {
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        let traps = self.hard_negative_traps.read();
+        let wins = self.winner_pullbacks.read();
+
+        let mut causal_traps: Vec<&HardNegativeTrapRecord> = traps
+            .iter()
+            .filter(|t| {
+                t.brain_id == brain_id
+                    && t.closed_timestamp_ns < current_timestamp_ns
+                    && t.entry_features_32.len() >= 32
+            })
+            .collect();
+        if causal_traps.is_empty() {
+            causal_traps = traps
+                .iter()
+                .filter(|t| {
+                    t.closed_timestamp_ns < current_timestamp_ns && t.entry_features_32.len() >= 32
+                })
+                .collect();
+        }
+
+        let mut causal_wins: Vec<&WinnerPullbackRecord> = wins
+            .iter()
+            .filter(|w| {
+                w.brain_id == brain_id
+                    && w.closed_timestamp_ns < current_timestamp_ns
+                    && w.entry_features_32.len() >= 32
+            })
+            .collect();
+        if causal_wins.is_empty() {
+            causal_wins = wins
+                .iter()
+                .filter(|w| {
+                    w.closed_timestamp_ns < current_timestamp_ns && w.entry_features_32.len() >= 32
+                })
+                .collect();
+        }
+
+        let fisher_p = syn_state.learned_fisher_sparsity_exponent_p.clamp(0.50, 2.75);
+        let mut raw_syn_w = [0.0_f64; 32];
+        let mut w_sum = 0.0_f64;
+        for i in 0..32 {
+            let wi = syn_state.synaptic_feature_weights_32[i]
+                .max(0.05)
+                .powf(fisher_p);
+            raw_syn_w[i] = wi;
+            w_sum += wi;
+        }
+        w_sum = w_sum.max(1e-6);
+        let mut culprit_weights = [0.0_f64; 32];
+        for i in 0..32 {
+            culprit_weights[i] = (raw_syn_w[i] / w_sum) * 6.0;
+        }
+
+        let n_traps = causal_traps.len();
+        let n_wins = causal_wins.len();
+        if n_traps == 0 || n_wins == 0 || query_entry_features_32.len() < 32 {
+            drop(traps);
+            drop(wins);
+            let mut syn_dot = 0.0_f64;
+            for i in 0..32.min(query_entry_features_32.len()) {
+                syn_dot += (culprit_weights[i] / 6.0) * (query_entry_features_32[i] as f64);
+            }
+            let p_b = 1.0 / (1.0 + (-syn_dot).exp());
+            let eng_b = (52.0 + 46.5 * p_b).clamp(50.0, 99.2);
+            let cons = 0.50 * engine_a_confidence_pct + 0.50 * eng_b;
+            return DualEngineLiveEvaluation {
+                generation_id: syn_state.generation_id,
+                engine_a_confidence_pct: (engine_a_confidence_pct * 100.0).round() / 100.0,
+                engine_b_confidence_pct: (eng_b * 100.0).round() / 100.0,
+                consensus_confidence_pct: (cons * 100.0).round() / 100.0,
+                active_engine_mode: "CONSENSUS_BOTH_ENGINES".to_string(),
+                mahalanobis_win_distance: 1.0,
+                mahalanobis_loss_distance: 1.0,
+                mahalanobis_llr: 0.0,
+                fisher_llr: 0.0,
+                ledoit_wolf_shrinkage_lambda: 0.50,
+            };
+        }
+
+        let mut trap_centroid = [0.0_f64; 32];
+        let mut win_centroid = [0.0_f64; 32];
+        let inv_t = 1.0 / (n_traps as f64);
+        let inv_w = 1.0 / (n_wins as f64);
+        let mut range_entry_sum = 0.0_f64;
+        let mut range_entry_cnt = 0usize;
+        for t in &causal_traps {
+            for i in 0..32 {
+                trap_centroid[i] += (t.entry_features_32[i] as f64) * inv_t;
+            }
+            let r_part = (t.entry_features_32[8] as f64).abs()
+                + (t.entry_features_32[9] as f64).abs()
+                + (t.entry_features_32[10] as f64).abs();
+            if r_part > 1e-9 {
+                range_entry_sum += r_part;
+                range_entry_cnt += 1;
+            }
+        }
+        for w in &causal_wins {
+            for i in 0..32 {
+                win_centroid[i] += (w.entry_features_32[i] as f64) * inv_w;
+            }
+            let r_part = (w.entry_features_32[8] as f64).abs()
+                + (w.entry_features_32[9] as f64).abs()
+                + (w.entry_features_32[10] as f64).abs();
+            if r_part > 1e-9 {
+                range_entry_sum += r_part;
+                range_entry_cnt += 1;
+            }
+        }
+        let scale_entry = if range_entry_cnt > 0 {
+            (range_entry_sum / (range_entry_cnt as f64)).max(1e-9)
+        } else {
+            1.0
+        };
+        let scale_entry_sq = (scale_entry * scale_entry).max(1e-12);
+        let entry_ridge = 0.035 * scale_entry_sq;
+        let entry_var_floor = 0.020 * scale_entry_sq;
+
+        let mut pooled_entry_cov = [[0.0_f64; 32]; 32];
+        for i in 0..32 {
+            pooled_entry_cov[i][i] = entry_ridge;
+        }
+        for t in &causal_traps {
+            for i in 0..32 {
+                let di = (t.entry_features_32[i] as f64) - trap_centroid[i];
+                for j in 0..=i {
+                    let dj = (t.entry_features_32[j] as f64) - trap_centroid[j];
+                    let c_ij = 0.5 * (di * dj) * inv_t;
+                    pooled_entry_cov[i][j] += c_ij;
+                    pooled_entry_cov[j][i] = pooled_entry_cov[i][j];
+                }
+            }
+        }
+        for w in &causal_wins {
+            for i in 0..32 {
+                let di = (w.entry_features_32[i] as f64) - win_centroid[i];
+                for j in 0..=i {
+                    let dj = (w.entry_features_32[j] as f64) - win_centroid[j];
+                    let c_ij = 0.5 * (di * dj) * inv_w;
+                    pooled_entry_cov[i][j] += c_ij;
+                    pooled_entry_cov[j][i] = pooled_entry_cov[i][j];
+                }
+            }
+        }
+
+        let mut diff_trap = [0.0_f64; 32];
+        let mut diff_win = [0.0_f64; 32];
+        let mut fisher_win_num = 0.0_f64;
+        let mut fisher_win_den = 0.0_f64;
+        for i in 0..32 {
+            let q_i = query_entry_features_32[i] as f64;
+            diff_trap[i] = q_i - trap_centroid[i];
+            diff_win[i] = q_i - win_centroid[i];
+            let mid_i = 0.5 * (win_centroid[i] + trap_centroid[i]);
+            let sep_win_i = win_centroid[i] - trap_centroid[i];
+            let var_i = pooled_entry_cov[i][i].max(entry_var_floor);
+            let wi = culprit_weights[i] / 6.0;
+            fisher_win_num += wi * ((q_i - mid_i) * sep_win_i) / var_i;
+            fisher_win_den += wi * (sep_win_i * sep_win_i) / var_i;
+        }
+        let fisher_win_llr = if fisher_win_den > 1e-12 {
+            fisher_win_num / fisher_win_den.sqrt()
+        } else {
+            0.0
+        };
+
+        let n_causal = n_traps + n_wins;
+        let (maha_trap, lw_lambda) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+            &pooled_entry_cov,
+            n_causal,
+            &culprit_weights,
+            &diff_trap,
+            scale_entry_sq,
+        );
+        let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+            &pooled_entry_cov,
+            n_causal,
+            &culprit_weights,
+            &diff_win,
+            scale_entry_sq,
+        );
+
+        let mut max_trap_kernel = 0.0_f64;
+        for trap in &causal_traps {
+            let dot_128: f64 = query_embedding_128
+                .iter()
+                .zip(trap.embedding_128.iter())
+                .map(|(a, b)| (*a as f64) * (*b as f64))
+                .sum::<f64>()
+                .clamp(-1.0, 1.0);
+            let mut d_sq = 0.0_f64;
+            for k in 0..32 {
+                let d = (query_entry_features_32[k] as f64) - (trap.entry_features_32[k] as f64);
+                let var_k = pooled_entry_cov[k][k].max(entry_var_floor);
+                d_sq += (culprit_weights[k] / 6.0) * (d * d) / var_k;
+            }
+            let sym_bonus = if trap.symbol.eq_ignore_ascii_case(symbol) {
+                0.015
+            } else {
+                0.0
+            };
+            let trap_w = syn_state
+                .trap_conviction_weights
+                .get(&trap.loss_trade_id.to_string())
+                .copied()
+                .unwrap_or(1.0);
+            let k_sim = (0.72 * (-0.32 * d_sq).exp() + 0.28 * (0.5 * (1.0 + dot_128)) + sym_bonus)
+                * trap_w.clamp(0.75, 1.25);
+            if k_sim > max_trap_kernel {
+                max_trap_kernel = k_sim;
+            }
+        }
+
+        let mut max_win_kernel = 0.0_f64;
+        for win in &causal_wins {
+            let dot_128: f64 = query_embedding_128
+                .iter()
+                .zip(win.embedding_128.iter())
+                .map(|(a, b)| (*a as f64) * (*b as f64))
+                .sum::<f64>()
+                .clamp(-1.0, 1.0);
+            let mut d_sq = 0.0_f64;
+            for k in 0..32 {
+                let d = (query_entry_features_32[k] as f64) - (win.entry_features_32[k] as f64);
+                let var_k = pooled_entry_cov[k][k].max(entry_var_floor);
+                d_sq += (culprit_weights[k] / 6.0) * (d * d) / var_k;
+            }
+            let sym_bonus = if win.symbol.eq_ignore_ascii_case(symbol) {
+                0.015
+            } else {
+                0.0
+            };
+            let k_sim = 0.72 * (-0.32 * d_sq).exp() + 0.28 * (0.5 * (1.0 + dot_128)) + sym_bonus;
+            if k_sim > max_win_kernel {
+                max_win_kernel = k_sim;
+            }
+        }
+        drop(traps);
+        drop(wins);
+
+        let prior_win_log_odds = ((n_wins as f64 + 1.0) / (n_traps as f64 + 1.0)).ln();
+        let maha_win_llr = (0.22 * (maha_trap * maha_trap - maha_win * maha_win)).clamp(-3.5, 3.5);
+        let kernel_win_llr = 4.50 * (max_win_kernel - max_trap_kernel);
+        let hurdle_shift = -0.35 * syn_state.learned_asymmetric_hurdle_llr_lambda_star
+            + 0.40 * (0.18 - syn_state.learned_conformal_alpha);
+        let engine_b_llr = (0.35 * prior_win_log_odds
+            + maha_win_llr
+            + 0.90 * fisher_win_llr
+            + kernel_win_llr
+            + hurdle_shift)
+            .clamp(-10.0, 10.0);
+        let p_win_b = 1.0 / (1.0 + (-engine_b_llr).exp());
+        let engine_b_conf = (52.0 + 46.5 * p_win_b).clamp(50.0, 99.2);
+        let consensus_conf = 0.50 * engine_a_confidence_pct + 0.50 * engine_b_conf;
+        let active_mode = if engine_a_confidence_pct >= 62.0 && engine_b_conf >= 62.0 {
+            "CONSENSUS_BOTH_ENGINES"
+        } else if engine_b_conf > engine_a_confidence_pct {
+            "PURE_ML_SELF_LEARNED"
+        } else {
+            "STRUCTURED_HYBRID_CHAMPION"
+        };
+
+        DualEngineLiveEvaluation {
+            generation_id: syn_state.generation_id,
+            engine_a_confidence_pct: (engine_a_confidence_pct * 100.0).round() / 100.0,
+            engine_b_confidence_pct: (engine_b_conf * 100.0).round() / 100.0,
+            consensus_confidence_pct: (consensus_conf * 100.0).round() / 100.0,
+            active_engine_mode: active_mode.to_string(),
+            mahalanobis_win_distance: (maha_win * 1000.0).round() / 1000.0,
+            mahalanobis_loss_distance: (maha_trap * 1000.0).round() / 1000.0,
+            mahalanobis_llr: (maha_win_llr * 1000.0).round() / 1000.0,
+            fisher_llr: (fisher_win_llr * 1000.0).round() / 1000.0,
+            ledoit_wolf_shrinkage_lambda: (lw_lambda * 1000.0).round() / 1000.0,
         }
     }
 }

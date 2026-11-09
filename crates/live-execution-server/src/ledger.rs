@@ -593,7 +593,8 @@ pub fn classify_strategy_archetype(
     let wick_rejection_z = (((f0[4].abs() + f0[5].abs()) as f64) / sigma_f0
         + ((f_recent[4].abs() + f_recent[5].abs()) as f64) / sigma_recent)
         * 0.5;
-    let breakout_impulse = body_conviction_z / wick_rejection_z.max(1e-6);
+    let breakout_impulse =
+        (body_conviction_z / wick_rejection_z.max(1e-6)) + body_conviction_z * body_conviction_z;
     let e_s1_breakout = 0.5
         * (rms_norm(&f0[0..4], sigma_f0) + rms_norm(&f_recent[0..4], sigma_recent))
         * (1.0 + breakout_impulse)

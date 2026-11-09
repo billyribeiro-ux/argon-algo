@@ -69,25 +69,69 @@ pub fn canonical_settled_walk_forward_streams(
         .last()
         .map(|b| b.timestamp_ns)
         .unwrap_or(1_793_232_000_000_000_000);
-    let make_sf = |short_vol_ratio: f64, cum_vol: u64| RawShortFloatSnapshot {
-        timestamp_ns: ts_ns,
-        public_float_shares: 150_000_000,
-        shares_outstanding: 180_000_000,
-        short_interest_shares: 12_000_000,
-        days_to_cover: 2.1,
-        intraday_short_volume_ratio: short_vol_ratio,
-        cost_to_borrow_annual_pct: 7.039999999999999,
-        cumulative_session_volume: cum_vol,
+    let make_sf = |short_vol_ratio: f64, cum_vol: u64| {
+        let sym_up = symbol.to_uppercase();
+        let (public_float_shares, short_interest_shares, days_to_cover, cost_to_borrow_annual_pct) =
+            match sym_up.as_str() {
+                "KULR" => (10_500_000, 9_450_000, 8.8, 165.0),
+                "CLOV" => (18_000_000, 15_800_000, 8.2, 138.0),
+                "MARA" => (12_000_000, 18_500_000, 9.6, 240.0),
+                "IONQ" => (24_000_000, 21_600_000, 8.5, 148.0),
+                "MSTR" => (14_000_000, 21_500_000, 9.5, 235.0),
+                "PLUG" => (125_000_000, 18_500_000, 2.4, 9.5),
+                "SOUN" => (135_000_000, 19_200_000, 2.3, 8.5),
+                "COIN" => (190_000_000, 22_000_000, 2.1, 6.5),
+                "SOFI" => (780_000_000, 92_000_000, 2.2, 5.2),
+                "SMCI" => (490_000_000, 58_000_000, 2.1, 6.4),
+                "PLTR" => (2_100_000_000, 112_000_000, 1.9, 0.80),
+                "TSLA" => (2_800_000_000, 98_000_000, 1.6, 0.65),
+                "AMD" => (1_600_000_000, 48_000_000, 1.4, 0.50),
+                "AVGO" => (4_600_000_000, 69_000_000, 1.3, 0.45),
+                "META" => (2_180_000_000, 32_700_000, 1.2, 0.40),
+                "AAPL" => (15_200_000_000, 121_600_000, 1.1, 0.35),
+                "MSFT" => (7_400_000_000, 51_800_000, 1.1, 0.35),
+                "NVDA" => (23_500_000_000, 285_000_000, 1.2, 0.45),
+                "GS" => (315_000_000, 4_900_000, 1.8, 0.40),
+                "SPY" => (920_000_000, 11_000_000, 1.0, 0.35),
+                "QQQ" => (610_000_000, 7_300_000, 1.0, 0.35),
+                _ => (150_000_000, 12_000_000, 2.1, 7.039999999999999),
+            };
+        let shares_outstanding = match sym_up.as_str() {
+            "KULR" | "CLOV" | "MARA" | "IONQ" | "MSTR" => (public_float_shares as f64 * 2.15) as u64,
+            _ => (public_float_shares as f64 * 1.12) as u64,
+        };
+        let eff_cum_vol = match sym_up.as_str() {
+            "KULR" | "CLOV" | "MARA" | "IONQ" | "MSTR" => cum_vol.max(public_float_shares * 2),
+            _ => cum_vol,
+        };
+        RawShortFloatSnapshot {
+            timestamp_ns: ts_ns,
+            public_float_shares,
+            shares_outstanding,
+            short_interest_shares,
+            days_to_cover,
+            intraday_short_volume_ratio: short_vol_ratio,
+            cost_to_borrow_annual_pct,
+            cumulative_session_volume: eff_cum_vol,
+        }
     };
-    let make_int = |sector_flow: f64| raw_fingerprint_core::RawMarketInternalsSnapshot {
-        timestamp_ns: ts_ns,
-        nyse_tick: -950,
-        nasdaq_tick: -1120,
-        add_breadth: -2100,
-        vold_up_down_ratio: 0.15,
-        vix_spot: 17.2,
-        vix_front_month: 18.317999999999998,
-        sector_relative_flow: sector_flow,
+    let make_int = |sector_flow: f64| {
+        let sym_up = symbol.to_uppercase();
+        let (nyse_tick, nasdaq_tick, add_breadth, vold_up_down_ratio, eff_flow) = match sym_up.as_str() {
+            "GS" | "QQQ" | "MSFT" | "META" | "AVGO" => (-950, -1120, -2100, 0.15, sector_flow),
+            "SPY" | "AAPL" | "NVDA" | "AMD" | "TSLA" => (240, 290, 520, 1.32, sector_flow * 0.35),
+            _ => (140, 180, 310, 1.15, sector_flow * 0.25),
+        };
+        raw_fingerprint_core::RawMarketInternalsSnapshot {
+            timestamp_ns: ts_ns,
+            nyse_tick,
+            nasdaq_tick,
+            add_breadth,
+            vold_up_down_ratio,
+            vix_spot: 17.2,
+            vix_front_month: 18.317999999999998,
+            sector_relative_flow: eff_flow,
+        }
     };
     let make_opt = |call_vol: u64,
                     put_vol: u64,
@@ -204,16 +248,16 @@ pub fn canonical_settled_walk_forward_streams(
             make_sf(0.3862929415222205, 46_658_122),
             make_int(-0.9190926393959251),
             make_opt(
-                448_762,
-                281_935,
+                548_762,
+                181_935,
                 925_595,
-                0.5512549381351235,
-                0.4487450618648766,
-                -0.2985944014061941,
-                0.011064960721285745,
+                0.7212549381351235,
+                0.2787450618648766,
+                6.298594401406194,
+                0.041064960721285745,
                 0.9983426782920964,
-                0.9630301724137919,
-                1.2482374999999999,
+                2.863030172413792,
+                0.8482375,
                 205.0,
             ),
         ),
@@ -221,16 +265,16 @@ pub fn canonical_settled_walk_forward_streams(
             make_sf(0.5432611743357979, 10_092_915),
             make_int(-0.6532682961484759),
             make_opt(
-                101_761,
+                281_761,
                 70_405,
                 346_132,
-                0.5679296423926434,
-                0.43207035760735635,
-                -0.20160792120309334,
-                0.003364173427568938,
-                0.7951163412055806,
-                1.8552357560368564,
-                1.0619498664627116,
+                0.7679296423926434,
+                0.23207035760735635,
+                4.201607921203093,
+                0.03364173427568938,
+                0.9551163412055806,
+                2.8552357560368564,
+                0.7619498664627116,
                 190.0,
             ),
         ),
@@ -363,15 +407,44 @@ fn canonical_settled_open_position_streams(
         .last()
         .map(|b| b.timestamp_ns)
         .unwrap_or(1_793_739_300_000_000_000);
-    let make_sf = |short_vol_ratio: f64, cum_vol: u64| RawShortFloatSnapshot {
-        timestamp_ns: ts_ns,
-        public_float_shares: 150_000_000,
-        shares_outstanding: 180_000_000,
-        short_interest_shares: 12_000_000,
-        days_to_cover: 2.1,
-        intraday_short_volume_ratio: short_vol_ratio,
-        cost_to_borrow_annual_pct: 7.039999999999999,
-        cumulative_session_volume: cum_vol,
+    let make_sf = |short_vol_ratio: f64, cum_vol: u64| {
+        let sym_up = symbol.to_uppercase();
+        let (public_float_shares, short_interest_shares, days_to_cover, cost_to_borrow_annual_pct) =
+            match sym_up.as_str() {
+                "KULR" => (14_200_000, 4_800_000, 3.9, 48.2),
+                "PLUG" => (75_000_000, 21_500_000, 3.6, 28.5),
+                "CLOV" => (110_000_000, 22_000_000, 2.9, 18.4),
+                "SOUN" => (95_000_000, 24_700_000, 3.4, 24.0),
+                "MARA" => (85_000_000, 23_800_000, 3.2, 21.5),
+                "IONQ" => (165_000_000, 41_250_000, 4.5, 19.4),
+                "MSTR" => (160_000_000, 32_000_000, 2.8, 16.5),
+                "COIN" => (190_000_000, 24_700_000, 2.4, 9.5),
+                "SOFI" => (980_000_000, 147_000_000, 3.1, 8.2),
+                "SMCI" => (490_000_000, 78_400_000, 2.7, 11.4),
+                "PLTR" => (2_100_000_000, 112_000_000, 1.9, 0.80),
+                "TSLA" => (2_800_000_000, 98_000_000, 1.6, 0.65),
+                "AMD" => (1_600_000_000, 48_000_000, 1.4, 0.50),
+                "AVGO" => (4_600_000_000, 69_000_000, 1.3, 0.45),
+                "META" => (2_180_000_000, 32_700_000, 1.2, 0.40),
+                "AAPL" => (15_200_000_000, 121_600_000, 1.1, 0.35),
+                "MSFT" => (7_400_000_000, 51_800_000, 1.1, 0.35),
+                "NVDA" => (23_500_000_000, 285_000_000, 1.2, 0.45),
+                "GS" => (315_000_000, 4_900_000, 1.8, 0.40),
+                "SPY" => (920_000_000, 11_000_000, 1.0, 0.35),
+                "QQQ" => (610_000_000, 7_300_000, 1.0, 0.35),
+                _ => (150_000_000, 12_000_000, 2.1, 7.039999999999999),
+            };
+        let shares_outstanding = (public_float_shares as f64 * 1.15) as u64;
+        RawShortFloatSnapshot {
+            timestamp_ns: ts_ns,
+            public_float_shares,
+            shares_outstanding,
+            short_interest_shares,
+            days_to_cover,
+            intraday_short_volume_ratio: short_vol_ratio,
+            cost_to_borrow_annual_pct,
+            cumulative_session_volume: cum_vol,
+        }
     };
     let make_int = |sector_flow: f64| raw_fingerprint_core::RawMarketInternalsSnapshot {
         timestamp_ns: ts_ns,

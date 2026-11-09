@@ -498,11 +498,13 @@ pub struct IbkrBagComboLeg {
     pub cboe_mid_price: f64,
 }
 
-/// Phase 22 Upgrade 3: Atomic 2-Leg Combo Order Specification (`IbkrBagComboPayload`).
+/// Phase 22 & 28 Upgrade: Atomic 2-Leg Combo Order Specification (`IbkrBagComboPayload`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IbkrBagComboPayload {
-    /// `"IBKR_BAG_VERTICAL_ROLL_COMBO"` / `"SCHWAB_2LEG_NET_ROLL"` / `"ALPACA_MLEG_LIMIT"`
+    /// `"IBKR_BAG_VERTICAL_ROLL_COMBO"` / `"SCHWAB_2LEG_NET_ROLL"` / `"WEBULL_2LEG_VERTICAL_ROLL"` / `"ROBINHOOD_2LEG_SPREAD_ROLL"` / `"ALPACA_MLEG_LIMIT"`
     pub combo_order_type: String,
+    #[serde(default)]
+    pub is_atomic_combo_order: bool,
     pub leg_1_close: IbkrBagComboLeg,
     pub leg_2_open: IbkrBagComboLeg,
     pub net_combo_limit_price: f64,
@@ -510,10 +512,12 @@ pub struct IbkrBagComboPayload {
     pub pre_roll_net_delta: f64,
     pub post_roll_net_delta: f64,
     pub post_roll_gamma_convexity_boost_pct: f64,
+    #[serde(default)]
+    pub occ_tims_pm_relief_ratio_pct: f64,
     pub locked_cash_harvested_usd: f64,
 }
 
-/// Phase 21 & 22 Upgrade 3: Automated Options Gamma-Vanna Atomic 2-Leg Roll-Up Ticket (`StagedOptionRollUpTicket`).
+/// Phase 21, 22 & 28 Upgrade: Automated Options Gamma-Vanna Atomic 2-Leg Roll-Up Ticket (`StagedOptionRollUpTicket`).
 /// Whenever an active position or confirmed runner reaches the Brain's self-learned ITM delta-saturation
 /// & profit-lock zone ($R_{\text{locked}, k} \ge q_{\text{lock}, b}^*$ and $\Lambda_{\text{giveback}, k} \le B_{\text{runner}, b}^{(g)}$),
 /// banks $(1.0 - \phi_{\text{effective}, b}^{(g)})$ of the intrinsic option gain into realized cash and rolls
@@ -529,6 +533,8 @@ pub struct StagedOptionRollUpTicket {
     pub direction: TradeDirection,
     pub roll_status: String,
     pub is_gamma_roll_active: bool,
+    #[serde(default)]
+    pub is_atomic_combo_order: bool,
     pub current_itm_occ_symbol: String,
     pub current_itm_contract_desc: String,
     pub sell_to_close_contracts: u32,
@@ -557,14 +563,22 @@ pub struct StagedOptionRollUpTicket {
     pub pre_roll_net_delta: f64,
     pub post_roll_net_delta: f64,
     pub post_roll_gamma_convexity_boost_pct: f64,
+    #[serde(default)]
+    pub occ_tims_pm_relief_ratio_pct: f64,
+    #[serde(default)]
+    pub child_execution_slices: Vec<MicrostructureChildSlice>,
     pub locked_cash_harvested_usd: f64,
     pub ibkr_bag_combo_payload: IbkrBagComboPayload,
     pub ibkr_combo_roll_payload_json: String,
     pub schwab_roll_payload_json: String,
+    #[serde(default)]
+    pub webull_roll_payload_json: String,
+    #[serde(default)]
+    pub robinhood_roll_payload_json: String,
     pub alpaca_roll_payload_json: String,
 }
 
-/// Phase 22 Upgrade 3: Execution & Reconciliation Confirmation for an Atomic 2-Leg `BAG` Option Roll Combo (`POST /api/v1/execution/execute-roll-combo/{position_id}`).
+/// Phase 22 & 28 Upgrade: Execution & Reconciliation Confirmation for an Atomic 2-Leg `BAG` Option Roll Combo (`POST /api/v1/execution/execute-roll-combo/{position_id}`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrokerRollComboExecutionConfirmation {
     pub confirmation_id: String,
@@ -574,6 +588,8 @@ pub struct BrokerRollComboExecutionConfirmation {
     pub brain_id: String,
     pub broker_venue: String,
     pub combo_order_type: String,
+    #[serde(default)]
+    pub is_atomic_combo_order: bool,
     pub leg_1_close: IbkrBagComboLeg,
     pub leg_2_open: IbkrBagComboLeg,
     pub net_combo_limit_price: f64,
@@ -583,6 +599,8 @@ pub struct BrokerRollComboExecutionConfirmation {
     pub pre_roll_net_delta: f64,
     pub post_roll_net_delta: f64,
     pub post_roll_gamma_convexity_boost_pct: f64,
+    #[serde(default)]
+    pub occ_tims_pm_relief_ratio_pct: f64,
     pub locked_cash_harvested_usd: f64,
     pub house_money_reinvested_usd: f64,
     pub total_combo_commission_usd: f64,

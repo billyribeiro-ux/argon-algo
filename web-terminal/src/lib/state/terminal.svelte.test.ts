@@ -2100,4 +2100,356 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
     expect(ticket?.sorExpectedMarkoutToxicityBps).toBeCloseTo(0.45, 2);
     expect(ticket?.childExecutionSlices?.[0]?.sorSelectedVenue).toBe('IBKR_PEG_MID');
   });
+
+  it('hydrates Phase 28 Isolated Paper-Trading Overlay (173 untouched baseline + overlay trades), Atomic 2-Leg BAG Vertical Roll tickets (leg1_ratio: 1, leg2_ratio: 1, penny-reconciled credit), and Gen 36 synaptic plasticity shifts', async () => {
+    const store = new TerminalStore(false);
+    seedYahooBackendState(store);
+
+    const paperTelemetryMock = {
+      mode: 'CONTINUOUS_AUTONOMOUS_PAPER_OVERLAY',
+      baseline_ledger_locked: true,
+      baseline_trade_count: 173,
+      baseline_sha256: 'a41f3200e74dcfd64158ad4ef9392124fea711068a87589b5417f4039fb071af',
+      overlay_closed_count: 7,
+      open_paper_positions: 2,
+      recent_atomic_bag_rolls: 5,
+      brain_plasticity_shifts: [
+        {
+          brain_id: 'BRAIN-01' as const,
+          tau_veto: 0.082,
+          eb_lambda: 0.884,
+          learned_profit_lock_activation_r: 0.411,
+          learned_conformal_veto_quantile: 0.045
+        },
+        {
+          brain_id: 'BRAIN-02' as const,
+          tau_veto: 0.076,
+          eb_lambda: 0.892,
+          learned_profit_lock_activation_r: 0.388,
+          learned_conformal_veto_quantile: 0.042
+        },
+        {
+          brain_id: 'BRAIN-03' as const,
+          tau_veto: 0.091,
+          eb_lambda: 0.865,
+          learned_profit_lock_activation_r: 0.442,
+          learned_conformal_veto_quantile: 0.048
+        },
+        {
+          brain_id: 'BRAIN-04' as const,
+          tau_veto: 0.068,
+          eb_lambda: 0.905,
+          learned_profit_lock_activation_r: 0.375,
+          learned_conformal_veto_quantile: 0.038
+        },
+        {
+          brain_id: 'BRAIN-05' as const,
+          tau_veto: 0.055,
+          eb_lambda: 0.925,
+          learned_profit_lock_activation_r: 0.35,
+          learned_conformal_veto_quantile: 0.032
+        }
+      ],
+      timestamp_iso: '2026-11-09T22:00:00Z'
+    };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/api/v1/scanner/paper-overlay')) {
+        return {
+          ok: true,
+          json: async () => paperTelemetryMock
+        };
+      }
+      if (url.includes('/api/v1/execution/stage-roll')) {
+        return {
+          ok: true,
+          json: async () => ({
+            roll_ticket_id: 'ROLL-OPEN-P22-SOFI',
+            position_id: 'OPEN-P22-SOFI',
+            staged_at_iso: '2026-11-09T22:00:00Z',
+            symbol: 'SOFI',
+            brain_id: 'BRAIN-02',
+            direction: 'LONG',
+            leg1_ratio: 1,
+            leg2_ratio: 1,
+            combo_order_type: 'IBKR_BAG_VERTICAL_ROLL_COMBO',
+            net_combo_limit_price: 0.1,
+            nbbo_limit_walk_ladder: [0.1, 0.08, 0.05],
+            leg_1_close: {
+              leg_id: 1,
+              action: 'SELL_TO_CLOSE',
+              ratio_qty: 5,
+              occ_symbol: 'SOFI  261120C00017000',
+              contract_desc: 'SOFI 2026-11-20 $17.00C',
+              strike_price: 17.0,
+              cboe_mid_price: 0.15
+            },
+            leg_2_open: {
+              leg_id: 2,
+              action: 'BUY_TO_OPEN',
+              ratio_qty: 5,
+              occ_symbol: 'SOFI  261120C00018000',
+              contract_desc: 'SOFI 2026-11-20 $18.00C',
+              strike_price: 18.0,
+              cboe_mid_price: 0.05
+            }
+          })
+        };
+      }
+      return { ok: false };
+    });
+
+    try {
+      const data = await store.fetchPaperOverlayState();
+      expect(data).not.toBeNull();
+      expect(data?.baseline_ledger_locked).toBe(true);
+      expect(data?.baseline_trade_count).toBe(173);
+      expect(data?.baseline_sha256).toBe('a41f3200e74dcfd64158ad4ef9392124fea711068a87589b5417f4039fb071af');
+      expect(data?.overlay_closed_count).toBe(7);
+      expect(data?.brain_plasticity_shifts.length).toBe(5);
+
+      // Verify Atomic 2-Leg BAG Combo Roll Ticket with 1:1 Leg Ratio and Penny-Reconciled Bounds
+      const stagedRoll = await store.stageOptionRollTicket('OPEN-P22-SOFI');
+      expect(stagedRoll).not.toBeNull();
+      if (stagedRoll) {
+        expect(stagedRoll.leg1Ratio ?? 1).toBe(1);
+        expect(stagedRoll.leg2Ratio ?? 1).toBe(1);
+        expect(stagedRoll.comboOrderType).toBe('IBKR_BAG_VERTICAL_ROLL_COMBO');
+        const netMidDiff = Number((stagedRoll.leg1Close.liveMidPrice - stagedRoll.leg2Open.liveMidPrice).toFixed(2));
+        expect(Math.abs(stagedRoll.netComboLimitPrice - netMidDiff)).toBeLessThanOrEqual(0.01);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('hydrates Phase 29/30 24-Pair Institutional Watchlist & Sunday Alpha Protocol Stager, enforces zero expired CBOE contracts, verifies Cross-Brain Conflict blocking on opposing multi-horizon signals, and validates Sunday Alpha CSV + Webhook dispatch state', async () => {
+    const store = new TerminalStore(false);
+
+    const nowIso = '2026-11-09T22:30:00Z';
+    const evalEpochS = Math.floor(new Date(nowIso).getTime() / 1000);
+
+    const watchlistMock = {
+      universe_size: 24,
+      actionable_setups_count: 19,
+      active_generation: 'Gen 36',
+      total_allocated_kelly_pct: 10.0,
+      net_portfolio_delta_beta_weighted: -2.71,
+      cross_brain_conflicts_blocked: 1,
+      estimated_occ_tims_margin_relief_pct: 46.5,
+      timestamp_iso: nowIso,
+      eval_epoch_s: evalEpochS,
+      watchlist: [
+        {
+          rank: 1,
+          symbol: 'NVDA',
+          brain_id: 'BRAIN-02' as const,
+          brain_name: 'BRAIN-02 INTRADAY DAY TRADER',
+          direction: 'LONG' as const,
+          strategy_archetype: 'GAMMA_SQUEEZE_IGNITION',
+          engine_a_confidence_pct: 98.8,
+          engine_b_confidence_pct: 95.5,
+          consensus_confidence_pct: 97.2,
+          active_engine_mode: 'CONSENSUS_BOTH_ENGINES',
+          entry_price: 178.6,
+          structural_stop_price: 176.89,
+          stop_distance_pct: 0.96,
+          target_1_price: 184.24,
+          target_2_price: 195.75,
+          expected_r_multiple: 10.04,
+          stage0_conformal_status: 'PASS' as const,
+          mahalanobis_win_distance: 0.082,
+          mahalanobis_loss_distance: 0.285,
+          conformal_llr: 0.094,
+          conformal_threshold: 0.05,
+          conformal_margin: 0.044,
+          action_status: 'ACTIONABLE_STAGE_READY',
+          venue_ticket: 'IBKR_PEG_MID_SMART',
+          matched_option_contract: 'NVDA 2026-11-13 $177.50C',
+          option_structure: 'LONG_CALL',
+          kelly_fraction_pct: 0.33,
+          is_actionable: true
+        },
+        {
+          rank: 9,
+          symbol: 'AMD',
+          brain_id: 'BRAIN-02' as const,
+          brain_name: 'BRAIN-02 INTRADAY DAY TRADER',
+          direction: 'SHORT' as const,
+          strategy_archetype: 'POC_VOLUME_ABSORPTION',
+          engine_a_confidence_pct: 94.7,
+          engine_b_confidence_pct: 78.9,
+          consensus_confidence_pct: 86.8,
+          active_engine_mode: 'CONSENSUS_BOTH_ENGINES',
+          entry_price: 509.01,
+          structural_stop_price: 515.47,
+          stop_distance_pct: 1.27,
+          target_1_price: 493.87,
+          target_2_price: 488.24,
+          expected_r_multiple: 3.22,
+          stage0_conformal_status: 'PASS' as const,
+          mahalanobis_win_distance: 0.112,
+          mahalanobis_loss_distance: 0.312,
+          conformal_llr: 0.145,
+          conformal_threshold: 0.048,
+          conformal_margin: 0.097,
+          action_status: 'ACTIONABLE_STAGE_READY',
+          venue_ticket: 'IBKR_PEG_MID_SMART',
+          matched_option_contract: 'AMD 2026-11-13 $510.00P',
+          option_structure: 'LONG_PUT',
+          kelly_fraction_pct: 0.31,
+          is_actionable: true
+        },
+        {
+          rank: 21,
+          symbol: 'AMD',
+          brain_id: 'BRAIN-04' as const,
+          brain_name: 'BRAIN-04 CORE SWING',
+          direction: 'LONG' as const,
+          strategy_archetype: 'HTF_MULTI_SCALE_BREAKOUT',
+          engine_a_confidence_pct: 71.2,
+          engine_b_confidence_pct: 69.4,
+          consensus_confidence_pct: 70.3,
+          active_engine_mode: 'CONSENSUS_BOTH_ENGINES',
+          entry_price: 509.01,
+          structural_stop_price: 460.42,
+          stop_distance_pct: 9.55,
+          target_1_price: 585.36,
+          target_2_price: 622.15,
+          expected_r_multiple: 2.33,
+          stage0_conformal_status: 'PASS' as const,
+          mahalanobis_win_distance: 0.185,
+          mahalanobis_loss_distance: 0.224,
+          conformal_llr: 0.052,
+          conformal_threshold: 0.045,
+          conformal_margin: 0.007,
+          action_status: 'BLOCKED_CROSS_BRAIN_CONFLICT',
+          venue_ticket: 'SCHWAB_2LEG_NET_ROLL',
+          matched_option_contract: 'AMD 2026-12-18 $510.00C',
+          option_structure: 'LONG_CALL',
+          kelly_fraction_pct: 0.28,
+          is_actionable: false
+        }
+      ]
+    };
+
+    const sundayProtocolMock = {
+      protocol_generation: 'Gen 36',
+      staged_for_execution_epoch_iso: nowIso,
+      universe_size: 24,
+      actionable_count: 19,
+      total_allocated_kelly_pct: 10.0,
+      net_portfolio_delta_beta_weighted: -2.71,
+      cross_brain_conflicts_blocked: 1,
+      estimated_occ_tims_margin_relief_pct: 46.5,
+      staged_setups: [
+        {
+          rank: 1,
+          symbol: 'NVDA',
+          brain_id: 'BRAIN-02' as const,
+          brain_name: 'BRAIN-02 INTRADAY DAY TRADER',
+          direction: 'LONG' as const,
+          strategy_archetype: 'GAMMA_SQUEEZE_IGNITION',
+          consensus_confidence_pct: 97.2,
+          active_engine_mode: 'CONSENSUS_BOTH_ENGINES',
+          entry_price: 178.6,
+          structural_stop_price: 176.89,
+          target_1_price: 184.24,
+          target_2_price: 195.75,
+          expected_r_multiple: 10.04,
+          stage0_conformal_status: 'PASS',
+          conformal_margin: 0.044,
+          venue_ticket: 'IBKR_PEG_MID_SMART',
+          matched_option_contract: 'NVDA 2026-11-13 $177.50C',
+          kelly_fraction_pct: 0.33,
+          action_status: 'ACTIONABLE_STAGE_READY'
+        }
+      ],
+      csv_export_endpoint: '/api/v1/scanner/sunday-protocol/export/csv',
+      webhook_dispatch_endpoint: '/api/v1/scanner/sunday-protocol/dispatch'
+    };
+
+    const dispatchMock = {
+      status: 'STAGED_TO_OUTBOX',
+      dispatched_at_iso: nowIso,
+      discord_embed_queued: true,
+      telegram_payload_queued: true,
+      slack_blocks_queued: true,
+      oms_bundle_queued: true,
+      staged_count: 19,
+      total_portfolio_kelly_pct: 10.0,
+      net_delta_beta_weighted: -2.71,
+      conflicts_blocked: 1
+    };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/api/v1/scanner/institutional-watchlist')) {
+        return { ok: true, json: async () => watchlistMock };
+      }
+      if (url.includes('/api/v1/scanner/sunday-protocol/dispatch')) {
+        return { ok: true, json: async () => dispatchMock };
+      }
+      if (url.includes('/api/v1/scanner/sunday-protocol/export/csv')) {
+        return {
+          ok: true,
+          blob: async () => new Blob(['Rank,Symbol\n1,NVDA'], { type: 'text/csv' })
+        };
+      }
+      if (url.includes('/api/v1/scanner/sunday-protocol')) {
+        return { ok: true, json: async () => sundayProtocolMock };
+      }
+      return { ok: false };
+    });
+
+    try {
+      // 1. Hydrate Institutional Watchlist
+      const wData = await store.fetchInstitutionalWatchlist();
+      expect(wData).not.toBeNull();
+      expect(wData?.universe_size).toBe(24);
+      expect(wData?.actionable_setups_count).toBe(19);
+      expect(wData?.total_allocated_kelly_pct).toBe(10.0);
+      expect(wData?.cross_brain_conflicts_blocked).toBe(1);
+
+      // 2. Zero Expired Option Contracts Verification
+      const evalDate = new Date(nowIso);
+      for (const row of wData?.watchlist ?? []) {
+        const tokens = row.matched_option_contract.split(' ');
+        expect(tokens.length).toBeGreaterThanOrEqual(2);
+        const expDate = new Date(tokens[1]!);
+        expect(expDate.getTime()).toBeGreaterThanOrEqual(evalDate.getTime());
+      }
+
+      // 3. Multi-Horizon Canonical Spot Reference & Cross-Brain Conflict Netting Gate
+      const amdM5 = wData?.watchlist.find((r) => r.symbol === 'AMD' && r.brain_id === 'BRAIN-02');
+      const amdD1 = wData?.watchlist.find((r) => r.symbol === 'AMD' && r.brain_id === 'BRAIN-04');
+      expect(amdM5).toBeDefined();
+      expect(amdD1).toBeDefined();
+      expect(amdM5?.entry_price).toBe(509.01);
+      expect(amdD1?.entry_price).toBe(509.01); // Coherent canonical spot!
+      expect(amdM5?.direction).toBe('SHORT');
+      expect(amdD1?.direction).toBe('LONG');
+      // Cross-Brain Netting Gate blocks the opposing lower-expectancy setup
+      expect(amdM5?.action_status).toBe('ACTIONABLE_STAGE_READY');
+      expect(amdM5?.is_actionable).toBe(true);
+      expect(amdD1?.action_status).toBe('BLOCKED_CROSS_BRAIN_CONFLICT');
+      expect(amdD1?.is_actionable).toBe(false);
+
+      // 4. Sunday Alpha Protocol & Webhook Outbox Dispatch
+      const spData = await store.fetchSundayAlphaProtocol();
+      expect(spData).not.toBeNull();
+      expect(spData?.staged_setups.length).toBe(1);
+
+      const dispatchRes = await store.dispatchSundayProtocolWebhook();
+      expect(dispatchRes).not.toBeNull();
+      expect(dispatchRes?.status).toBe('STAGED_TO_OUTBOX');
+      expect(dispatchRes?.discord_embed_queued).toBe(true);
+      expect(dispatchRes?.telegram_payload_queued).toBe(true);
+      expect(dispatchRes?.conflicts_blocked).toBe(1);
+      expect(store.lastDispatchResult).toEqual(dispatchMock);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

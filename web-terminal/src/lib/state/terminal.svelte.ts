@@ -2001,6 +2001,8 @@ export class TerminalStore {
       liveGivebackLlr: Number(t.live_giveback_llr ?? 0.28),
       runnerContinuationThreshold: Number(t.runner_continuation_threshold ?? -0.52),
       guaranteedNetFloorR: Number(t.guaranteed_net_floor_r ?? 0),
+      leg1Ratio: Number(t.leg1_ratio ?? t.leg1Ratio ?? rawCombo.leg1_ratio ?? rawCombo.leg1Ratio ?? 1),
+      leg2Ratio: Number(t.leg2_ratio ?? t.leg2Ratio ?? rawCombo.leg2_ratio ?? rawCombo.leg2Ratio ?? 1),
       comboOrderType,
       leg1Close,
       leg2Open,
@@ -2012,6 +2014,8 @@ export class TerminalStore {
       lockedCashHarvestedUsd,
       ibkrBagCombo: {
         comboOrderType,
+        leg1Ratio: Number(t.leg1_ratio ?? t.leg1Ratio ?? rawCombo.leg1_ratio ?? rawCombo.leg1Ratio ?? 1),
+        leg2Ratio: Number(t.leg2_ratio ?? t.leg2Ratio ?? rawCombo.leg2_ratio ?? rawCombo.leg2Ratio ?? 1),
         leg1Close,
         leg2Open,
         netComboLimitPrice: netMid,
@@ -2329,6 +2333,8 @@ export class TerminalStore {
       liveGivebackLlr: pos.liveSequentialLlr,
       runnerContinuationThreshold: -0.52,
       guaranteedNetFloorR: pos.guaranteedNetFloorR ?? 0.24,
+      leg1Ratio: 1,
+      leg2Ratio: 1,
       comboOrderType: 'IBKR_BAG_VERTICAL_ROLL_COMBO',
       leg1Close: {
         legId: 1,
@@ -2360,6 +2366,8 @@ export class TerminalStore {
       lockedCashHarvestedUsd: pos.bankedOptionGainUsd ?? 185,
       ibkrBagCombo: {
         comboOrderType: 'IBKR_BAG_VERTICAL_ROLL_COMBO',
+        leg1Ratio: 1,
+        leg2Ratio: 1,
         leg1Close: {
           legId: 1,
           action: 'SELL_TO_CLOSE',
@@ -4614,6 +4622,140 @@ export class TerminalStore {
     a.download = `quant_intelligence_ledger_${new Date().toISOString().slice(0, 10)}.xlsx`;
     a.click();
     URL.revokeObjectURL(url);
+  }
+
+  /**
+   * Fetches the 24-pair institutional watchlist snapshot from `/api/v1/scanner/institutional-watchlist`.
+   */
+  public async fetchInstitutionalWatchlist(): Promise<InstitutionalWatchlistResponse | null> {
+    this.isLoadingWatchlist = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/institutional-watchlist`);
+      if (res.ok) {
+        const data: InstitutionalWatchlistResponse = await res.json();
+        this.institutionalWatchlist = data;
+        return data;
+      }
+    } catch {
+      // Offline / disconnected fallback
+    } finally {
+      this.isLoadingWatchlist = false;
+    }
+    return this.institutionalWatchlist;
+  }
+
+  /**
+   * Fetches the Sunday Alpha Protocol stager summary from `/api/v1/scanner/sunday-protocol`.
+   */
+  public async fetchSundayAlphaProtocol(): Promise<SundayAlphaProtocolResponse | null> {
+    this.isLoadingSundayProtocol = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/sunday-protocol`);
+      if (res.ok) {
+        const data: SundayAlphaProtocolResponse = await res.json();
+        this.sundayAlphaProtocol = data;
+        return data;
+      }
+    } catch {
+      // Offline fallback
+    } finally {
+      this.isLoadingSundayProtocol = false;
+    }
+    return this.sundayAlphaProtocol;
+  }
+
+  /**
+   * Triggers a 1-click download of the Sunday Alpha Protocol `.CSV` stager spreadsheet via `/api/v1/scanner/sunday-protocol/export/csv`.
+   */
+  public async exportSundayProtocolCsv(): Promise<void> {
+    if (typeof document === 'undefined') return;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/sunday-protocol/export/csv`);
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `argon_sunday_alpha_protocol_${new Date().toISOString().slice(0, 10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+        return;
+      }
+    } catch {
+      // Fallback to client-generated CSV below
+    }
+
+    if (this.sundayAlphaProtocol && this.sundayAlphaProtocol.staged_setups.length > 0) {
+      const header = 'Rank,Symbol,Brain,Direction,Action,ConsensusConf%,VenueTicket,EntryLimit,StopLoss,Target1,Target2,RiskRewardR,KellyPct,CBOEContract,Stage0Verdict,MahalanobisLLR';
+      const lines = [header];
+      for (const row of this.sundayAlphaProtocol.staged_setups) {
+        lines.push([
+          row.rank,
+          row.symbol,
+          row.brain_id,
+          row.direction,
+          row.action_status,
+          `${row.consensus_confidence_pct.toFixed(2)}%`,
+          row.venue_ticket,
+          row.entry_price.toFixed(2),
+          row.structural_stop_price.toFixed(2),
+          row.target_1_price.toFixed(2),
+          row.target_2_price.toFixed(2),
+          row.expected_r_multiple.toFixed(2),
+          `${row.kelly_fraction_pct.toFixed(2)}%`,
+          `"${row.matched_option_contract}"`,
+          row.stage0_conformal_status,
+          row.conformal_margin.toFixed(3)
+        ].join(','));
+      }
+      const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `argon_sunday_alpha_protocol_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  /**
+   * Dispatches the Sunday Alpha Protocol staged package to Discord, Telegram, and generic OMS outbox via `POST /api/v1/scanner/sunday-protocol/dispatch`.
+   */
+  public async dispatchSundayProtocolWebhook(): Promise<SundayAlphaDispatchResponse | null> {
+    this.isDispatchingSundayWebhook = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/sunday-protocol/dispatch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      if (res.ok) {
+        const data: SundayAlphaDispatchResponse = await res.json();
+        this.lastDispatchResult = data;
+        return data;
+      }
+    } catch {
+      // Offline fallback
+    } finally {
+      this.isDispatchingSundayWebhook = false;
+    }
+    return this.lastDispatchResult;
+  }
+
+  /**
+   * Fetches isolated Phase 28 paper-daemon telemetry without touching baseline `data/ledger_state.json`.
+   */
+  public async fetchPaperOverlayState(): Promise<PaperOverlayTelemetryResponse | null> {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/paper-overlay`);
+      if (res.ok) {
+        const data: PaperOverlayTelemetryResponse = await res.json();
+        this.paperOverlayState = data;
+        return data;
+      }
+    } catch {
+      // Offline fallback
+    }
+    return this.paperOverlayState;
   }
 }
 

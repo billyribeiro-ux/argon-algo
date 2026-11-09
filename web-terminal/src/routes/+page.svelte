@@ -9,6 +9,7 @@
   import PositionsOpenedPanel from '$lib/components/PositionsOpenedPanel.svelte';
   import ClosedTradeLedgerPanel from '$lib/components/ClosedTradeLedgerPanel.svelte';
   import BrainAutopsyLab from '$lib/components/BrainAutopsyLab.svelte';
+  import InstitutionalWatchlistPanel from '$lib/components/InstitutionalWatchlistPanel.svelte';
 
   const candidates = $derived(terminalStore.filteredScannerCandidates);
   let scanningYahoo = $state(false);
@@ -240,4 +241,7 @@
 
   <!-- Full-Width Panel 3: 3-Speed Continuous Self-Learning & Nightly Autopsy Lab -->
   <BrainAutopsyLab />
+
+  <!-- Full-Width Panel 4: Phase 29/30 Institutional Watchlist & Sunday Alpha Protocol Stager -->
+  <InstitutionalWatchlistPanel />
 </div>

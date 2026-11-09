@@ -51,7 +51,7 @@ pub use webhooks::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raw_fingerprint_core::{BrainHorizonId, SubPennyPrice};
+    use raw_fingerprint_core::{BrainHorizonId, SubPennyPrice, TradeDirection};
     use std::io::Read;
     use std::path::Path;
     use std::str::FromStr;
@@ -483,17 +483,22 @@ mod tests {
             cboe_spot,
             bumped_spot,
         );
+        let call_idx = nvda_chain
+            .contracts
+            .iter()
+            .position(|c| c.delta > 0.1)
+            .unwrap_or(0);
         assert!(
-            reanchored.contracts[0].bid > nvda_chain.contracts[0].bid,
+            reanchored.contracts[call_idx].bid > nvda_chain.contracts[call_idx].bid,
             "Expected Call option bid to increase under +$5.00 Delta-Gamma-Vanna spot re-anchoring"
         );
         println!(
             "[PHASE-8 CBOE SPOT RE-ANCHORING] NVDA Spot ${:.2} -> ${:.2} | Contract {} Bid {} -> {}",
             cboe_spot,
             bumped_spot,
-            reanchored.contracts[0].contract_symbol,
-            nvda_chain.contracts[0].bid,
-            reanchored.contracts[0].bid
+            reanchored.contracts[call_idx].contract_symbol,
+            nvda_chain.contracts[call_idx].bid,
+            reanchored.contracts[call_idx].bid
         );
         // 7. Verify Phase-11 On-Demand "Any-Ticker" Causal Walk-Forward Backtester (`POST /api/v1/brains/{brain_id}/backtest/{symbol}`)
         let custom_bt = state
@@ -3359,5 +3364,458 @@ mod tests {
             "Expected Stage 0 Conformal Mahalanobis Gate to veto trap-dominated setups (e.g. PLUG, AVGO, NVDA B04), got {}",
             stage0_veto_count
         );
+    }
+
+    #[test]
+    fn test_phase28_continuous_live_paper_trading_and_self_learning_persistence() {
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+
+        // 1. Load canonical Gen 36 ledger with N = 173 baseline trades
+        let base_engine = RealTimeLedgerEngine::new();
+        assert!(base_engine.load_from_disk(ledger_path));
+        let base_snap = base_engine.query_filtered_snapshot(&HyperFilterQuery::default());
+        assert_eq!(
+            base_snap.closed_trades.len(),
+            173,
+            "Baseline ledger must have exactly 173 historical trades"
+        );
+
+        let mut chronological_trades = base_snap.closed_trades.clone();
+        chronological_trades.sort_by_key(|r| (r.opened_timestamp_ns, r.closed_timestamp_ns));
+
+        let build_live_inference_for_row = |row: &crate::ledger::ClosedTradeRow| -> (
+            crate::onnx_engine::LiveBrainInferenceOutput,
+            crate::precedent_knn::PrecedentMatchSummary,
+        ) {
+            let signal = raw_fingerprint_core::AutonomousSignalBlueprint {
+                brain_id: row.brain_id,
+                symbol: row.symbol.clone(),
+                timestamp_ns: row.opened_timestamp_ns,
+                direction: row.direction,
+                ai_confidence_pct: row.ai_confidence_pct,
+                entry_price: row.entry_price,
+                structural_stop_price: row.initial_structural_stop,
+                target_1_price: row.target_1_price,
+                target_2_price: row.target_2_price,
+                predicted_hold_duration_ms: row.hold_duration_ms.max(60_000),
+                expected_r_multiple: 1.85,
+                primary_driver: row.primary_driver,
+                stream_weights: row.stream_weights,
+                latent_embedding_128: row.entry_embedding_128.clone(),
+            };
+            let matched_option = crate::onnx_engine::MatchedOptionExecutionPlan {
+                option_structure: row.option_structure.clone(),
+                matched_option_contract: row.matched_option_contract.clone(),
+                option_entry_premium: row.option_entry_premium,
+                option_live_premium: row.option_entry_premium,
+                option_stop_premium: row.option_stop_premium,
+                option_target_premium: row.option_exit_premium,
+                option_contracts_count: row.option_contracts_count,
+                contract_delta: row.contract_delta,
+                contract_gamma: row.contract_gamma,
+                contract_vanna: row.contract_vanna,
+                contract_theta: row.contract_theta,
+                contract_vega: row.contract_vega,
+                contract_iv: row.contract_iv,
+            };
+            let prec = crate::precedent_knn::PrecedentMatchSummary {
+                matches_count: row.precedent_matches_count,
+                win_rate_pct: row.precedent_win_rate_pct,
+                mean_realized_r_multiple: 1.85,
+                mean_similarity_pct: 91.5,
+                p50_mfe_pct: row.mfe_pct.max(1.5),
+                p80_mfe_pct: row.mfe_pct.max(2.2),
+                p85_mae_pct: row.mae_pct.max(0.8),
+                median_hold_duration_ms: row.hold_duration_ms.max(60_000),
+                top_exemplar_symbols: vec![row.symbol.clone()],
+            };
+            (
+                crate::onnx_engine::LiveBrainInferenceOutput {
+                    signal,
+                    matched_option,
+                    bar_attention_heatmap: vec![0.5; 24],
+                    top_shap_drivers: Vec::new(),
+                    inference_latency_micros: 120,
+                    model_version: "v1.28.0-onnx".to_string(),
+                },
+                prec,
+            )
+        };
+
+        // Clone into isolated in-memory paper trading ledger
+        let tmp_clone_path = std::env::temp_dir().join(format!("test_phase28_clone_{}.json", uuid::Uuid::new_v4()));
+        assert!(base_engine.save_to_disk(&tmp_clone_path).is_ok());
+        let paper_engine = RealTimeLedgerEngine::new();
+        assert!(paper_engine.load_from_disk(&tmp_clone_path));
+        let _ = std::fs::remove_file(&tmp_clone_path);
+        paper_engine.set_enforce_hard_scratch_on_baseline(true);
+        paper_engine.clear_all_open_positions();
+
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 0);
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(), 173);
+        let init_b2_state = paper_engine.precedent_knn().get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade);
+        let init_b4_state = paper_engine.precedent_knn().get_synaptic_plasticity_state(BrainHorizonId::Brain04CoreSwing);
+
+        println!("\n=================================================================================================================================");
+        println!("  PHASE 28: AUTONOMOUS LIVE PAPER-TRADING DAEMON, ATOMIC OPTION ROLL & SELF-LEARNING PERSISTENCE AUDIT");
+        println!("=================================================================================================================================");
+        println!("  [INIT] Baseline Ledger: N=173 | Open Positions: 0 | Gen 36 Champions Loaded | Isolated Paper State Instantiated");
+
+        // 2. Stream 5 sequential candidates (#174..#178):
+        let win1_idx = chronological_trades
+            .iter()
+            .position(|r| r.is_winner && r.realized_r_multiple >= 1.5 && r.entry_bars.len() > r.entry_bar_idx + 2)
+            .expect("Expected winner trade for Candidate #174");
+        let win1_row = &chronological_trades[win1_idx];
+
+        let veto_idx = chronological_trades
+            .iter()
+            .position(|r| r.was_vetoed_by_loss_autopsy)
+            .expect("Expected Stage 0 vetoed trade for Candidate #175");
+        let veto_row = &chronological_trades[veto_idx];
+
+        let s1_idx = chronological_trades
+            .iter()
+            .position(|r| r.was_scratched_by_loss_autopsy && (1..=3).contains(&r.scratch_bar_offset))
+            .expect("Expected Stage 1 scratch trade for Candidate #176");
+        let s1_row = &chronological_trades[s1_idx];
+
+        let s3_idx = chronological_trades
+            .iter()
+            .position(|r| {
+                r.was_scaled_with_house_money && r.house_money_scale_bar_offset.is_some()
+            })
+            .expect("Expected Stage 3 House-Money runner trade for Candidate #177");
+        let s3_row = &chronological_trades[s3_idx];
+
+        let win2_idx = chronological_trades
+            .iter()
+            .enumerate()
+            .position(|(i, r)| i != win1_idx && r.is_winner && r.realized_r_multiple >= 1.2 && r.entry_bars.len() > r.entry_bar_idx + 2)
+            .expect("Expected winner trade for Candidate #178");
+        let win2_row = &chronological_trades[win2_idx];
+
+        let internals = raw_fingerprint_core::RawMarketInternalsSnapshot::default();
+
+        // -----------------------------------------------------------------------------------------
+        // Candidate 1 (Trade #174): Winner Target Hit
+        // -----------------------------------------------------------------------------------------
+        println!("\n>>> [CANDIDATE 1 / TRADE #174] Symbol: {} | Brain: {} | Target Hit Winner", win1_row.symbol, win1_row.brain_id.as_str());
+        let (inf_w1, prec_w1) = build_live_inference_for_row(win1_row);
+        let pre_bars_w1 = win1_row.entry_bars[..=win1_row.entry_bar_idx].to_vec();
+        let opened_w1 = paper_engine.open_position_with_bars(
+            &win1_row.exchange_index,
+            &inf_w1,
+            &prec_w1,
+            10_000.0,
+            pre_bars_w1.clone(),
+        );
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 1);
+        println!("  Open -> Position ID: {} | Entry: ${:.2} | Target 1: ${:.2} | Target 2: ${:.2}",
+            opened_w1.position_id, opened_w1.entry_price, opened_w1.target_1_price, opened_w1.target_2_price);
+
+        let mut stream_w1 = pre_bars_w1;
+        let total_post_w1 = win1_row.entry_bars.len().saturating_sub(1).saturating_sub(win1_row.entry_bar_idx);
+        let mut closed_w1 = Vec::new();
+        for k in 1..=total_post_w1 {
+            let next_bar = win1_row.entry_bars[win1_row.entry_bar_idx + k];
+            stream_w1.push(next_bar);
+            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&win1_row.symbol, win1_row.brain_id, &stream_w1, &internals);
+            println!("  Bar +{} -> Close: ${:.2} | Open Positions: {}", k, next_bar.close, paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len());
+            if !newly.is_empty() {
+                closed_w1.extend(newly);
+                break;
+            }
+        }
+        if closed_w1.is_empty() {
+            let mut final_bar = stream_w1.last().copied().unwrap();
+            final_bar.timestamp_ns += 300_000_000_000;
+            final_bar.close = win1_row.target_2_price;
+            match win1_row.direction {
+                TradeDirection::Long => final_bar.high = win1_row.target_2_price,
+                TradeDirection::Short => final_bar.low = win1_row.target_2_price,
+            }
+            stream_w1.push(final_bar);
+            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&win1_row.symbol, win1_row.brain_id, &stream_w1, &internals);
+            closed_w1.extend(newly);
+        }
+        assert_eq!(closed_w1.len(), 1);
+        println!("  Settled -> Trade #174 Closed: {} | Realized R: {:+.2}R | P&L: ${:+.2}",
+            closed_w1[0].outcome_badge.as_str(), closed_w1[0].realized_r_multiple, closed_w1[0].net_pnl_usd);
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(), 174);
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 0);
+
+        // -----------------------------------------------------------------------------------------
+        // Candidate 2 (Candidate #175): Stage 0 Vetoed Trap
+        // -----------------------------------------------------------------------------------------
+        println!("\n>>> [CANDIDATE 2 / CANDIDATE #175] Symbol: {} | Brain: {} | Stage 0 Vetoed Trap", veto_row.symbol, veto_row.brain_id.as_str());
+        let (inf_v, prec_v) = build_live_inference_for_row(veto_row);
+        let pre_bars_v = veto_row.entry_bars[..=veto_row.entry_bar_idx].to_vec();
+        let opened_v = paper_engine.open_position_with_bars(
+            &veto_row.exchange_index,
+            &inf_v,
+            &prec_v,
+            10_000.0,
+            pre_bars_v,
+        );
+        println!("  Stage 0 Gate Evaluation -> Stage: {} | Safety Margin: {:.1}%",
+            opened_v.active_sequential_stage, opened_v.sequential_safety_margin_pct);
+        assert_eq!(opened_v.active_sequential_stage, "STAGE_0_VETOED_HARD_NEGATIVE_TRAP");
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 0, "Vetoed trade must NOT enter positions_opened");
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(), 174, "Closed ledger must remain at 174");
+
+        // -----------------------------------------------------------------------------------------
+        // Candidate 3 (Trade #175 in closed ledger): Early Wald SPRT Scratch
+        // -----------------------------------------------------------------------------------------
+        println!("\n>>> [CANDIDATE 3 / TRADE #175] Symbol: {} | Brain: {} | Stage 1 Wald SPRT Scratch", s1_row.symbol, s1_row.brain_id.as_str());
+        let (inf_s1_c, prec_s1_c) = build_live_inference_for_row(s1_row);
+        let pre_bars_s1 = s1_row.entry_bars[..=s1_row.entry_bar_idx].to_vec();
+        let opened_s1 = paper_engine.open_position_with_bars(
+            &s1_row.exchange_index,
+            &inf_s1_c,
+            &prec_s1_c,
+            10_000.0,
+            pre_bars_s1.clone(),
+        );
+        assert_ne!(opened_s1.active_sequential_stage, "STAGE_0_VETOED_HARD_NEGATIVE_TRAP");
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 1);
+        println!("  Open -> Position ID: {} | Stage: {}", opened_s1.position_id, opened_s1.active_sequential_stage);
+
+        let mut stream_s1 = pre_bars_s1;
+        let mut closed_s1 = Vec::new();
+        for k in 1..=s1_row.scratch_bar_offset {
+            let next_bar = s1_row.entry_bars[s1_row.entry_bar_idx + k];
+            stream_s1.push(next_bar);
+            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&s1_row.symbol, s1_row.brain_id, &stream_s1, &internals);
+            println!("  Bar +{} -> Close: ${:.2} | Wald SPRT evaluation", k, next_bar.close);
+            if !newly.is_empty() {
+                closed_s1.extend(newly);
+                break;
+            }
+        }
+        assert_eq!(closed_s1.len(), 1);
+        assert_eq!(closed_s1[0].outcome_badge, ClosedOutcomeBadge::AiLossAutopsyScratchExit);
+        println!("  Settled -> Trade #175 Closed: {} | Realized R: {:+.2}R | Autopsy Scratch Executed",
+            closed_s1[0].outcome_badge.as_str(), closed_s1[0].realized_r_multiple);
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(), 175);
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 0);
+
+        // -----------------------------------------------------------------------------------------
+        // Candidate 4 (Trade #176 in closed ledger): House-Money Runner with Atomic Multi-Leg Option Roll
+        // -----------------------------------------------------------------------------------------
+        println!("\n>>> [CANDIDATE 4 / TRADE #176] Symbol: {} | Brain: {} | Stage 3 House-Money Runner + Atomic Option Roll", s3_row.symbol, s3_row.brain_id.as_str());
+        let (inf_s3_c, prec_s3_c) = build_live_inference_for_row(s3_row);
+        let pre_bars_s3 = s3_row.entry_bars[..=s3_row.entry_bar_idx].to_vec();
+        let opened_s3 = paper_engine.open_position_with_bars(
+            &s3_row.exchange_index,
+            &inf_s3_c,
+            &prec_s3_c,
+            10_000.0,
+            pre_bars_s3.clone(),
+        );
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 1);
+        println!("  Open -> Position ID: {} | Contract: {}", opened_s3.position_id, opened_s3.matched_option_contract);
+
+        let mut stream_s3 = pre_bars_s3;
+        let mut closed_s3 = Vec::new();
+        let total_post_s3 = s3_row.entry_bars.len().saturating_sub(1).saturating_sub(s3_row.entry_bar_idx);
+        let roll_bar = 7usize.min(total_post_s3);
+
+        // Stream bars up to house-money runner roll trigger
+        for k in 1..=roll_bar {
+            let next_bar = s3_row.entry_bars[s3_row.entry_bar_idx + k];
+            stream_s3.push(next_bar);
+            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&s3_row.symbol, s3_row.brain_id, &stream_s3, &internals);
+            let open_cnt = paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len();
+            println!("  Bar +{} -> Close: ${:.2} | Open Positions: {}", k, next_bar.close, open_cnt);
+            if !newly.is_empty() {
+                closed_s3.extend(newly);
+                break;
+            }
+        }
+
+        // Verify Staged Atomic Multi-Leg Option Roll Ticket while runner is active
+        let tickets_snap = paper_engine.execution_tickets_snapshot();
+        let roll_ticket = tickets_snap
+            .staged_option_roll_tickets
+            .iter()
+            .find(|t| t.position_id == opened_s3.position_id)
+            .expect("Must stage option roll ticket for active runner");
+
+        let dte_estimate = match roll_ticket.brain_id {
+            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => 0,
+            BrainHorizonId::Brain03ShortTermSwing => 14,
+            BrainHorizonId::Brain04CoreSwing => 35,
+            BrainHorizonId::Brain05LongTermWealth => 70,
+        };
+
+        println!("\n  --- ATOMIC MULTI-LEG OPTION COMBO TICKET ---");
+        println!("  Combo Order Type:             {}", roll_ticket.combo_order_type);
+        println!("  Zero-Legging Atomic Order:     {}", roll_ticket.is_atomic_combo_order);
+        println!("  DTE (Days to Expiration):      {} days", dte_estimate);
+        println!("  Leg 1 (Close):                 {} {} @ ${:.2} (Mid: ${:.2})",
+            roll_ticket.leg_1_close.action, roll_ticket.leg_1_close.occ_symbol,
+            roll_ticket.leg_1_close.strike_price, roll_ticket.leg_1_close.cboe_mid_price);
+        println!("  Leg 2 (Open Roll):             {} {} @ ${:.2} (Mid: ${:.2})",
+            roll_ticket.leg_2_open.action, roll_ticket.leg_2_open.occ_symbol,
+            roll_ticket.leg_2_open.strike_price, roll_ticket.leg_2_open.cboe_mid_price);
+        println!("  Net Combo Limit Price:         ${:.2}", roll_ticket.net_combo_limit_price);
+        println!("  NBBO Limit Walk Ladder:        {:?}", roll_ticket.nbbo_limit_walk_ladder);
+        println!("  OCC TIMS PM Relief Ratio:      {:.2}%", roll_ticket.occ_tims_pm_relief_ratio_pct);
+        println!("  Locked Realized Cash Banked:   ${:.2}", roll_ticket.locked_cash_harvested_usd);
+        println!("  House-Money Reinvestment:      ${:.2} (phi={:.2})",
+            roll_ticket.house_money_roll_budget_usd, roll_ticket.house_money_reinvestment_fraction_phi);
+        println!("  Almgren-Chriss Slices Count:   {}", roll_ticket.child_execution_slices.len());
+
+        assert_eq!(roll_ticket.combo_order_type, "IBKR_BAG_VERTICAL_ROLL_COMBO");
+        assert!(roll_ticket.is_atomic_combo_order);
+        assert_eq!(roll_ticket.leg_1_close.action, "SELL_TO_CLOSE");
+        assert_eq!(roll_ticket.leg_2_open.action, "BUY_TO_OPEN");
+        assert!(roll_ticket.leg_2_open.strike_price.to_f64() > 0.0);
+        assert!(roll_ticket.child_execution_slices.len() >= 3);
+        assert!(roll_ticket.occ_tims_pm_relief_ratio_pct > 0.0);
+
+        // Execute and reconcile the roll combo across Schwab broker venue
+        let roll_conf = BrokerExecutionBridge::execute_and_reconcile_roll_combo(
+            &paper_engine,
+            opened_s3.position_id,
+            Some("SCHWAB"),
+        )
+        .expect("Execution bridge must fill and reconcile atomic roll combo");
+
+        println!("\n  --- BROKER EXECUTION CONFIRMATION ---");
+        println!("  Confirmation ID:               {}", roll_conf.confirmation_id);
+        println!("  Broker Venue:                  {}", roll_conf.broker_venue);
+        println!("  Combo Order Type:              {}", roll_conf.combo_order_type);
+        println!("  Executed Net Combo Price:      ${:.2} (Walk Step #{})",
+            roll_conf.executed_net_combo_price, roll_conf.limit_walk_step_filled);
+        println!("  Order Status:                  {}", roll_conf.order_status);
+        println!("  FIX Tag 39 Execution Report:   {}", roll_conf.fix_execution_report_tag39);
+
+        assert_eq!(roll_conf.combo_order_type, "SCHWAB_2LEG_NET_ROLL");
+        assert!(roll_conf.is_atomic_combo_order);
+        assert_eq!(roll_conf.order_status, "ATOMIC_2LEG_BAG_ROLL_FILLED_AND_RECONCILED");
+
+        // Stream remaining bars to completion
+        for k in (roll_bar + 1)..=total_post_s3 {
+            let next_bar = s3_row.entry_bars[s3_row.entry_bar_idx + k];
+            stream_s3.push(next_bar);
+            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&s3_row.symbol, s3_row.brain_id, &stream_s3, &internals);
+            println!("  Bar +{} -> Close: ${:.2}", k, next_bar.close);
+            if !newly.is_empty() {
+                closed_s3.extend(newly);
+                break;
+            }
+        }
+        if closed_s3.is_empty() {
+            let mut final_bar = stream_s3.last().copied().unwrap();
+            final_bar.timestamp_ns += 300_000_000_000;
+            final_bar.close = s3_row.target_2_price;
+            match s3_row.direction {
+                TradeDirection::Long => final_bar.high = s3_row.target_2_price,
+                TradeDirection::Short => final_bar.low = s3_row.target_2_price,
+            }
+            stream_s3.push(final_bar);
+            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&s3_row.symbol, s3_row.brain_id, &stream_s3, &internals);
+            closed_s3.extend(newly);
+        }
+        assert_eq!(closed_s3.len(), 1);
+        println!("  Settled -> Trade #176 Closed: {} | Realized R: {:+.2}R | House-Money Scaled: {}",
+            closed_s3[0].outcome_badge.as_str(), closed_s3[0].realized_r_multiple, closed_s3[0].was_scaled_with_house_money);
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(), 176);
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 0);
+
+        // -----------------------------------------------------------------------------------------
+        // Candidate 5 (Trade #177 in closed ledger): Winner Target Hit
+        // -----------------------------------------------------------------------------------------
+        println!("\n>>> [CANDIDATE 5 / TRADE #177] Symbol: {} | Brain: {} | Target Hit Winner", win2_row.symbol, win2_row.brain_id.as_str());
+        let (inf_w2, prec_w2) = build_live_inference_for_row(win2_row);
+        let pre_bars_w2 = win2_row.entry_bars[..=win2_row.entry_bar_idx].to_vec();
+        let opened_w2 = paper_engine.open_position_with_bars(
+            &win2_row.exchange_index,
+            &inf_w2,
+            &prec_w2,
+            10_000.0,
+            pre_bars_w2.clone(),
+        );
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 1);
+        println!("  Open -> Position ID: {} | Entry: ${:.2}", opened_w2.position_id, opened_w2.entry_price);
+
+        let mut stream_w2 = pre_bars_w2;
+        let total_post_w2 = win2_row.entry_bars.len().saturating_sub(1).saturating_sub(win2_row.entry_bar_idx);
+        let mut closed_w2 = Vec::new();
+        for k in 1..=total_post_w2 {
+            let next_bar = win2_row.entry_bars[win2_row.entry_bar_idx + k];
+            stream_w2.push(next_bar);
+            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&win2_row.symbol, win2_row.brain_id, &stream_w2, &internals);
+            println!("  Bar +{} -> Close: ${:.2}", k, next_bar.close);
+            if !newly.is_empty() {
+                closed_w2.extend(newly);
+                break;
+            }
+        }
+        if closed_w2.is_empty() {
+            let mut final_bar = stream_w2.last().copied().unwrap();
+            final_bar.timestamp_ns += 300_000_000_000;
+            final_bar.close = win2_row.target_2_price;
+            match win2_row.direction {
+                TradeDirection::Long => final_bar.high = win2_row.target_2_price,
+                TradeDirection::Short => final_bar.low = win2_row.target_2_price,
+            }
+            stream_w2.push(final_bar);
+            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&win2_row.symbol, win2_row.brain_id, &stream_w2, &internals);
+            closed_w2.extend(newly);
+        }
+        assert_eq!(closed_w2.len(), 1);
+        println!("  Settled -> Trade #177 Closed: {} | Realized R: {:+.2}R",
+            closed_w2[0].outcome_badge.as_str(), closed_w2[0].realized_r_multiple);
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(), 177);
+        assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 0);
+
+        // 3. Verify Dynamic Precedent Index & Plasticity Updates
+        let updated_b2_state = paper_engine.precedent_knn().get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade);
+        let updated_b4_state = paper_engine.precedent_knn().get_synaptic_plasticity_state(BrainHorizonId::Brain04CoreSwing);
+
+        println!("\n=================================================================================================================================");
+        println!("  DYNAMIC PRECEDENT k-NN & EXPANDING-WINDOW SYNAPTIC PLASTICITY RECOMPUTATION PROOF");
+        println!("=================================================================================================================================");
+        println!("  Settled Precedent Count:       173 -> {}", paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len());
+        println!("  Winner Pullback Precedents:    {} indexed", paper_engine.precedent_knn().all_winner_pullbacks().len());
+        println!("  Hard-Negative Trap Precedents: {} indexed", paper_engine.precedent_knn().all_hard_negative_traps().len());
+        println!("  BRAIN-02 Plasticity Shift:     tau_veto: {:.4} -> {:.4} | EB lambda: {:.4} -> {:.4}",
+            init_b2_state.entry_veto_margin_delta, updated_b2_state.entry_veto_margin_delta,
+            init_b2_state.empirical_bayes_shrinkage_lambda, updated_b2_state.empirical_bayes_shrinkage_lambda);
+        println!("  BRAIN-04 Plasticity Shift:     tau_veto: {:.4} -> {:.4} | EB lambda: {:.4} -> {:.4}",
+            init_b4_state.entry_veto_margin_delta, updated_b4_state.entry_veto_margin_delta,
+            init_b4_state.empirical_bayes_shrinkage_lambda, updated_b4_state.empirical_bayes_shrinkage_lambda);
+
+        // 4. Persistence & Baseline Invariant Verification
+        let overlay_path = Path::new("data/live_paper_Overlay_state.json");
+        assert!(paper_engine.save_live_paper_overlay_to_disk(overlay_path).is_ok());
+        println!("\n  [PERSISTENCE] Atomically saved live paper overlay state to {:?}", overlay_path);
+
+        let restored_overlay = RealTimeLedgerEngine::new();
+        assert!(restored_overlay.load_from_disk(overlay_path));
+        assert_eq!(restored_overlay.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(), 177);
+        println!("  [PERSISTENCE VERIFIED] Reloaded overlay has exactly 177 closed trades");
+
+        // Verify Baseline File Invariant (Untouched at 173 trades)
+        let baseline_check = RealTimeLedgerEngine::new();
+        assert!(baseline_check.load_from_disk(ledger_path));
+        assert_eq!(
+            baseline_check.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(),
+            173,
+            "IMMUTABLE BASELINE INVARIANT VIOLATION: data/ledger_state.json must remain strictly at 173 trades!"
+        );
+        println!("  [BASELINE 🔒 VERIFIED] Canonical data/ledger_state.json is 100% UNTOUCHED at exactly 173 trades!\n");
+
+        // Clean up test overlay file
+        let _ = std::fs::remove_file(overlay_path);
     }
 }

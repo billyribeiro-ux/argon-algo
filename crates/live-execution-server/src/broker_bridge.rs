@@ -978,8 +978,37 @@ impl BrokerExecutionBridge {
         let locked_cash_harvested_usd = banked_realized_cash_usd;
         let combo_order_type = "IBKR_BAG_VERTICAL_ROLL_COMBO".to_string();
 
+        let occ_tims_pm_relief_ratio_pct = {
+            let sigma_tims = syn_state.learned_occ_tims_sigma_shock_pct.max(0.01);
+            let theta_h = syn_state.learned_vanna_tail_hedge_ratio_theta;
+            let base_relief =
+                100.0 * (0.28 + 1.45 * theta_h + 0.35 * 0.15) / (1.0 + sigma_tims);
+            (base_relief * 100.0).round() / 100.0
+        };
+
+        let s1_f64: Vec<f64> = pos
+            .entry_embedding_128
+            .iter()
+            .take(32)
+            .map(|&v| v as f64)
+            .collect();
+        let tranche_multiplier = 1.35;
+        let slice_plan = AlmgrenChrissExecutionSlicer::compute_slice_plan(
+            &s1_f64,
+            pos.quantity_shares,
+            buy_to_open_roll_contracts.max(1),
+            pos.entry_price.to_f64(),
+            pos.notional_allocated_usd,
+            syn_state.learned_almgren_chriss_risk_aversion_lambda,
+            syn_state.learned_sor_venue_weights_4,
+            syn_state.generation_id,
+            tranche_multiplier,
+        );
+        let child_execution_slices = slice_plan.child_execution_slices;
+
         let ibkr_bag_combo_payload = IbkrBagComboPayload {
             combo_order_type: combo_order_type.clone(),
+            is_atomic_combo_order: true,
             leg_1_close: leg_1_close.clone(),
             leg_2_open: leg_2_open.clone(),
             net_combo_limit_price,
@@ -987,6 +1016,7 @@ impl BrokerExecutionBridge {
             pre_roll_net_delta,
             post_roll_net_delta,
             post_roll_gamma_convexity_boost_pct,
+            occ_tims_pm_relief_ratio_pct,
             locked_cash_harvested_usd,
         };
 
@@ -994,6 +1024,7 @@ impl BrokerExecutionBridge {
             "broker": "IBKR_TWS_API_V10",
             "strategy": "CBOE_GAMMA_WALL_HOUSE_MONEY_ROLL_UP",
             "comboOrderType": "IBKR_BAG_VERTICAL_ROLL_COMBO",
+            "isAtomicComboOrder": true,
             "secType": "BAG",
             "symbol": pos.symbol,
             "netComboLimitPrice": net_combo_limit_price,
@@ -1001,6 +1032,7 @@ impl BrokerExecutionBridge {
             "preRollNetDelta": pre_roll_net_delta,
             "postRollNetDelta": post_roll_net_delta,
             "postRollGammaConvexityBoostPct": post_roll_gamma_convexity_boost_pct,
+            "occTimsPmReliefRatioPct": occ_tims_pm_relief_ratio_pct,
             "lockedCashHarvestedUsd": locked_cash_harvested_usd,
             "comboLegs": [
                 {
@@ -1086,6 +1118,63 @@ impl BrokerExecutionBridge {
         })
         .to_string();
 
+        let webull_roll_payload_json = serde_json::json!({
+            "broker": "WEBULL_FINANCIAL_API_V1",
+            "comboOrderType": "WEBULL_2LEG_VERTICAL_ROLL",
+            "isAtomicComboOrder": true,
+            "symbol": pos.symbol,
+            "netComboLimitPrice": net_combo_limit_price,
+            "nbboLimitWalkLadder": nbbo_limit_walk_ladder,
+            "legs": [
+                {
+                    "leg": 1,
+                    "action": "SELL_TO_CLOSE",
+                    "symbol": current_itm_occ_symbol,
+                    "quantity": stc_contracts,
+                    "orderType": "LMT",
+                    "lmtPrice": leg1_mid
+                },
+                {
+                    "leg": 2,
+                    "action": "BUY_TO_OPEN",
+                    "symbol": next_gamma_wall_occ_symbol,
+                    "quantity": buy_to_open_roll_contracts,
+                    "orderType": "LMT",
+                    "lmtPrice": leg2_mid
+                }
+            ],
+            "netCreditBankedUsd": banked_realized_cash_usd,
+            "lockedCashHarvestedUsd": locked_cash_harvested_usd,
+            "occTimsPmReliefRatioPct": occ_tims_pm_relief_ratio_pct
+        })
+        .to_string();
+
+        let robinhood_roll_payload_json = serde_json::json!({
+            "broker": "ROBINHOOD_DERIVATIVES_API_V2",
+            "comboOrderType": "ROBINHOOD_2LEG_SPREAD_ROLL",
+            "isAtomicComboOrder": true,
+            "symbol": pos.symbol,
+            "price": net_combo_limit_price,
+            "direction": "credit",
+            "legs": [
+                {
+                    "side": "sell",
+                    "position_effect": "close",
+                    "option": current_itm_occ_symbol,
+                    "ratio_quantity": stc_contracts
+                },
+                {
+                    "side": "buy",
+                    "position_effect": "open",
+                    "option": next_gamma_wall_occ_symbol,
+                    "ratio_quantity": buy_to_open_roll_contracts
+                }
+            ],
+            "netCreditHarvestedUsd": banked_realized_cash_usd,
+            "occTimsPmReliefRatioPct": occ_tims_pm_relief_ratio_pct
+        })
+        .to_string();
+
         let mut roll_bytes = *pos.position_id.as_bytes();
         roll_bytes[0] ^= 0xC3;
         roll_bytes[15] ^= 0x3C;
@@ -1104,6 +1193,7 @@ impl BrokerExecutionBridge {
                 "ARMED_AWAITING_PROFIT_LOCK_QUANTILE".to_string()
             },
             is_gamma_roll_active,
+            is_atomic_combo_order: true,
             current_itm_occ_symbol,
             current_itm_contract_desc: pos.matched_option_contract.clone(),
             sell_to_close_contracts: stc_contracts,
@@ -1132,10 +1222,14 @@ impl BrokerExecutionBridge {
             pre_roll_net_delta,
             post_roll_net_delta,
             post_roll_gamma_convexity_boost_pct,
+            occ_tims_pm_relief_ratio_pct,
+            child_execution_slices,
             locked_cash_harvested_usd,
             ibkr_bag_combo_payload,
             ibkr_combo_roll_payload_json,
             schwab_roll_payload_json,
+            webull_roll_payload_json,
+            robinhood_roll_payload_json,
             alpaca_roll_payload_json,
         }
     }
@@ -1150,6 +1244,8 @@ impl BrokerExecutionBridge {
         let broker_venue = venue_override.unwrap_or("IBKR_TWS").to_uppercase();
         let combo_order_type = match broker_venue.as_str() {
             "CHARLES_SCHWAB" | "SCHWAB" => "SCHWAB_2LEG_NET_ROLL".to_string(),
+            "WEBULL" | "WEBULL_FINANCIAL" => "WEBULL_2LEG_VERTICAL_ROLL".to_string(),
+            "ROBINHOOD" => "ROBINHOOD_2LEG_SPREAD_ROLL".to_string(),
             "ALPACA_API" | "ALPACA" => "ALPACA_MLEG_LIMIT".to_string(),
             _ => "IBKR_BAG_VERTICAL_ROLL_COMBO".to_string(),
         };
@@ -1201,6 +1297,7 @@ impl BrokerExecutionBridge {
             brain_id: roll_ticket.brain_id.code().to_string(),
             broker_venue,
             combo_order_type,
+            is_atomic_combo_order: true,
             leg_1_close: roll_ticket.leg_1_close.clone(),
             leg_2_open: roll_ticket.leg_2_open.clone(),
             net_combo_limit_price: roll_ticket.net_combo_limit_price,
@@ -1210,6 +1307,7 @@ impl BrokerExecutionBridge {
             pre_roll_net_delta: roll_ticket.pre_roll_net_delta,
             post_roll_net_delta: roll_ticket.post_roll_net_delta,
             post_roll_gamma_convexity_boost_pct: roll_ticket.post_roll_gamma_convexity_boost_pct,
+            occ_tims_pm_relief_ratio_pct: roll_ticket.occ_tims_pm_relief_ratio_pct,
             locked_cash_harvested_usd: roll_ticket.locked_cash_harvested_usd,
             house_money_reinvested_usd: roll_ticket.house_money_roll_budget_usd,
             total_combo_commission_usd,

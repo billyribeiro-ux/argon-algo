@@ -3619,6 +3619,10 @@ impl RealTimeLedgerEngine {
             .retain(|p| !(p.symbol.eq_ignore_ascii_case(symbol) && p.brain_id == brain_id));
     }
 
+    pub fn clear_all_open_positions(&self) {
+        self.positions_opened.write().clear();
+    }
+
     pub fn clear_trades_and_positions_for_symbol_and_brain(
         &self,
         symbol: &str,
@@ -4949,6 +4953,7 @@ impl RealTimeLedgerEngine {
         self.populate_causal_adaptive_outcome_for_row(&mut row);
         self.closed_ledger.write().push(row.clone());
         self.sync_closed_row_to_precedent_knn(&row);
+        self.recompute_causal_plasticity();
 
         self.webhook_dispatcher
             .record_lifecycle_event(WebhookEventPayload {
@@ -9229,6 +9234,7 @@ impl RealTimeLedgerEngine {
         settled_row: &ClosedTradeRow,
     ) -> Option<EvolutionGenerationRecord> {
         self.sync_closed_row_to_precedent_knn(settled_row);
+        self.recompute_causal_plasticity();
         if self.evolution_generations_history.read().len() < 37 {
             let _ = self.run_autonomous_evolution_generation();
         }
@@ -9238,6 +9244,30 @@ impl RealTimeLedgerEngine {
             .filter(|r| r.is_current_champion)
             .max_by_key(|r| r.generation_id)
             .cloned()
+    }
+
+    /// Recomputes causal synaptic plasticity states across all 5 brains (`BRAIN-01..BRAIN-05`)
+    /// incorporating all settled trades in `closed_ledger` at the active champion generation (Gen 36).
+    pub fn recompute_causal_plasticity(&self) {
+        let settled_snap = self.closed_ledger.read().clone();
+        let active_gen = self
+            .evolution_generations_history
+            .read()
+            .iter()
+            .filter(|r| r.is_current_champion)
+            .map(|r| r.generation_id)
+            .max()
+            .unwrap_or(36);
+        for b in [
+            BrainHorizonId::Brain01PennyAnomaly,
+            BrainHorizonId::Brain02IntradayDayTrade,
+            BrainHorizonId::Brain03ShortTermSwing,
+            BrainHorizonId::Brain04CoreSwing,
+            BrainHorizonId::Brain05LongTermWealth,
+        ] {
+            let st = self.compute_causal_plasticity_state_for_prefix(b, &settled_snap, active_gen);
+            self.precedent_knn.set_synaptic_plasticity_state(st);
+        }
     }
 
     /// Resets multi-generation evolution history and synaptic plasticity states to Gen 0 baseline.
@@ -9335,7 +9365,15 @@ impl RealTimeLedgerEngine {
             synaptic_plasticity_states: self.precedent_knn.ordered_synaptic_plasticity_states(),
         };
         let bytes = serde_json::to_vec_pretty(&payload).map_err(std::io::Error::other)?;
-        std::fs::write(path, bytes)
+        let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp_path, &bytes)?;
+        std::fs::rename(&tmp_path, path)
+    }
+
+    /// Persists the active live paper trading overlay atomically to `data/live_paper_Overlay_state.json` (or `path`),
+    /// ensuring zero corruption of the underlying canonical ledger baseline.
+    pub fn save_live_paper_overlay_to_disk(&self, path: &std::path::Path) -> std::io::Result<()> {
+        self.save_to_disk(path)
     }
 
     /// Restores `positions_opened`, `closed_ledger`, `era1_calibrations`, `era1_symbol_median_stops`, `vetoed_repeat_traps`, and `webhook_outbox` from disk if present and non-empty.

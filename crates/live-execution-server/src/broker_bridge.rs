@@ -854,6 +854,28 @@ impl BrokerExecutionBridge {
         put.max((k - s).max(0.0))
     }
 
+    /// Greatest common divisor for multi-leg combo order contract ratio simplification
+    pub fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+        while b != 0 {
+            let t = b;
+            b = a % b;
+            a = t;
+        }
+        a.max(1)
+    }
+
+    /// Howard Hinnant civil calendar algorithm to convert (year, month, day) to unix epoch seconds
+    pub fn ymd_to_epoch_seconds(year: i64, month: i64, day: i64) -> i64 {
+        let y = if month <= 2 { year - 1 } else { year };
+        let era = (if y >= 0 { y } else { y - 399 }) / 400;
+        let yoe = (y - era * 400) as u32;
+        let m = (if month > 2 { month - 3 } else { month + 9 }) as u32;
+        let doy = (153 * m + 2) / 5 + (day as u32) - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days_since_epoch = era * 146097 + (doe as i64) - 719468;
+        days_since_epoch * 86400
+    }
+
     /// Robust parser for matched option contracts supporting OCC format ("MSFT  261218C00465000"),
     /// human-readable format ("MSFT 2026-12-18 $465.00C"), or dynamic future expiration synthesis.
     pub fn parse_occ_or_contract_desc(
@@ -1047,15 +1069,45 @@ impl BrokerExecutionBridge {
         let stc_contracts = pos.option_contracts_count.max(1);
 
         // Analytical Black-Scholes Pricing & Strict No-Arbitrage Bounds
-        let dte_days: f64 = match pos.brain_id {
+        let default_dte_days: f64 = match pos.brain_id {
             BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => 7.0,
             BrainHorizonId::Brain03ShortTermSwing => 14.0,
             BrainHorizonId::Brain04CoreSwing => 35.0,
             BrainHorizonId::Brain05LongTermWealth => 70.0,
         };
+        let dte_days: f64 = if exp_code.len() == 6 {
+            if let (Ok(yy), Ok(mm), Ok(dd)) = (
+                exp_code[0..2].parse::<i64>(),
+                exp_code[2..4].parse::<i64>(),
+                exp_code[4..6].parse::<i64>(),
+            ) {
+                let year = 2000 + yy;
+                let exp_epoch_s = Self::ymd_to_epoch_seconds(year, mm, dd);
+                let cur_epoch_s = pos
+                    .entry_bars
+                    .last()
+                    .map(|b| (b.timestamp_ns / 1_000_000_000) as i64)
+                    .unwrap_or((pos.opened_timestamp_ns / 1_000_000_000) as i64);
+                let diff_days = (exp_epoch_s - cur_epoch_s) as f64 / 86400.0;
+                if diff_days >= 0.5 && diff_days <= 120.0 {
+                    diff_days
+                } else {
+                    default_dte_days
+                }
+            } else {
+                default_dte_days
+            }
+        } else {
+            default_dte_days
+        };
         let t_years = (dte_days / 365.0_f64).max(0.005_f64);
         let r_rf = 0.045; // 4.5% US Treasury risk-free benchmark
-        let iv = pos.contract_iv.clamp(0.18, 0.65);
+        let raw_iv = if pos.contract_iv > 1.5 {
+            pos.contract_iv / 100.0
+        } else {
+            pos.contract_iv
+        };
+        let iv = raw_iv.clamp(0.12, 1.50);
 
         let bs_leg1 = if right == "C" {
             Self::black_scholes_call(live_px, cur_strike_f64, t_years, r_rf, iv)
@@ -1090,27 +1142,6 @@ impl BrokerExecutionBridge {
             leg1_mid = leg2_mid + (spread_width * 0.35).clamp(0.50, spread_width - 0.20);
         }
 
-        // Strict No-Arbitrage Theorem on Vertical Spreads:
-        // 0.10 <= Net Credit <= spread_width - 0.10 < spread_width
-        let net_combo_limit_price =
-            ((leg1_mid - leg2_mid).clamp(0.10, (spread_width - 0.10).max(0.10)) * 100.0).round()
-                / 100.0;
-
-        // Ensure leg2_mid matches net combo limit
-        if (leg1_mid - leg2_mid - net_combo_limit_price).abs() > 0.01 {
-            leg2_mid = ((leg1_mid - net_combo_limit_price) * 100.0).round() / 100.0;
-        }
-
-        let leg1_half_spread = (leg1_mid * 0.008).clamp(0.01, 0.06);
-        let leg1_bid = (((leg1_mid - leg1_half_spread).max(0.05)) * 100.0).round() / 100.0;
-        let leg1_ask = (((leg1_mid + leg1_half_spread).max(0.06)) * 100.0).round() / 100.0;
-        let cur_strike_price =
-            SubPennyPrice::from_f64(cur_strike_f64).unwrap_or(pos.entry_price);
-
-        let leg2_half_spread = (leg2_mid * 0.009).clamp(0.01, 0.05);
-        let leg2_bid = (((leg2_mid - leg2_half_spread).max(0.04)) * 100.0).round() / 100.0;
-        let leg2_ask = (((leg2_mid + leg2_half_spread).max(0.05)) * 100.0).round() / 100.0;
-
         let entry_prem = pos.option_entry_premium.to_f64().max(0.15);
         let intrinsic_option_gain_usd =
             (((leg1_mid - entry_prem).max(entry_prem * 0.38) * (stc_contracts as f64) * 100.0)
@@ -1125,10 +1156,36 @@ impl BrokerExecutionBridge {
             ((intrinsic_option_gain_usd - banked_realized_cash_usd).max(25.0) * 100.0).round()
                 / 100.0;
 
-        let buy_to_open_roll_contracts = ((house_money_roll_budget_usd
-            / (leg2_mid * 100.0).max(12.0))
-        .floor() as u32)
-            .clamp(1, stc_contracts.saturating_mul(2).max(2));
+        // 1:1 vertical roll structure with harvested cash and house-money reinvestment
+        let buy_to_open_roll_contracts = stc_contracts;
+
+        // Exact Multi-Leg Ratio Consistency on IBKR BAG / Schwab Combo Orders
+        let gcd = Self::gcd_u32(stc_contracts, buy_to_open_roll_contracts);
+        let _leg1_ratio = stc_contracts / gcd;
+        let _leg2_ratio = buy_to_open_roll_contracts / gcd;
+
+        // Strict No-Arbitrage Theorem & Exact Combo Limit Pricing:
+        // Price net_combo_limit_price as the exact net credit per combo unit:
+        // (stc_contracts * leg1_mid - buy_to_open_roll_contracts * leg2_mid) / (stc_contracts.max(1))
+        let total_credit_spread =
+            (stc_contracts as f64 * leg1_mid) - (buy_to_open_roll_contracts as f64 * leg2_mid);
+        let unit_net_credit = total_credit_spread / (stc_contracts.max(1) as f64);
+        let net_combo_limit_price =
+            ((unit_net_credit.clamp(0.10, (spread_width - 0.10).max(0.10))) * 100.0).round()
+                / 100.0;
+
+        // Reconcile leg2_mid so Leg 1, Leg 2, and Net Credit reconcile to the penny
+        leg2_mid = ((leg1_mid - net_combo_limit_price) * 100.0).round() / 100.0;
+
+        let leg1_half_spread = (leg1_mid * 0.008).clamp(0.01, 0.06);
+        let leg1_bid = (((leg1_mid - leg1_half_spread).max(0.05)) * 100.0).round() / 100.0;
+        let leg1_ask = (((leg1_mid + leg1_half_spread).max(0.06)) * 100.0).round() / 100.0;
+        let cur_strike_price =
+            SubPennyPrice::from_f64(cur_strike_f64).unwrap_or(pos.entry_price);
+
+        let leg2_half_spread = (leg2_mid * 0.009).clamp(0.01, 0.05);
+        let leg2_bid = (((leg2_mid - leg2_half_spread).max(0.04)) * 100.0).round() / 100.0;
+        let leg2_ask = (((leg2_mid + leg2_half_spread).max(0.05)) * 100.0).round() / 100.0;
 
         let current_itm_live_premium =
             SubPennyPrice::from_f64(leg1_mid).unwrap_or(pos.option_live_premium);

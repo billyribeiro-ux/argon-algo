@@ -4975,7 +4975,14 @@ impl RealTimeLedgerEngine {
                 row.house_money_scale_bar_offset = Some((pos.bars_held_count.max(5) as u8).min(255));
             }
             if row.house_money_additional_r_gained <= 0.0 {
-                row.house_money_additional_r_gained = (pos.locked_profit_r * 0.45).max(0.35);
+                let floor_r = pos.guaranteed_net_floor_r.max(pos.locked_profit_r);
+                let option_banked_r = if pos.risk_budget_usd > 0.0 {
+                    pos.banked_option_gain_usd / pos.risk_budget_usd
+                } else {
+                    0.0
+                };
+                let excess_r = (realized_r_multiple - floor_r).max(0.0) + option_banked_r;
+                row.house_money_additional_r_gained = ((excess_r.max(0.01)) * 1000.0).round() / 1000.0;
             }
             if !row.adaptive_outcome_badge.contains("HOUSE-MONEY")
                 && !row.adaptive_outcome_badge.contains("TargetHit")
@@ -4988,7 +4995,11 @@ impl RealTimeLedgerEngine {
         }
 
         // If the position was protected from giveback live or hit a profit-locked ratchet stop
-        if pos.structural_stop_price > pos.initial_structural_stop
+        let stop_was_ratcheted = match pos.direction {
+            TradeDirection::Long => pos.structural_stop_price > pos.initial_structural_stop,
+            TradeDirection::Short => pos.structural_stop_price < pos.initial_structural_stop,
+        };
+        if stop_was_ratcheted
             && row.scale_in_history.iter().any(|s| {
                 s.contains("Ratchet")
                     || s.contains("Protected")
@@ -5001,7 +5012,18 @@ impl RealTimeLedgerEngine {
                 row.giveback_ratchet_bar_offset = (pos.bars_held_count.max(5) as u8).min(255);
             }
             if row.giveback_r_saved <= 0.0 {
-                row.giveback_r_saved = 0.50;
+                let dist_from_initial_stop_u = match pos.direction {
+                    TradeDirection::Long => {
+                        (exit_price.scaled_units() - pos.initial_structural_stop.scaled_units())
+                            as f64
+                    }
+                    TradeDirection::Short => {
+                        (pos.initial_structural_stop.scaled_units()
+                            - exit_price.scaled_units()) as f64
+                    }
+                };
+                let r_saved = (dist_from_initial_stop_u / risk_units).max(0.0);
+                row.giveback_r_saved = ((r_saved.max(0.01)) * 100.0).round() / 100.0;
             }
         }
 

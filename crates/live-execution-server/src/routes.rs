@@ -2315,6 +2315,14 @@ pub fn build_axum_router(state: AppState) -> Router {
             "/api/v1/scanner/candidates",
             get(scanner_candidates_handler),
         )
+        .route(
+            "/api/v1/scanner/watchlist",
+            get(institutional_watchlist_handler),
+        )
+        .route(
+            "/api/v1/scanner/sunday-protocol",
+            get(sunday_alpha_protocol_handler),
+        )
         .route("/api/v1/chart/{symbol}", get(live_chart_handler))
         .route("/api/v1/ledger/snapshot", get(ledger_snapshot_handler))
         .route("/api/v1/positions/{id}", get(get_open_position_handler))
@@ -2597,6 +2605,403 @@ async fn scanner_candidates_handler(
     Ok(Json(ScannerCandidatesResponse {
         candidates,
         internals,
+    }))
+}
+
+/// Canonical 24 symbols spanning BRAIN-01..BRAIN-05 native operational horizons
+pub const CANONICAL_24_WATCHLIST_PAIRS: [(&str, BrainHorizonId, Timeframe); 24] = [
+    // BRAIN-01: Penny / Micro-Cap Anomaly (5m)
+    ("PLUG", BrainHorizonId::Brain01PennyAnomaly, Timeframe::M5),
+    ("CLOV", BrainHorizonId::Brain01PennyAnomaly, Timeframe::M5),
+    ("KULR", BrainHorizonId::Brain01PennyAnomaly, Timeframe::M5),
+    ("SOUN", BrainHorizonId::Brain01PennyAnomaly, Timeframe::M5),
+    // BRAIN-02: Intraday Day-Trading (5m)
+    ("NVDA", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+    ("TSLA", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+    ("SOFI", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+    ("AMD", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+    ("MARA", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+    ("SMCI", BrainHorizonId::Brain02IntradayDayTrade, Timeframe::M5),
+    // BRAIN-03: Short-Term Swing (1H)
+    ("PLTR", BrainHorizonId::Brain03ShortTermSwing, Timeframe::H1),
+    ("IONQ", BrainHorizonId::Brain03ShortTermSwing, Timeframe::H1),
+    ("COIN", BrainHorizonId::Brain03ShortTermSwing, Timeframe::H1),
+    ("AVGO", BrainHorizonId::Brain03ShortTermSwing, Timeframe::H1),
+    ("MSTR", BrainHorizonId::Brain03ShortTermSwing, Timeframe::H1),
+    // BRAIN-04: Core Swing (1D)
+    ("NVDA", BrainHorizonId::Brain04CoreSwing, Timeframe::D1),
+    ("AMD", BrainHorizonId::Brain04CoreSwing, Timeframe::D1),
+    ("AAPL", BrainHorizonId::Brain04CoreSwing, Timeframe::D1),
+    ("MSFT", BrainHorizonId::Brain04CoreSwing, Timeframe::D1),
+    ("META", BrainHorizonId::Brain04CoreSwing, Timeframe::D1),
+    // BRAIN-05: Long-Term Portfolio & Wealth (1W ISO)
+    ("GS", BrainHorizonId::Brain05LongTermWealth, Timeframe::W1),
+    ("SPY", BrainHorizonId::Brain05LongTermWealth, Timeframe::W1),
+    ("QQQ", BrainHorizonId::Brain05LongTermWealth, Timeframe::W1),
+    ("MSFT", BrainHorizonId::Brain05LongTermWealth, Timeframe::W1),
+];
+
+/// Phase 29: Institutional Watchlist Row with Dual-Engine and Stage 0 Conformal Gate telemetry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstitutionalWatchlistRow {
+    pub rank: usize,
+    pub symbol: String,
+    pub brain_id: BrainHorizonId,
+    pub brain_name: String,
+    pub direction: raw_fingerprint_core::TradeDirection,
+    pub strategy_archetype: String,
+    pub engine_a_confidence_pct: f64,
+    pub engine_b_confidence_pct: f64,
+    pub consensus_confidence_pct: f64,
+    pub active_engine_mode: String,
+    pub entry_price: f64,
+    pub structural_stop_price: f64,
+    pub stop_distance_pct: f64,
+    pub target_1_price: f64,
+    pub target_2_price: f64,
+    pub expected_r_multiple: f64,
+    pub stage0_conformal_status: String,
+    pub mahalanobis_win_distance: f64,
+    pub mahalanobis_loss_distance: f64,
+    pub conformal_llr: f64,
+    pub conformal_threshold: f64,
+    pub matched_option_contract: String,
+    pub option_structure: String,
+    pub kelly_fraction_pct: f64,
+    pub is_actionable: bool,
+}
+
+/// Phase 29: Institutional Watchlist Response returned by `GET /api/v1/scanner/watchlist`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstitutionalWatchlistResponse {
+    pub timestamp_iso: String,
+    pub universe_size: usize,
+    pub actionable_setups_count: usize,
+    pub active_generation_id: u32,
+    pub watchlist: Vec<InstitutionalWatchlistRow>,
+    pub market_internals: UnifiedMarketInternals,
+}
+
+/// Phase 29: Sunday Alpha Protocol OMS/EMS Stager Export Row
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SundayAlphaProtocolExportRow {
+    pub protocol_rank: usize,
+    pub symbol: String,
+    pub brain_id: String,
+    pub direction: String,
+    pub action_status: String,
+    pub engine_consensus_pct: f64,
+    pub execution_venue_ticket: String,
+    pub limit_entry_price: f64,
+    pub structural_stop_loss: f64,
+    pub profit_target_1: f64,
+    pub profit_target_2: f64,
+    pub risk_reward_r: f64,
+    pub kelly_sizing_pct: f64,
+    pub matched_cboe_contract: String,
+    pub stage0_conformal_verdict: String,
+    pub mahalanobis_llr: f64,
+}
+
+/// Phase 29: Sunday Alpha Protocol Response returned by `GET /api/v1/scanner/sunday-protocol`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SundayAlphaProtocolResponse {
+    pub protocol_title: String,
+    pub generated_at_iso: String,
+    pub generation_id: u32,
+    pub total_screened: usize,
+    pub approved_signals_count: usize,
+    pub export_feed: Vec<SundayAlphaProtocolExportRow>,
+    pub csv_feed: String,
+}
+
+/// Helper to build the unified live institutional watchlist
+pub async fn build_institutional_watchlist(
+    state: &AppState,
+) -> Result<InstitutionalWatchlistResponse, (StatusCode, String)> {
+    let mut rows = Vec::new();
+    let gen_id = state
+        .ledger
+        .precedent_knn()
+        .get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade)
+        .generation_id;
+
+    for &(sym, brain_id, tf) in &CANONICAL_24_WATCHLIST_PAIRS {
+        if let Some(cached_ohlcv) =
+            market_data_bus::YahooSessionManager::try_load_warm_ohlcv_disk_cache(
+                sym,
+                tf,
+                24,
+                u64::MAX,
+            )
+        {
+            let last_close = cached_ohlcv.last().map(|b| b.close).unwrap_or(10.0);
+            let spread = (last_close * 0.0005).max(0.00001);
+            let unified_bars = YahooFinanceLiveAdapter::map_real_ohlcv_to_unified_bars(
+                sym,
+                tf,
+                &cached_ohlcv,
+                spread,
+            );
+            let raw_bars: Vec<RawBarRecord> =
+                unified_bars.iter().map(|b| b.to_raw_bar_record()).collect();
+            let window_bars = if raw_bars.len() > 32 {
+                &raw_bars[raw_bars.len() - 32..]
+            } else {
+                &raw_bars[..]
+            };
+            let (raw_sf, raw_internals, raw_opts) = canonical_settled_walk_forward_streams(
+                sym,
+                window_bars,
+                raw_fingerprint_core::RawShortFloatSnapshot::default(),
+                raw_fingerprint_core::RawMarketInternalsSnapshot::default(),
+                raw_fingerprint_core::RawOptionsSnapshot::default(),
+            );
+            if let Ok(probe) = state.onnx_engine.evaluate_live_signal(
+                sym,
+                brain_id,
+                true,
+                window_bars,
+                &raw_opts,
+                &raw_sf,
+                &raw_internals,
+            ) {
+                let precedents = state.ledger.precedent_knn().query_causal_precedents(
+                    brain_id,
+                    Some(sym),
+                    i64::MAX,
+                    &probe.signal.latent_embedding_128,
+                    11,
+                );
+                let emp_dist = precedents.to_empirical_distribution();
+                let inference = state
+                    .onnx_engine
+                    .evaluate_live_signal_with_precedents(
+                        sym,
+                        brain_id,
+                        true,
+                        window_bars,
+                        &raw_opts,
+                        &raw_sf,
+                        &raw_internals,
+                        Some(&emp_dist),
+                    )
+                    .unwrap_or(probe);
+
+                let stage0 = state.ledger.evaluate_live_entry_stage0_gate(
+                    &inference,
+                    precedents.win_rate_pct,
+                    window_bars,
+                    false,
+                );
+
+                let dual_eval = state.ledger.evaluate_live_dual_engine_signal_for_entry(
+                    &inference,
+                    precedents.win_rate_pct,
+                    window_bars,
+                );
+
+                let entry_p = inference.signal.entry_price.to_f64();
+                let stop_p = inference.signal.structural_stop_price.to_f64();
+                let stop_dist_pct =
+                    ((entry_p - stop_p).abs() / entry_p.max(0.01) * 100.0 * 100.0).round() / 100.0;
+                let is_actionable = !stage0.should_veto && dual_eval.consensus_confidence_pct >= 65.0;
+
+                let (era1_wr, era1_pf, brain_era1_stop_pct) = state
+                    .ledger
+                    .get_era1_brain_calibration(brain_id)
+                    .map(|c| {
+                        (
+                            c.era1_calibrated_win_rate_pct,
+                            c.era1_calibrated_profit_factor,
+                            c.era1_median_stop_pct,
+                        )
+                    })
+                    .unwrap_or((72.5, 1.95, 0.032));
+                let symbol_era1_median_stop_pct = state
+                    .ledger
+                    .get_era1_symbol_median_stop_pct(sym, brain_id)
+                    .unwrap_or(brain_era1_stop_pct);
+                let kelly_plan =
+                    crate::ledger::KellyCapitalAllocator::compute_allocation_with_symbol_stop(
+                        100_000.0,
+                        brain_id,
+                        inference.signal.entry_price,
+                        inference.signal.structural_stop_price,
+                        inference.signal.target_1_price,
+                        inference.signal.target_2_price,
+                        dual_eval.consensus_confidence_pct,
+                        precedents.win_rate_pct,
+                        precedents.p50_mfe_pct,
+                        precedents.p85_mae_pct,
+                        era1_wr,
+                        era1_pf,
+                        symbol_era1_median_stop_pct,
+                    );
+
+                let syn_state = state
+                    .ledger
+                    .precedent_knn()
+                    .get_synaptic_plasticity_state(brain_id);
+                let conf_thresh = if stage0.conformal_entry_hurdle > 0.0 {
+                    stage0.conformal_entry_hurdle
+                } else {
+                    ((syn_state.learned_conformal_veto_quantile.max(0.01)) * 1000.0).round()
+                        / 1000.0
+                };
+
+                rows.push(InstitutionalWatchlistRow {
+                    rank: 0,
+                    symbol: sym.to_string(),
+                    brain_id,
+                    brain_name: brain_id.display_name().to_string(),
+                    direction: inference.signal.direction,
+                    strategy_archetype: inference.signal.primary_driver.as_str().to_string(),
+                    engine_a_confidence_pct: dual_eval.engine_a_confidence_pct,
+                    engine_b_confidence_pct: dual_eval.engine_b_confidence_pct,
+                    consensus_confidence_pct: dual_eval.consensus_confidence_pct,
+                    active_engine_mode: dual_eval.active_engine_mode,
+                    entry_price: entry_p,
+                    structural_stop_price: stop_p,
+                    stop_distance_pct: stop_dist_pct,
+                    target_1_price: inference.signal.target_1_price.to_f64(),
+                    target_2_price: inference.signal.target_2_price.to_f64(),
+                    expected_r_multiple: inference.signal.expected_r_multiple,
+                    stage0_conformal_status: if stage0.should_veto {
+                        "VETO".to_string()
+                    } else {
+                        "PASS".to_string()
+                    },
+                    mahalanobis_win_distance: dual_eval.mahalanobis_win_distance,
+                    mahalanobis_loss_distance: dual_eval.mahalanobis_loss_distance,
+                    conformal_llr: stage0.conformal_entry_llr,
+                    conformal_threshold: conf_thresh,
+                    matched_option_contract: inference.matched_option.matched_option_contract.clone(),
+                    option_structure: format!("{:?}", inference.matched_option.option_structure),
+                    kelly_fraction_pct: kelly_plan.kelly_fraction_pct,
+                    is_actionable,
+                });
+            }
+        }
+    }
+
+    // Rank rows: actionable first, then by consensus confidence descending
+    rows.sort_by(|a, b| {
+        b.is_actionable
+            .cmp(&a.is_actionable)
+            .then_with(|| {
+                b.consensus_confidence_pct
+                    .partial_cmp(&a.consensus_confidence_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    for (idx, row) in rows.iter_mut().enumerate() {
+        row.rank = idx + 1;
+    }
+
+    let actionable_count = rows.iter().filter(|r| r.is_actionable).count();
+    let universe_size = rows.len();
+
+    let internals = state
+        .data_bus
+        .fetch_market_internals_with_failover()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(InstitutionalWatchlistResponse {
+        timestamp_iso: chrono::Utc::now().to_rfc3339(),
+        universe_size,
+        actionable_setups_count: actionable_count,
+        active_generation_id: gen_id,
+        watchlist: rows,
+        market_internals: internals,
+    })
+}
+
+async fn institutional_watchlist_handler(
+    State(state): State<AppState>,
+) -> Result<Json<InstitutionalWatchlistResponse>, (StatusCode, String)> {
+    let res = build_institutional_watchlist(&state).await?;
+    Ok(Json(res))
+}
+
+async fn sunday_alpha_protocol_handler(
+    State(state): State<AppState>,
+) -> Result<Json<SundayAlphaProtocolResponse>, (StatusCode, String)> {
+    let watchlist_res = build_institutional_watchlist(&state).await?;
+    let mut export_feed = Vec::new();
+    let mut csv_lines = vec![
+        "Rank,Symbol,Brain,Direction,Action,ConsensusConf%,VenueTicket,EntryLimit,StopLoss,Target1,Target2,RiskRewardR,KellyPct,CBOEContract,Stage0Verdict,MahalanobisLLR".to_string()
+    ];
+
+    for row in &watchlist_res.watchlist {
+        let venue_ticket = match row.brain_id {
+            BrainHorizonId::Brain01PennyAnomaly => "IEX_DLIMIT_DAY",
+            BrainHorizonId::Brain02IntradayDayTrade => "IBKR_PEG_MID_SMART",
+            BrainHorizonId::Brain03ShortTermSwing => "IBKR_BAG_VERTICAL_COMBO",
+            BrainHorizonId::Brain04CoreSwing => "SCHWAB_2LEG_NET_ROLL",
+            BrainHorizonId::Brain05LongTermWealth => "IBKR_VOL_AUCTION_ACCUM",
+        };
+        let action_status = if row.is_actionable {
+            "ACTIONABLE_STAGE_READY"
+        } else if row.stage0_conformal_status == "VETO" {
+            "STAGE0_VETOED_TRAP"
+        } else {
+            "CONFIDENCE_SUB_THRESHOLD"
+        };
+        let maha_llr = row.mahalanobis_loss_distance - row.mahalanobis_win_distance;
+
+        export_feed.push(SundayAlphaProtocolExportRow {
+            protocol_rank: row.rank,
+            symbol: row.symbol.clone(),
+            brain_id: row.brain_id.as_str().to_string(),
+            direction: format!("{:?}", row.direction),
+            action_status: action_status.to_string(),
+            engine_consensus_pct: row.consensus_confidence_pct,
+            execution_venue_ticket: venue_ticket.to_string(),
+            limit_entry_price: row.entry_price,
+            structural_stop_loss: row.structural_stop_price,
+            profit_target_1: row.target_1_price,
+            profit_target_2: row.target_2_price,
+            risk_reward_r: row.expected_r_multiple,
+            kelly_sizing_pct: row.kelly_fraction_pct,
+            matched_cboe_contract: row.matched_option_contract.clone(),
+            stage0_conformal_verdict: row.stage0_conformal_status.clone(),
+            mahalanobis_llr: ((maha_llr * 1000.0).round() / 1000.0),
+        });
+
+        csv_lines.push(format!(
+            "{},{},{},{:?},{},{:.2}%,{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}%,{},{},{:.3}",
+            row.rank,
+            row.symbol,
+            row.brain_id.as_str(),
+            row.direction,
+            action_status,
+            row.consensus_confidence_pct,
+            venue_ticket,
+            row.entry_price,
+            row.structural_stop_price,
+            row.target_1_price,
+            row.target_2_price,
+            row.expected_r_multiple,
+            row.kelly_fraction_pct,
+            row.matched_option_contract,
+            row.stage0_conformal_status,
+            maha_llr
+        ));
+    }
+
+    let approved_count = export_feed.iter().filter(|r| r.action_status == "ACTIONABLE_STAGE_READY").count();
+
+    Ok(Json(SundayAlphaProtocolResponse {
+        protocol_title: "ARGON SUNDAY ALPHA PROTOCOL — INSTITUTIONAL EXECUTION STAGER FEED".to_string(),
+        generated_at_iso: watchlist_res.timestamp_iso,
+        generation_id: watchlist_res.active_generation_id,
+        total_screened: export_feed.len(),
+        approved_signals_count: approved_count,
+        export_feed,
+        csv_feed: csv_lines.join("\n"),
     }))
 }
 

@@ -1185,9 +1185,8 @@ impl BrokerExecutionBridge {
         let upper_bound = (leg1_mid - leg2_intrinsic.max(0.05))
             .min(spread_width - 0.05)
             .max(0.05);
-        let lower_bound = 0.05_f64.min(upper_bound);
         let net_combo_limit_price =
-            ((unit_net_credit.clamp(lower_bound, upper_bound)) * 100.0).round()
+            ((unit_net_credit.clamp(0.10, upper_bound.max(0.10))) * 100.0).round()
                 / 100.0;
 
         // Reconcile leg2_mid so Leg 1, Leg 2, and Net Credit reconcile to the penny

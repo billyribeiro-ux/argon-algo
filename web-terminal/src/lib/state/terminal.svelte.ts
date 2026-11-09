@@ -791,6 +791,8 @@ export interface IbkrBagComboLegEntry {
 
 export interface IbkrBagComboPayloadEntry {
   comboOrderType: string;
+  leg1Ratio?: number;
+  leg2Ratio?: number;
   leg1Close: IbkrBagComboLegEntry;
   leg2Open: IbkrBagComboLegEntry;
   netComboLimitPrice: number;
@@ -811,6 +813,8 @@ export interface StagedOptionRollUpTicketEntry {
   direction: TradeDirection;
   rollStatus: string;
   isGammaRollActive: boolean;
+  leg1Ratio?: number;
+  leg2Ratio?: number;
   currentItmOccSymbol: string;
   currentItmContractDesc: string;
   sellToCloseContracts: number;
@@ -844,6 +848,119 @@ export interface StagedOptionRollUpTicketEntry {
   ibkrComboRollPayloadJson: string;
   schwabRollPayloadJson: string;
   alpacaRollPayloadJson: string;
+}
+
+export interface InstitutionalWatchlistRow {
+  rank: number;
+  symbol: string;
+  brain_id: BrainId;
+  brain_name: string;
+  direction: TradeDirection;
+  strategy_archetype: string;
+  engine_a_confidence_pct: number;
+  engine_b_confidence_pct: number;
+  consensus_confidence_pct: number;
+  active_engine_mode: string;
+  entry_price: number;
+  structural_stop_price: number;
+  stop_distance_pct: number;
+  target_1_price: number;
+  target_2_price: number;
+  expected_r_multiple: number;
+  stage0_conformal_status: 'PASS' | 'VETO';
+  mahalanobis_win_distance: number;
+  mahalanobis_loss_distance: number;
+  conformal_llr: number;
+  conformal_threshold: number;
+  conformal_margin: number;
+  action_status: string;
+  venue_ticket: string;
+  matched_option_contract: string;
+  option_structure: string;
+  kelly_fraction_pct: number;
+  is_actionable: boolean;
+}
+
+export interface InstitutionalWatchlistResponse {
+  universe_size: number;
+  actionable_setups_count: number;
+  active_generation: string;
+  total_allocated_kelly_pct: number;
+  net_portfolio_delta_beta_weighted: number;
+  cross_brain_conflicts_blocked: number;
+  estimated_occ_tims_margin_relief_pct: number;
+  timestamp_iso: string;
+  eval_epoch_s: number;
+  watchlist: InstitutionalWatchlistRow[];
+}
+
+export interface SundayAlphaProtocolExportRow {
+  rank: number;
+  symbol: string;
+  brain_id: BrainId;
+  brain_name: string;
+  direction: TradeDirection;
+  strategy_archetype: string;
+  consensus_confidence_pct: number;
+  active_engine_mode: string;
+  entry_price: number;
+  structural_stop_price: number;
+  target_1_price: number;
+  target_2_price: number;
+  expected_r_multiple: number;
+  stage0_conformal_status: string;
+  conformal_margin: number;
+  venue_ticket: string;
+  matched_option_contract: string;
+  kelly_fraction_pct: number;
+  action_status: string;
+}
+
+export interface SundayAlphaProtocolResponse {
+  protocol_generation: string;
+  staged_for_execution_epoch_iso: string;
+  universe_size: number;
+  actionable_count: number;
+  total_allocated_kelly_pct: number;
+  net_portfolio_delta_beta_weighted: number;
+  cross_brain_conflicts_blocked: number;
+  estimated_occ_tims_margin_relief_pct: number;
+  staged_setups: SundayAlphaProtocolExportRow[];
+  csv_export_endpoint: string;
+  webhook_dispatch_endpoint: string;
+}
+
+export interface PaperOverlayBrainPlasticity {
+  brain_id: BrainId;
+  tau_veto: number;
+  eb_lambda: number;
+  learned_profit_lock_activation_r: number;
+  learned_conformal_veto_quantile: number;
+}
+
+export interface PaperOverlayTelemetryResponse {
+  mode: string;
+  baseline_ledger_locked: boolean;
+  baseline_trade_count: number;
+  baseline_sha256: string;
+  overlay_closed_count: number;
+  open_paper_positions: number;
+  recent_atomic_bag_rolls: number;
+  brain_plasticity_shifts: PaperOverlayBrainPlasticity[];
+  timestamp_iso: string;
+}
+
+export interface SundayAlphaDispatchResponse {
+  status: string;
+  dispatched_at_iso: string;
+  discord_embed_queued: boolean;
+  telegram_payload_queued: boolean;
+  slack_blocks_queued: boolean;
+  oms_bundle_queued: boolean;
+  staged_count: number;
+  total_portfolio_kelly_pct: number;
+  net_delta_beta_weighted: number;
+  conflicts_blocked: number;
 }
 
 const API_BASE: string = import.meta.env.VITE_ARGON_API_BASE ?? 'http://127.0.0.1:8090';
@@ -1061,6 +1178,17 @@ export class TerminalStore {
   activeStagedTicketModal = $state<StagedBrokerOrderTicketEntry | null>(null);
   activeStagedRollTicketModal = $state<StagedOptionRollUpTicketEntry | null>(null);
   lastExecutedRollComboBanner = $state<string | null>(null);
+
+  // Phase 29 & 30 Institutional Watchlist, Sunday Alpha Protocol & Paper Overlay
+  institutionalWatchlist = $state<InstitutionalWatchlistResponse | null>(null);
+  sundayAlphaProtocol = $state<SundayAlphaProtocolResponse | null>(null);
+  paperOverlayState = $state<PaperOverlayTelemetryResponse | null>(null);
+  lastDispatchResult = $state<SundayAlphaDispatchResponse | null>(null);
+  isLoadingWatchlist = $state<boolean>(false);
+  isLoadingSundayProtocol = $state<boolean>(false);
+  isDispatchingSundayWebhook = $state<boolean>(false);
+  actionableWatchlistOnly = $state<boolean>(false);
+  watchlistSearchQuery = $state<string>('');
   webhookStatus = $state<WebhookStatusPayload>({
     config: {
       discordWebhookUrl: '',

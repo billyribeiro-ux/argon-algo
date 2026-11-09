@@ -426,9 +426,18 @@ impl RawFingerprintEngine {
         let latest = &bars[seq_len - 1];
         let entry_price = latest.close;
 
-        // Inspect recent 10-bar micro-structure pivot window and multi-scale log drift
+        // Inspect recent 10-bar turnover window and horizon-scaled structural absorption pivot window
         let lookback = seq_len.min(10);
         let window = &bars[seq_len - lookback..];
+        let pivot_lookback = match brain_id {
+            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => {
+                seq_len.min(5)
+            }
+            BrainHorizonId::Brain03ShortTermSwing => seq_len.min(4),
+            BrainHorizonId::Brain04CoreSwing => seq_len.min(3),
+            BrainHorizonId::Brain05LongTermWealth => seq_len.min(2),
+        };
+        let pivot_window = &bars[seq_len - pivot_lookback..];
 
         let mut net_signed_turnover = 0.0_f64;
         let mut total_window_vol = 0.0_f64;
@@ -441,6 +450,8 @@ impl RawFingerprintEngine {
             let body_conv = (body_u / range_u).clamp(-1.0, 1.0);
             net_signed_turnover += (b.volume as f64) * body_conv;
             total_window_vol += b.volume as f64;
+        }
+        for b in pivot_window {
             if b.low < absorption_low {
                 absorption_low = b.low;
             }
@@ -488,8 +499,15 @@ impl RawFingerprintEngine {
         };
 
         // Measure empirical multi-bar excursion quantiles directly from the ticker's raw bar history
-        // so even when `precedents` is None, targets and stops come from empirical bar excursions.
-        let step_span = (seq_len / 4).clamp(2, 12);
+        // scaled cleanly by timeframe horizon so targets and stops reflect empirical bar excursions.
+        let step_span = match brain_id {
+            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => {
+                (seq_len / 4).clamp(3, 12)
+            }
+            BrainHorizonId::Brain03ShortTermSwing => (seq_len / 4).clamp(3, 8),
+            BrainHorizonId::Brain04CoreSwing => (seq_len / 5).clamp(2, 6),
+            BrainHorizonId::Brain05LongTermWealth => (seq_len / 6).clamp(2, 4),
+        };
         let mut local_maes = Vec::with_capacity(seq_len);
         let mut local_mfes = Vec::with_capacity(seq_len);
         for i in 0..seq_len.saturating_sub(1) {
@@ -525,9 +543,9 @@ impl RawFingerprintEngine {
             sorted[idx.min(sorted.len() - 1)].max(fallback)
         };
 
-        let local_p85_mae_pct = percentile_of(&local_maes, 0.85, 0.55);
-        let local_p50_mfe_pct = percentile_of(&local_mfes, 0.52, local_p85_mae_pct * 1.45);
-        let local_p80_mfe_pct = percentile_of(&local_mfes, 0.82, local_p50_mfe_pct * 1.65);
+        let local_p85_mae_pct = percentile_of(&local_maes, 0.72, 0.55);
+        let local_p50_mfe_pct = percentile_of(&local_mfes, 0.58, local_p85_mae_pct * 1.55);
+        let local_p80_mfe_pct = percentile_of(&local_mfes, 0.85, local_p50_mfe_pct * 1.65);
 
         // Blend historical precedent distribution (from PrecedentKnnIndex) with local raw physics
         let (empirical_mae_pct, empirical_p50_mfe_pct, empirical_p80_mfe_pct, hold_ms, win_rate) =
@@ -556,11 +574,17 @@ impl RawFingerprintEngine {
                 )
             };
 
-        // Solve exact AI Structural Stop-Loss from the 85th-percentile MAE invalidation structure
-        // anchored to the local raw absorption wick boundary.
+        // Solve exact AI Structural Stop-Loss from the empirical MAE invalidation structure
+        // anchored to the horizon-scaled local raw absorption wick boundary.
         let entry_u = entry_price.scaled_units();
         let min_tick_buffer = (entry_u / 250).max(1);
         let mae_stop_units = ((entry_u as f64) * (empirical_mae_pct / 100.0)).round() as i64;
+        let max_horizon_stop_units = ((entry_u as f64)
+            * ((mean_bar_range_log * (pivot_lookback as f64).sqrt() * 1.45).clamp(0.008, 0.065)))
+            .round() as i64;
+        let bounded_outer_units = (mae_stop_units * 7 / 5)
+            .min(max_horizon_stop_units.max(mae_stop_units))
+            .max(min_tick_buffer * 2);
 
         let structural_stop_price = match direction {
             TradeDirection::Long => {
@@ -568,12 +592,12 @@ impl RawFingerprintEngine {
                     .scaled_units()
                     .saturating_sub(min_tick_buffer);
                 let mae_candidate = entry_u.saturating_sub(mae_stop_units.max(min_tick_buffer));
-                let outer_cap =
-                    entry_u.saturating_sub((mae_stop_units * 9 / 5).max(min_tick_buffer * 2));
+                let outer_cap = entry_u.saturating_sub(bounded_outer_units);
+                let wick_capped = wick_candidate.max(outer_cap);
                 let chosen_stop = if brain_id == BrainHorizonId::Brain01PennyAnomaly {
                     wick_candidate.min(mae_candidate).max(outer_cap)
                 } else {
-                    ((wick_candidate as i128 + mae_candidate as i128) / 2) as i64
+                    ((wick_capped as i128 + mae_candidate as i128) / 2).max(outer_cap as i128) as i64
                 };
                 let max_stop = entry_u.saturating_sub(min_tick_buffer);
                 SubPennyPrice::from_scaled_units(
@@ -586,12 +610,12 @@ impl RawFingerprintEngine {
                     .scaled_units()
                     .saturating_add(min_tick_buffer);
                 let mae_candidate = entry_u.saturating_add(mae_stop_units.max(min_tick_buffer));
-                let outer_cap =
-                    entry_u.saturating_add((mae_stop_units * 9 / 5).max(min_tick_buffer * 2));
+                let outer_cap = entry_u.saturating_add(bounded_outer_units);
+                let wick_capped = wick_candidate.min(outer_cap);
                 let chosen_stop = if brain_id == BrainHorizonId::Brain01PennyAnomaly {
                     wick_candidate.max(mae_candidate).min(outer_cap)
                 } else {
-                    ((wick_candidate as i128 + mae_candidate as i128) / 2) as i64
+                    ((wick_capped as i128 + mae_candidate as i128) / 2).min(outer_cap as i128) as i64
                 };
                 let min_stop = entry_u.saturating_add(min_tick_buffer);
                 SubPennyPrice::from_scaled_units(
@@ -607,10 +631,17 @@ impl RawFingerprintEngine {
             .max(1);
 
         // Solve Target 1 (50th-percentile MFE) and Target 2 (80th-percentile MFE or Dealer Gamma Wall)
+        // ensuring positive expected value (Target 1 R:R >= empirical payoff ratio \hat{\mu}_{R^+, b})
+        let empirical_payoff_ratio =
+            (empirical_p50_mfe_pct / empirical_mae_pct.max(0.25)).clamp(1.42, 3.60);
+        let min_positive_ev_t1_units =
+            ((risk_units as f64) * empirical_payoff_ratio).round() as i64;
         let p50_mfe_units = (((entry_u as f64) * (empirical_p50_mfe_pct / 100.0)).round() as i64)
-            .max(risk_units);
+            .max(min_positive_ev_t1_units)
+            .max(risk_units + 1);
         let mut p80_mfe_units = (((entry_u as f64) * (empirical_p80_mfe_pct / 100.0)).round()
             as i64)
+            .max(((p50_mfe_units as f64) * 1.40).round() as i64)
             .max(risk_units + (risk_units * 3 / 4).max(2));
 
         // If Stream 2 (Options Gamma/Vanna) has a dominant gamma wall strike aligned with trade direction,

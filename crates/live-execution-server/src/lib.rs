@@ -3192,6 +3192,9 @@ mod tests {
         println!("--------------------------------------------------------------------------------------------------------------------------------------------------------------------------");
 
         let mut gen36_changed_count = 0usize;
+        let mut positive_shift_count = 0usize;
+        let mut negative_shift_count = 0usize;
+        let mut stage0_veto_count = 0usize;
 
         for (idx, (symbol, brain_id, _tf, window_bars)) in pair_bars.iter().enumerate() {
             let (raw_sf, raw_internals, raw_opts) =
@@ -3258,7 +3261,17 @@ mod tests {
                 *brain_id,
                 inference.signal.primary_driver,
                 &inference.signal.stream_weights,
+                &inference.signal.latent_embedding_128,
             );
+            if *symbol == "QQQ" || *symbol == "MSFT" {
+                assert_ne!(
+                    archetype,
+                    StrategyArchetype::ShortFloatLiquefaction,
+                    "{} ({}) must never be misclassified as SHORT_FLOAT_LIQUEFACTION",
+                    symbol,
+                    brain_id.as_str()
+                );
+            }
 
             let entry_px = inference.signal.entry_price.to_f64();
             let stop_px = inference.signal.structural_stop_price.to_f64();
@@ -3266,19 +3279,47 @@ mod tests {
             let risk_px = (entry_px - stop_px).abs().max(1e-6);
             let stop_pct = (risk_px / entry_px.max(1e-6)) * 100.0;
             let t1_rr = (t1_px - entry_px).abs() / risk_px;
+            assert!(
+                t1_rr >= 1.35,
+                "Expected positive EV Target 1 R:R >= 1.35 for {} ({}), got {:.2}R",
+                symbol,
+                brain_id.as_str(),
+                t1_rr
+            );
 
             let gen0_b = gen0_engine_b_confs[idx];
             let gen36_b = dual_gen36.engine_b_confidence_pct;
-            if (gen36_b - gen0_b).abs() > 1e-4
+            let shift_b = gen36_b - gen0_b;
+            if shift_b > 0.0 {
+                positive_shift_count += 1;
+            } else if shift_b < 0.0 {
+                negative_shift_count += 1;
+            }
+            if shift_b.abs() > 1e-4
                 || (dual_gen36.mahalanobis_win_distance - gen0_maha_wins[idx]).abs() > 1e-4
             {
                 gen36_changed_count += 1;
             }
 
-            let gate_str = if stage0.should_veto {
-                format!("VETO ({:.2}>{:.2})", stage0.trap_similarity_score, stage0.winner_similarity_score)
+            let cmp_op = if stage0.trap_similarity_score > stage0.winner_similarity_score {
+                ">"
+            } else if (stage0.trap_similarity_score - stage0.winner_similarity_score).abs() < 0.005
+            {
+                "<="
             } else {
-                format!("PASS ({:.2}<{:.2})", stage0.trap_similarity_score, stage0.winner_similarity_score)
+                "<"
+            };
+            let gate_str = if stage0.should_veto {
+                stage0_veto_count += 1;
+                format!(
+                    "VETO ({:.2}{}{:.2})",
+                    stage0.trap_similarity_score, cmp_op, stage0.winner_similarity_score
+                )
+            } else {
+                format!(
+                    "PASS ({:.2}{}{:.2})",
+                    stage0.trap_similarity_score, cmp_op, stage0.winner_similarity_score
+                )
             };
 
             println!(
@@ -3289,7 +3330,7 @@ mod tests {
                 dual_gen36.engine_a_confidence_pct,
                 gen0_b,
                 gen36_b,
-                gen36_b - gen0_b,
+                shift_b,
                 dual_gen36.consensus_confidence_pct,
                 archetype.as_str(),
                 entry_px,
@@ -3304,13 +3345,27 @@ mod tests {
         }
         println!("==========================================================================================================================================================================");
         println!(
-            "[PHASE 27 SYNAPTIC PLASTICITYSENSITIVITY VERIFIED] Gen 0 -> Gen 36 updated Engine-B ML conviction & Mahalanobis distances on {}/24 canonical pairs\n",
-            gen36_changed_count
+            "[PHASE 27.1 SYNAPTIC PLASTICITY & STAGE-0 CONFORMAL GATE VERIFIED] Gen 0 -> Gen 36 updated {}/24 pairs (+{} winner-aligned increases / -{} trap-aligned decreases) | Stage 0 Vetoes: {}\n",
+            gen36_changed_count,
+            positive_shift_count,
+            negative_shift_count,
+            stage0_veto_count,
         );
 
         assert_eq!(
             gen36_changed_count, 24,
             "Expected Gen 0 -> Gen 36 SynapticPlasticityState evolution to update Engine-B ML conviction/Mahalanobis metrics across all 24 canonical pairs"
+        );
+        assert!(
+            positive_shift_count > 0 && negative_shift_count > 0,
+            "Expected both positive (winner-aligned) and negative (trap-aligned) Engine-B shifts, got +{} / -{}",
+            positive_shift_count,
+            negative_shift_count
+        );
+        assert!(
+            stage0_veto_count >= 3,
+            "Expected Stage 0 Conformal Mahalanobis Gate to veto trap-dominated setups (e.g. PLUG, AVGO, NVDA B04), got {}",
+            stage0_veto_count
         );
     }
 }

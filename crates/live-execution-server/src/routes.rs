@@ -1045,8 +1045,6 @@ impl AppState {
             f64,
             raw_fingerprint_core::FourStreamWeights,
         )> = Vec::new();
-        // Era-1 Pure ML Ridge Training Samples (`ENGINE-B`: 32 direction-aligned raw features -> realized R)
-        let mut era1_ml_samples: Vec<([f64; 32], f64)> = Vec::new();
         let mut era1_stop_pcts: Vec<f64> = Vec::new();
         let mut era1_win_hold_bars: Vec<usize> = Vec::new();
         // Phase 16 Upgrade 1: Era-1 Discriminant Calibration Samples (sim_r, entry_emb_128, entry_x32, bar1_x32, bar1_r, open_ts_ns, direction)
@@ -1182,13 +1180,6 @@ impl AppState {
                 }
                 era1_win_hold_bars.push(peak_bar_offset.max(trace_horizon));
             }
-            if inf.signal.latent_embedding_128.len() >= 32 {
-                let mut x_raw = [0.0_f64; 32];
-                for (k, slot) in x_raw.iter_mut().enumerate() {
-                    *slot = (inf.signal.latent_embedding_128[k] as f64) * dir_sign;
-                }
-                era1_ml_samples.push((x_raw, sim_r));
-            }
             era1_samples.push((
                 inf.signal.direction,
                 inf.signal.ai_confidence_pct,
@@ -1197,48 +1188,6 @@ impl AppState {
                 raw_disp10_pct,
                 inf.signal.stream_weights,
             ));
-        }
-
-        // Fit Era-1 Pure ML Ridge Regression weight vector w* in R^32 for ENGINE-B (`PURE_ML_SELF_LEARNED`)
-        let mut ml_x_mean = [0.0_f64; 32];
-        let mut ml_w_ridge = [0.0_f64; 32];
-        let mut ml_r_mean = 0.45_f64;
-        let mut ml_r_threshold = 1.45_f64;
-        if era1_ml_samples.len() >= 6 {
-            let n_ml = era1_ml_samples.len() as f64;
-            ml_r_mean = era1_ml_samples.iter().map(|(_, r)| *r).sum::<f64>() / n_ml;
-            for (x_vec, _) in &era1_ml_samples {
-                for (k, &v) in x_vec.iter().enumerate() {
-                    ml_x_mean[k] += v / n_ml;
-                }
-            }
-            let ridge_lambda = 0.08_f64;
-            for k in 0..32 {
-                let mut cov = 0.0_f64;
-                let mut var = 0.0_f64;
-                for (x_vec, r) in &era1_ml_samples {
-                    let dx = x_vec[k] - ml_x_mean[k];
-                    cov += dx * (*r - ml_r_mean);
-                    var += dx * dx;
-                }
-                ml_w_ridge[k] = (cov / (var + ridge_lambda)).clamp(-4.5, 4.5);
-            }
-            let mut pred_win_rs: Vec<f64> = era1_ml_samples
-                .iter()
-                .filter(|(_, r)| *r > 0.0)
-                .map(|(x_vec, _)| {
-                    let mut p = ml_r_mean;
-                    for k in 0..32 {
-                        p += ml_w_ridge[k] * (x_vec[k] - ml_x_mean[k]);
-                    }
-                    p
-                })
-                .collect();
-            pred_win_rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            if !pred_win_rs.is_empty() {
-                let q75_idx = ((pred_win_rs.len() as f64) * 0.72).floor() as usize;
-                ml_r_threshold = pred_win_rs[q75_idx.min(pred_win_rs.len() - 1)].clamp(0.85, 2.35);
-            }
         }
 
         let candidate_floors = [60.0_f64, 62.0, 64.0, 66.0, 68.0];
@@ -1818,14 +1767,12 @@ impl AppState {
                         && inference.signal.expected_r_multiple
                             >= cal_profile.min_expected_r_multiple;
 
-                    // Compute ENGINE-B (`PURE_ML_SELF_LEARNED`) predicted R-multiple from Era-1 ridge weights w* in R^32
-                    let mut predicted_ml_r = ml_r_mean;
-                    if inference.signal.latent_embedding_128.len() >= 32 {
-                        for k in 0..32 {
-                            let x_k = (inference.signal.latent_embedding_128[k] as f64) * dir_sign;
-                            predicted_ml_r += ml_w_ridge[k] * (x_k - ml_x_mean[k]);
-                        }
-                    }
+                    // Evaluate unified live Dual-Engine signal (`evaluate_live_dual_engine_signal`)
+                    let dual_eval = self.ledger.evaluate_live_dual_engine_signal_for_entry(
+                        &inference,
+                        precedents.win_rate_pct,
+                        causal_slice,
+                    );
                     let p_win_knn = (precedents.win_rate_pct / 100.0).clamp(0.0, 1.0);
                     let payoff_knn =
                         (precedents.p50_mfe_pct / precedents.p85_mae_pct.max(0.25)).clamp(0.8, 5.0);
@@ -1850,19 +1797,23 @@ impl AppState {
                         }
                     };
 
-                    let engine_b_pure_ml_dominant = predicted_ml_r >= (ml_r_threshold + 0.08)
+                    let engine_b_pure_ml_dominant = dual_eval.active_engine_mode == "PURE_ML_SELF_LEARNED"
+                        && dual_eval.mahalanobis_llr > 0.0
                         && expected_r_knn >= 1.10
                         && precedents.win_rate_pct >= 72.0;
-                    let engine_b_consensus_ok = predicted_ml_r >= ml_r_threshold
+                    let engine_b_consensus_ok = dual_eval.engine_b_confidence_pct
+                        >= cal_profile.calibrated_confidence_floor
                         && expected_r_knn >= 0.72
                         && precedents.win_rate_pct >= 62.0;
-                    // Pure ML standalone entry requires zero active trap match and ultra-high ML + KNN conviction
+                    // Pure ML standalone entry requires zero active trap match and unified Engine-B + KNN conviction
                     let engine_b_standalone_fires = !engine_a_fires
                         && trap_match.is_none()
                         && ml_bar_aligned
                         && causal_m15_confluence_ok
                         && causal_d1_swing_confluence_ok
-                        && predicted_ml_r >= (ml_r_threshold + 0.45)
+                        && dual_eval.engine_b_confidence_pct
+                            >= (cal_profile.calibrated_confidence_floor + 7.5)
+                        && dual_eval.mahalanobis_llr > 0.0
                         && expected_r_knn >= 1.55
                         && precedents.win_rate_pct >= 82.0
                         && inference.signal.ai_confidence_pct
@@ -2498,9 +2449,70 @@ async fn scanner_candidates_handler(
         .read()
         .iter()
         .filter(|cand| {
-            !vetoed_traps
-                .iter()
-                .any(|v| v.symbol.eq_ignore_ascii_case(&cand.snapshot.symbol) && v.trap_similarity_score >= 0.90)
+            let sym = &cand.snapshot.symbol;
+            let brain_id = if cand.snapshot.is_otc_penny {
+                BrainHorizonId::Brain01PennyAnomaly
+            } else {
+                BrainHorizonId::Brain02IntradayDayTrade
+            };
+            let syn_state = state
+                .ledger
+                .precedent_knn()
+                .get_synaptic_plasticity_state(brain_id);
+            let conformal_hurdle = syn_state.learned_conformal_veto_quantile;
+            if vetoed_traps.iter().any(|v| {
+                v.symbol.eq_ignore_ascii_case(sym) && v.trap_similarity_score >= conformal_hurdle
+            }) {
+                return false;
+            }
+            if let Some(cached_ohlcv) = market_data_bus::YahooSessionManager::try_load_warm_ohlcv_disk_cache(
+                sym,
+                Timeframe::M5,
+                24,
+                u64::MAX,
+            ) {
+                let spread = (cand.snapshot.last_price.to_f64() * 0.0005).max(0.00001);
+                let unified_bars = YahooFinanceLiveAdapter::map_real_ohlcv_to_unified_bars(
+                    sym,
+                    Timeframe::M5,
+                    &cached_ohlcv,
+                    spread,
+                );
+                let raw_bars: Vec<RawBarRecord> =
+                    unified_bars.iter().map(|b| b.to_raw_bar_record()).collect();
+                let window_bars = if raw_bars.len() > 32 {
+                    &raw_bars[raw_bars.len() - 32..]
+                } else {
+                    &raw_bars[..]
+                };
+                let (raw_sf, raw_internals, raw_opts) = canonical_settled_walk_forward_streams(
+                    sym,
+                    window_bars,
+                    cand.snapshot.to_raw_short_float_snapshot(),
+                    raw_fingerprint_core::RawMarketInternalsSnapshot::default(),
+                    raw_fingerprint_core::RawOptionsSnapshot::default(),
+                );
+                if let Ok(inference) = state.onnx_engine.evaluate_live_signal(
+                    sym,
+                    brain_id,
+                    cand.snapshot.is_optionable,
+                    window_bars,
+                    &raw_opts,
+                    &raw_sf,
+                    &raw_internals,
+                ) {
+                    let stage0 = state.ledger.evaluate_live_entry_stage0_gate(
+                        &inference,
+                        72.5,
+                        window_bars,
+                        false,
+                    );
+                    if stage0.should_veto {
+                        return false;
+                    }
+                }
+            }
+            true
         })
         .cloned()
         .collect();

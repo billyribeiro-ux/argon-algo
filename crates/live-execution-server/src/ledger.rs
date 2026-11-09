@@ -501,34 +501,130 @@ pub const RAW_32_FEATURE_METADATA: [(&str, &str); 32] = [
 
 pub fn classify_strategy_archetype(
     engine_mode: EngineExecutionMode,
-    brain_id: BrainHorizonId,
-    primary_driver: PrimaryFingerprintDriver,
+    _brain_id: BrainHorizonId,
+    _primary_driver: PrimaryFingerprintDriver,
     stream_weights: &FourStreamWeights,
+    latent_embedding_128: &[f32],
 ) -> StrategyArchetype {
     if engine_mode == EngineExecutionMode::PureMlSelfLearned {
         return StrategyArchetype::PureMlLatentAnomaly;
     }
-    if primary_driver == PrimaryFingerprintDriver::GammaSqueeze
-        || stream_weights.options_gamma_vanna_weight >= 0.27
-    {
-        StrategyArchetype::GammaSqueezeIgnition
-    } else if primary_driver == PrimaryFingerprintDriver::ShortSqueeze
-        || stream_weights.short_float_squeeze_weight >= 0.255
-    {
-        StrategyArchetype::ShortFloatLiquefaction
-    } else if matches!(
-        brain_id,
-        BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain03ShortTermSwing
-    ) && stream_weights.chart_tape_physics_weight >= 0.23
-    {
-        StrategyArchetype::HtfMultiScaleBreakout
-    } else if primary_driver == PrimaryFingerprintDriver::VolumeAbsorption
-        || stream_weights.chart_tape_physics_weight >= stream_weights.market_internals_macro_weight
-    {
-        StrategyArchetype::PocVolumeAbsorption
-    } else {
-        StrategyArchetype::MacroInternalsTideDrive
+
+    // Compute empirical per-feature dispersion \hat{\sigma}_f across the 32-feature state vector
+    let n_feat = latent_embedding_128.len().min(32);
+    if n_feat < 32 {
+        let candidates = [
+            (
+                stream_weights.options_gamma_vanna_weight,
+                StrategyArchetype::GammaSqueezeIgnition,
+            ),
+            (
+                stream_weights.chart_tape_physics_weight,
+                StrategyArchetype::PocVolumeAbsorption,
+            ),
+            (
+                stream_weights.market_internals_macro_weight,
+                StrategyArchetype::MacroInternalsTideDrive,
+            ),
+        ];
+        return candidates
+            .into_iter()
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, arch)| arch)
+            .unwrap_or(StrategyArchetype::PocVolumeAbsorption);
     }
+
+    let f0 = &latent_embedding_128[0..32];
+    let f_recent = if latent_embedding_128.len() >= 64 {
+        &latent_embedding_128[32..64]
+    } else {
+        f0
+    };
+    let f_full = if latent_embedding_128.len() >= 96 {
+        &latent_embedding_128[64..96]
+    } else {
+        f0
+    };
+
+    let f_peak = if latent_embedding_128.len() >= 128 {
+        &latent_embedding_128[96..128]
+    } else {
+        f0
+    };
+
+    let mean_sq_all = (f0.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / 32.0).max(1e-8);
+    let sigma_all = mean_sq_all.sqrt();
+
+    let rms_slice = |slice: &[f32]| -> f64 {
+        if slice.is_empty() {
+            return 0.0;
+        }
+        let ms = slice
+            .iter()
+            .map(|v| {
+                let z = (*v as f64) / sigma_all;
+                z * z
+            })
+            .sum::<f64>()
+            / (slice.len() as f64);
+        ms.sqrt()
+    };
+
+    // Sub-stream intrinsic dispersion \hat{\sigma}_{E_s} from full-sequence peak excursion signature `f_peak`
+    let sigma_s1_breakout = rms_slice(&f_peak[0..4]).max(0.35);
+    let sigma_s1_absorption = rms_slice(&f_peak[4..12]).max(0.35);
+    let sigma_s2_gamma = rms_slice(&f_peak[12..20]).max(0.35);
+    let sigma_s3_short = rms_slice(&f_peak[20..25]).max(0.35);
+    let sigma_s4_macro = rms_slice(&f_peak[26..32]).max(0.35);
+
+    let w1 = (stream_weights.chart_tape_physics_weight as f64).max(0.05) / 0.25;
+    let w2 = (stream_weights.options_gamma_vanna_weight as f64).max(0.05) / 0.25;
+    let w3 = (stream_weights.short_float_squeeze_weight as f64).max(0.05) / 0.25;
+    let w4 = (stream_weights.market_internals_macro_weight as f64).max(0.05) / 0.25;
+
+    // 1. Stream 1A (`f[0..4]`): Multi-bar trend drift & range expansion -> HtfMultiScaleBreakout
+    let e_s1_breakout = 0.5 * (rms_slice(&f0[0..4]) + rms_slice(&f_recent[0..4]) * 1.35) * w1;
+    let z_s1_breakout = e_s1_breakout / sigma_s1_breakout;
+
+    // 2. Stream 1B (`f[4..12]`): Wick absorption, volume surge & POC clustering -> PocVolumeAbsorption
+    let e_s1_absorption = 0.5 * (rms_slice(&f0[4..12]) + rms_slice(&f_recent[4..12])) * w1;
+    let z_s1_absorption = e_s1_absorption / sigma_s1_absorption;
+
+    // 3. Stream 2 (`f[12..20]`): Options Gamma/Vanna & 0DTE dealer flow -> GammaSqueezeIgnition
+    let e_s2_gamma = rms_slice(&f0[12..20]) * w2;
+    let z_s2_gamma = e_s2_gamma / sigma_s2_gamma;
+
+    // 4. Stream 3 (`f[20..26]`): Short-to-float, float rotation & CTB/DTC pressure -> ShortFloatLiquefaction
+    //    Asset Physics Gate: ONLY eligible when the asset's short-interest (`f[21]`) and float rotation (`f[20]`)
+    //    exceed the cross-sectional median of the universe (preventing mega-cap ETFs/equities like QQQ/MSFT).
+    let z_float_rot = (f0[20].abs() as f64) / sigma_all;
+    let z_short_float = (f0[21].abs() as f64) / sigma_all;
+    let z_ctb = (f0[24].abs() as f64) / sigma_all;
+    let short_physics_above_median =
+        z_short_float > 0.55 && (z_float_rot + z_short_float + z_ctb) > 1.85;
+    let z_s3_short = if short_physics_above_median {
+        (rms_slice(&f0[20..25]) * w3) / sigma_s3_short
+    } else {
+        0.0
+    };
+
+    // 5. Stream 4 (`f[26..32]`): NYSE/Nasdaq TICK, ADD breadth, VOLD & VIX macro tide -> MacroInternalsTideDrive
+    let e_s4_macro = 0.5 * (rms_slice(&f0[26..32]) + rms_slice(&f_full[26..32])) * w4;
+    let z_s4_macro = e_s4_macro / sigma_s4_macro;
+
+    let ranked = [
+        (z_s2_gamma, StrategyArchetype::GammaSqueezeIgnition),
+        (z_s3_short, StrategyArchetype::ShortFloatLiquefaction),
+        (z_s4_macro, StrategyArchetype::MacroInternalsTideDrive),
+        (z_s1_absorption, StrategyArchetype::PocVolumeAbsorption),
+        (z_s1_breakout, StrategyArchetype::HtfMultiScaleBreakout),
+    ];
+
+    ranked
+        .into_iter()
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, arch)| arch)
+        .unwrap_or(StrategyArchetype::PocVolumeAbsorption)
 }
 
 /// Live active row in the `POSITIONS OPENED` monitor (`positions_opened` table).
@@ -3811,18 +3907,31 @@ impl RealTimeLedgerEngine {
         let syn_state = self.precedent_knn.get_synaptic_plasticity_state(sig.brain_id);
         let tau_veto = (0.855 + syn_state.entry_veto_margin_delta).clamp(0.84, 0.94);
         let delta_margin = syn_state.entry_veto_margin_delta.clamp(0.005, 0.05);
-        let diag = self
-            .precedent_knn
-            .evaluate_causal_entry_trap_vs_winner_discriminant(
-                sig.brain_id,
-                &sig.symbol,
-                sig.direction,
-                sig.timestamp_ns,
-                &sig.latent_embedding_128,
-                &entry_features_32,
-                tau_veto,
-                delta_margin,
-            );
+        let diag = if record_audit {
+            self.precedent_knn
+                .evaluate_causal_entry_trap_vs_winner_discriminant(
+                    sig.brain_id,
+                    &sig.symbol,
+                    sig.direction,
+                    sig.timestamp_ns,
+                    &sig.latent_embedding_128,
+                    &entry_features_32,
+                    tau_veto,
+                    delta_margin,
+                )
+        } else {
+            self.precedent_knn
+                .evaluate_causal_stage0_conformal_entry_gate(
+                    sig.brain_id,
+                    &sig.symbol,
+                    sig.direction,
+                    sig.timestamp_ns,
+                    &sig.latent_embedding_128,
+                    &entry_features_32,
+                    tau_veto,
+                    delta_margin,
+                )
+        };
         if diag.should_veto
             && record_audit
             && let Some(matched_loss_id) = diag.matched_trap_id
@@ -3999,6 +4108,7 @@ impl RealTimeLedgerEngine {
             sig.brain_id,
             sig.primary_driver,
             &sig.stream_weights,
+            &sig.latent_embedding_128,
         );
 
         // Retain up to 24 pre-entry context bars leading into opened_timestamp_ns

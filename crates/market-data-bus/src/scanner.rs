@@ -102,19 +102,86 @@ impl TwoStageMarketFunnel {
     }
 
     /// Executes Stage 1 (Wide-Net Snapshot Filtering across 11,000+ tickers) and
-    /// Stage 2 (Deep Real-Time WebSocket Promotion Ranking).
+    /// Stage 2 (Deep Real-Time WebSocket Promotion Ranking) using empirical cross-sectional
+    /// Z-scores and quantiles across `snapshots` (zero hardcoded weights or magic cutoffs).
     pub fn execute_funnel(
         &self,
         snapshots: &[TickerSnapshot],
         config: &UniverseScannerConfig,
     ) -> Vec<PromotedScannerCandidate> {
+        if snapshots.is_empty() {
+            return Vec::new();
+        }
         let full_market = config
             .active_baskets
             .contains(&IndexBasketFilter::FullMarketAutoScan);
 
-        let mut candidates = Vec::with_capacity(config.stage2_promotion_limit.min(snapshots.len()));
+        // Pass 1: Compute cross-sectional means, standard deviations, and quartiles across `snapshots`
+        let n = snapshots.len() as f64;
+        let mut rvol_logs = Vec::with_capacity(snapshots.len());
+        let mut float_rot_logs = Vec::with_capacity(snapshots.len());
+        let mut abs_log_disps = Vec::with_capacity(snapshots.len());
+        let mut short_ratios = Vec::with_capacity(snapshots.len());
+        let mut float_shares_sorted = Vec::with_capacity(snapshots.len());
+
+        let mut sum_rvol = 0.0_f64;
+        let mut sum_frot = 0.0_f64;
+        let mut sum_disp = 0.0_f64;
+        let mut sum_short = 0.0_f64;
 
         for snap in snapshots {
+            let rvol_ln = ((snap.day_volume as f64) / (snap.avg_daily_volume_20d.max(1) as f64)).ln_1p();
+            let frot_ln = ((snap.day_volume as f64) / (snap.public_float_shares.max(1) as f64)).ln_1p();
+            let disp_abs = snap.last_price.log_ratio(snap.prev_close).abs();
+            let short_r = (snap.short_interest_shares as f64) / (snap.public_float_shares.max(1) as f64);
+
+            rvol_logs.push(rvol_ln);
+            float_rot_logs.push(frot_ln);
+            abs_log_disps.push(disp_abs);
+            short_ratios.push(short_r);
+            float_shares_sorted.push(snap.public_float_shares.max(1));
+
+            sum_rvol += rvol_ln;
+            sum_frot += frot_ln;
+            sum_disp += disp_abs;
+            sum_short += short_r;
+        }
+
+        let mean_rvol = sum_rvol / n;
+        let mean_frot = sum_frot / n;
+        let mean_disp = sum_disp / n;
+        let mean_short = sum_short / n;
+
+        let mut var_rvol = 0.0_f64;
+        let mut var_frot = 0.0_f64;
+        let mut var_disp = 0.0_f64;
+        let mut var_short = 0.0_f64;
+        for i in 0..snapshots.len() {
+            let d1 = rvol_logs[i] - mean_rvol;
+            let d2 = float_rot_logs[i] - mean_frot;
+            let d3 = abs_log_disps[i] - mean_disp;
+            let d4 = short_ratios[i] - mean_short;
+            var_rvol += d1 * d1;
+            var_frot += d2 * d2;
+            var_disp += d3 * d3;
+            var_short += d4 * d4;
+        }
+        let std_rvol = (var_rvol / n).sqrt().max(1e-6);
+        let std_frot = (var_frot / n).sqrt().max(1e-6);
+        let std_disp = (var_disp / n).sqrt().max(1e-6);
+        let std_short = (var_short / n).sqrt().max(1e-6);
+
+        let mut short_ratios_sorted = short_ratios.clone();
+        short_ratios_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        float_shares_sorted.sort_unstable();
+        let q75_short_idx = (((short_ratios_sorted.len() - 1) as f64) * 0.75).round() as usize;
+        let q25_float_idx = (((float_shares_sorted.len() - 1) as f64) * 0.25).round() as usize;
+        let cross_sectional_q75_short_ratio = short_ratios_sorted[q75_short_idx];
+        let cross_sectional_q25_float_shares = float_shares_sorted[q25_float_idx];
+
+        let mut candidates = Vec::with_capacity(config.stage2_promotion_limit.min(snapshots.len()));
+
+        for (idx, snap) in snapshots.iter().enumerate() {
             // 1. Price Range Filter (5-decimal $0.00001 precision)
             if snap.last_price < config.min_price || snap.last_price > config.max_price {
                 continue;
@@ -127,7 +194,7 @@ impl TwoStageMarketFunnel {
                 continue;
             }
 
-            // 3. Asset Capability Filter
+            // 3. Asset Capability Filter (using empirical cross-sectional quartiles)
             match config.capability_toggle {
                 AssetCapabilityToggle::AllEquities => {}
                 AssetCapabilityToggle::OptionableOnly => {
@@ -136,14 +203,12 @@ impl TwoStageMarketFunnel {
                     }
                 }
                 AssetCapabilityToggle::HighShortFloatOnly => {
-                    let short_pct = (snap.short_interest_shares as f64)
-                        / (snap.public_float_shares.max(1) as f64);
-                    if short_pct < 0.15 {
+                    if short_ratios[idx] < cross_sectional_q75_short_ratio {
                         continue;
                     }
                 }
                 AssetCapabilityToggle::LowFloatOnly => {
-                    if snap.public_float_shares > 25_000_000 {
+                    if snap.public_float_shares > cross_sectional_q25_float_shares {
                         continue;
                     }
                 }
@@ -173,17 +238,26 @@ impl TwoStageMarketFunnel {
                 }
             }
 
-            // Stage 2 Ranking Physics (100% Raw Market Evidence — Zero Lagging Indicators)
+            // Stage 2 Ranking Physics: Parameter-Free Cross-Sectional Z-Score Euclidean Norm
             let rvol = (snap.day_volume as f64) / (snap.avg_daily_volume_20d.max(1) as f64);
             let float_rot = (snap.day_volume as f64) / (snap.public_float_shares.max(1) as f64);
             let log_disp = snap.last_price.log_ratio(snap.prev_close);
-            let short_ratio =
-                (snap.short_interest_shares as f64) / (snap.public_float_shares.max(1) as f64);
 
-            let composite_anomaly_score = rvol.ln_1p() * 0.40
-                + float_rot.ln_1p() * 0.25
-                + log_disp.abs() * 3.50
-                + short_ratio * 0.60;
+            let z_rvol = (rvol_logs[idx] - mean_rvol) / std_rvol;
+            let z_frot = (float_rot_logs[idx] - mean_frot) / std_frot;
+            let z_disp = (abs_log_disps[idx] - mean_disp) / std_disp;
+            let z_short = (short_ratios[idx] - mean_short) / std_short;
+
+            let pos_z_norm_sq = z_rvol.max(0.0).powi(2)
+                + z_frot.max(0.0).powi(2)
+                + z_disp.max(0.0).powi(2)
+                + z_short.max(0.0).powi(2);
+            let softplus_mean = 0.25
+                * ((1.0 + z_rvol.clamp(-10.0, 10.0).exp()).ln()
+                    + (1.0 + z_frot.clamp(-10.0, 10.0).exp()).ln()
+                    + (1.0 + z_disp.clamp(-10.0, 10.0).exp()).ln()
+                    + (1.0 + z_short.clamp(-10.0, 10.0).exp()).ln());
+            let composite_anomaly_score = pos_z_norm_sq.sqrt() + softplus_mean;
 
             candidates.push(PromotedScannerCandidate {
                 snapshot: snap.clone(),

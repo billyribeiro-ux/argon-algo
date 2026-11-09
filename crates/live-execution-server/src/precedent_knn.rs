@@ -3283,7 +3283,11 @@ impl PrecedentKnnIndex {
                 .collect();
         }
 
-        let fisher_p = syn_state.learned_fisher_sparsity_exponent_p.clamp(0.50, 2.75);
+        let fisher_p = if syn_state.generation_id == 0 {
+            1.0
+        } else {
+            syn_state.learned_fisher_sparsity_exponent_p.clamp(1.15, 2.75)
+        };
         let mut raw_syn_w = [0.0_f64; 32];
         let mut w_sum = 0.0_f64;
         for i in 0..32 {
@@ -3294,9 +3298,16 @@ impl PrecedentKnnIndex {
             w_sum += wi;
         }
         w_sum = w_sum.max(1e-6);
+        let base_weights = [6.0 / 32.0; 32];
         let mut culprit_weights = [0.0_f64; 32];
         for i in 0..32 {
-            culprit_weights[i] = (raw_syn_w[i] / w_sum) * 6.0;
+            let norm_syn_i = (raw_syn_w[i] / w_sum) * 32.0;
+            let eff_w_i = if syn_state.generation_id == 0 {
+                1.0
+            } else {
+                (0.88 + 0.12 * norm_syn_i) * fisher_p
+            };
+            culprit_weights[i] = (6.0 / 32.0) * eff_w_i;
         }
 
         let n_traps = causal_traps.len();
@@ -3309,7 +3320,7 @@ impl PrecedentKnnIndex {
                 syn_dot += (culprit_weights[i] / 6.0) * (query_entry_features_32[i] as f64);
             }
             let p_b = 1.0 / (1.0 + (-syn_dot).exp());
-            let eng_b = (52.0 + 46.5 * p_b).clamp(50.0, 99.2);
+            let eng_b = (p_b * 100.0).clamp(1.0, 99.9);
             let cons = 0.50 * engine_a_confidence_pct + 0.50 * eng_b;
             return DualEngineLiveEvaluation {
                 generation_id: syn_state.generation_id,
@@ -3428,77 +3439,99 @@ impl PrecedentKnnIndex {
             scale_entry_sq,
         );
 
-        let mut max_trap_kernel = 0.0_f64;
-        for trap in &causal_traps {
-            let dot_128: f64 = query_embedding_128
-                .iter()
-                .zip(trap.embedding_128.iter())
-                .map(|(a, b)| (*a as f64) * (*b as f64))
-                .sum::<f64>()
-                .clamp(-1.0, 1.0);
-            let mut d_sq = 0.0_f64;
-            for k in 0..32 {
-                let d = (query_entry_features_32[k] as f64) - (trap.entry_features_32[k] as f64);
-                let var_k = pooled_entry_cov[k][k].max(entry_var_floor);
-                d_sq += (culprit_weights[k] / 6.0) * (d * d) / var_k;
-            }
-            let sym_bonus = if trap.symbol.eq_ignore_ascii_case(symbol) {
-                0.015
-            } else {
-                0.0
-            };
-            let trap_w = syn_state
-                .trap_conviction_weights
-                .get(&trap.loss_trade_id.to_string())
-                .copied()
-                .unwrap_or(1.0);
-            let k_sim = (0.72 * (-0.32 * d_sq).exp() + 0.28 * (0.5 * (1.0 + dot_128)) + sym_bonus)
-                * trap_w.clamp(0.75, 1.25);
-            if k_sim > max_trap_kernel {
-                max_trap_kernel = k_sim;
-            }
-        }
+        // Compute empirical dispersion \hat{\sigma}_{\Lambda, b}^{(g)} of \Lambda_{EB} across settled prior trades on Brain b
+        let prior_win_log_odds = ((n_wins as f64 + 1.0) / (n_traps as f64 + 1.0)).ln();
+        let (q_maha_trap_0, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+            &pooled_entry_cov,
+            n_causal,
+            &base_weights,
+            &diff_trap,
+            scale_entry_sq,
+        );
+        let (q_maha_win_0, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+            &pooled_entry_cov,
+            n_causal,
+            &base_weights,
+            &diff_win,
+            scale_entry_sq,
+        );
+        let query_radial_sq_0 = 0.5 * (q_maha_trap_0 * q_maha_trap_0 + q_maha_win_0 * q_maha_win_0);
 
-        let mut max_win_kernel = 0.0_f64;
-        for win in &causal_wins {
-            let dot_128: f64 = query_embedding_128
-                .iter()
-                .zip(win.embedding_128.iter())
-                .map(|(a, b)| (*a as f64) * (*b as f64))
-                .sum::<f64>()
-                .clamp(-1.0, 1.0);
-            let mut d_sq = 0.0_f64;
-            for k in 0..32 {
-                let d = (query_entry_features_32[k] as f64) - (win.entry_features_32[k] as f64);
-                let var_k = pooled_entry_cov[k][k].max(entry_var_floor);
-                d_sq += (culprit_weights[k] / 6.0) * (d * d) / var_k;
+        let mut settled_llrs = Vec::with_capacity(n_causal);
+        let mut settled_radial_sq_sum = 0.0_f64;
+        for t in &causal_traps {
+            let mut dt_trap = [0.0_f64; 32];
+            let mut dt_win = [0.0_f64; 32];
+            for i in 0..32 {
+                let v = t.entry_features_32[i] as f64;
+                dt_trap[i] = v - trap_centroid[i];
+                dt_win[i] = v - win_centroid[i];
             }
-            let sym_bonus = if win.symbol.eq_ignore_ascii_case(symbol) {
-                0.015
-            } else {
-                0.0
-            };
-            let k_sim = 0.72 * (-0.32 * d_sq).exp() + 0.28 * (0.5 * (1.0 + dot_128)) + sym_bonus;
-            if k_sim > max_win_kernel {
-                max_win_kernel = k_sim;
+            let (d_l, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                &pooled_entry_cov,
+                n_causal,
+                &base_weights,
+                &dt_trap,
+                scale_entry_sq,
+            );
+            let (d_w, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                &pooled_entry_cov,
+                n_causal,
+                &base_weights,
+                &dt_win,
+                scale_entry_sq,
+            );
+            settled_radial_sq_sum += 0.5 * (d_l * d_l + d_w * d_w);
+            settled_llrs.push(prior_win_log_odds + 0.5 * (d_l * d_l - d_w * d_w));
+        }
+        for w in &causal_wins {
+            let mut dw_trap = [0.0_f64; 32];
+            let mut dw_win = [0.0_f64; 32];
+            for i in 0..32 {
+                let v = w.entry_features_32[i] as f64;
+                dw_trap[i] = v - trap_centroid[i];
+                dw_win[i] = v - win_centroid[i];
             }
+            let (d_l, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                &pooled_entry_cov,
+                n_causal,
+                &base_weights,
+                &dw_trap,
+                scale_entry_sq,
+            );
+            let (d_w, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                &pooled_entry_cov,
+                n_causal,
+                &base_weights,
+                &dw_win,
+                scale_entry_sq,
+            );
+            settled_radial_sq_sum += 0.5 * (d_l * d_l + d_w * d_w);
+            settled_llrs.push(prior_win_log_odds + 0.5 * (d_l * d_l - d_w * d_w));
         }
         drop(traps);
         drop(wins);
 
-        let prior_win_log_odds = ((n_wins as f64 + 1.0) / (n_traps as f64 + 1.0)).ln();
-        let maha_win_llr = (0.22 * (maha_trap * maha_trap - maha_win * maha_win)).clamp(-3.5, 3.5);
-        let kernel_win_llr = 4.50 * (max_win_kernel - max_trap_kernel);
-        let hurdle_shift = -0.35 * syn_state.learned_asymmetric_hurdle_llr_lambda_star
-            + 0.40 * (0.18 - syn_state.learned_conformal_alpha);
-        let engine_b_llr = (0.35 * prior_win_log_odds
-            + maha_win_llr
-            + 0.90 * fisher_win_llr
-            + kernel_win_llr
-            + hurdle_shift)
-            .clamp(-10.0, 10.0);
-        let p_win_b = 1.0 / (1.0 + (-engine_b_llr).exp());
-        let engine_b_conf = (52.0 + 46.5 * p_win_b).clamp(50.0, 99.2);
+        let mean_settled_llr =
+            settled_llrs.iter().sum::<f64>() / (settled_llrs.len().max(1) as f64);
+        let var_settled_llr = settled_llrs
+            .iter()
+            .map(|x| {
+                let d = *x - mean_settled_llr;
+                d * d
+            })
+            .sum::<f64>()
+            / (settled_llrs.len().max(1) as f64);
+        let mean_settled_radial_sq =
+            (settled_radial_sq_sum / (settled_llrs.len().max(1) as f64)).max(1e-6);
+        let radial_leverage = (query_radial_sq_0 / mean_settled_radial_sq).max(1.0);
+        let sigma_lambda_b = (var_settled_llr.sqrt() * radial_leverage).max(1e-6);
+
+        // Exact Bayesian posterior log-odds under the 32x32 Ledoit-Wolf Cholesky precision matrix
+        let maha_win_llr = 0.5 * (maha_trap * maha_trap - maha_win * maha_win);
+        let lambda_eb = prior_win_log_odds + maha_win_llr;
+        let p_win_b = 1.0 / (1.0 + (-lambda_eb / sigma_lambda_b).exp());
+        let engine_b_conf = (p_win_b * 100.0).clamp(1.0, 99.9);
         let consensus_conf = 0.50 * engine_a_confidence_pct + 0.50 * engine_b_conf;
         let active_mode = if engine_a_confidence_pct >= 62.0 && engine_b_conf >= 62.0 {
             "CONSENSUS_BOTH_ENGINES"
@@ -3507,6 +3540,8 @@ impl PrecedentKnnIndex {
         } else {
             "STRUCTURED_HYBRID_CHAMPION"
         };
+
+        let _ = (symbol, query_embedding_128);
 
         DualEngineLiveEvaluation {
             generation_id: syn_state.generation_id,
@@ -3520,6 +3555,240 @@ impl PrecedentKnnIndex {
             fisher_llr: (fisher_win_llr * 1000.0).round() / 1000.0,
             ledoit_wolf_shrinkage_lambda: (lw_lambda * 1000.0).round() / 1000.0,
         }
+    }
+
+    /// Evaluates the causal Stage 0 Conformal Mahalanobis Entry Discriminant:
+    /// A live candidate is VETOED (`should_veto = true`) whenever its Mahalanobis loss-vs-win
+    /// log-likelihood ratio $\Lambda_{\text{entry}}(x) = \frac{1}{2}(D_{\text{Mahal}, W}^2(x) - D_{\text{Mahal}, L}^2(x))$
+    /// exceeds the causal conformal upper quantile of settled prior winners
+    /// $Q_{1 - \alpha_g}(\{\Lambda_{\text{entry}}(w) : w \in \mathcal{W}_{0..t}\})$ (or exceeds the causal
+    /// asymmetric entry hurdle when $D_{\text{Mahal}, L}(x) < D_{\text{Mahal}, W}(x)$).
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    pub fn evaluate_causal_stage0_conformal_entry_gate(
+        &self,
+        brain_id: BrainHorizonId,
+        symbol: &str,
+        direction: TradeDirection,
+        current_timestamp_ns: i64,
+        query_embedding_128: &[f32],
+        query_entry_features_32: &[f32],
+        tau_veto: f64,
+        delta_margin: f64,
+    ) -> EntryTrapVsWinnerDiagnostic {
+        let mut diag = self.evaluate_causal_entry_trap_vs_winner_discriminant(
+            brain_id,
+            symbol,
+            direction,
+            current_timestamp_ns,
+            query_embedding_128,
+            query_entry_features_32,
+            tau_veto,
+            delta_margin,
+        );
+        if query_entry_features_32.len() < 32 {
+            return diag;
+        }
+
+        let syn_state = self.get_synaptic_plasticity_state(brain_id);
+        let traps = self.hard_negative_traps.read();
+        let wins = self.winner_pullbacks.read();
+
+        let causal_traps: Vec<&HardNegativeTrapRecord> = traps
+            .iter()
+            .filter(|t| {
+                t.brain_id == brain_id
+                    && t.closed_timestamp_ns < current_timestamp_ns
+                    && t.entry_features_32.len() >= 32
+            })
+            .collect();
+        let causal_wins: Vec<&WinnerPullbackRecord> = wins
+            .iter()
+            .filter(|w| {
+                w.brain_id == brain_id
+                    && w.closed_timestamp_ns < current_timestamp_ns
+                    && w.entry_features_32.len() >= 32
+            })
+            .collect();
+
+        let n_traps = causal_traps.len();
+        let n_wins = causal_wins.len();
+        if n_traps == 0 || n_wins == 0 || (n_traps + n_wins) < 3 {
+            return diag;
+        }
+
+        let fisher_p = if syn_state.generation_id == 0 {
+            1.0
+        } else {
+            syn_state.learned_fisher_sparsity_exponent_p.clamp(1.15, 2.75)
+        };
+        let mut raw_syn_w = [0.0_f64; 32];
+        let mut w_sum = 0.0_f64;
+        for i in 0..32 {
+            let wi = syn_state.synaptic_feature_weights_32[i]
+                .max(0.05)
+                .powf(fisher_p);
+            raw_syn_w[i] = wi;
+            w_sum += wi;
+        }
+        w_sum = w_sum.max(1e-6);
+        let mut culprit_weights = [0.0_f64; 32];
+        for i in 0..32 {
+            let norm_syn_i = (raw_syn_w[i] / w_sum) * 32.0;
+            let eff_w_i = if syn_state.generation_id == 0 {
+                1.0
+            } else {
+                (0.88 + 0.12 * norm_syn_i) * fisher_p
+            };
+            culprit_weights[i] = (6.0 / 32.0) * eff_w_i;
+        }
+
+        let mut trap_centroid = [0.0_f64; 32];
+        let mut win_centroid = [0.0_f64; 32];
+        let inv_t = 1.0 / (n_traps as f64);
+        let inv_w = 1.0 / (n_wins as f64);
+        let mut range_entry_sum = 0.0_f64;
+        let mut range_entry_cnt = 0usize;
+        for t in &causal_traps {
+            for i in 0..32 {
+                trap_centroid[i] += (t.entry_features_32[i] as f64) * inv_t;
+            }
+            let r_part = (t.entry_features_32[8] as f64).abs()
+                + (t.entry_features_32[9] as f64).abs()
+                + (t.entry_features_32[10] as f64).abs();
+            if r_part > 1e-9 {
+                range_entry_sum += r_part;
+                range_entry_cnt += 1;
+            }
+        }
+        for w in &causal_wins {
+            for i in 0..32 {
+                win_centroid[i] += (w.entry_features_32[i] as f64) * inv_w;
+            }
+            let r_part = (w.entry_features_32[8] as f64).abs()
+                + (w.entry_features_32[9] as f64).abs()
+                + (w.entry_features_32[10] as f64).abs();
+            if r_part > 1e-9 {
+                range_entry_sum += r_part;
+                range_entry_cnt += 1;
+            }
+        }
+        let scale_entry = if range_entry_cnt > 0 {
+            (range_entry_sum / (range_entry_cnt as f64)).max(1e-9)
+        } else {
+            1.0
+        };
+        let scale_entry_sq = (scale_entry * scale_entry).max(1e-12);
+        let entry_ridge = 0.035 * scale_entry_sq;
+
+        let mut pooled_entry_cov = [[0.0_f64; 32]; 32];
+        for i in 0..32 {
+            pooled_entry_cov[i][i] = entry_ridge;
+        }
+        for t in &causal_traps {
+            for i in 0..32 {
+                let di = (t.entry_features_32[i] as f64) - trap_centroid[i];
+                for j in 0..=i {
+                    let dj = (t.entry_features_32[j] as f64) - trap_centroid[j];
+                    let c_ij = 0.5 * (di * dj) * inv_t;
+                    pooled_entry_cov[i][j] += c_ij;
+                    pooled_entry_cov[j][i] = pooled_entry_cov[i][j];
+                }
+            }
+        }
+        for w in &causal_wins {
+            for i in 0..32 {
+                let di = (w.entry_features_32[i] as f64) - win_centroid[i];
+                for j in 0..=i {
+                    let dj = (w.entry_features_32[j] as f64) - win_centroid[j];
+                    let c_ij = 0.5 * (di * dj) * inv_w;
+                    pooled_entry_cov[i][j] += c_ij;
+                    pooled_entry_cov[j][i] = pooled_entry_cov[i][j];
+                }
+            }
+        }
+
+        let n_causal = n_traps + n_wins;
+        let mut diff_trap = [0.0_f64; 32];
+        let mut diff_win = [0.0_f64; 32];
+        for i in 0..32 {
+            let q_i = query_entry_features_32[i] as f64;
+            diff_trap[i] = q_i - trap_centroid[i];
+            diff_win[i] = q_i - win_centroid[i];
+        }
+        let (maha_trap, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+            &pooled_entry_cov,
+            n_causal,
+            &culprit_weights,
+            &diff_trap,
+            scale_entry_sq,
+        );
+        let (maha_win, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+            &pooled_entry_cov,
+            n_causal,
+            &culprit_weights,
+            &diff_win,
+            scale_entry_sq,
+        );
+        let radial_sq_x = (0.5 * (maha_win * maha_win + maha_trap * maha_trap)).max(1.0);
+        let lambda_entry_x = 0.5 * (maha_win * maha_win - maha_trap * maha_trap) / radial_sq_x;
+
+        // Compute causal conformal upper quantile Q_{1 - alpha_g} of settled prior winners
+        let mut winner_lambda_entries = Vec::with_capacity(n_wins);
+        for w in &causal_wins {
+            let mut dw_trap = [0.0_f64; 32];
+            let mut dw_win = [0.0_f64; 32];
+            for i in 0..32 {
+                let v = w.entry_features_32[i] as f64;
+                dw_trap[i] = v - trap_centroid[i];
+                dw_win[i] = v - win_centroid[i];
+            }
+            let (dw_l, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                &pooled_entry_cov,
+                n_causal,
+                &culprit_weights,
+                &dw_trap,
+                scale_entry_sq,
+            );
+            let (dw_w, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                &pooled_entry_cov,
+                n_causal,
+                &culprit_weights,
+                &dw_win,
+                scale_entry_sq,
+            );
+            let rad_w = (0.5 * (dw_w * dw_w + dw_l * dw_l)).max(1.0);
+            winner_lambda_entries.push(0.5 * (dw_w * dw_w - dw_l * dw_l) / rad_w);
+        }
+        drop(traps);
+        drop(wins);
+
+        winner_lambda_entries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let alpha_g = syn_state.learned_conformal_alpha.clamp(0.05, 0.35);
+        let q_idx = (((winner_lambda_entries.len() - 1) as f64) * (1.0 - alpha_g)).round() as usize;
+        let conformal_win_q = winner_lambda_entries[q_idx.min(winner_lambda_entries.len() - 1)];
+
+        let win_mean =
+            winner_lambda_entries.iter().sum::<f64>() / (winner_lambda_entries.len() as f64);
+        let win_std = (winner_lambda_entries
+            .iter()
+            .map(|v| {
+                let d = *v - win_mean;
+                d * d
+            })
+            .sum::<f64>()
+            / (winner_lambda_entries.len() as f64))
+            .sqrt()
+            .max(1e-6);
+        let asymmetric_hurdle = (win_mean + win_std * (1.0 - alpha_g)).max(0.030);
+        let effective_entry_hurdle = conformal_win_q.min(asymmetric_hurdle);
+
+        if diag.trap_similarity_score > diag.winner_similarity_score
+            && maha_trap < maha_win
+            && lambda_entry_x > effective_entry_hurdle
+        {
+            diag.should_veto = true;
+        }
+        diag
     }
 }
 

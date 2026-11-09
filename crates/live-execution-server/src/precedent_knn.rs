@@ -166,6 +166,10 @@ pub struct EntryTrapVsWinnerDiagnostic {
     pub should_veto: bool,
     pub matched_trap_id: Option<Uuid>,
     pub root_cause_category: String,
+    #[serde(default)]
+    pub conformal_entry_llr: f64,
+    #[serde(default)]
+    pub conformal_entry_hurdle: f64,
 }
 
 /// Phase 27 Live Dual-Engine (`ENGINE-A` Structured Champion vs. `ENGINE-B` Self-Learned Synaptic ML vs. `CONSENSUS`)
@@ -1180,6 +1184,8 @@ impl PrecedentKnnIndex {
                 should_veto: false,
                 matched_trap_id: None,
                 root_cause_category: "HTF_STRUCTURAL_HEADWIND".to_string(),
+                conformal_entry_llr: -0.46,
+                conformal_entry_hurdle: 0.05,
             };
         }
 
@@ -1395,6 +1401,8 @@ impl PrecedentKnnIndex {
             should_veto,
             matched_trap_id: Some(best_trap_id),
             root_cause_category: best_trap_cat,
+            conformal_entry_llr: (margin * 1000.0).round() / 1000.0,
+            conformal_entry_hurdle: (eff_delta_margin * 1000.0).round() / 1000.0,
         }
     }
 
@@ -3283,11 +3291,10 @@ impl PrecedentKnnIndex {
                 .collect();
         }
 
-        let fisher_p = if syn_state.generation_id == 0 {
-            1.0
-        } else {
-            syn_state.learned_fisher_sparsity_exponent_p.clamp(1.15, 2.75)
-        };
+        let fisher_p = syn_state
+            .learned_fisher_sparsity_exponent_p
+            .max(1.0)
+            .min(2.75);
         let mut raw_syn_w = [0.0_f64; 32];
         let mut w_sum = 0.0_f64;
         for i in 0..32 {
@@ -3302,11 +3309,7 @@ impl PrecedentKnnIndex {
         let mut culprit_weights = [0.0_f64; 32];
         for i in 0..32 {
             let norm_syn_i = (raw_syn_w[i] / w_sum) * 32.0;
-            let eff_w_i = if syn_state.generation_id == 0 {
-                1.0
-            } else {
-                (0.88 + 0.12 * norm_syn_i) * fisher_p
-            };
+            let eff_w_i = (0.88 + 0.12 * norm_syn_i) * fisher_p;
             culprit_weights[i] = (6.0 / 32.0) * eff_w_i;
         }
 
@@ -3616,11 +3619,10 @@ impl PrecedentKnnIndex {
             return diag;
         }
 
-        let fisher_p = if syn_state.generation_id == 0 {
-            1.0
-        } else {
-            syn_state.learned_fisher_sparsity_exponent_p.clamp(1.15, 2.75)
-        };
+        let fisher_p = syn_state
+            .learned_fisher_sparsity_exponent_p
+            .max(1.0)
+            .min(2.75);
         let mut raw_syn_w = [0.0_f64; 32];
         let mut w_sum = 0.0_f64;
         for i in 0..32 {
@@ -3634,11 +3636,7 @@ impl PrecedentKnnIndex {
         let mut culprit_weights = [0.0_f64; 32];
         for i in 0..32 {
             let norm_syn_i = (raw_syn_w[i] / w_sum) * 32.0;
-            let eff_w_i = if syn_state.generation_id == 0 {
-                1.0
-            } else {
-                (0.88 + 0.12 * norm_syn_i) * fisher_p
-            };
+            let eff_w_i = (0.88 + 0.12 * norm_syn_i) * fisher_p;
             culprit_weights[i] = (6.0 / 32.0) * eff_w_i;
         }
 
@@ -3781,13 +3779,9 @@ impl PrecedentKnnIndex {
             .max(1e-6);
         let asymmetric_hurdle = (win_mean + win_std * (1.0 - alpha_g)).max(0.030);
         let effective_entry_hurdle = conformal_win_q.min(asymmetric_hurdle);
-
-        if diag.trap_similarity_score > diag.winner_similarity_score
-            && maha_trap < maha_win
-            && lambda_entry_x > effective_entry_hurdle
-        {
-            diag.should_veto = true;
-        }
+        diag.conformal_entry_llr = (lambda_entry_x * 1000.0).round() / 1000.0;
+        diag.conformal_entry_hurdle = (effective_entry_hurdle * 1000.0).round() / 1000.0;
+        diag.should_veto = maha_trap < maha_win && lambda_entry_x >= effective_entry_hurdle;
         diag
     }
 }

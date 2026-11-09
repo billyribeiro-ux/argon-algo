@@ -3301,24 +3301,16 @@ mod tests {
                 gen36_changed_count += 1;
             }
 
-            let cmp_op = if stage0.trap_similarity_score > stage0.winner_similarity_score {
-                ">"
-            } else if (stage0.trap_similarity_score - stage0.winner_similarity_score).abs() < 0.005
-            {
-                "<="
-            } else {
-                "<"
-            };
             let gate_str = if stage0.should_veto {
                 stage0_veto_count += 1;
                 format!(
-                    "VETO ({:.2}{}{:.2})",
-                    stage0.trap_similarity_score, cmp_op, stage0.winner_similarity_score
+                    "VETO (Λ={:.2}>={:.2})",
+                    stage0.conformal_entry_llr, stage0.conformal_entry_hurdle
                 )
             } else {
                 format!(
-                    "PASS ({:.2}{}{:.2})",
-                    stage0.trap_similarity_score, cmp_op, stage0.winner_similarity_score
+                    "PASS (Λ={:.2}<{:.2})",
+                    stage0.conformal_entry_llr, stage0.conformal_entry_hurdle
                 )
             };
 

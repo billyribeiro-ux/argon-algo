@@ -502,7 +502,7 @@ pub const RAW_32_FEATURE_METADATA: [(&str, &str); 32] = [
 pub fn classify_strategy_archetype(
     engine_mode: EngineExecutionMode,
     _brain_id: BrainHorizonId,
-    _primary_driver: PrimaryFingerprintDriver,
+    primary_driver: PrimaryFingerprintDriver,
     stream_weights: &FourStreamWeights,
     latent_embedding_128: &[f32],
 ) -> StrategyArchetype {
@@ -510,7 +510,6 @@ pub fn classify_strategy_archetype(
         return StrategyArchetype::PureMlLatentAnomaly;
     }
 
-    // Compute empirical per-feature dispersion \hat{\sigma}_f across the 32-feature state vector
     let n_feat = latent_embedding_128.len().min(32);
     if n_feat < 32 {
         let candidates = [
@@ -540,29 +539,27 @@ pub fn classify_strategy_archetype(
     } else {
         f0
     };
-    let f_full = if latent_embedding_128.len() >= 96 {
-        &latent_embedding_128[64..96]
-    } else {
-        f0
-    };
 
-    let f_peak = if latent_embedding_128.len() >= 128 {
-        &latent_embedding_128[96..128]
-    } else {
-        f0
-    };
+    // Cross-feature L2 dispersion \hat{\sigma}_{all} of the same temporal slice (`f0` and `f_recent`)
+    let sigma_f0 = (f0.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / (f0.len() as f64))
+        .max(1e-12)
+        .sqrt();
+    let sigma_recent = (f_recent
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        / (f_recent.len() as f64))
+        .max(1e-12)
+        .sqrt();
 
-    let mean_sq_all = (f0.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / 32.0).max(1e-8);
-    let sigma_all = mean_sq_all.sqrt();
-
-    let rms_slice = |slice: &[f32]| -> f64 {
+    let rms_norm = |slice: &[f32], sigma: f64| -> f64 {
         if slice.is_empty() {
             return 0.0;
         }
         let ms = slice
             .iter()
             .map(|v| {
-                let z = (*v as f64) / sigma_all;
+                let z = (*v as f64) / sigma;
                 z * z
             })
             .sum::<f64>()
@@ -570,54 +567,76 @@ pub fn classify_strategy_archetype(
         ms.sqrt()
     };
 
-    // Sub-stream intrinsic dispersion \hat{\sigma}_{E_s} from full-sequence peak excursion signature `f_peak`
-    let sigma_s1_breakout = rms_slice(&f_peak[0..4]).max(0.35);
-    let sigma_s1_absorption = rms_slice(&f_peak[4..12]).max(0.35);
-    let sigma_s2_gamma = rms_slice(&f_peak[12..20]).max(0.35);
-    let sigma_s3_short = rms_slice(&f_peak[20..25]).max(0.35);
-    let sigma_s4_macro = rms_slice(&f_peak[26..32]).max(0.35);
+    let w1_raw = stream_weights.chart_tape_physics_weight as f64;
+    let w2_raw = stream_weights.options_gamma_vanna_weight as f64;
+    let w3_raw = stream_weights.short_float_squeeze_weight as f64;
+    let w4_raw = stream_weights.market_internals_macro_weight as f64;
+    let mean_w = (0.25 * (w1_raw + w2_raw + w3_raw + w4_raw)).max(1e-6);
 
-    let w1 = (stream_weights.chart_tape_physics_weight as f64).max(0.05) / 0.25;
-    let w2 = (stream_weights.options_gamma_vanna_weight as f64).max(0.05) / 0.25;
-    let w3 = (stream_weights.short_float_squeeze_weight as f64).max(0.05) / 0.25;
-    let w4 = (stream_weights.market_internals_macro_weight as f64).max(0.05) / 0.25;
+    let stream_weight_factor = |driver: PrimaryFingerprintDriver, w_raw: f64| -> f64 {
+        let rel_w = w_raw / mean_w;
+        if primary_driver == driver {
+            rel_w * (1.0 + w_raw)
+        } else {
+            rel_w
+        }
+    };
+
+    let w1 = stream_weight_factor(PrimaryFingerprintDriver::VolumeAbsorption, w1_raw);
+    let w2 = stream_weight_factor(PrimaryFingerprintDriver::GammaSqueeze, w2_raw);
+    let w3 = stream_weight_factor(PrimaryFingerprintDriver::ShortSqueeze, w3_raw);
+    let w4 = stream_weight_factor(PrimaryFingerprintDriver::InternalsAlignment, w4_raw);
 
     // 1. Stream 1A (`f[0..4]`): Multi-bar trend drift & range expansion -> HtfMultiScaleBreakout
-    let e_s1_breakout = 0.5 * (rms_slice(&f0[0..4]) + rms_slice(&f_recent[0..4]) * 1.35) * w1;
-    let z_s1_breakout = e_s1_breakout / sigma_s1_breakout;
+    let body_conviction_z =
+        ((f0[3].abs() as f64) / sigma_f0 + (f_recent[3].abs() as f64) / sigma_recent) * 0.5;
+    let wick_rejection_z = (((f0[4].abs() + f0[5].abs()) as f64) / sigma_f0
+        + ((f_recent[4].abs() + f_recent[5].abs()) as f64) / sigma_recent)
+        * 0.5;
+    let breakout_impulse = body_conviction_z / wick_rejection_z.max(1e-6);
+    let e_s1_breakout = 0.5
+        * (rms_norm(&f0[0..4], sigma_f0) + rms_norm(&f_recent[0..4], sigma_recent))
+        * (1.0 + breakout_impulse)
+        * w1;
 
     // 2. Stream 1B (`f[4..12]`): Wick absorption, volume surge & POC clustering -> PocVolumeAbsorption
-    let e_s1_absorption = 0.5 * (rms_slice(&f0[4..12]) + rms_slice(&f_recent[4..12])) * w1;
-    let z_s1_absorption = e_s1_absorption / sigma_s1_absorption;
+    let e_s1_absorption =
+        0.5 * (rms_norm(&f0[4..12], sigma_f0) + rms_norm(&f_recent[4..12], sigma_recent)) * w1;
 
     // 3. Stream 2 (`f[12..20]`): Options Gamma/Vanna & 0DTE dealer flow -> GammaSqueezeIgnition
-    let e_s2_gamma = rms_slice(&f0[12..20]) * w2;
-    let z_s2_gamma = e_s2_gamma / sigma_s2_gamma;
+    let e_s2_gamma =
+        0.5 * (rms_norm(&f0[12..20], sigma_f0) + rms_norm(&f_recent[12..20], sigma_recent)) * w2;
 
     // 4. Stream 3 (`f[20..26]`): Short-to-float, float rotation & CTB/DTC pressure -> ShortFloatLiquefaction
-    //    Asset Physics Gate: ONLY eligible when the asset's short-interest (`f[21]`) and float rotation (`f[20]`)
-    //    exceed the cross-sectional median of the universe (preventing mega-cap ETFs/equities like QQQ/MSFT).
-    let z_float_rot = (f0[20].abs() as f64) / sigma_all;
-    let z_short_float = (f0[21].abs() as f64) / sigma_all;
-    let z_ctb = (f0[24].abs() as f64) / sigma_all;
-    let short_physics_above_median =
-        z_short_float > 0.55 && (z_float_rot + z_short_float + z_ctb) > 1.85;
-    let z_s3_short = if short_physics_above_median {
-        (rms_slice(&f0[20..25]) * w3) / sigma_s3_short
+    let e_s3_short =
+        0.5 * (rms_norm(&f0[20..26], sigma_f0) + rms_norm(&f_recent[20..26], sigma_recent)) * w3;
+
+    // 5. Stream 4 (`f[26..32]`): NYSE/Nasdaq TICK, ADD breadth, VOLD & VIX macro tide -> MacroInternalsTideDrive
+    let e_s4_macro =
+        0.5 * (rms_norm(&f0[26..32], sigma_f0) + rms_norm(&f_recent[26..32], sigma_recent)) * w4;
+
+    // Cross-feature median of `f0` and mean energy of the other 3 streams for Stream 3 Asset Physics Gate
+    let mut f0_sorted = [0.0_f64; 32];
+    for (i, &v) in f0.iter().enumerate() {
+        f0_sorted[i] = (v as f64).abs();
+    }
+    f0_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_f0 = 0.5 * (f0_sorted[15] + f0_sorted[16]);
+
+    let e_s1_dominant = e_s1_breakout.max(e_s1_absorption);
+    let mean_other_streams = (e_s1_dominant + e_s2_gamma + e_s4_macro) / 3.0;
+    let gated_s3_short = if e_s3_short > mean_other_streams && (f0[21] as f64) > median_f0 {
+        e_s3_short
     } else {
         0.0
     };
 
-    // 5. Stream 4 (`f[26..32]`): NYSE/Nasdaq TICK, ADD breadth, VOLD & VIX macro tide -> MacroInternalsTideDrive
-    let e_s4_macro = 0.5 * (rms_slice(&f0[26..32]) + rms_slice(&f_full[26..32])) * w4;
-    let z_s4_macro = e_s4_macro / sigma_s4_macro;
-
     let ranked = [
-        (z_s2_gamma, StrategyArchetype::GammaSqueezeIgnition),
-        (z_s3_short, StrategyArchetype::ShortFloatLiquefaction),
-        (z_s4_macro, StrategyArchetype::MacroInternalsTideDrive),
-        (z_s1_absorption, StrategyArchetype::PocVolumeAbsorption),
-        (z_s1_breakout, StrategyArchetype::HtfMultiScaleBreakout),
+        (e_s2_gamma, StrategyArchetype::GammaSqueezeIgnition),
+        (gated_s3_short, StrategyArchetype::ShortFloatLiquefaction),
+        (e_s4_macro, StrategyArchetype::MacroInternalsTideDrive),
+        (e_s1_absorption, StrategyArchetype::PocVolumeAbsorption),
+        (e_s1_breakout, StrategyArchetype::HtfMultiScaleBreakout),
     ];
 
     ranked

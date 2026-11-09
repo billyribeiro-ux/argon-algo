@@ -613,6 +613,8 @@ pub struct AppState {
     pub precedent_knn: Arc<PrecedentKnnIndex>,
     pub ledger: Arc<RealTimeLedgerEngine>,
     pub ws_tx: broadcast::Sender<String>,
+    pub staged_paper_positions: Arc<RwLock<Vec<OpenPositionRow>>>,
+    pub staged_paper_receipts: Arc<RwLock<Vec<StagedOrderReceipt>>>,
 }
 
 impl AppState {
@@ -653,6 +655,8 @@ impl AppState {
             precedent_knn,
             ledger,
             ws_tx,
+            staged_paper_positions: Arc::new(RwLock::new(Vec::new())),
+            staged_paper_receipts: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -2320,6 +2324,10 @@ pub fn build_axum_router(state: AppState) -> Router {
             get(institutional_watchlist_handler),
         )
         .route(
+            "/api/v1/scanner/institutional-watchlist",
+            get(institutional_watchlist_handler),
+        )
+        .route(
             "/api/v1/scanner/sunday-protocol",
             get(sunday_alpha_protocol_handler),
         )
@@ -2330,6 +2338,18 @@ pub fn build_axum_router(state: AppState) -> Router {
         .route(
             "/api/v1/scanner/sunday-protocol/dispatch",
             post(sunday_protocol_dispatch_handler),
+        )
+        .route(
+            "/api/v1/scanner/sunday-protocol/stage-orders",
+            post(stage_sunday_orders_handler),
+        )
+        .route(
+            "/api/v1/scanner/webhooks/config",
+            get(scanner_webhooks_get_config_handler).post(scanner_webhooks_post_config_handler),
+        )
+        .route(
+            "/api/v1/scanner/webhooks/test-ping",
+            post(scanner_webhooks_test_ping_handler),
         )
         .route("/api/v1/chart/{symbol}", get(live_chart_handler))
         .route("/api/v1/ledger/snapshot", get(ledger_snapshot_handler))

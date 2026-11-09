@@ -406,12 +406,22 @@ impl OnnxMultiBrainEngine {
             BrainHorizonId::Brain04CoreSwing => 30,
             BrainHorizonId::Brain05LongTermWealth => 60,
         };
+        let min_expiry_epoch_s = eval_epoch_s + min_dte_days * 86_400;
         let mut candidate_date = eval_date + chrono::Duration::days(min_dte_days);
-        while candidate_date.weekday() != chrono::Weekday::Fri {
+        loop {
+            let cand_epoch_s = crate::broker_bridge::ymd_to_epoch_seconds(
+                candidate_date.year() as i64,
+                candidate_date.month() as i64,
+                candidate_date.day() as i64,
+            );
+            let is_friday = candidate_date.weekday() == chrono::Weekday::Fri;
+            let is_new_years_day = candidate_date.month() == 1 && candidate_date.day() == 1;
+            if is_friday && !is_new_years_day && cand_epoch_s >= min_expiry_epoch_s {
+                let dte_days = ((cand_epoch_s - eval_epoch_s) as f64 / 86_400.0).max(1.0);
+                return (candidate_date.format("%Y-%m-%d").to_string(), dte_days);
+            }
             candidate_date += chrono::Duration::days(1);
         }
-        let dte_days = (candidate_date - eval_date).num_days() as f64;
-        (candidate_date.format("%Y-%m-%d").to_string(), dte_days.max(1.0))
     }
 
     #[allow(clippy::too_many_arguments)]

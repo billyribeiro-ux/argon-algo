@@ -93,6 +93,59 @@ pub struct WebhookChannelConfig {
 }
 
 impl WebhookChannelConfig {
+    /// Loads initial webhook channel configuration from environment variables (`ARGON_DISCORD_WEBHOOK_URL`,
+    /// `ARGON_TELEGRAM_BOT_TOKEN`, `ARGON_TELEGRAM_CHAT_ID`) without writing secrets to disk.
+    pub fn from_env() -> Self {
+        let discord_webhook_url = std::env::var("ARGON_DISCORD_WEBHOOK_URL")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let telegram_bot_token = std::env::var("ARGON_TELEGRAM_BOT_TOKEN")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let telegram_chat_id = std::env::var("ARGON_TELEGRAM_CHAT_ID")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let discord_enabled = !discord_webhook_url.is_empty();
+        let telegram_enabled = !telegram_bot_token.is_empty() && !telegram_chat_id.is_empty();
+        Self {
+            discord_webhook_url,
+            discord_enabled,
+            telegram_bot_token,
+            telegram_chat_id,
+            telegram_enabled,
+            slack_webhook_url: String::new(),
+            slack_enabled: false,
+            custom_json_webhook_url: String::new(),
+            custom_json_enabled: false,
+        }
+    }
+
+    /// Masks any webhook URL or secret token so raw credentials are never leaked over HTTP GET responses.
+    pub fn mask_secret(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let chars: Vec<char> = trimmed.chars().collect();
+        let len = chars.len();
+        if len <= 8 {
+            return "****".to_string();
+        }
+        let suffix: String = chars[len.saturating_sub(4)..].iter().collect();
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            let prefix_len = 36.min(len.saturating_sub(6));
+            let prefix: String = chars[..prefix_len].iter().collect();
+            format!("{prefix}...****{suffix}")
+        } else {
+            let prefix_len = 4.min(len.saturating_sub(5));
+            let prefix: String = chars[..prefix_len].iter().collect();
+            format!("{prefix}...****{suffix}")
+        }
+    }
+
     /// Returns the list of active external channels that have both their toggle enabled and non-empty credentials.
     pub fn active_channel_names(&self) -> Vec<String> {
         let mut channels = Vec::new();
@@ -116,6 +169,32 @@ impl WebhookChannelConfig {
         }
         channels
     }
+}
+
+/// Strict secret-redacted webhook configuration response for `GET/POST /api/v1/scanner/webhooks/config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactedWebhookConfigResponse {
+    pub discord_webhook_url_masked: String,
+    pub discord_configured: bool,
+    pub discord_enabled: bool,
+    pub telegram_bot_token_masked: String,
+    pub telegram_chat_id_masked: String,
+    pub telegram_configured: bool,
+    pub telegram_enabled: bool,
+    pub configured: bool,
+    pub dry_run_mode: bool,
+    pub outbox_count: usize,
+    pub active_channels: Vec<String>,
+}
+
+/// Request payload for `POST /api/v1/scanner/webhooks/config` runtime in-memory override.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScannerWebhookConfigUpdateRequest {
+    pub discord_webhook_url: Option<String>,
+    pub discord_enabled: Option<bool>,
+    pub telegram_bot_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
+    pub telegram_enabled: Option<bool>,
 }
 
 /// Input telemetry for constructing a multi-channel execution alert.
@@ -212,7 +291,7 @@ impl OutboundWebhookDispatcher {
             .build()
             .unwrap_or_default();
         Self {
-            config: RwLock::new(WebhookChannelConfig::default()),
+            config: RwLock::new(WebhookChannelConfig::from_env()),
             outbox: RwLock::new(VecDeque::with_capacity(MAX_WEBHOOK_OUTBOX_RECORDS)),
             http_client,
         }
@@ -225,6 +304,67 @@ impl OutboundWebhookDispatcher {
     pub fn update_config(&self, new_cfg: WebhookChannelConfig) -> WebhookChannelConfig {
         *self.config.write() = new_cfg.clone();
         new_cfg
+    }
+
+    pub fn get_redacted_config(&self) -> RedactedWebhookConfigResponse {
+        let cfg = self.config.read().clone();
+        let outbox_count = self.outbox.read().len();
+        let discord_configured = !cfg.discord_webhook_url.trim().is_empty();
+        let telegram_configured = !cfg.telegram_bot_token.trim().is_empty()
+            && !cfg.telegram_chat_id.trim().is_empty();
+        let active_channels = cfg.active_channel_names();
+        let has_remote_target = active_channels.iter().any(|c| c != "LOCAL_OUTBOX");
+        RedactedWebhookConfigResponse {
+            discord_webhook_url_masked: WebhookChannelConfig::mask_secret(&cfg.discord_webhook_url),
+            discord_configured,
+            discord_enabled: cfg.discord_enabled,
+            telegram_bot_token_masked: WebhookChannelConfig::mask_secret(&cfg.telegram_bot_token),
+            telegram_chat_id_masked: WebhookChannelConfig::mask_secret(&cfg.telegram_chat_id),
+            telegram_configured,
+            telegram_enabled: cfg.telegram_enabled,
+            configured: discord_configured || telegram_configured,
+            dry_run_mode: !has_remote_target,
+            outbox_count,
+            active_channels,
+        }
+    }
+
+    pub fn apply_scanner_config_update(
+        &self,
+        req: ScannerWebhookConfigUpdateRequest,
+    ) -> RedactedWebhookConfigResponse {
+        {
+            let mut guard = self.config.write();
+            if let Some(url) = req.discord_webhook_url {
+                let trimmed = url.trim().to_string();
+                if !trimmed.contains("****") {
+                    guard.discord_webhook_url = trimmed;
+                }
+            }
+            if let Some(en) = req.discord_enabled {
+                guard.discord_enabled = en;
+            } else if !guard.discord_webhook_url.is_empty() {
+                guard.discord_enabled = true;
+            }
+            if let Some(tok) = req.telegram_bot_token {
+                let trimmed = tok.trim().to_string();
+                if !trimmed.contains("****") {
+                    guard.telegram_bot_token = trimmed;
+                }
+            }
+            if let Some(cid) = req.telegram_chat_id {
+                let trimmed = cid.trim().to_string();
+                if !trimmed.contains("****") {
+                    guard.telegram_chat_id = trimmed;
+                }
+            }
+            if let Some(en) = req.telegram_enabled {
+                guard.telegram_enabled = en;
+            } else if !guard.telegram_bot_token.is_empty() && !guard.telegram_chat_id.is_empty() {
+                guard.telegram_enabled = true;
+            }
+        }
+        self.get_redacted_config()
     }
 
     pub fn export_outbox(&self) -> Vec<WebhookDispatchRecord> {

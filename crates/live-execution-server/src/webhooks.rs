@@ -41,6 +41,8 @@ pub enum WebhookEventType {
     Target1PartialBankedAndStopRatcheted,
     #[serde(rename = "POSITION_CLOSED")]
     PositionClosed,
+    #[serde(rename = "SUNDAY_ALPHA_PROTOCOL_DISPATCH")]
+    SundayAlphaProtocolDispatch,
 }
 
 impl WebhookEventType {
@@ -52,6 +54,7 @@ impl WebhookEventType {
                 "TARGET_1_PARTIAL_BANKED_AND_STOP_RATCHETED"
             }
             Self::PositionClosed => "POSITION_CLOSED",
+            Self::SundayAlphaProtocolDispatch => "SUNDAY_ALPHA_PROTOCOL_DISPATCH",
         }
     }
 
@@ -61,6 +64,7 @@ impl WebhookEventType {
             Self::ScaleInTrancheAdded => "➕ SCALE-IN TRANCHE ADDED",
             Self::Target1PartialBankedAndStopRatcheted => "🏦 50% BANKED @ T1 & STOP RATCHETED",
             Self::PositionClosed => "🏁 POSITION CLOSED",
+            Self::SundayAlphaProtocolDispatch => "🏛️ SUNDAY ALPHA STAGER DISPATCH",
         }
     }
 }
@@ -532,6 +536,180 @@ impl OutboundWebhookDispatcher {
             }
             guard.push_back(record.clone());
         }
+
+        if has_remote_target && tokio::runtime::Handle::try_current().is_ok() {
+            let client = self.http_client.clone();
+            let cfg_clone = cfg.clone();
+            let rec_clone = record.clone();
+            tokio::spawn(async move {
+                let _ = Self::deliver_over_http(&client, &cfg_clone, &rec_clone).await;
+            });
+        }
+
+        record
+    }
+
+    /// Formats an institutional Sunday Alpha Protocol approved stager summary into Discord, Telegram,
+    /// Slack, and Generic JSON payloads, logs the event to the bounded outbox, and dispatches HTTP POSTs.
+    pub fn record_sunday_alpha_protocol_dispatch(
+        &self,
+        protocol: &crate::routes::SundayAlphaProtocolResponse,
+    ) -> WebhookDispatchRecord {
+        let cfg = self.config.read().clone();
+        let channels_targeted = cfg.active_channel_names();
+        let has_remote_target = channels_targeted.iter().any(|c| c != "LOCAL_OUTBOX");
+        let dispatched_at_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string();
+        let ts_ms = Utc::now().timestamp_millis();
+
+        let top_signals: Vec<String> = protocol
+            .export_feed
+            .iter()
+            .take(5)
+            .map(|row| {
+                format!(
+                    "• **{}** ({}) {} | Cons: {:.1}% | Entry: ${:.2} | Stop: ${:.2} | Target: ${:.2} | Ticket: `{}` | CBOE: `{}`",
+                    row.symbol,
+                    row.brain_id,
+                    row.direction,
+                    row.engine_consensus_pct,
+                    row.limit_entry_price,
+                    row.structural_stop_loss,
+                    row.profit_target_1,
+                    row.execution_venue_ticket,
+                    row.matched_cboe_contract
+                )
+            })
+            .collect();
+
+        let discord_val = json!({
+            "username": "ARGON-4 Sunday Alpha OMS",
+            "avatar_url": "https://raw.githubusercontent.com/argon-algo/assets/main/bot_avatar.png",
+            "embeds": [{
+                "title": "🏛️ ARGON SUNDAY ALPHA PROTOCOL — INSTITUTIONAL STAGER DISPATCH",
+                "description": format!(
+                    "**Approved Signals:** {} / {} screened | **Active Generation:** Gen {}\n**Total Allocated Kelly:** {:.2}% | **Net Beta-Weighted Delta:** {:+.2}\n**OCC TIMS Relief:** {:.1}% | **Cross-Brain Conflicts Blocked:** {}\n\n{}",
+                    protocol.approved_signals_count,
+                    protocol.total_screened,
+                    protocol.generation_id,
+                    protocol.total_allocated_kelly_pct,
+                    protocol.net_portfolio_delta_beta_weighted,
+                    protocol.estimated_occ_tims_margin_relief_pct,
+                    protocol.cross_brain_conflicts_blocked,
+                    top_signals.join("\n")
+                ),
+                "color": 0x00E676,
+                "timestamp": dispatched_at_iso,
+                "footer": {
+                    "text": "ARGON Sunday Alpha OMS / EMS Autonomous Engine"
+                }
+            }]
+        });
+
+        let telegram_md = format!(
+            "🏛️ *ARGON SUNDAY ALPHA PROTOCOL — APPROVED STAGER DISPATCH*\n\n\
+            *Approved Signals:* {}/{} screened | *Active Gen:* Gen {}\n\
+            *Total Allocated Kelly:* {:.2}% | *Net Delta:* {:+.2}\n\
+            *OCC TIMS Relief:* {:.1}% | *Conflicts Blocked:* {}\n\n\
+            ```csv\n{}\n```",
+            protocol.approved_signals_count,
+            protocol.total_screened,
+            protocol.generation_id,
+            protocol.total_allocated_kelly_pct,
+            protocol.net_portfolio_delta_beta_weighted,
+            protocol.estimated_occ_tims_margin_relief_pct,
+            protocol.cross_brain_conflicts_blocked,
+            protocol.csv_feed.lines().take(6).collect::<Vec<_>>().join("\n")
+        );
+
+        let slack_val = json!({
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": { "type": "plain_text", "text": "🏛️ ARGON Sunday Alpha Stager Dispatch", "emoji": true }
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": format!(
+                            "*Approved Signals:* {}/{} | *Total Kelly:* {:.2}%\n*Net Delta:* {:+.2} | *OCC TIMS Relief:* {:.1}%",
+                            protocol.approved_signals_count, protocol.total_screened,
+                            protocol.total_allocated_kelly_pct, protocol.net_portfolio_delta_beta_weighted,
+                            protocol.estimated_occ_tims_margin_relief_pct
+                        )
+                    }
+                }
+            ]
+        });
+
+        let generic_val = json!({
+            "eventType": "SUNDAY_ALPHA_PROTOCOL_DISPATCH",
+            "dispatchedAtIso": dispatched_at_iso,
+            "generationId": protocol.generation_id,
+            "totalScreened": protocol.total_screened,
+            "approvedSignalsCount": protocol.approved_signals_count,
+            "totalAllocatedKellyPct": protocol.total_allocated_kelly_pct,
+            "netPortfolioDeltaBetaWeighted": protocol.net_portfolio_delta_beta_weighted,
+            "crossBrainConflictsBlocked": protocol.cross_brain_conflicts_blocked,
+            "estimatedOccTimsMarginReliefPct": protocol.estimated_occ_tims_margin_relief_pct,
+            "exportFeed": protocol.export_feed,
+            "csvFeed": protocol.csv_feed
+        });
+
+        let dispatch_id = Uuid::new_v4();
+        let record = WebhookDispatchRecord {
+            dispatch_id,
+            dispatched_at_iso: dispatched_at_iso.clone(),
+            dispatched_timestamp_ms: ts_ms,
+            event_type: WebhookEventType::SundayAlphaProtocolDispatch,
+            outcome_detail: format!(
+                "Approved {}/{} setups | Total Kelly {:.2}% | Conflicts Blocked: {}",
+                protocol.approved_signals_count,
+                protocol.total_screened,
+                protocol.total_allocated_kelly_pct,
+                protocol.cross_brain_conflicts_blocked
+            ),
+            symbol: "PORTFOLIO_UNIVERSE_24".to_string(),
+            brain_id: BrainHorizonId::Brain02IntradayDayTrade,
+            brain_name: "Sunday Alpha Portfolio Dispatcher".to_string(),
+            direction: TradeDirection::Long,
+            entry_price: SubPennyPrice::ZERO,
+            structural_stop_price: SubPennyPrice::ZERO,
+            target_1_price: SubPennyPrice::ZERO,
+            target_2_price: SubPennyPrice::ZERO,
+            current_or_exit_price: SubPennyPrice::ZERO,
+            kelly_fraction_pct: protocol.total_allocated_kelly_pct,
+            risk_budget_usd: 10_000.0,
+            notional_allocated_usd: 100_000.0,
+            matched_option_contract: "PORTFOLIO_COMBO_STAGER".to_string(),
+            greeks_summary: format!(
+                "Net Delta {:+.2} | OCC Relief {:.1}%",
+                protocol.net_portfolio_delta_beta_weighted,
+                protocol.estimated_occ_tims_margin_relief_pct
+            ),
+            stream_attribution_summary: "Multi-Horizon 5-Brain Consensus".to_string(),
+            precedent_win_rate_pct: 100.0,
+            ai_confidence_pct: 95.0,
+            pnl_usd: 0.0,
+            r_multiple: 0.0,
+            delivery_status: if has_remote_target {
+                "DISPATCHING_ASYNC".to_string()
+            } else {
+                "STORED_IN_LOCAL_OUTBOX".to_string()
+            },
+            channels_targeted,
+            discord_embed_json: serde_json::to_string_pretty(&discord_val).unwrap_or_default(),
+            telegram_markdown: telegram_md,
+            slack_blocks_json: serde_json::to_string_pretty(&slack_val).unwrap_or_default(),
+            generic_webhook_json: serde_json::to_string_pretty(&generic_val).unwrap_or_default(),
+        };
+
+        let mut guard = self.outbox.write();
+        if guard.len() >= MAX_WEBHOOK_OUTBOX_RECORDS {
+            guard.pop_front();
+        }
+        guard.push_back(record.clone());
+        drop(guard);
 
         if has_remote_target && tokio::runtime::Handle::try_current().is_ok() {
             let client = self.http_client.clone();

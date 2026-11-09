@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
+use chrono::Datelike;
 use raw_fingerprint_core::{
     AutonomousSignalBlueprint, BrainHorizonId, EmpiricalPrecedentDistribution,
     FINGERPRINT_FEATURE_DIM, FourStreamWeights, PrimaryFingerprintDriver, RawBarRecord,
@@ -320,7 +321,10 @@ impl OnnxMultiBrainEngine {
         signal.stream_weights = refined_weights;
         signal.primary_driver = refined_weights.primary_driver();
 
-        let matched_option = Self::match_option_contract(
+        let latest_bar_epoch_s = bars.last().map(|b| b.timestamp_ns / 1_000_000_000).unwrap_or(0);
+        let eval_epoch_s = latest_bar_epoch_s.max(chrono::Utc::now().timestamp());
+
+        let matched_option = Self::match_option_contract_with_epoch(
             symbol,
             brain_id,
             signal.direction,
@@ -330,6 +334,7 @@ impl OnnxMultiBrainEngine {
             is_optionable,
             options.front_iv,
             options.net_dealer_vanna,
+            eval_epoch_s,
         );
         Self::assert_option_direction_invariant(signal.direction, &matched_option);
 
@@ -381,6 +386,34 @@ impl OnnxMultiBrainEngine {
         }
     }
 
+    /// Computes the forward-rolling CBOE option expiration date and DTE days anchored to an evaluation epoch.
+    /// Strictly guarantees that no emitted contract has already expired or violates minimum DTE floors:
+    /// - `BRAIN-01` / `BRAIN-02`: `expiry_epoch_s >= eval_epoch_s + 2 * 86_400`
+    /// - `BRAIN-03`: `expiry_epoch_s >= eval_epoch_s + 14 * 86_400` (+14d..+21d Friday)
+    /// - `BRAIN-04`: `expiry_epoch_s >= eval_epoch_s + 30 * 86_400` (+30d..+45d monthly/Friday)
+    /// - `BRAIN-05`: `expiry_epoch_s >= eval_epoch_s + 60 * 86_400` (+60d..+90d cycle)
+    pub fn compute_forward_cboe_expiration(
+        brain_id: BrainHorizonId,
+        eval_epoch_s: i64,
+    ) -> (String, f64) {
+        let dt = chrono::DateTime::from_timestamp(eval_epoch_s, 0)
+            .unwrap_or_else(chrono::Utc::now);
+        let eval_date = dt.date_naive();
+        let min_dte_days: i64 = match brain_id {
+            BrainHorizonId::Brain01PennyAnomaly => 2,
+            BrainHorizonId::Brain02IntradayDayTrade => 2,
+            BrainHorizonId::Brain03ShortTermSwing => 14,
+            BrainHorizonId::Brain04CoreSwing => 30,
+            BrainHorizonId::Brain05LongTermWealth => 60,
+        };
+        let mut candidate_date = eval_date + chrono::Duration::days(min_dte_days);
+        while candidate_date.weekday() != chrono::Weekday::Fri {
+            candidate_date += chrono::Duration::days(1);
+        }
+        let dte_days = (candidate_date - eval_date).num_days() as f64;
+        (candidate_date.format("%Y-%m-%d").to_string(), dte_days.max(1.0))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn match_option_contract(
         symbol: &str,
@@ -392,6 +425,33 @@ impl OnnxMultiBrainEngine {
         is_optionable: bool,
         front_iv: f64,
         net_dealer_vanna: f64,
+    ) -> MatchedOptionExecutionPlan {
+        Self::match_option_contract_with_epoch(
+            symbol,
+            brain_id,
+            direction,
+            entry_price,
+            stop_price,
+            target_2_price,
+            is_optionable,
+            front_iv,
+            net_dealer_vanna,
+            chrono::Utc::now().timestamp(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn match_option_contract_with_epoch(
+        symbol: &str,
+        brain_id: BrainHorizonId,
+        direction: TradeDirection,
+        entry_price: SubPennyPrice,
+        stop_price: SubPennyPrice,
+        target_2_price: SubPennyPrice,
+        is_optionable: bool,
+        front_iv: f64,
+        net_dealer_vanna: f64,
+        eval_epoch_s: i64,
     ) -> MatchedOptionExecutionPlan {
         let spot = entry_price.to_f64();
         if !is_optionable || spot < 1.25 {
@@ -415,6 +475,9 @@ impl OnnxMultiBrainEngine {
         let is_long = direction == TradeDirection::Long;
         let right_char = if is_long { 'C' } else { 'P' };
 
+        let (calc_exp_date, calc_dte_days) =
+            Self::compute_forward_cboe_expiration(brain_id, eval_epoch_s);
+
         let (structure, exp_date, delta_abs, dte_days) = match brain_id {
             BrainHorizonId::Brain01PennyAnomaly => (
                 if front_iv > 0.85 {
@@ -424,9 +487,9 @@ impl OnnxMultiBrainEngine {
                 } else {
                     "SINGLE_LEG_PUT"
                 },
-                "2026-11-20",
+                calc_exp_date,
                 0.50,
-                21.0,
+                calc_dte_days,
             ),
             BrainHorizonId::Brain02IntradayDayTrade => (
                 if is_long {
@@ -434,15 +497,15 @@ impl OnnxMultiBrainEngine {
                 } else {
                     "SINGLE_LEG_PUT"
                 },
-                "2026-11-06",
+                calc_exp_date,
                 0.55,
-                5.0,
+                calc_dte_days,
             ),
             BrainHorizonId::Brain03ShortTermSwing => {
                 if front_iv > 0.85 {
-                    ("CREDIT_SPREAD", "2026-11-13", 0.48, 14.0)
+                    ("CREDIT_SPREAD", calc_exp_date, 0.48, calc_dte_days)
                 } else if front_iv > 0.52 {
-                    ("VERTICAL_DEBIT_SPREAD", "2026-11-13", 0.56, 14.0)
+                    ("VERTICAL_DEBIT_SPREAD", calc_exp_date, 0.56, calc_dte_days)
                 } else {
                     (
                         if is_long {
@@ -450,14 +513,14 @@ impl OnnxMultiBrainEngine {
                         } else {
                             "SINGLE_LEG_PUT"
                         },
-                        "2026-11-13",
+                        calc_exp_date,
                         0.56,
-                        14.0,
+                        calc_dte_days,
                     )
                 }
             }
-            BrainHorizonId::Brain04CoreSwing => ("DIAGONAL_SPREAD", "2026-12-18", 0.62, 45.0),
-            BrainHorizonId::Brain05LongTermWealth => ("DEEP_ITM_LEAPS", "2027-11-19", 0.80, 365.0),
+            BrainHorizonId::Brain04CoreSwing => ("DIAGONAL_SPREAD", calc_exp_date, 0.62, calc_dte_days),
+            BrainHorizonId::Brain05LongTermWealth => ("DEEP_ITM_LEAPS", calc_exp_date, 0.80, calc_dte_days),
         };
 
         let strike_step = if spot < 15.0 {

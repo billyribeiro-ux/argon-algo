@@ -498,6 +498,10 @@ pub struct IbkrBagComboLeg {
     pub cboe_mid_price: f64,
 }
 
+fn default_ratio_one() -> u32 {
+    1
+}
+
 /// Phase 22 & 28 Upgrade: Atomic 2-Leg Combo Order Specification (`IbkrBagComboPayload`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IbkrBagComboPayload {
@@ -505,6 +509,10 @@ pub struct IbkrBagComboPayload {
     pub combo_order_type: String,
     #[serde(default)]
     pub is_atomic_combo_order: bool,
+    #[serde(default = "default_ratio_one")]
+    pub leg1_ratio: u32,
+    #[serde(default = "default_ratio_one")]
+    pub leg2_ratio: u32,
     pub leg_1_close: IbkrBagComboLeg,
     pub leg_2_open: IbkrBagComboLeg,
     pub net_combo_limit_price: f64,
@@ -535,6 +543,10 @@ pub struct StagedOptionRollUpTicket {
     pub is_gamma_roll_active: bool,
     #[serde(default)]
     pub is_atomic_combo_order: bool,
+    #[serde(default = "default_ratio_one")]
+    pub leg1_ratio: u32,
+    #[serde(default = "default_ratio_one")]
+    pub leg2_ratio: u32,
     pub current_itm_occ_symbol: String,
     pub current_itm_contract_desc: String,
     pub sell_to_close_contracts: u32,
@@ -1161,8 +1173,8 @@ impl BrokerExecutionBridge {
 
         // Exact Multi-Leg Ratio Consistency on IBKR BAG / Schwab Combo Orders
         let gcd = Self::gcd_u32(stc_contracts, buy_to_open_roll_contracts);
-        let _leg1_ratio = stc_contracts / gcd;
-        let _leg2_ratio = buy_to_open_roll_contracts / gcd;
+        let leg1_ratio = stc_contracts / gcd;
+        let leg2_ratio = buy_to_open_roll_contracts / gcd;
 
         // Strict No-Arbitrage Theorem & Exact Combo Limit Pricing:
         // Price net_combo_limit_price as the exact net credit per combo unit:
@@ -1170,12 +1182,29 @@ impl BrokerExecutionBridge {
         let total_credit_spread =
             (stc_contracts as f64 * leg1_mid) - (buy_to_open_roll_contracts as f64 * leg2_mid);
         let unit_net_credit = total_credit_spread / (stc_contracts.max(1) as f64);
+        let upper_bound = (leg1_mid - leg2_intrinsic.max(0.05))
+            .min(spread_width - 0.05)
+            .max(0.05);
+        let lower_bound = 0.05_f64.min(upper_bound);
         let net_combo_limit_price =
-            ((unit_net_credit.clamp(0.10, (spread_width - 0.10).max(0.10))) * 100.0).round()
+            ((unit_net_credit.clamp(lower_bound, upper_bound)) * 100.0).round()
                 / 100.0;
 
         // Reconcile leg2_mid so Leg 1, Leg 2, and Net Credit reconcile to the penny
         leg2_mid = ((leg1_mid - net_combo_limit_price) * 100.0).round() / 100.0;
+        debug_assert!(
+            leg2_mid >= leg2_intrinsic - 1e-6,
+            "leg2_mid {} must be >= leg2_intrinsic {}",
+            leg2_mid,
+            leg2_intrinsic
+        );
+        assert!(
+            ((leg1_mid - leg2_mid) - net_combo_limit_price).abs() < 1e-6,
+            "Reconciled credit ({} - {}) must match net_combo_limit_price {}",
+            leg1_mid,
+            leg2_mid,
+            net_combo_limit_price
+        );
 
         let leg1_half_spread = (leg1_mid * 0.008).clamp(0.01, 0.06);
         let leg1_bid = (((leg1_mid - leg1_half_spread).max(0.05)) * 100.0).round() / 100.0;
@@ -1283,6 +1312,8 @@ impl BrokerExecutionBridge {
         let ibkr_bag_combo_payload = IbkrBagComboPayload {
             combo_order_type: combo_order_type.clone(),
             is_atomic_combo_order: true,
+            leg1_ratio,
+            leg2_ratio,
             leg_1_close: leg_1_close.clone(),
             leg_2_open: leg_2_open.clone(),
             net_combo_limit_price,
@@ -1299,6 +1330,8 @@ impl BrokerExecutionBridge {
             "strategy": "CBOE_GAMMA_WALL_HOUSE_MONEY_ROLL_UP",
             "comboOrderType": "IBKR_BAG_VERTICAL_ROLL_COMBO",
             "isAtomicComboOrder": true,
+            "leg1Ratio": leg1_ratio,
+            "leg2Ratio": leg2_ratio,
             "secType": "BAG",
             "symbol": pos.symbol,
             "netComboLimitPrice": net_combo_limit_price,
@@ -1346,6 +1379,8 @@ impl BrokerExecutionBridge {
         let schwab_roll_payload_json = serde_json::json!({
             "broker": "CHARLES_SCHWAB_TRADER_API_V1",
             "comboOrderType": "SCHWAB_2LEG_NET_ROLL",
+            "leg1Ratio": leg1_ratio,
+            "leg2Ratio": leg2_ratio,
             "orderStrategyType": "SINGLE",
             "complexOrderStrategyType": "DIAGONAL_OR_VERTICAL_ROLL",
             "netComboLimitPrice": net_combo_limit_price,
@@ -1468,6 +1503,8 @@ impl BrokerExecutionBridge {
             },
             is_gamma_roll_active,
             is_atomic_combo_order: true,
+            leg1_ratio,
+            leg2_ratio,
             current_itm_occ_symbol,
             current_itm_contract_desc: pos.matched_option_contract.clone(),
             sell_to_close_contracts: stc_contracts,

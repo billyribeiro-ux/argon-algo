@@ -810,6 +810,157 @@ impl BrokerExecutionBridge {
         }
     }
 
+    /// Standard normal cumulative distribution function (Abramowitz & Stegun 7.1.26 approximation, max error < 1.5e-7)
+    pub fn norm_cdf(x: f64) -> f64 {
+        let p = 0.2316419;
+        let b1 = 0.319381530;
+        let b2 = -0.356563782;
+        let b3 = 1.781477937;
+        let b4 = -1.821255978;
+        let b5 = 1.330274429;
+
+        let abs_x = x.abs();
+        let t = 1.0 / (1.0 + p * abs_x);
+        let phi = (-0.5 * abs_x * abs_x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        let poly = t * (b1 + t * (b2 + t * (b3 + t * (b4 + t * b5))));
+        let cdf_pos = 1.0 - phi * poly;
+
+        if x >= 0.0 {
+            cdf_pos
+        } else {
+            1.0 - cdf_pos
+        }
+    }
+
+    pub fn black_scholes_call(s: f64, k: f64, t: f64, r: f64, v: f64) -> f64 {
+        if t <= 0.001 || v <= 0.001 {
+            return (s - k).max(0.0);
+        }
+        let sqrt_t = t.sqrt();
+        let d1 = ((s / k.max(0.01)).ln() + (r + 0.5 * v * v) * t) / (v * sqrt_t);
+        let d2 = d1 - v * sqrt_t;
+        let call = s * Self::norm_cdf(d1) - k * (-r * t).exp() * Self::norm_cdf(d2);
+        call.max((s - k).max(0.0))
+    }
+
+    pub fn black_scholes_put(s: f64, k: f64, t: f64, r: f64, v: f64) -> f64 {
+        if t <= 0.001 || v <= 0.001 {
+            return (k - s).max(0.0);
+        }
+        let sqrt_t = t.sqrt();
+        let d1 = ((s / k.max(0.01)).ln() + (r + 0.5 * v * v) * t) / (v * sqrt_t);
+        let d2 = d1 - v * sqrt_t;
+        let put = k * (-r * t).exp() * Self::norm_cdf(-d2) - s * Self::norm_cdf(-d1);
+        put.max((k - s).max(0.0))
+    }
+
+    /// Robust parser for matched option contracts supporting OCC format ("MSFT  261218C00465000"),
+    /// human-readable format ("MSFT 2026-12-18 $465.00C"), or dynamic future expiration synthesis.
+    pub fn parse_occ_or_contract_desc(
+        symbol: &str,
+        contract_str: &str,
+        opened_timestamp_ns: i64,
+        brain_id: BrainHorizonId,
+        direction: TradeDirection,
+        spot_price: f64,
+    ) -> (String, String, f64, String) {
+        let sym_upper = symbol.to_uppercase();
+        let sym_padded = format!("{:<6}", sym_upper);
+        let default_right = match direction {
+            TradeDirection::Long => "C",
+            TradeDirection::Short => "P",
+        };
+
+        let trimmed = contract_str.trim();
+
+        // 1. Try parsing standard OCC symbol: "MSFT  261218C00465000"
+        if trimmed.len() >= 15 && (trimmed.contains('C') || trimmed.contains('P')) {
+            if let Some(pos_cp) = trimmed.find(['C', 'P']) {
+                if pos_cp >= 6 && pos_cp + 1 < trimmed.len() {
+                    let maybe_yymmdd = &trimmed[pos_cp - 6..pos_cp];
+                    let maybe_strike_str = &trimmed[pos_cp + 1..];
+                    if maybe_yymmdd.chars().all(|c| c.is_ascii_digit())
+                        && maybe_strike_str.chars().all(|c| c.is_ascii_digit())
+                    {
+                        let right = &trimmed[pos_cp..=pos_cp];
+                        if let Ok(strike_int) = maybe_strike_str.parse::<u64>() {
+                            let strike = (strike_int as f64) / 1000.0;
+                            let strike_millis = strike_int.min(99_999_999);
+                            let occ = format!("{sym_padded}{maybe_yymmdd}{right}{strike_millis:08}");
+                            return (occ, maybe_yymmdd.to_string(), strike, right.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Try parsing human-readable format: "MSFT 2026-12-18 $465.00C" or "CLOV 2026-11-20 $4.50/$5.50C"
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let mut parsed_date: Option<String> = None;
+        let mut parsed_strike: Option<f64> = None;
+        let mut parsed_right: Option<String> = None;
+
+        for token in &tokens {
+            if token.len() == 10 && token.chars().nth(4) == Some('-') && token.chars().nth(7) == Some('-') {
+                let parts: Vec<&str> = token.split('-').collect();
+                if parts.len() == 3 && parts[0].len() == 4 && parts[1].len() == 2 && parts[2].len() == 2 {
+                    let yy = &parts[0][2..4];
+                    let mm = parts[1];
+                    let dd = parts[2];
+                    parsed_date = Some(format!("{yy}{mm}{dd}"));
+                }
+            }
+            if token.starts_with('$') {
+                let stripped = &token[1..];
+                let right_char = if stripped.ends_with('C') || stripped.ends_with('c') {
+                    parsed_right = Some("C".to_string());
+                    &stripped[..stripped.len() - 1]
+                } else if stripped.ends_with('P') || stripped.ends_with('p') {
+                    parsed_right = Some("P".to_string());
+                    &stripped[..stripped.len() - 1]
+                } else {
+                    stripped
+                };
+
+                let first_strike_str = right_char.split('/').next().unwrap_or(right_char);
+                if let Ok(stk) = first_strike_str.parse::<f64>() {
+                    parsed_strike = Some(stk);
+                }
+            }
+        }
+
+        let exp_code = parsed_date.unwrap_or_else(|| {
+            let dte_days = match brain_id {
+                BrainHorizonId::Brain01PennyAnomaly => 7,
+                BrainHorizonId::Brain02IntradayDayTrade => 14,
+                BrainHorizonId::Brain03ShortTermSwing => 30,
+                BrainHorizonId::Brain04CoreSwing => 60,
+                BrainHorizonId::Brain05LongTermWealth => 120,
+            };
+            let future_ts_s = (opened_timestamp_ns / 1_000_000_000).max(1_770_000_000) + dte_days * 86_400;
+            let days_since_epoch = future_ts_s / 86400;
+            let z = days_since_epoch + 719468;
+            let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+            let doe = (z - era * 146097) as u32;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let y = (yoe as i64) + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = if m <= 2 { y + 1 } else { y };
+            let yy = (y % 100).abs();
+            format!("{yy:02}{m:02}{d:02}")
+        });
+
+        let right = parsed_right.unwrap_or_else(|| default_right.to_string());
+        let strike = parsed_strike.unwrap_or_else(|| spot_price.round().max(1.0));
+        let strike_millis = ((strike * 1000.0).round() as u64).min(99_999_999);
+        let occ = format!("{sym_padded}{exp_code}{right}{strike_millis:08}");
+
+        (occ, exp_code, strike, right)
+    }
+
     /// Phase 21 Upgrade 3: Builds a self-learned CBOE Gamma-Wall Options Roll-Up Ticket (`StagedOptionRollUpTicket`)
     /// using the Brain's self-learned $(q_{\text{lock}, b}^*, \phi_b^{(g)}, B_{\text{runner}, b}^{(g)})$ parameters
     /// with zero hardcoded constants.
@@ -818,6 +969,7 @@ impl BrokerExecutionBridge {
         syn_state: &BrainSynapticPlasticityState,
     ) -> StagedOptionRollUpTicket {
         let entry_px = pos.entry_price.to_f64().max(0.01);
+        let live_px = pos.live_price.to_f64().max(0.01);
         let init_stop_px = pos.initial_structural_stop.to_f64().max(0.01);
         let cur_stop_px = pos.structural_stop_price.to_f64().max(0.01);
         let risk_per_share = (entry_px - init_stop_px).abs().max(entry_px * 0.004);
@@ -841,21 +993,18 @@ impl BrokerExecutionBridge {
         let is_gamma_roll_active =
             locked_profit_r >= q_lock_b && live_giveback_llr <= b_runner_b;
 
-        let sym_padded = format!("{:<6}", pos.symbol.to_uppercase());
-        let right = match pos.direction {
-            TradeDirection::Long => "C",
-            TradeDirection::Short => "P",
-        };
-        let exp_code = match pos.brain_id {
-            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => "260410",
-            BrainHorizonId::Brain03ShortTermSwing => "260424",
-            BrainHorizonId::Brain04CoreSwing => "260515",
-            BrainHorizonId::Brain05LongTermWealth => "260619",
-        };
+        // Dynamically parse actual held contract for Leg 1 (SELL_TO_CLOSE)
+        let (current_itm_occ_symbol, exp_code, cur_strike_f64, right) =
+            Self::parse_occ_or_contract_desc(
+                &pos.symbol,
+                &pos.matched_option_contract,
+                pos.opened_timestamp_ns,
+                pos.brain_id,
+                pos.direction,
+                entry_px,
+            );
 
-        let cur_strike_f64 = entry_px.round().max(1.0);
-        let cur_strike_millis = ((cur_strike_f64 * 1000.0).round() as u64).min(99_999_999);
-        let current_itm_occ_symbol = format!("{sym_padded}{exp_code}{right}{cur_strike_millis:08}");
+        let sym_padded = format!("{:<6}", pos.symbol.to_uppercase());
 
         // Next overhead/underfoot CBOE Gamma Wall Strike derived from Target 1 / Target 2 gamma wall geometry
         let t1_px = pos.target_1_price.to_f64().max(0.5);
@@ -870,7 +1019,21 @@ impl BrokerExecutionBridge {
         } else {
             0.5
         };
-        let next_gw_strike_f64 = ((gamma_wall_raw / strike_step).round() * strike_step).max(0.5);
+
+        // Ensure roll direction maintains vertical spread mechanics:
+        // Long / Calls: Roll up to higher strike (K2 > K1)
+        // Short / Puts: Roll down to lower strike (K2 < K1)
+        let next_gw_strike_f64 = match pos.direction {
+            TradeDirection::Long => {
+                let candidate = ((gamma_wall_raw / strike_step).round() * strike_step).max(0.5);
+                candidate.max(cur_strike_f64 + strike_step)
+            }
+            TradeDirection::Short => {
+                let candidate = ((gamma_wall_raw / strike_step).round() * strike_step).max(0.5);
+                candidate.min(cur_strike_f64 - strike_step).max(strike_step)
+            }
+        };
+
         let next_gamma_wall_strike =
             SubPennyPrice::from_f64(next_gw_strike_f64).unwrap_or(pos.target_1_price);
         let next_gw_millis = ((next_gw_strike_f64 * 1000.0).round() as u64).min(99_999_999);
@@ -882,16 +1045,75 @@ impl BrokerExecutionBridge {
         );
 
         let stc_contracts = pos.option_contracts_count.max(1);
-        let entry_prem = pos.option_entry_premium.to_f64().max(0.15);
-        let live_prem = pos
-            .option_live_premium
-            .to_f64()
-            .max(entry_prem * (1.0 + 0.42 * locked_profit_r));
-        let current_itm_live_premium =
-            SubPennyPrice::from_f64(live_prem).unwrap_or(pos.option_live_premium);
 
+        // Analytical Black-Scholes Pricing & Strict No-Arbitrage Bounds
+        let dte_days: f64 = match pos.brain_id {
+            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => 7.0,
+            BrainHorizonId::Brain03ShortTermSwing => 14.0,
+            BrainHorizonId::Brain04CoreSwing => 35.0,
+            BrainHorizonId::Brain05LongTermWealth => 70.0,
+        };
+        let t_years = (dte_days / 365.0_f64).max(0.005_f64);
+        let r_rf = 0.045; // 4.5% US Treasury risk-free benchmark
+        let iv = pos.contract_iv.clamp(0.18, 0.65);
+
+        let bs_leg1 = if right == "C" {
+            Self::black_scholes_call(live_px, cur_strike_f64, t_years, r_rf, iv)
+        } else {
+            Self::black_scholes_put(live_px, cur_strike_f64, t_years, r_rf, iv)
+        };
+        let bs_leg2 = if right == "C" {
+            Self::black_scholes_call(live_px, next_gw_strike_f64, t_years, r_rf, iv)
+        } else {
+            Self::black_scholes_put(live_px, next_gw_strike_f64, t_years, r_rf, iv)
+        };
+
+        // Intrinsic lower bounds: max(0, S - K) for Calls, max(0, K - S) for Puts
+        let leg1_intrinsic = if right == "C" {
+            (live_px - cur_strike_f64).max(0.0)
+        } else {
+            (cur_strike_f64 - live_px).max(0.0)
+        };
+        let leg2_intrinsic = if right == "C" {
+            (live_px - next_gw_strike_f64).max(0.0)
+        } else {
+            (next_gw_strike_f64 - live_px).max(0.0)
+        };
+
+        let spread_width = (next_gw_strike_f64 - cur_strike_f64).abs().max(1.0);
+
+        let mut leg1_mid = (bs_leg1.max(leg1_intrinsic).max(0.15) * 100.0).round() / 100.0;
+        let mut leg2_mid = (bs_leg2.max(leg2_intrinsic).max(0.08) * 100.0).round() / 100.0;
+
+        // In a vertical credit roll-up/roll-down, the ITM leg closed (Leg 1) must be more valuable than Leg 2
+        if leg1_mid <= leg2_mid {
+            leg1_mid = leg2_mid + (spread_width * 0.35).clamp(0.50, spread_width - 0.20);
+        }
+
+        // Strict No-Arbitrage Theorem on Vertical Spreads:
+        // 0.10 <= Net Credit <= spread_width - 0.10 < spread_width
+        let net_combo_limit_price =
+            ((leg1_mid - leg2_mid).clamp(0.10, (spread_width - 0.10).max(0.10)) * 100.0).round()
+                / 100.0;
+
+        // Ensure leg2_mid matches net combo limit
+        if (leg1_mid - leg2_mid - net_combo_limit_price).abs() > 0.01 {
+            leg2_mid = ((leg1_mid - net_combo_limit_price) * 100.0).round() / 100.0;
+        }
+
+        let leg1_half_spread = (leg1_mid * 0.008).clamp(0.01, 0.06);
+        let leg1_bid = (((leg1_mid - leg1_half_spread).max(0.05)) * 100.0).round() / 100.0;
+        let leg1_ask = (((leg1_mid + leg1_half_spread).max(0.06)) * 100.0).round() / 100.0;
+        let cur_strike_price =
+            SubPennyPrice::from_f64(cur_strike_f64).unwrap_or(pos.entry_price);
+
+        let leg2_half_spread = (leg2_mid * 0.009).clamp(0.01, 0.05);
+        let leg2_bid = (((leg2_mid - leg2_half_spread).max(0.04)) * 100.0).round() / 100.0;
+        let leg2_ask = (((leg2_mid + leg2_half_spread).max(0.05)) * 100.0).round() / 100.0;
+
+        let entry_prem = pos.option_entry_premium.to_f64().max(0.15);
         let intrinsic_option_gain_usd =
-            (((live_prem - entry_prem).max(entry_prem * 0.38) * (stc_contracts as f64) * 100.0)
+            (((leg1_mid - entry_prem).max(entry_prem * 0.38) * (stc_contracts as f64) * 100.0)
                 * 100.0)
                 .round()
                 / 100.0;
@@ -903,30 +1125,18 @@ impl BrokerExecutionBridge {
             ((intrinsic_option_gain_usd - banked_realized_cash_usd).max(25.0) * 100.0).round()
                 / 100.0;
 
-        // Next Gamma Wall OTM/ATM strike limit premium
-        let roll_limit_prem_f64 = ((entry_prem * 0.68).max(0.12) * 100.0).round() / 100.0;
-        let next_gamma_wall_limit_premium =
-            SubPennyPrice::from_f64(roll_limit_prem_f64).unwrap_or(pos.option_entry_premium);
         let buy_to_open_roll_contracts = ((house_money_roll_budget_usd
-            / (roll_limit_prem_f64 * 100.0).max(12.0))
+            / (leg2_mid * 100.0).max(12.0))
         .floor() as u32)
             .clamp(1, stc_contracts.saturating_mul(2).max(2));
 
+        let current_itm_live_premium =
+            SubPennyPrice::from_f64(leg1_mid).unwrap_or(pos.option_live_premium);
+        let next_gamma_wall_limit_premium =
+            SubPennyPrice::from_f64(leg2_mid).unwrap_or(pos.option_entry_premium);
+
         let guaranteed_net_floor_r =
             (((1.0 - phi_b) * locked_profit_r) * 1000.0).round() / 1000.0;
-
-        // Phase 22 Upgrade 3: Atomic 2-Leg (`IBKR BAG` / `SCHWAB_MLEG` / `ALPACA_MLEG`) Combo Order Specification
-        let leg1_mid = ((live_prem * 100.0).round() / 100.0).max(0.10);
-        let leg1_half_spread = (leg1_mid * 0.008).clamp(0.01, 0.06);
-        let leg1_bid = (((leg1_mid - leg1_half_spread).max(0.05)) * 100.0).round() / 100.0;
-        let leg1_ask = (((leg1_mid + leg1_half_spread).max(0.06)) * 100.0).round() / 100.0;
-        let cur_strike_price =
-            SubPennyPrice::from_f64(cur_strike_f64).unwrap_or(pos.entry_price);
-
-        let leg2_mid = ((roll_limit_prem_f64 * 100.0).round() / 100.0).max(0.08);
-        let leg2_half_spread = (leg2_mid * 0.009).clamp(0.01, 0.05);
-        let leg2_bid = (((leg2_mid - leg2_half_spread).max(0.04)) * 100.0).round() / 100.0;
-        let leg2_ask = (((leg2_mid + leg2_half_spread).max(0.05)) * 100.0).round() / 100.0;
 
         let leg_1_close = IbkrBagComboLeg {
             leg_number: 1,
@@ -952,11 +1162,10 @@ impl BrokerExecutionBridge {
             cboe_mid_price: leg2_mid,
         };
 
-        let net_combo_limit_price = ((leg1_mid - leg2_mid) * 100.0).round() / 100.0;
         let nbbo_limit_walk_ladder = [
             net_combo_limit_price,
-            ((net_combo_limit_price - 0.02) * 100.0).round() / 100.0,
-            ((net_combo_limit_price - 0.05) * 100.0).round() / 100.0,
+            ((net_combo_limit_price - 0.02).max(0.05) * 100.0).round() / 100.0,
+            ((net_combo_limit_price - 0.05).max(0.05) * 100.0).round() / 100.0,
         ];
 
         let unit_itm_delta = pos.contract_delta.abs().clamp(0.58, 0.88);
@@ -979,11 +1188,19 @@ impl BrokerExecutionBridge {
         let combo_order_type = "IBKR_BAG_VERTICAL_ROLL_COMBO".to_string();
 
         let occ_tims_pm_relief_ratio_pct = {
-            let sigma_tims = syn_state.learned_occ_tims_sigma_shock_pct.max(0.01);
-            let theta_h = syn_state.learned_vanna_tail_hedge_ratio_theta;
-            let base_relief =
-                100.0 * (0.28 + 1.45 * theta_h + 0.35 * 0.15) / (1.0 + sigma_tims);
-            (base_relief * 100.0).round() / 100.0
+            let sigma_shock = syn_state.learned_occ_tims_sigma_shock_pct.clamp(0.08, 0.25);
+            let theta_h = syn_state.learned_vanna_tail_hedge_ratio_theta.clamp(0.0, 0.50);
+
+            // OCC TIMS 10-point valuation grid shock loss:
+            // Pre-roll: Long Leg 1 capital-at-risk = (stc_contracts * 100 * leg1_mid)
+            // Post-roll: Long Leg 2 capital-at-risk = (buy_to_open_roll_contracts * 100 * leg2_mid)
+            let pre_roll_risk = (stc_contracts as f64) * 100.0 * leg1_mid;
+            let post_roll_risk = (buy_to_open_roll_contracts as f64) * 100.0 * leg2_mid;
+            let reduction = (pre_roll_risk - post_roll_risk).max(0.0);
+            let raw_relief = (reduction / pre_roll_risk.max(1.0)) * 100.0;
+            let relief = (raw_relief * (1.0 + 0.20 * theta_h) / (1.0 + 0.40 * sigma_shock))
+                .clamp(15.0, 85.0);
+            (relief * 100.0).round() / 100.0
         };
 
         let s1_f64: Vec<f64> = pos
@@ -1278,10 +1495,21 @@ impl BrokerExecutionBridge {
 
         ledger.reconcile_option_roll_combo_on_open_position(
             position_id,
-            &roll_ticket.next_gamma_wall_contract_desc,
+            &roll_ticket.leg_2_open.occ_symbol,
             roll_ticket.buy_to_open_roll_contracts,
             roll_ticket.next_gamma_wall_limit_premium,
             roll_ticket.post_roll_gamma_convexity_boost_pct,
+            roll_ticket.locked_cash_harvested_usd,
+            roll_ticket.house_money_roll_budget_usd,
+            &format!(
+                "BAG-ROLL-{} FILLED @ Net ${:.2} (Harvested ${:.2} Banked, Reinvested ${:.2} in {}x {})",
+                roll_ticket.symbol,
+                executed_net_combo_price,
+                roll_ticket.locked_cash_harvested_usd,
+                roll_ticket.house_money_roll_budget_usd,
+                roll_ticket.buy_to_open_roll_contracts,
+                roll_ticket.leg_2_open.occ_symbol
+            ),
         );
 
         let short_hash = format!(

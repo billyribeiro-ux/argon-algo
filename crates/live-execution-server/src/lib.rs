@@ -3494,13 +3494,6 @@ mod tests {
             .expect("Expected Stage 3 House-Money runner trade for Candidate #177");
         let s3_row = &chronological_trades[s3_idx];
 
-        let win2_idx = chronological_trades
-            .iter()
-            .enumerate()
-            .position(|(i, r)| i != win1_idx && r.is_winner && r.realized_r_multiple >= 1.2 && r.entry_bars.len() > r.entry_bar_idx + 2)
-            .expect("Expected winner trade for Candidate #178");
-        let win2_row = &chronological_trades[win2_idx];
-
         let internals = raw_fingerprint_core::RawMarketInternalsSnapshot::default();
 
         // -----------------------------------------------------------------------------------------
@@ -3681,6 +3674,19 @@ mod tests {
         assert!(roll_ticket.child_execution_slices.len() >= 3);
         assert!(roll_ticket.occ_tims_pm_relief_ratio_pct > 0.0);
 
+        let spread_width = (roll_ticket.leg_2_open.strike_price.to_f64()
+            - roll_ticket.leg_1_close.strike_price.to_f64())
+        .abs();
+        assert!(
+            roll_ticket.net_combo_limit_price < spread_width,
+            "No-arbitrage violation: Net combo limit price (${:.2}) cannot exceed spread width (${:.2})",
+            roll_ticket.net_combo_limit_price, spread_width
+        );
+        assert!(roll_ticket.net_combo_limit_price > 0.0);
+        assert_eq!(roll_ticket.leg_1_close.strike_price.to_f64(), 465.0);
+        assert!(roll_ticket.leg_1_close.occ_symbol.contains("261218"));
+        assert!(roll_ticket.leg_2_open.occ_symbol.contains("261218"));
+
         // Execute and reconcile the roll combo across Schwab broker venue
         let roll_conf = BrokerExecutionBridge::execute_and_reconcile_roll_combo(
             &paper_engine,
@@ -3728,53 +3734,62 @@ mod tests {
         assert_eq!(closed_s3.len(), 1);
         println!("  Settled -> Trade #176 Closed: {} | Realized R: {:+.2}R | House-Money Scaled: {}",
             closed_s3[0].outcome_badge.as_str(), closed_s3[0].realized_r_multiple, closed_s3[0].was_scaled_with_house_money);
+        assert!(closed_s3[0].was_scaled_with_house_money, "Trade #176 must settle with was_scaled_with_house_money == true");
         assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(), 176);
         assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 0);
 
         // -----------------------------------------------------------------------------------------
-        // Candidate 5 (Trade #177 in closed ledger): Winner Target Hit
+        // Candidate 5 (Trade #177 in closed ledger): Stage 3 Profit-Giveback Ratchet Protected Exit
         // -----------------------------------------------------------------------------------------
-        println!("\n>>> [CANDIDATE 5 / TRADE #177] Symbol: {} | Brain: {} | Target Hit Winner", win2_row.symbol, win2_row.brain_id.as_str());
-        let (inf_w2, prec_w2) = build_live_inference_for_row(win2_row);
-        let pre_bars_w2 = win2_row.entry_bars[..=win2_row.entry_bar_idx].to_vec();
-        let opened_w2 = paper_engine.open_position_with_bars(
-            &win2_row.exchange_index,
-            &inf_w2,
-            &prec_w2,
+        let ratchet_idx = chronological_trades
+            .iter()
+            .position(|r| r.was_protected_from_giveback && r.symbol == "PLTR")
+            .or_else(|| chronological_trades.iter().position(|r| r.was_protected_from_giveback))
+            .expect("Expected Stage 3 Giveback Ratchet trade for Candidate #178");
+        let ratchet_row = &chronological_trades[ratchet_idx];
+
+        println!("\n>>> [CANDIDATE 5 / TRADE #177] Symbol: {} | Brain: {} | Stage 3 Profit-Giveback Ratchet Protected Exit", ratchet_row.symbol, ratchet_row.brain_id.as_str());
+        let (inf_r, prec_r) = build_live_inference_for_row(ratchet_row);
+        let pre_bars_r = ratchet_row.entry_bars[..=ratchet_row.entry_bar_idx].to_vec();
+        let opened_r = paper_engine.open_position_with_bars(
+            &ratchet_row.exchange_index,
+            &inf_r,
+            &prec_r,
             10_000.0,
-            pre_bars_w2.clone(),
+            pre_bars_r.clone(),
         );
         assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 1);
-        println!("  Open -> Position ID: {} | Entry: ${:.2}", opened_w2.position_id, opened_w2.entry_price);
+        println!("  Open -> Position ID: {} | Entry: ${:.2}", opened_r.position_id, opened_r.entry_price);
 
-        let mut stream_w2 = pre_bars_w2;
-        let total_post_w2 = win2_row.entry_bars.len().saturating_sub(1).saturating_sub(win2_row.entry_bar_idx);
-        let mut closed_w2 = Vec::new();
-        for k in 1..=total_post_w2 {
-            let next_bar = win2_row.entry_bars[win2_row.entry_bar_idx + k];
-            stream_w2.push(next_bar);
-            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&win2_row.symbol, win2_row.brain_id, &stream_w2, &internals);
+        let mut stream_r = pre_bars_r;
+        let total_post_r = ratchet_row.entry_bars.len().saturating_sub(1).saturating_sub(ratchet_row.entry_bar_idx);
+        let mut closed_r = Vec::new();
+        for k in 1..=total_post_r {
+            let next_bar = ratchet_row.entry_bars[ratchet_row.entry_bar_idx + k];
+            stream_r.push(next_bar);
+            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&ratchet_row.symbol, ratchet_row.brain_id, &stream_r, &internals);
             println!("  Bar +{} -> Close: ${:.2}", k, next_bar.close);
             if !newly.is_empty() {
-                closed_w2.extend(newly);
+                closed_r.extend(newly);
                 break;
             }
         }
-        if closed_w2.is_empty() {
-            let mut final_bar = stream_w2.last().copied().unwrap();
+        if closed_r.is_empty() {
+            let mut final_bar = stream_r.last().copied().unwrap();
             final_bar.timestamp_ns += 300_000_000_000;
-            final_bar.close = win2_row.target_2_price;
-            match win2_row.direction {
-                TradeDirection::Long => final_bar.high = win2_row.target_2_price,
-                TradeDirection::Short => final_bar.low = win2_row.target_2_price,
+            final_bar.close = ratchet_row.actual_exit_price;
+            match ratchet_row.direction {
+                TradeDirection::Long => final_bar.low = ratchet_row.actual_exit_price,
+                TradeDirection::Short => final_bar.high = ratchet_row.actual_exit_price,
             }
-            stream_w2.push(final_bar);
-            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&win2_row.symbol, win2_row.brain_id, &stream_w2, &internals);
-            closed_w2.extend(newly);
+            stream_r.push(final_bar);
+            let newly = paper_engine.process_live_bar_for_symbol_and_brain(&ratchet_row.symbol, ratchet_row.brain_id, &stream_r, &internals);
+            closed_r.extend(newly);
         }
-        assert_eq!(closed_w2.len(), 1);
-        println!("  Settled -> Trade #177 Closed: {} | Realized R: {:+.2}R",
-            closed_w2[0].outcome_badge.as_str(), closed_w2[0].realized_r_multiple);
+        assert_eq!(closed_r.len(), 1);
+        println!("  Settled -> Trade #177 Closed: {} | Realized R: {:+.2}R | Giveback Protected: {}",
+            closed_r[0].outcome_badge.as_str(), closed_r[0].realized_r_multiple, closed_r[0].was_protected_from_giveback);
+        assert!(closed_r[0].was_protected_from_giveback, "Trade #177 must settle with was_protected_from_giveback == true");
         assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(), 177);
         assert_eq!(paper_engine.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len(), 0);
 
@@ -3796,12 +3811,12 @@ mod tests {
             init_b4_state.empirical_bayes_shrinkage_lambda, updated_b4_state.empirical_bayes_shrinkage_lambda);
 
         // 4. Persistence & Baseline Invariant Verification
-        let overlay_path = Path::new("data/live_paper_Overlay_state.json");
-        assert!(paper_engine.save_live_paper_overlay_to_disk(overlay_path).is_ok());
+        let overlay_path = std::env::temp_dir().join(format!("test_phase28_overlay_{}.json", uuid::Uuid::new_v4()));
+        assert!(paper_engine.save_live_paper_overlay_to_disk(&overlay_path).is_ok());
         println!("\n  [PERSISTENCE] Atomically saved live paper overlay state to {:?}", overlay_path);
 
         let restored_overlay = RealTimeLedgerEngine::new();
-        assert!(restored_overlay.load_from_disk(overlay_path));
+        assert!(restored_overlay.load_from_disk(&overlay_path));
         assert_eq!(restored_overlay.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(), 177);
         println!("  [PERSISTENCE VERIFIED] Reloaded overlay has exactly 177 closed trades");
 
@@ -3816,6 +3831,7 @@ mod tests {
         println!("  [BASELINE 🔒 VERIFIED] Canonical data/ledger_state.json is 100% UNTOUCHED at exactly 173 trades!\n");
 
         // Clean up test overlay file
-        let _ = std::fs::remove_file(overlay_path);
+        let _ = std::fs::remove_file(&overlay_path);
+        let _ = std::fs::remove_file("data/live_paper_Overlay_state.json");
     }
 }

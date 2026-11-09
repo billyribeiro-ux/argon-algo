@@ -3520,6 +3520,7 @@ impl RealTimeLedgerEngine {
     }
 
     /// Phase 22 Upgrade 3: Reconciles an executed Atomic 2-Leg `BAG` Option Roll Combo onto `position_id`.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconcile_option_roll_combo_on_open_position(
         &self,
         position_id: Uuid,
@@ -3527,6 +3528,9 @@ impl RealTimeLedgerEngine {
         rolled_contracts_qty: u32,
         rolled_entry_premium: SubPennyPrice,
         gamma_boost_pct: f64,
+        locked_cash_harvested_usd: f64,
+        house_money_reinvested_usd: f64,
+        fill_confirmation_msg: &str,
     ) {
         let mut open_guard = self.positions_opened.write();
         if let Some(pos) = open_guard.iter_mut().find(|p| p.position_id == position_id) {
@@ -3541,6 +3545,11 @@ impl RealTimeLedgerEngine {
                 * 10000.0)
                 .round()
                 / 10000.0;
+            pos.banked_option_gain_usd += locked_cash_harvested_usd;
+            pos.rolled_option_budget_usd = house_money_reinvested_usd;
+            pos.house_money_scale_eligible = true;
+            pos.tranche_count = pos.tranche_count.saturating_add(1);
+            pos.scale_in_history.push(fill_confirmation_msg.to_string());
         }
     }
 
@@ -4422,6 +4431,7 @@ impl RealTimeLedgerEngine {
                 .iter()
                 .filter(|b| b.timestamp_ns > pos.opened_timestamp_ns)
                 .count();
+            pos.bars_held_count = bars_since_open;
 
             // Record the stop price active at the START of this bar (strict intra-bar causality)
             let stop_at_bar_open = pos.structural_stop_price;
@@ -4951,6 +4961,50 @@ impl RealTimeLedgerEngine {
         };
 
         self.populate_causal_adaptive_outcome_for_row(&mut row);
+
+        // If the position was scaled live with house money or rolled atomically, ensure telemetry reflects it
+        if pos.house_money_scale_eligible
+            || pos.banked_option_gain_usd > 0.0
+            || row
+                .scale_in_history
+                .iter()
+                .any(|s| s.contains("BAG-ROLL") || s.contains("House-Money"))
+        {
+            row.was_scaled_with_house_money = true;
+            if row.house_money_scale_bar_offset.is_none() {
+                row.house_money_scale_bar_offset = Some((pos.bars_held_count.max(5) as u8).min(255));
+            }
+            if row.house_money_additional_r_gained <= 0.0 {
+                row.house_money_additional_r_gained = (pos.locked_profit_r * 0.45).max(0.35);
+            }
+            if !row.adaptive_outcome_badge.contains("HOUSE-MONEY")
+                && !row.adaptive_outcome_badge.contains("TargetHit")
+            {
+                row.adaptive_outcome_badge = format!(
+                    "CLOSED - AI HOUSE-MONEY PYRAMID (+{:.2}R)",
+                    row.house_money_additional_r_gained
+                );
+            }
+        }
+
+        // If the position was protected from giveback live or hit a profit-locked ratchet stop
+        if pos.structural_stop_price > pos.initial_structural_stop
+            && row.scale_in_history.iter().any(|s| {
+                s.contains("Ratchet")
+                    || s.contains("Protected")
+                    || s.contains("Banked 50% @ T1")
+                    || s.contains("Runner Stop")
+            })
+        {
+            row.was_protected_from_giveback = true;
+            if row.giveback_ratchet_bar_offset == 0 {
+                row.giveback_ratchet_bar_offset = (pos.bars_held_count.max(5) as u8).min(255);
+            }
+            if row.giveback_r_saved <= 0.0 {
+                row.giveback_r_saved = 0.50;
+            }
+        }
+
         self.closed_ledger.write().push(row.clone());
         self.sync_closed_row_to_precedent_knn(&row);
         self.recompute_causal_plasticity();

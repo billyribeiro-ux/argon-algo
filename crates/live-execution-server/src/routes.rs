@@ -2802,9 +2802,78 @@ pub struct SundayAlphaDispatchResponse {
     pub outbox_record: crate::webhooks::WebhookDispatchRecord,
 }
 
+/// Phase 31: Institutional Hardware Safety Latch for OMS Order Staging
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionSafetyMode {
+    #[serde(rename = "PAPER_ISOLATED_ONLY")]
+    PaperIsolatedOnly,
+    #[serde(rename = "LIVE_AUTHORIZED")]
+    LiveAuthorized,
+}
+
+/// Phase 31: Request payload for `POST /api/v1/scanner/sunday-protocol/stage-orders`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StageSundayOrdersRequest {
+    #[serde(default)]
+    pub symbols: Option<Vec<String>>,
+    #[serde(default)]
+    pub live: Option<bool>,
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+/// Phase 31: Receipt for an individual staged Sunday Alpha order in the Isolated Paper-OMS
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedOrderReceipt {
+    pub client_order_id: String,
+    pub symbol: String,
+    pub brain_id: String,
+    pub direction: String,
+    pub execution_safety_mode: ExecutionSafetyMode,
+    pub execution_venue: String,
+    pub limit_entry_price: f64,
+    pub structural_stop_loss: f64,
+    pub profit_target_1: f64,
+    pub profit_target_2: f64,
+    pub kelly_fraction_pct: f64,
+    pub allocated_notional_usd: f64,
+    pub matched_cboe_contract: String,
+    pub almgren_chriss_slices: Vec<f64>,
+    pub staged_at_iso: String,
+}
+
+/// Phase 31: Response payload for `POST /api/v1/scanner/sunday-protocol/stage-orders`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageSundayOrdersResponse {
+    pub status: String,
+    pub execution_safety_mode: ExecutionSafetyMode,
+    pub staged_orders_count: usize,
+    pub total_staged_kelly_pct: f64,
+    pub receipts: Vec<StagedOrderReceipt>,
+    pub open_paper_positions_count: usize,
+    pub ledger_baseline_trades_untouched: usize,
+}
+
+/// Phase 31: Error response when `PAPER_SAFETY_LOCK_ACTIVE` blocks unauthorized live routing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageSundayOrdersErrorResponse {
+    pub status: String,
+    pub error_code: String,
+    pub message: String,
+    pub execution_safety_mode: ExecutionSafetyMode,
+}
+
 /// Helper to build the unified live institutional watchlist
 pub async fn build_institutional_watchlist(
     state: &AppState,
+) -> Result<InstitutionalWatchlistResponse, (StatusCode, String)> {
+    build_institutional_watchlist_at_epoch(state, None).await
+}
+
+/// Helper to build the unified institutional watchlist anchored to an explicit or live evaluation epoch
+pub async fn build_institutional_watchlist_at_epoch(
+    state: &AppState,
+    override_eval_epoch_s: Option<i64>,
 ) -> Result<InstitutionalWatchlistResponse, (StatusCode, String)> {
     let mut rows = Vec::new();
     let gen_id = state

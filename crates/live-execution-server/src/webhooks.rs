@@ -306,6 +306,7 @@ impl OutboundWebhookDispatcher {
                     0xFF5252 // Laser Crimson Stop
                 }
             }
+            WebhookEventType::SundayAlphaProtocolDispatch => 0x00E676, // Emerald Stager Dispatch
         };
 
         let pnl_sign = if payload.pnl_usd >= 0.0 { "+" } else { "" };

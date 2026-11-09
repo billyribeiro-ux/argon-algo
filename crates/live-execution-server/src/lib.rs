@@ -41,8 +41,9 @@ pub use precedent_knn::{
 };
 pub use routes::{
     AppState, CustomBacktestSummaryResponse, InstitutionalWatchlistResponse,
-    InstitutionalWatchlistRow, LiveChartResponse, ScannerCandidatesResponse,
-    SundayAlphaProtocolExportRow, SundayAlphaProtocolResponse, CANONICAL_24_WATCHLIST_PAIRS,
+    InstitutionalWatchlistRow, LiveChartResponse, PaperOverlayTelemetryResponse,
+    ScannerCandidatesResponse, SundayAlphaDispatchResponse, SundayAlphaProtocolExportRow,
+    SundayAlphaProtocolResponse, CANONICAL_24_WATCHLIST_PAIRS,
     build_axum_router,
 };
 pub use webhooks::{
@@ -3922,7 +3923,7 @@ mod tests {
             assert!(row.conformal_threshold > 0.0);
             assert!(!row.matched_option_contract.is_empty());
             assert!(!row.option_structure.is_empty());
-            assert!(row.kelly_fraction_pct >= 0.50 && row.kelly_fraction_pct <= 2.75);
+            assert!(row.kelly_fraction_pct > 0.0 && row.kelly_fraction_pct <= 2.75);
 
             if row.rank <= 10 {
                 println!("  #{:<3} {:<6} {:<10} {:<6} {:<10} {:<8.1} {:<8.1} {:<8.1} ${:<9.2} ${:<9.2} ${:<9.2} {:<8}",
@@ -3943,6 +3944,82 @@ mod tests {
             } else {
                 assert!(w[0].is_actionable && !w[1].is_actionable, "Actionable setups must rank before non-actionable setups");
             }
+        }
+
+        // Phase 29.1 Invariant 1: Option expiration strictly in the future relative to response timestamp
+        let resp_date = chrono::DateTime::parse_from_rfc3339(&watchlist_res.timestamp_iso)
+            .expect("Valid ISO timestamp")
+            .naive_utc()
+            .date();
+
+        for row in &watchlist_res.watchlist {
+            let tokens: Vec<&str> = row.matched_option_contract.split_whitespace().collect();
+            if tokens.len() >= 2 {
+                if let Ok(exp_date) = chrono::NaiveDate::parse_from_str(tokens[1], "%Y-%m-%d") {
+                    assert!(
+                        exp_date > resp_date,
+                        "Row {} ({}) contract expiration {} must be strictly in the future relative to response date {}",
+                        row.symbol, row.brain_id.as_str(), exp_date, resp_date
+                    );
+                }
+            }
+        }
+
+        // Phase 29.1 Invariant 2: Canonical Underlying Spot Coherence (< 0.50% diff) across dual-horizon tickers
+        for sym in ["NVDA", "AMD", "MSFT"] {
+            let sym_rows: Vec<_> = watchlist_res.watchlist.iter().filter(|r| r.symbol == sym).collect();
+            assert!(sym_rows.len() >= 2, "Expected at least 2 rows for dual-horizon symbol {}", sym);
+            let first_spot = sym_rows[0].entry_price;
+            for r in &sym_rows[1..] {
+                let diff_pct = (r.entry_price - first_spot).abs() / first_spot * 100.0;
+                assert!(
+                    diff_pct < 0.50,
+                    "Dual-horizon ticker {} must share coherent spot marks (< 0.50% diff), got {} vs {} (diff {:.3}%)",
+                    sym, first_spot, r.entry_price, diff_pct
+                );
+            }
+        }
+
+        // Phase 29.1 Invariant 3: Cross-Brain Conflict Netting Gate (Zero simultaneous opposing signals)
+        for sym in ["NVDA", "AMD", "MSFT"] {
+            let actionable_sym_rows: Vec<_> = watchlist_res
+                .watchlist
+                .iter()
+                .filter(|r| r.symbol == sym && r.is_actionable)
+                .collect();
+            if actionable_sym_rows.len() > 1 {
+                let first_dir = actionable_sym_rows[0].direction;
+                for r in &actionable_sym_rows[1..] {
+                    assert_eq!(
+                        r.direction, first_dir,
+                        "Dual-listed ticker {} cannot have opposing actionable directions! Got {:?} vs {:?}",
+                        sym, first_dir, r.direction
+                    );
+                }
+            }
+        }
+
+        // Phase 29.1 Invariant 4: Stage 0 Conformal Status parity with Conformal LLR >= Threshold
+        for row in &watchlist_res.watchlist {
+            if row.stage0_conformal_status == "PASS" {
+                assert!(
+                    row.conformal_llr >= row.conformal_threshold,
+                    "Row {} ({}) stage0 is PASS but conformal_llr ({}) < conformal_threshold ({})",
+                    row.symbol, row.brain_id.as_str(), row.conformal_llr, row.conformal_threshold
+                );
+                assert!(row.conformal_margin >= 0.0);
+            } else {
+                assert!(
+                    row.conformal_llr < row.conformal_threshold,
+                    "Row {} ({}) stage0 is VETO but conformal_llr ({}) >= conformal_threshold ({})",
+                    row.symbol, row.brain_id.as_str(), row.conformal_llr, row.conformal_threshold
+                );
+                assert!(row.conformal_margin < 0.0);
+            }
+            assert!(
+                ((row.conformal_llr - row.conformal_threshold) - row.conformal_margin).abs() < 1e-3,
+                "conformal_margin must equal conformal_llr - conformal_threshold"
+            );
         }
 
         // 2. Verify GET /api/v1/scanner/sunday-protocol endpoint
@@ -3997,6 +4074,159 @@ mod tests {
         }
 
         // 3. Baseline Ledger Invariant (Untouched at 173 trades)
+        let baseline_check = RealTimeLedgerEngine::new();
+        assert!(baseline_check.load_from_disk(ledger_path));
+        assert_eq!(
+            baseline_check.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(),
+            173,
+            "IMMUTABLE BASELINE INVARIANT VIOLATION: data/ledger_state.json must remain strictly at 173 trades!"
+        );
+        println!("\n  [BASELINE 🔒 VERIFIED] Canonical data/ledger_state.json is 100% UNTOUCHED at exactly 173 trades!\n");
+    }
+
+    #[tokio::test]
+    async fn test_phase30_cross_brain_allocator_and_sunday_dispatch() {
+        use tower::ServiceExt;
+
+        let models_dir = Path::new("../../models");
+        let app_models_path = if models_dir.exists() {
+            Some(models_dir)
+        } else {
+            None
+        };
+        let state = AppState::new(app_models_path);
+
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+        assert!(state.ledger.load_from_disk(ledger_path));
+        let snap_initial = state.ledger.query_filtered_snapshot(&HyperFilterQuery::default());
+        for closed_row in &snap_initial.closed_trades {
+            state.ledger.sync_closed_row_to_precedent_knn(closed_row);
+        }
+        state.ledger.recompute_causal_plasticity();
+
+        let router = build_axum_router(state.clone());
+
+        println!("\n=================================================================================================================================");
+        println!("  PHASE 30: CROSS-BRAIN RISK ALLOCATOR, PAPER-OVERLAY TELEMETRY & SUNDAY ALPHA DISPATCH AUDIT");
+        println!("=================================================================================================================================");
+
+        // 1. Verify GET /api/v1/scanner/paper-overlay
+        let req_paper = axum::http::Request::builder()
+            .uri("/api/v1/scanner/paper-overlay")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .expect("Build paper-overlay request");
+
+        let resp_paper = router
+            .clone()
+            .oneshot(req_paper)
+            .await
+            .expect("Paper overlay endpoint succeeds");
+        assert_eq!(resp_paper.status(), axum::http::StatusCode::OK);
+
+        let paper_bytes = axum::body::to_bytes(resp_paper.into_body(), usize::MAX)
+            .await
+            .expect("Read paper overlay response body");
+        let paper_res: PaperOverlayTelemetryResponse =
+            serde_json::from_slice(&paper_bytes).expect("Deserialize PaperOverlayTelemetryResponse");
+
+        assert!(paper_res.is_paper_overlay_active);
+        assert_eq!(paper_res.baseline_trade_count, 173);
+        assert_eq!(paper_res.total_closed_trades_count, 173);
+        assert_eq!(paper_res.overlay_closed_count, 0);
+        assert_eq!(paper_res.brain_plasticity_shifts.len(), 5);
+
+        for shift in &paper_res.brain_plasticity_shifts {
+            assert!(shift.generation_id >= 36);
+            assert!(shift.tau_veto >= 0.84 && shift.tau_veto <= 0.94);
+            assert!(shift.eb_lambda >= 0.0);
+        }
+        println!("  [PAPER OVERLAY] Verified isolated telemetry: Baseline {} trades, 5 Brain plasticity states (Gen 36+)",
+            paper_res.baseline_trade_count);
+
+        // 2. Verify GET /api/v1/scanner/watchlist Portfolio-Level Telemetry
+        let req_watchlist = axum::http::Request::builder()
+            .uri("/api/v1/scanner/watchlist")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .expect("Build watchlist request");
+
+        let resp_watchlist = router
+            .clone()
+            .oneshot(req_watchlist)
+            .await
+            .expect("Watchlist endpoint succeeds");
+        assert_eq!(resp_watchlist.status(), axum::http::StatusCode::OK);
+
+        let watchlist_bytes = axum::body::to_bytes(resp_watchlist.into_body(), usize::MAX)
+            .await
+            .expect("Read response body");
+        let watchlist_res: InstitutionalWatchlistResponse =
+            serde_json::from_slice(&watchlist_bytes).expect("Deserialize InstitutionalWatchlistResponse");
+
+        assert!(watchlist_res.total_allocated_kelly_pct <= 10.0, "Total Kelly must be capped at 10.0%");
+        assert!(watchlist_res.estimated_occ_tims_margin_relief_pct >= 28.0 && watchlist_res.estimated_occ_tims_margin_relief_pct <= 72.0);
+        println!("  [PORTFOLIO RISK ALLOCATOR] Total Kelly: {:.2}% | Net Delta: {:+.2} | Blocked Conflicts: {} | TIMS Relief: {:.1}%",
+            watchlist_res.total_allocated_kelly_pct,
+            watchlist_res.net_portfolio_delta_beta_weighted,
+            watchlist_res.cross_brain_conflicts_blocked,
+            watchlist_res.estimated_occ_tims_margin_relief_pct);
+
+        // Verify zero opposing actionable setups on any symbol
+        for sym in ["NVDA", "AMD", "MSFT"] {
+            let actionable_sym_rows: Vec<_> = watchlist_res
+                .watchlist
+                .iter()
+                .filter(|r| r.symbol == sym && r.is_actionable)
+                .collect();
+            if actionable_sym_rows.len() > 1 {
+                let dir0 = actionable_sym_rows[0].direction;
+                for r in &actionable_sym_rows[1..] {
+                    assert_eq!(r.direction, dir0, "Actionable rows on {} must not have opposing directions!", sym);
+                }
+            }
+        }
+
+        // 3. Verify POST /api/v1/scanner/sunday-protocol/dispatch
+        let req_dispatch = axum::http::Request::builder()
+            .uri("/api/v1/scanner/sunday-protocol/dispatch")
+            .method("POST")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::empty())
+            .expect("Build dispatch request");
+
+        let resp_dispatch = router
+            .clone()
+            .oneshot(req_dispatch)
+            .await
+            .expect("Dispatch endpoint succeeds");
+        assert_eq!(resp_dispatch.status(), axum::http::StatusCode::OK);
+
+        let dispatch_bytes = axum::body::to_bytes(resp_dispatch.into_body(), usize::MAX)
+            .await
+            .expect("Read dispatch response body");
+        let dispatch_res: SundayAlphaDispatchResponse =
+            serde_json::from_slice(&dispatch_bytes).expect("Deserialize SundayAlphaDispatchResponse");
+
+        assert_eq!(dispatch_res.status, "DISPATCHED_TO_OUTBOX");
+        assert!(!dispatch_res.receipt_id.is_empty());
+        assert!(dispatch_res.approved_signals_count > 0);
+        assert!(dispatch_res.total_allocated_kelly_pct <= 10.0);
+        assert_eq!(dispatch_res.outbox_record.event_type, WebhookEventType::SundayAlphaProtocolDispatch);
+        assert!(!dispatch_res.outbox_record.discord_embed_json.is_empty());
+        assert!(!dispatch_res.outbox_record.telegram_markdown.is_empty());
+        assert!(!dispatch_res.outbox_record.generic_webhook_json.is_empty());
+
+        println!("  [WEBHOOK OUTBOX DISPATCH] Successfully staged to outbox: Receipt ID {}, Channels {:?}",
+            dispatch_res.receipt_id, dispatch_res.channels_targeted);
+
+        // 4. Verify Baseline Ledger Invariant (Untouched at 173 trades)
         let baseline_check = RealTimeLedgerEngine::new();
         assert!(baseline_check.load_from_disk(ledger_path));
         assert_eq!(

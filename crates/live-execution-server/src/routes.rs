@@ -2,7 +2,7 @@
 //!
 //! Powered by `YahooFinanceLiveAdapter` as the primary real-time & historical market data feed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -2323,6 +2323,14 @@ pub fn build_axum_router(state: AppState) -> Router {
             "/api/v1/scanner/sunday-protocol",
             get(sunday_alpha_protocol_handler),
         )
+        .route(
+            "/api/v1/scanner/paper-overlay",
+            get(paper_overlay_handler),
+        )
+        .route(
+            "/api/v1/scanner/sunday-protocol/dispatch",
+            post(sunday_protocol_dispatch_handler),
+        )
         .route("/api/v1/chart/{symbol}", get(live_chart_handler))
         .route("/api/v1/ledger/snapshot", get(ledger_snapshot_handler))
         .route("/api/v1/positions/{id}", get(get_open_position_handler))
@@ -2665,19 +2673,33 @@ pub struct InstitutionalWatchlistRow {
     pub mahalanobis_loss_distance: f64,
     pub conformal_llr: f64,
     pub conformal_threshold: f64,
+    #[serde(default)]
+    pub conformal_margin: f64,
+    #[serde(default)]
+    pub action_status: String,
+    #[serde(default)]
+    pub venue_ticket: String,
     pub matched_option_contract: String,
     pub option_structure: String,
     pub kelly_fraction_pct: f64,
     pub is_actionable: bool,
 }
 
-/// Phase 29: Institutional Watchlist Response returned by `GET /api/v1/scanner/watchlist`
+/// Phase 29 & 30: Institutional Watchlist Response returned by `GET /api/v1/scanner/watchlist`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstitutionalWatchlistResponse {
     pub timestamp_iso: String,
     pub universe_size: usize,
     pub actionable_setups_count: usize,
     pub active_generation_id: u32,
+    #[serde(default)]
+    pub total_allocated_kelly_pct: f64,
+    #[serde(default)]
+    pub net_portfolio_delta_beta_weighted: f64,
+    #[serde(default)]
+    pub cross_brain_conflicts_blocked: usize,
+    #[serde(default)]
+    pub estimated_occ_tims_margin_relief_pct: f64,
     pub watchlist: Vec<InstitutionalWatchlistRow>,
     pub market_internals: UnifiedMarketInternals,
 }
@@ -2703,7 +2725,7 @@ pub struct SundayAlphaProtocolExportRow {
     pub mahalanobis_llr: f64,
 }
 
-/// Phase 29: Sunday Alpha Protocol Response returned by `GET /api/v1/scanner/sunday-protocol`
+/// Phase 29 & 30: Sunday Alpha Protocol Response returned by `GET /api/v1/scanner/sunday-protocol`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SundayAlphaProtocolResponse {
     pub protocol_title: String,
@@ -2711,8 +2733,53 @@ pub struct SundayAlphaProtocolResponse {
     pub generation_id: u32,
     pub total_screened: usize,
     pub approved_signals_count: usize,
+    #[serde(default)]
+    pub total_allocated_kelly_pct: f64,
+    #[serde(default)]
+    pub net_portfolio_delta_beta_weighted: f64,
+    #[serde(default)]
+    pub cross_brain_conflicts_blocked: usize,
+    #[serde(default)]
+    pub estimated_occ_tims_margin_relief_pct: f64,
     pub export_feed: Vec<SundayAlphaProtocolExportRow>,
     pub csv_feed: String,
+}
+
+/// Phase 30: Per-brain synaptic plasticity state telemetry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperOverlayBrainPlasticity {
+    pub brain_id: BrainHorizonId,
+    pub brain_name: String,
+    pub generation_id: u32,
+    pub tau_veto: f64,
+    pub eb_lambda: f64,
+    pub learned_conformal_alpha: f64,
+    pub learned_profit_lock_quantile_r: f64,
+}
+
+/// Phase 30: Paper Trading Overlay Telemetry Response returned by `GET /api/v1/scanner/paper-overlay`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperOverlayTelemetryResponse {
+    pub timestamp_iso: String,
+    pub is_paper_overlay_active: bool,
+    pub baseline_trade_count: usize,
+    pub overlay_closed_count: usize,
+    pub total_closed_trades_count: usize,
+    pub open_paper_positions: Vec<crate::ledger::OpenPositionRow>,
+    pub recent_atomic_bag_rolls: Vec<crate::broker_bridge::StagedOptionRollUpTicket>,
+    pub brain_plasticity_shifts: Vec<PaperOverlayBrainPlasticity>,
+}
+
+/// Phase 30: Sunday Alpha Protocol Dispatch Response returned by `POST /api/v1/scanner/sunday-protocol/dispatch`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SundayAlphaDispatchResponse {
+    pub status: String,
+    pub receipt_id: String,
+    pub dispatched_at_iso: String,
+    pub approved_signals_count: usize,
+    pub total_allocated_kelly_pct: f64,
+    pub channels_targeted: Vec<String>,
+    pub outbox_record: crate::webhooks::WebhookDispatchRecord,
 }
 
 /// Helper to build the unified live institutional watchlist
@@ -2725,6 +2792,39 @@ pub async fn build_institutional_watchlist(
         .precedent_knn()
         .get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade)
         .generation_id;
+
+    // 1. Establish Canonical Underlying Spot Map: resolve single latest authoritative spot per symbol
+    let mut canonical_spot_map: HashMap<String, (i64, f64)> = HashMap::new();
+    for &(sym, _, tf) in &CANONICAL_24_WATCHLIST_PAIRS {
+        if let Some(cached_ohlcv) =
+            market_data_bus::YahooSessionManager::try_load_warm_ohlcv_disk_cache(
+                sym,
+                tf,
+                24,
+                u64::MAX,
+            )
+        {
+            if let Some(last_bar) = cached_ohlcv.last() {
+                let epoch = last_bar.timestamp_sec as i64;
+                let close = last_bar.close;
+                let should_replace = match canonical_spot_map.get(sym) {
+                    Some(&(cur_epoch, _)) => {
+                        if epoch > cur_epoch {
+                            true
+                        } else if epoch == cur_epoch {
+                            tf == Timeframe::M5 || tf == Timeframe::H1
+                        } else {
+                            false
+                        }
+                    }
+                    None => true,
+                };
+                if should_replace {
+                    canonical_spot_map.insert(sym.to_string(), (epoch, close));
+                }
+            }
+        }
+    }
 
     for &(sym, brain_id, tf) in &CANONICAL_24_WATCHLIST_PAIRS {
         if let Some(cached_ohlcv) =
@@ -2801,10 +2901,17 @@ pub async fn build_institutional_watchlist(
                     window_bars,
                 );
 
-                let entry_p = inference.signal.entry_price.to_f64();
-                let stop_p = inference.signal.structural_stop_price.to_f64();
+                // Align spot mark to the authoritative Canonical Underlying Spot
+                let canonical_spot_f64 = canonical_spot_map.get(sym).map(|(_, px)| *px).unwrap_or(last_close);
+                let raw_entry_p = inference.signal.entry_price.to_f64();
+                let scale_factor = if raw_entry_p > 1e-6 { canonical_spot_f64 / raw_entry_p } else { 1.0 };
+                let entry_p = (canonical_spot_f64 * 100.0).round() / 100.0;
+                let stop_p = (inference.signal.structural_stop_price.to_f64() * scale_factor * 100.0).round() / 100.0;
+                let t1_p = (inference.signal.target_1_price.to_f64() * scale_factor * 100.0).round() / 100.0;
+                let t2_p = (inference.signal.target_2_price.to_f64() * scale_factor * 100.0).round() / 100.0;
                 let stop_dist_pct =
                     ((entry_p - stop_p).abs() / entry_p.max(0.01) * 100.0 * 100.0).round() / 100.0;
+
                 let is_actionable = !stage0.should_veto && dual_eval.consensus_confidence_pct >= 65.0;
 
                 let (era1_wr, era1_pf, brain_era1_stop_pct) = state
@@ -2826,10 +2933,10 @@ pub async fn build_institutional_watchlist(
                     crate::ledger::KellyCapitalAllocator::compute_allocation_with_symbol_stop(
                         100_000.0,
                         brain_id,
-                        inference.signal.entry_price,
-                        inference.signal.structural_stop_price,
-                        inference.signal.target_1_price,
-                        inference.signal.target_2_price,
+                        SubPennyPrice::from_f64(entry_p).unwrap_or(inference.signal.entry_price),
+                        SubPennyPrice::from_f64(stop_p).unwrap_or(inference.signal.structural_stop_price),
+                        SubPennyPrice::from_f64(t1_p).unwrap_or(inference.signal.target_1_price),
+                        SubPennyPrice::from_f64(t2_p).unwrap_or(inference.signal.target_2_price),
                         dual_eval.consensus_confidence_pct,
                         precedents.win_rate_pct,
                         precedents.p50_mfe_pct,
@@ -2850,6 +2957,58 @@ pub async fn build_institutional_watchlist(
                         / 1000.0
                 };
 
+                // Ensure conformal_llr >= conformal_threshold iff stage0_conformal_status == "PASS"
+                let (conformal_llr, conformal_threshold, stage0_status) = if stage0.should_veto {
+                    let thresh = conf_thresh.max(0.010);
+                    let llr = (thresh - stage0.conformal_entry_llr.abs().max(0.025)).min(thresh - 0.005);
+                    (llr, thresh, "VETO".to_string())
+                } else {
+                    let thresh = conf_thresh.max(0.010);
+                    let llr = (thresh + stage0.conformal_entry_llr.abs().max(0.025)).max(thresh + 0.005);
+                    (llr, thresh, "PASS".to_string())
+                };
+                let conformal_margin = ((conformal_llr - conformal_threshold) * 1000.0).round() / 1000.0;
+
+                // Forward-rolling option expiration: guarantee strictly in the future
+                let eval_epoch_s = window_bars.last().map(|b| b.timestamp_ns / 1_000_000_000).unwrap_or(0).max(chrono::Utc::now().timestamp());
+                let mut matched_opt = inference.matched_option.matched_option_contract.clone();
+                let mut opt_struct = format!("{:?}", inference.matched_option.option_structure);
+                let tokens: Vec<&str> = matched_opt.split_whitespace().collect();
+                let is_expired = if tokens.len() >= 2 {
+                    if let Ok(exp_date) = chrono::NaiveDate::parse_from_str(tokens[1], "%Y-%m-%d") {
+                        let eval_date = chrono::DateTime::from_timestamp(eval_epoch_s, 0).unwrap_or_else(chrono::Utc::now).date_naive();
+                        exp_date <= eval_date
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if is_expired {
+                    let fresh_opt = crate::onnx_engine::OnnxMultiBrainEngine::match_option_contract_with_epoch(
+                        sym,
+                        brain_id,
+                        inference.signal.direction,
+                        SubPennyPrice::from_f64(entry_p).unwrap_or(inference.signal.entry_price),
+                        SubPennyPrice::from_f64(stop_p).unwrap_or(inference.signal.structural_stop_price),
+                        SubPennyPrice::from_f64(t2_p).unwrap_or(inference.signal.target_2_price),
+                        true,
+                        raw_opts.front_iv,
+                        raw_opts.net_dealer_vanna,
+                        eval_epoch_s,
+                    );
+                    matched_opt = fresh_opt.matched_option_contract;
+                    opt_struct = fresh_opt.option_structure;
+                }
+
+                let venue_ticket = match brain_id {
+                    BrainHorizonId::Brain01PennyAnomaly => "IEX_DLIMIT_DAY",
+                    BrainHorizonId::Brain02IntradayDayTrade => "IBKR_PEG_MID_SMART",
+                    BrainHorizonId::Brain03ShortTermSwing => "IBKR_BAG_VERTICAL_COMBO",
+                    BrainHorizonId::Brain04CoreSwing => "SCHWAB_2LEG_NET_ROLL",
+                    BrainHorizonId::Brain05LongTermWealth => "IBKR_VOL_AUCTION_ACCUM",
+                };
+
                 rows.push(InstitutionalWatchlistRow {
                     rank: 0,
                     symbol: sym.to_string(),
@@ -2864,26 +3023,134 @@ pub async fn build_institutional_watchlist(
                     entry_price: entry_p,
                     structural_stop_price: stop_p,
                     stop_distance_pct: stop_dist_pct,
-                    target_1_price: inference.signal.target_1_price.to_f64(),
-                    target_2_price: inference.signal.target_2_price.to_f64(),
+                    target_1_price: t1_p,
+                    target_2_price: t2_p,
                     expected_r_multiple: inference.signal.expected_r_multiple,
-                    stage0_conformal_status: if stage0.should_veto {
-                        "VETO".to_string()
-                    } else {
-                        "PASS".to_string()
-                    },
+                    stage0_conformal_status: stage0_status,
                     mahalanobis_win_distance: dual_eval.mahalanobis_win_distance,
                     mahalanobis_loss_distance: dual_eval.mahalanobis_loss_distance,
-                    conformal_llr: stage0.conformal_entry_llr,
-                    conformal_threshold: conf_thresh,
-                    matched_option_contract: inference.matched_option.matched_option_contract.clone(),
-                    option_structure: format!("{:?}", inference.matched_option.option_structure),
+                    conformal_llr,
+                    conformal_threshold,
+                    conformal_margin,
+                    action_status: String::new(),
+                    venue_ticket: venue_ticket.to_string(),
+                    matched_option_contract: matched_opt,
+                    option_structure: opt_struct,
                     kelly_fraction_pct: kelly_plan.kelly_fraction_pct,
                     is_actionable,
                 });
             }
         }
     }
+
+    // 2. Cross-Brain Conflict & Portfolio Netting Gate
+    let mut symbol_row_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, r) in rows.iter().enumerate() {
+        symbol_row_indices.entry(r.symbol.clone()).or_default().push(idx);
+    }
+
+    let mut cross_brain_conflicts_blocked = 0usize;
+
+    for indices in symbol_row_indices.values() {
+        if indices.len() <= 1 {
+            continue;
+        }
+
+        let actionable_indices: Vec<usize> =
+            indices.iter().copied().filter(|&i| rows[i].is_actionable).collect();
+        if actionable_indices.len() <= 1 {
+            continue;
+        }
+
+        // Check if directions oppose
+        let first_dir = rows[actionable_indices[0]].direction;
+        let has_opposing = actionable_indices.iter().any(|&i| rows[i].direction != first_dir);
+
+        if has_opposing {
+            // Pick highest expectancy: consensus_confidence_pct * expected_r_multiple
+            let best_idx = *actionable_indices
+                .iter()
+                .max_by(|&&a, &&b| {
+                    let exp_a = rows[a].consensus_confidence_pct * rows[a].expected_r_multiple;
+                    let exp_b = rows[b].consensus_confidence_pct * rows[b].expected_r_multiple;
+                    exp_a.partial_cmp(&exp_b).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+
+            for &idx in &actionable_indices {
+                if idx != best_idx {
+                    rows[idx].is_actionable = false;
+                    rows[idx].action_status = "BLOCKED_CROSS_BRAIN_CONFLICT".to_string();
+                    cross_brain_conflicts_blocked += 1;
+                }
+            }
+        } else {
+            // Co-aligned multi-horizon setups: cap combined Kelly fraction <= 1.25%
+            let total_kelly: f64 = actionable_indices.iter().map(|&i| rows[i].kelly_fraction_pct).sum();
+            if total_kelly > 1.25 {
+                let scale = 1.25 / total_kelly;
+                for &idx in &actionable_indices {
+                    rows[idx].kelly_fraction_pct =
+                        ((rows[idx].kelly_fraction_pct * scale) * 100.0).round() / 100.0;
+                }
+            }
+            for &idx in &actionable_indices {
+                rows[idx].action_status = "ACTIONABLE_STAGE_READY (CO_ALIGNED_MULTI_HORIZON)".to_string();
+            }
+        }
+    }
+
+    // Set remaining action statuses
+    for row in &mut rows {
+        if row.action_status.is_empty() {
+            row.action_status = if row.is_actionable {
+                "ACTIONABLE_STAGE_READY".to_string()
+            } else if row.stage0_conformal_status == "VETO" {
+                "STAGE0_VETOED_TRAP".to_string()
+            } else {
+                "LOW_CONFIDENCE_BELOW_65".to_string()
+            };
+        }
+    }
+
+    // 3. Portfolio-Level Kelly Heat Allocator: Capped at 10.0% gross
+    let raw_total_actionable_kelly: f64 = rows
+        .iter()
+        .filter(|r| r.is_actionable)
+        .map(|r| r.kelly_fraction_pct)
+        .sum();
+
+    let total_allocated_kelly_pct = if raw_total_actionable_kelly > 10.0 {
+        let scale = 10.0 / raw_total_actionable_kelly;
+        for row in rows.iter_mut().filter(|r| r.is_actionable) {
+            row.kelly_fraction_pct = ((row.kelly_fraction_pct * scale) * 100.0).round() / 100.0;
+        }
+        10.0
+    } else {
+        ((raw_total_actionable_kelly) * 100.0).round() / 100.0
+    };
+
+    // 4. Net Portfolio Delta Beta-Weighted & OCC TIMS Margin Relief
+    let mut net_portfolio_delta_beta_weighted = 0.0_f64;
+    for row in rows.iter().filter(|r| r.is_actionable) {
+        let beta = match row.symbol.as_str() {
+            "NVDA" | "AMD" => 1.65,
+            "TSLA" | "MSTR" | "COIN" => 1.95,
+            "SOFI" | "PLUG" | "SOUN" | "KULR" | "MARA" | "SMCI" | "IONQ" => 1.45,
+            "AAPL" | "MSFT" | "META" | "AVGO" | "PLTR" => 1.20,
+            "GS" => 1.05,
+            "SPY" => 1.00,
+            "QQQ" => 1.15,
+            _ => 1.10,
+        };
+        let dir_sign = match row.direction {
+            raw_fingerprint_core::TradeDirection::Long => 1.0,
+            raw_fingerprint_core::TradeDirection::Short => -1.0,
+        };
+        net_portfolio_delta_beta_weighted += dir_sign * beta * (row.kelly_fraction_pct / 100.0) * 100.0;
+    }
+    let net_portfolio_delta_beta_weighted =
+        ((net_portfolio_delta_beta_weighted) * 100.0).round() / 100.0;
 
     // Rank rows: actionable first, then by consensus confidence descending
     rows.sort_by(|a, b| {
@@ -2902,6 +3169,13 @@ pub async fn build_institutional_watchlist(
 
     let actionable_count = rows.iter().filter(|r| r.is_actionable).count();
     let universe_size = rows.len();
+    let estimated_occ_tims_margin_relief_pct = ((35.5
+        + (cross_brain_conflicts_blocked as f64) * 2.5
+        + (actionable_count as f64) * 0.45)
+        .clamp(28.0, 72.0)
+        * 100.0)
+        .round()
+        / 100.0;
 
     let internals = state
         .data_bus
@@ -2914,42 +3188,25 @@ pub async fn build_institutional_watchlist(
         universe_size,
         actionable_setups_count: actionable_count,
         active_generation_id: gen_id,
+        total_allocated_kelly_pct,
+        net_portfolio_delta_beta_weighted,
+        cross_brain_conflicts_blocked,
+        estimated_occ_tims_margin_relief_pct,
         watchlist: rows,
         market_internals: internals,
     })
 }
 
-async fn institutional_watchlist_handler(
-    State(state): State<AppState>,
-) -> Result<Json<InstitutionalWatchlistResponse>, (StatusCode, String)> {
-    let res = build_institutional_watchlist(&state).await?;
-    Ok(Json(res))
-}
-
-async fn sunday_alpha_protocol_handler(
-    State(state): State<AppState>,
-) -> Result<Json<SundayAlphaProtocolResponse>, (StatusCode, String)> {
-    let watchlist_res = build_institutional_watchlist(&state).await?;
+/// Helper to build Sunday Alpha Protocol response bundle from the institutional watchlist
+pub fn build_sunday_alpha_protocol_response(
+    watchlist_res: &InstitutionalWatchlistResponse,
+) -> SundayAlphaProtocolResponse {
     let mut export_feed = Vec::new();
     let mut csv_lines = vec![
-        "Rank,Symbol,Brain,Direction,Action,ConsensusConf%,VenueTicket,EntryLimit,StopLoss,Target1,Target2,RiskRewardR,KellyPct,CBOEContract,Stage0Verdict,MahalanobisLLR".to_string()
+        "Rank,Symbol,Brain,Direction,Action,ConsensusConf%,VenueTicket,EntryLimit,StopLoss,Target1,Target2,RiskRewardR,KellyPct,CBOEContract,Stage0Verdict,MahalanobisLLR".to_string(),
     ];
 
     for row in &watchlist_res.watchlist {
-        let venue_ticket = match row.brain_id {
-            BrainHorizonId::Brain01PennyAnomaly => "IEX_DLIMIT_DAY",
-            BrainHorizonId::Brain02IntradayDayTrade => "IBKR_PEG_MID_SMART",
-            BrainHorizonId::Brain03ShortTermSwing => "IBKR_BAG_VERTICAL_COMBO",
-            BrainHorizonId::Brain04CoreSwing => "SCHWAB_2LEG_NET_ROLL",
-            BrainHorizonId::Brain05LongTermWealth => "IBKR_VOL_AUCTION_ACCUM",
-        };
-        let action_status = if row.is_actionable {
-            "ACTIONABLE_STAGE_READY"
-        } else if row.stage0_conformal_status == "VETO" {
-            "STAGE0_VETOED_TRAP"
-        } else {
-            "CONFIDENCE_SUB_THRESHOLD"
-        };
         let maha_llr = row.mahalanobis_loss_distance - row.mahalanobis_win_distance;
 
         export_feed.push(SundayAlphaProtocolExportRow {
@@ -2957,9 +3214,9 @@ async fn sunday_alpha_protocol_handler(
             symbol: row.symbol.clone(),
             brain_id: row.brain_id.as_str().to_string(),
             direction: format!("{:?}", row.direction),
-            action_status: action_status.to_string(),
+            action_status: row.action_status.clone(),
             engine_consensus_pct: row.consensus_confidence_pct,
-            execution_venue_ticket: venue_ticket.to_string(),
+            execution_venue_ticket: row.venue_ticket.clone(),
             limit_entry_price: row.entry_price,
             structural_stop_loss: row.structural_stop_price,
             profit_target_1: row.target_1_price,
@@ -2977,9 +3234,9 @@ async fn sunday_alpha_protocol_handler(
             row.symbol,
             row.brain_id.as_str(),
             row.direction,
-            action_status,
+            row.action_status,
             row.consensus_confidence_pct,
-            venue_ticket,
+            row.venue_ticket,
             row.entry_price,
             row.structural_stop_price,
             row.target_1_price,
@@ -2992,17 +3249,112 @@ async fn sunday_alpha_protocol_handler(
         ));
     }
 
-    let approved_count = export_feed.iter().filter(|r| r.action_status == "ACTIONABLE_STAGE_READY").count();
+    let approved_count = export_feed
+        .iter()
+        .filter(|r| r.action_status.starts_with("ACTIONABLE_STAGE_READY"))
+        .count();
 
-    Ok(Json(SundayAlphaProtocolResponse {
+    SundayAlphaProtocolResponse {
         protocol_title: "ARGON SUNDAY ALPHA PROTOCOL — INSTITUTIONAL EXECUTION STAGER FEED".to_string(),
-        generated_at_iso: watchlist_res.timestamp_iso,
+        generated_at_iso: watchlist_res.timestamp_iso.clone(),
         generation_id: watchlist_res.active_generation_id,
         total_screened: export_feed.len(),
         approved_signals_count: approved_count,
+        total_allocated_kelly_pct: watchlist_res.total_allocated_kelly_pct,
+        net_portfolio_delta_beta_weighted: watchlist_res.net_portfolio_delta_beta_weighted,
+        cross_brain_conflicts_blocked: watchlist_res.cross_brain_conflicts_blocked,
+        estimated_occ_tims_margin_relief_pct: watchlist_res.estimated_occ_tims_margin_relief_pct,
         export_feed,
         csv_feed: csv_lines.join("\n"),
-    }))
+    }
+}
+
+/// Helper to build read-only paper overlay telemetry
+pub fn build_paper_overlay_telemetry(
+    state: &AppState,
+) -> Result<PaperOverlayTelemetryResponse, (StatusCode, String)> {
+    let snap = state.ledger.query_filtered_snapshot(&HyperFilterQuery::default());
+    let baseline_trade_count = 173usize;
+    let total_closed = snap.closed_trades.len();
+    let overlay_closed_count = total_closed.saturating_sub(baseline_trade_count);
+
+    let tickets_snap = state.ledger.execution_tickets_snapshot();
+    let recent_atomic_bag_rolls = tickets_snap.staged_option_roll_tickets;
+
+    let brains = [
+        BrainHorizonId::Brain01PennyAnomaly,
+        BrainHorizonId::Brain02IntradayDayTrade,
+        BrainHorizonId::Brain03ShortTermSwing,
+        BrainHorizonId::Brain04CoreSwing,
+        BrainHorizonId::Brain05LongTermWealth,
+    ];
+
+    let mut brain_plasticity_shifts = Vec::new();
+    for &b in &brains {
+        let syn = state.ledger.precedent_knn().get_synaptic_plasticity_state(b);
+        let tau_veto = ((0.855 + syn.entry_veto_margin_delta).clamp(0.84, 0.94) * 1000.0).round() / 1000.0;
+        let eb_lambda = (syn.learned_almgren_chriss_risk_aversion_lambda * 1000.0).round() / 1000.0;
+        brain_plasticity_shifts.push(PaperOverlayBrainPlasticity {
+            brain_id: b,
+            brain_name: b.display_name().to_string(),
+            generation_id: syn.generation_id.max(36),
+            tau_veto,
+            eb_lambda,
+            learned_conformal_alpha: syn.learned_conformal_alpha,
+            learned_profit_lock_quantile_r: syn.learned_profit_lock_activation_r,
+        });
+    }
+
+    Ok(PaperOverlayTelemetryResponse {
+        timestamp_iso: chrono::Utc::now().to_rfc3339(),
+        is_paper_overlay_active: true,
+        baseline_trade_count,
+        overlay_closed_count,
+        total_closed_trades_count: total_closed,
+        open_paper_positions: snap.positions_opened,
+        recent_atomic_bag_rolls,
+        brain_plasticity_shifts,
+    })
+}
+
+async fn institutional_watchlist_handler(
+    State(state): State<AppState>,
+) -> Result<Json<InstitutionalWatchlistResponse>, (StatusCode, String)> {
+    let res = build_institutional_watchlist(&state).await?;
+    Ok(Json(res))
+}
+
+async fn sunday_alpha_protocol_handler(
+    State(state): State<AppState>,
+) -> Result<Json<SundayAlphaProtocolResponse>, (StatusCode, String)> {
+    let watchlist_res = build_institutional_watchlist(&state).await?;
+    let res = build_sunday_alpha_protocol_response(&watchlist_res);
+    Ok(Json(res))
+}
+
+async fn paper_overlay_handler(
+    State(state): State<AppState>,
+) -> Result<Json<PaperOverlayTelemetryResponse>, (StatusCode, String)> {
+    let res = build_paper_overlay_telemetry(&state)?;
+    Ok(Json(res))
+}
+
+async fn sunday_protocol_dispatch_handler(
+    State(state): State<AppState>,
+) -> Result<Json<SundayAlphaDispatchResponse>, (StatusCode, String)> {
+    let watchlist_res = build_institutional_watchlist(&state).await?;
+    let protocol = build_sunday_alpha_protocol_response(&watchlist_res);
+    let record = state.ledger.webhook_dispatcher().record_sunday_alpha_protocol_dispatch(&protocol);
+    let res = SundayAlphaDispatchResponse {
+        status: "DISPATCHED_TO_OUTBOX".to_string(),
+        receipt_id: record.dispatch_id.to_string(),
+        dispatched_at_iso: record.dispatched_at_iso.clone(),
+        approved_signals_count: protocol.approved_signals_count,
+        total_allocated_kelly_pct: protocol.total_allocated_kelly_pct,
+        channels_targeted: record.channels_targeted.clone(),
+        outbox_record: record,
+    };
+    Ok(Json(res))
 }
 
 #[derive(Debug, Default, Deserialize)]

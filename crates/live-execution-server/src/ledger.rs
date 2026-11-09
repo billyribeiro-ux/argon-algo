@@ -2607,6 +2607,10 @@ impl RealTimeLedgerEngine {
         &self.webhook_dispatcher
     }
 
+    pub fn webhook_dispatcher(&self) -> &OutboundWebhookDispatcher {
+        &self.webhook_dispatcher
+    }
+
     pub fn set_era1_symbol_median_stop_pct(
         &self,
         symbol: &str,

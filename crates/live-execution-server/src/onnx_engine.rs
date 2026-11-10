@@ -392,36 +392,128 @@ impl OnnxMultiBrainEngine {
     /// - `BRAIN-03`: `expiry_epoch_s >= eval_epoch_s + 14 * 86_400` (+14d..+21d Friday)
     /// - `BRAIN-04`: `expiry_epoch_s >= eval_epoch_s + 30 * 86_400` (+30d..+45d monthly/Friday)
     /// - `BRAIN-05`: `expiry_epoch_s >= eval_epoch_s + 60 * 86_400` (+60d..+90d cycle)
+    /// Checks if a date is a standard closed US equity options exchange holiday:
+    /// - New Year's Day (Jan 1)
+    /// - Good Friday (Easter - 2 days)
+    /// - Independence Day (July 4, or observed July 3 if Fri)
+    /// - Christmas Day (Dec 25, or observed Dec 24 if Fri)
+    pub fn is_us_exchange_holiday(date: chrono::NaiveDate) -> bool {
+                let y = date.year();
+        let m = date.month();
+        let d = date.day();
+
+        if m == 1 && d == 1 {
+            return true;
+        }
+        if (m == 7 && d == 4) || (m == 7 && d == 3 && date.weekday() == chrono::Weekday::Fri) {
+            return true;
+        }
+        if (m == 12 && d == 25) || (m == 12 && d == 24 && date.weekday() == chrono::Weekday::Fri) {
+            return true;
+        }
+
+        // Good Friday calculation (Anonymous Gregorian algorithm)
+        let a = y % 19;
+        let b = y / 100;
+        let c = y % 100;
+        let d_div = b / 4;
+        let e = b % 4;
+        let f = (b + 8) / 25;
+        let g = (b - f + 1) / 3;
+        let h = (19 * a + b - d_div - g + 15) % 30;
+        let i = c / 4;
+        let k = c % 4;
+        let l = (32 + 2 * e + 2 * i - h - k) % 7;
+        let m_val = (a + 11 * h + 22 * l) / 451;
+        let month_easter = (h + l - 7 * m_val + 114) / 31;
+        let day_easter = ((h + l - 7 * m_val + 114) % 31) + 1;
+        if let Some(easter) = chrono::NaiveDate::from_ymd_opt(y, month_easter as u32, day_easter as u32) {
+            let good_friday = easter - chrono::Duration::days(2);
+            if date == good_friday {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Phase 31.1 & Phase 32B Upgrade: Computes forward-rolling CBOE expiration with exact 21:00 UTC
+    /// market-close settlement (+21 * 3600), US exchange holiday fallback (Thursday before closed Friday),
+    /// and Monday-Friday daily expirations for liquid index ETFs (`SPY`, `QQQ`, `IWM`).
+    pub fn compute_forward_cboe_expiration_for_symbol(
+        symbol: &str,
+        brain_id: BrainHorizonId,
+        eval_epoch_s: i64,
+    ) -> (String, f64) {
+                let dt = chrono::DateTime::from_timestamp(eval_epoch_s, 0)
+            .unwrap_or_else(chrono::Utc::now);
+        let eval_date = dt.date_naive();
+        let sym_upper = symbol.trim().to_uppercase();
+        let is_daily_etf = (sym_upper == "SPY" || sym_upper == "QQQ" || sym_upper == "IWM")
+            && (brain_id == BrainHorizonId::Brain01PennyAnomaly || brain_id == BrainHorizonId::Brain02IntradayDayTrade);
+
+        if is_daily_etf {
+            // Daily Mon-Fri expirations for liquid ETFs (SPY, QQQ, IWM)
+            // Requires minimum >= 2.0 hours (7,200s) remaining before 21:00:00 UTC market-close settlement
+            let mut candidate_date = eval_date;
+            loop {
+                let is_weekend = candidate_date.weekday() == chrono::Weekday::Sat
+                    || candidate_date.weekday() == chrono::Weekday::Sun;
+                let is_holiday = Self::is_us_exchange_holiday(candidate_date);
+                if !is_weekend && !is_holiday {
+                    let cand_settlement_epoch_s = crate::broker_bridge::ymd_to_epoch_seconds(
+                        candidate_date.year() as i64,
+                        candidate_date.month() as i64,
+                        candidate_date.day() as i64,
+                    ) + 21 * 3600;
+                    let remaining_seconds = cand_settlement_epoch_s - eval_epoch_s;
+                    if remaining_seconds >= 7200 {
+                        let dte_days = (remaining_seconds as f64 / 86_400.0).max(0.01);
+                        return (candidate_date.format("%Y-%m-%d").to_string(), dte_days);
+                    }
+                }
+                candidate_date += chrono::Duration::days(1);
+            }
+        } else {
+            // Single stocks & swing/wealth Friday weekly/monthly expirations
+            let min_dte_days: i64 = match brain_id {
+                BrainHorizonId::Brain01PennyAnomaly => 2,
+                BrainHorizonId::Brain02IntradayDayTrade => 2,
+                BrainHorizonId::Brain03ShortTermSwing => 14,
+                BrainHorizonId::Brain04CoreSwing => 30,
+                BrainHorizonId::Brain05LongTermWealth => 60,
+            };
+            let min_expiry_epoch_s = eval_epoch_s + min_dte_days * 86_400;
+            let mut candidate_date = eval_date + chrono::Duration::days(min_dte_days);
+            loop {
+                let is_friday = candidate_date.weekday() == chrono::Weekday::Fri;
+                if is_friday {
+                    let mut exp_date = candidate_date;
+                    // Holiday guard: fallback to Thursday if Friday is closed exchange holiday
+                    if Self::is_us_exchange_holiday(exp_date) {
+                        exp_date -= chrono::Duration::days(1);
+                    }
+                    let cand_settlement_epoch_s = crate::broker_bridge::ymd_to_epoch_seconds(
+                        exp_date.year() as i64,
+                        exp_date.month() as i64,
+                        exp_date.day() as i64,
+                    ) + 21 * 3600;
+                    if cand_settlement_epoch_s >= min_expiry_epoch_s {
+                        let dte_days = ((cand_settlement_epoch_s - eval_epoch_s) as f64 / 86_400.0).max(1.0);
+                        return (exp_date.format("%Y-%m-%d").to_string(), dte_days);
+                    }
+                }
+                candidate_date += chrono::Duration::days(1);
+            }
+        }
+    }
+
+    /// Forward-rolling option expiration helper for default symbol.
     pub fn compute_forward_cboe_expiration(
         brain_id: BrainHorizonId,
         eval_epoch_s: i64,
     ) -> (String, f64) {
-        let dt = chrono::DateTime::from_timestamp(eval_epoch_s, 0)
-            .unwrap_or_else(chrono::Utc::now);
-        let eval_date = dt.date_naive();
-        let min_dte_days: i64 = match brain_id {
-            BrainHorizonId::Brain01PennyAnomaly => 2,
-            BrainHorizonId::Brain02IntradayDayTrade => 2,
-            BrainHorizonId::Brain03ShortTermSwing => 14,
-            BrainHorizonId::Brain04CoreSwing => 30,
-            BrainHorizonId::Brain05LongTermWealth => 60,
-        };
-        let min_expiry_epoch_s = eval_epoch_s + min_dte_days * 86_400;
-        let mut candidate_date = eval_date + chrono::Duration::days(min_dte_days);
-        loop {
-            let cand_epoch_s = crate::broker_bridge::ymd_to_epoch_seconds(
-                candidate_date.year() as i64,
-                candidate_date.month() as i64,
-                candidate_date.day() as i64,
-            );
-            let is_friday = candidate_date.weekday() == chrono::Weekday::Fri;
-            let is_new_years_day = candidate_date.month() == 1 && candidate_date.day() == 1;
-            if is_friday && !is_new_years_day && cand_epoch_s >= min_expiry_epoch_s {
-                let dte_days = ((cand_epoch_s - eval_epoch_s) as f64 / 86_400.0).max(1.0);
-                return (candidate_date.format("%Y-%m-%d").to_string(), dte_days);
-            }
-            candidate_date += chrono::Duration::days(1);
-        }
+        Self::compute_forward_cboe_expiration_for_symbol("", brain_id, eval_epoch_s)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -486,7 +578,7 @@ impl OnnxMultiBrainEngine {
         let right_char = if is_long { 'C' } else { 'P' };
 
         let (calc_exp_date, calc_dte_days) =
-            Self::compute_forward_cboe_expiration(brain_id, eval_epoch_s);
+            Self::compute_forward_cboe_expiration_for_symbol(symbol, brain_id, eval_epoch_s);
 
         let (structure, exp_date, delta_abs, dte_days) = match brain_id {
             BrainHorizonId::Brain01PennyAnomaly => (

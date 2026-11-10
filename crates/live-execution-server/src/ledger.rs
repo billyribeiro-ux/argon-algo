@@ -2595,6 +2595,14 @@ impl RealTimeLedgerEngine {
         &self.precedent_knn
     }
 
+    pub fn closed_trades_snapshot(&self) -> Vec<ClosedTradeRow> {
+        self.closed_ledger.read().clone()
+    }
+
+    pub fn push_evolution_generation_record(&self, rec: EvolutionGenerationRecord) {
+        self.evolution_generations_history.write().push(rec);
+    }
+
     pub fn replace_closed_trades_for_audit(&self, trades: Vec<ClosedTradeRow>) {
         *self.closed_ledger.write() = trades;
     }
@@ -9113,7 +9121,7 @@ impl RealTimeLedgerEngine {
         }
     }
 
-    fn build_generation_record(
+    pub fn build_generation_record(
         &self,
         generation_id: u32,
         status_label: &str,

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import rustWireFixture from './__fixtures__/phase30_rust_wire_contract.json';
+import autopsyWireFixture from './__fixtures__/phase32_autopsy_wire_contract.json';
 import {
   TerminalStore,
   formatSubPennyPrice,
@@ -2683,6 +2684,152 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
       expect(pingRes?.delivery_status).toBe('RECORDED_IN_OUTBOX_DRY_RUN');
       expect(pingRes?.receipt_id).toBe('PING-REC-1762780824');
       expect(store.lastTestPingResult).toEqual(testPingMock);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('validates Phase 32 Closed-Loop Loss-Autopsy & Dual-Gate Pareto Evolution wire parity (#23)', async () => {
+    const store = new TerminalStore(false);
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/api/v1/scanner/autopsy-evolution')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => autopsyWireFixture
+        };
+      }
+      if (url.includes('/api/v1/scanner/evolve-cycle')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => autopsyWireFixture
+        };
+      }
+      if (url.includes('/api/v1/evolution/generations')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            current_champion_generation: autopsyWireFixture.candidate_generation_id,
+            generations_history: [],
+            synaptic_plasticity_states: []
+          })
+        };
+      }
+      return { ok: false };
+    });
+
+    try {
+      // 1. Fetch Autopsy Evolution State
+      const autoRes = await store.fetchAutopsyEvolution();
+      expect(autoRes).not.toBeNull();
+      expect(store.autopsyEvolutionState).toEqual(autopsyWireFixture);
+      expect(store.autopsyEvolutionState?.candidate_generation_id).toBeGreaterThanOrEqual(37);
+      expect(store.autopsyEvolutionState?.is_promoted).toBe(true);
+      expect(store.autopsyEvolutionState?.status).toBe('PROMOTED_CHAMPION');
+
+      // 2. Dual-Gate Pareto Audit Telemetry
+      const audit = store.autopsyEvolutionState!.gate_audit;
+      expect(audit.gate1_baseline_lock_passed).toBe(true);
+      expect(audit.gate1_baseline_winners_preserved).toBe(116);
+      expect(audit.gate1_baseline_winners_target).toBe(116);
+      expect(audit.gate1_candidate_expectancy_r).toBeGreaterThan(0.20);
+      expect(audit.gate1_candidate_pf).toBeGreaterThanOrEqual(1.70);
+      expect(audit.gate2_walkforward_passed).toBe(true);
+      expect(audit.gate2_candidate_walkforward_net_r).toBeGreaterThan(audit.gate2_current_walkforward_net_r);
+      expect(audit.gate2_offending_losses_reduced).toBeGreaterThanOrEqual(1);
+      expect(audit.gate2_walkforward_winners_preserved).toBe(true);
+
+      // 3. Decoded Trade Autopsies & 32-Feature Blame Attribution
+      const autopsies = store.autopsyEvolutionState!.autopsies_decoded;
+      expect(autopsies.length).toBeGreaterThanOrEqual(2);
+      const modes = autopsies.map((a) => a.failure_mode);
+      expect(modes).toContain('ENTRY_LIQUIDITY_VACUUM_TRAP');
+      expect(modes).toContain('MFE_STALL_GIVEBACK_EXHAUSTION');
+
+      for (const aut of autopsies) {
+        expect(aut.blame_attribution_32.length).toBe(32);
+        expect(aut.top_culprit_names.length).toBe(5);
+        expect(aut.top_culprit_feature_indices.length).toBe(5);
+        expect(aut.mahalanobis_distance_shift).toBeGreaterThan(0.0);
+        expect(typeof aut.summary).toBe('string');
+        expect(aut.summary.length).toBeGreaterThan(5);
+      }
+
+      // 4. Trigger Run Self-Learning Evolution Cycle
+      const runRes = await store.runEvolveCycle();
+      expect(runRes).not.toBeNull();
+      expect(runRes?.is_promoted).toBe(true);
+      expect(store.autopsyEvolutionState?.candidate_generation_id).toBe(autopsyWireFixture.candidate_generation_id);
+
+      // Drawer toggle
+      store.toggleEvolutionDrawer(true);
+      expect(store.evolutionDrawerOpen).toBe(true);
+      store.toggleEvolutionDrawer();
+      expect(store.evolutionDrawerOpen).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('filters 24-pair institutional watchlist across execution tiers (SCALP_0DTE, DAY, SWING, WEALTH) (#24)', async () => {
+    const store = new TerminalStore(false);
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/api/v1/scanner/watchlist') || url.includes('/api/v1/scanner/institutional-watchlist')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => rustWireFixture
+        };
+      }
+      return { ok: false };
+    });
+
+    try {
+      await store.fetchInstitutionalWatchlist();
+      expect(store.institutionalWatchlist).not.toBeNull();
+      const rows = store.institutionalWatchlist!.watchlist;
+      expect(rows.length).toBe(24);
+
+      // Verify execution tier presence on all 24 rows
+      for (const r of rows) {
+        expect(r.execution_tier).toBeDefined();
+        expect(typeof r.execution_tier).toBe('string');
+        expect(['SCALP_0DTE', 'DAY_TRADE', 'SWING', 'LONG_TERM_WEALTH']).toContain(r.execution_tier);
+      }
+
+      // Tier: SCALP_0DTE (SPY, QQQ, NVDA, TSLA)
+      store.setSelectedExecutionTier('SCALP_0DTE');
+      expect(store.selectedExecutionTier).toBe('SCALP_0DTE');
+      const scalpRows = rows.filter((r) => r.execution_tier === 'SCALP_0DTE');
+      expect(scalpRows.length).toBeGreaterThanOrEqual(2);
+      const scalpSymbols = scalpRows.map((r) => r.symbol);
+      expect(scalpSymbols).toContain('SPY');
+      expect(scalpSymbols).toContain('QQQ');
+
+      // Tier: DAY_TRADE
+      store.setSelectedExecutionTier('DAY_TRADE');
+      const dayRows = rows.filter((r) => r.execution_tier === 'DAY_TRADE');
+      expect(dayRows.length).toBeGreaterThanOrEqual(4);
+
+      // Tier: SWING
+      store.setSelectedExecutionTier('SWING');
+      const swingRows = rows.filter((r) => r.execution_tier === 'SWING');
+      expect(swingRows.length).toBeGreaterThanOrEqual(5);
+
+      // Tier: LONG_TERM_WEALTH
+      store.setSelectedExecutionTier('LONG_TERM_WEALTH');
+      const wealthRows = rows.filter((r) => r.execution_tier === 'LONG_TERM_WEALTH');
+      expect(wealthRows.length).toBeGreaterThanOrEqual(1);
+
+      // Reset to ALL
+      store.setSelectedExecutionTier('ALL');
+      expect(store.selectedExecutionTier).toBe('ALL');
     } finally {
       globalThis.fetch = originalFetch;
     }

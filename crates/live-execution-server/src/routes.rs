@@ -2351,6 +2351,14 @@ pub fn build_axum_router(state: AppState) -> Router {
             "/api/v1/scanner/webhooks/test-ping",
             post(scanner_webhooks_test_ping_handler),
         )
+        .route(
+            "/api/v1/scanner/evolve-cycle",
+            post(scanner_evolve_cycle_handler),
+        )
+        .route(
+            "/api/v1/scanner/autopsy-evolution",
+            get(scanner_autopsy_evolution_handler),
+        )
         .route("/api/v1/chart/{symbol}", get(live_chart_handler))
         .route("/api/v1/ledger/snapshot", get(ledger_snapshot_handler))
         .route("/api/v1/positions/{id}", get(get_open_position_handler))
@@ -2669,6 +2677,10 @@ pub const CANONICAL_24_WATCHLIST_PAIRS: [(&str, BrainHorizonId, Timeframe); 24] 
     ("MSFT", BrainHorizonId::Brain05LongTermWealth, Timeframe::W1),
 ];
 
+pub fn default_execution_tier() -> String {
+    "DAY_TRADE".to_string()
+}
+
 /// Phase 29: Institutional Watchlist Row with Dual-Engine and Stage 0 Conformal Gate telemetry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstitutionalWatchlistRow {
@@ -2703,6 +2715,8 @@ pub struct InstitutionalWatchlistRow {
     pub option_structure: String,
     pub kelly_fraction_pct: f64,
     pub is_actionable: bool,
+    #[serde(default = "default_execution_tier")]
+    pub execution_tier: String,
 }
 
 /// Phase 29 & 30: Institutional Watchlist Response returned by `GET /api/v1/scanner/watchlist`
@@ -3133,6 +3147,19 @@ pub async fn build_institutional_watchlist_at_epoch(
                     option_structure: opt_struct,
                     kelly_fraction_pct: kelly_plan.kelly_fraction_pct,
                     is_actionable,
+                    execution_tier: if sym == "SPY"
+                        || sym == "QQQ"
+                        || ((sym == "NVDA" || sym == "TSLA")
+                            && (brain_id == BrainHorizonId::Brain02IntradayDayTrade || brain_id == BrainHorizonId::Brain01PennyAnomaly))
+                    {
+                        "SCALP_0DTE".to_string()
+                    } else if brain_id == BrainHorizonId::Brain01PennyAnomaly || brain_id == BrainHorizonId::Brain02IntradayDayTrade {
+                        "DAY_TRADE".to_string()
+                    } else if brain_id == BrainHorizonId::Brain03ShortTermSwing || brain_id == BrainHorizonId::Brain04CoreSwing {
+                        "SWING".to_string()
+                    } else {
+                        "LONG_TERM_WEALTH".to_string()
+                    },
                 });
             }
         }
@@ -3461,6 +3488,18 @@ async fn sunday_protocol_dispatch_handler(
     Ok(Json(res))
 }
 
+/// Constant-time byte slice equality check to eliminate timing side-channels during live order routing authorization.
+pub fn constant_time_slice_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 async fn stage_sunday_orders_handler(
     State(state): State<AppState>,
     Json(req): Json<StageSundayOrdersRequest>,
@@ -3469,11 +3508,15 @@ async fn stage_sunday_orders_handler(
     let env_allows_live = std::env::var("ARGON_ALLOW_LIVE_BROKER_ROUTING")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
-    let token_valid = req
-        .confirmation_token
-        .as_deref()
-        .map(|t| !t.trim().is_empty() && t != "INVALID_TOKEN")
-        .unwrap_or(false);
+    let server_secret = std::env::var("ARGON_LIVE_CONFIRMATION_TOKEN").unwrap_or_default();
+    let token_valid = if server_secret.len() >= 16 {
+        req.confirmation_token
+            .as_deref()
+            .map(|t| constant_time_slice_eq(t.as_bytes(), server_secret.as_bytes()))
+            .unwrap_or(false)
+    } else {
+        false
+    };
 
     let safety_mode = if is_live_requested {
         if !env_allows_live || !token_valid {
@@ -3482,7 +3525,7 @@ async fn stage_sunday_orders_handler(
                 Json(StageSundayOrdersErrorResponse {
                     status: "ERROR".to_string(),
                     error_code: "PAPER_SAFETY_LOCK_ACTIVE".to_string(),
-                    message: "Live brokerage routing blocked: hardware safety lock active. Set ARGON_ALLOW_LIVE_BROKER_ROUTING=1 and provide valid confirmation token to unlock.".to_string(),
+                    message: "Live brokerage routing blocked: hardware safety lock active. Set ARGON_ALLOW_LIVE_BROKER_ROUTING=1 and provide valid confirmation token matching ARGON_LIVE_CONFIRMATION_TOKEN (>= 16 chars) to unlock.".to_string(),
                     execution_safety_mode: ExecutionSafetyMode::PaperIsolatedOnly,
                 }),
             ));
@@ -3699,6 +3742,20 @@ async fn scanner_webhooks_test_ping_handler(
         outbox_count,
         record,
     })
+}
+
+async fn scanner_evolve_cycle_handler(
+    State(state): State<AppState>,
+) -> Result<Json<crate::autopsy_evolver::AutopsyEvolutionResponse>, (StatusCode, String)> {
+    let res = crate::autopsy_evolver::run_autopsy_evolution_cycle(&state.ledger);
+    Ok(Json(res))
+}
+
+async fn scanner_autopsy_evolution_handler(
+    State(state): State<AppState>,
+) -> Result<Json<crate::autopsy_evolver::AutopsyEvolutionResponse>, (StatusCode, String)> {
+    let res = crate::autopsy_evolver::run_autopsy_evolution_cycle(&state.ledger);
+    Ok(Json(res))
 }
 
 #[derive(Debug, Default, Deserialize)]

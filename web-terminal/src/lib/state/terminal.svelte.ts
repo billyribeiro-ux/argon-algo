@@ -879,6 +879,7 @@ export interface InstitutionalWatchlistRow {
   option_structure: string;
   kelly_fraction_pct: number;
   is_actionable: boolean;
+  execution_tier?: string;
 }
 
 export interface InstitutionalWatchlistResponse {
@@ -1043,6 +1044,62 @@ export interface WebhookTestPingResponse {
   dry_run_mode: boolean;
   outbox_count: number;
   record?: any;
+}
+
+// Phase 32: Autonomous Closed-Loop Loss-Autopsy & Pareto Evolver Types
+export type ExecutionTier = 'ALL' | 'SCALP_0DTE' | 'DAY_TRADE' | 'SWING' | 'LONG_TERM_WEALTH';
+
+export type AutopsyFailureMode =
+  | 'ENTRY_LIQUIDITY_VACUUM_TRAP'
+  | 'POST_ENTRY_ORDERFLOW_TOXICITY_REVERSAL'
+  | 'DEALER_CHARM_VANNA_UNPIN_DECAY'
+  | 'MFE_STALL_GIVEBACK_EXHAUSTION';
+
+export interface DecodedTradeAutopsy {
+  trade_id: string;
+  symbol: string;
+  brain_id: string;
+  realized_r: number;
+  peak_mfe_r: number;
+  giveback_pct: number;
+  failure_mode: AutopsyFailureMode;
+  failure_mode_label: string;
+  blame_attribution_32: number[];
+  top_culprit_feature_indices: number[];
+  top_culprit_names: string[];
+  mahalanobis_distance_shift: number;
+  collapse_bar_offset: number;
+  summary: string;
+}
+
+export interface GateAuditReport {
+  gate1_baseline_lock_passed: boolean;
+  gate1_baseline_winners_preserved: number;
+  gate1_baseline_winners_target: number;
+  gate1_current_expectancy_r: number;
+  gate1_candidate_expectancy_r: number;
+  gate1_current_pf: number;
+  gate1_candidate_pf: number;
+  gate2_walkforward_passed: boolean;
+  gate2_current_walkforward_net_r: number;
+  gate2_candidate_walkforward_net_r: number;
+  gate2_offending_losses_reduced: number;
+  gate2_walkforward_winners_preserved: boolean;
+  all_gates_passed: boolean;
+  decision_rationale: string;
+}
+
+export interface AutopsyEvolutionResponse {
+  status: string;
+  timestamp_iso: string;
+  current_generation_id: number;
+  candidate_generation_id: number;
+  promoted_generation_id: number | null;
+  is_promoted: boolean;
+  total_trades_inspected: number;
+  autopsies_decoded: DecodedTradeAutopsy[];
+  gate_audit: GateAuditReport;
+  updated_synaptic_states: any[];
 }
 
 const API_BASE: string = import.meta.env.VITE_ARGON_API_BASE ?? 'http://127.0.0.1:8090';
@@ -1298,6 +1355,13 @@ export class TerminalStore {
     outboxRecords: []
   });
   webhookTesting = $state<boolean>(false);
+
+  // Phase 32: Closed-Loop Loss-Autopsy Reinforcement Evolver & Scalping Tier
+  selectedExecutionTier = $state<ExecutionTier>('ALL');
+  autopsyEvolutionState = $state<AutopsyEvolutionResponse | null>(null);
+  isEvolvingCycle = $state<boolean>(false);
+  isLoadingAutopsyEvolution = $state<boolean>(false);
+  evolutionDrawerOpen = $state<boolean>(false);
 
   // 6-Dimension Hyper-Filter State for Closed Trade Ledger
   quickPill = $state<QuickFilterPillId>('ALL');
@@ -4952,6 +5016,58 @@ export class TerminalStore {
       this.isTestPingingWebhook = false;
     }
     return null;
+  }
+  /**
+   * Fetches the latest autopsy & evolution state via `GET /api/v1/scanner/autopsy-evolution`.
+   */
+  public async fetchAutopsyEvolution(): Promise<AutopsyEvolutionResponse | null> {
+    this.isLoadingAutopsyEvolution = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/autopsy-evolution`);
+      if (res.ok) {
+        const data: AutopsyEvolutionResponse = await res.json();
+        this.autopsyEvolutionState = data;
+        return data;
+      }
+    } catch {
+      // Offline fallback
+    } finally {
+      this.isLoadingAutopsyEvolution = false;
+    }
+    return this.autopsyEvolutionState;
+  }
+
+  /**
+   * Triggers an autonomous closed-loop loss-autopsy & Pareto evolution cycle via `POST /api/v1/scanner/evolve-cycle`.
+   */
+  public async runEvolveCycle(): Promise<AutopsyEvolutionResponse | null> {
+    this.isEvolvingCycle = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/evolve-cycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      if (res.ok) {
+        const data: AutopsyEvolutionResponse = await res.json();
+        this.autopsyEvolutionState = data;
+        await this.fetchEvolutionStatus();
+        return data;
+      }
+    } catch {
+      // Offline fallback
+    } finally {
+      this.isEvolvingCycle = false;
+    }
+    return null;
+  }
+
+  public setSelectedExecutionTier(tier: ExecutionTier): void {
+    this.selectedExecutionTier = tier;
+  }
+
+  public toggleEvolutionDrawer(open?: boolean): void {
+    this.evolutionDrawerOpen = open !== undefined ? open : !this.evolutionDrawerOpen;
   }
 }
 

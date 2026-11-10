@@ -3,6 +3,7 @@
 //! `POSITIONS OPENED` Active Monitor, `closed_trade_ledger` Archiver, and
 //! 1-Click `.CSV` / Multi-Sheet `.XLSX` OpenXML Workbook Exporter.
 
+pub mod autopsy_evolver;
 pub mod broker_bridge;
 pub mod evolution;
 pub mod exporter;
@@ -12,6 +13,11 @@ pub mod precedent_knn;
 pub mod routes;
 pub mod webhooks;
 
+pub use autopsy_evolver::{
+    decode_trade_failure, propose_candidate_generation, run_autopsy_evolution_cycle,
+    verify_and_promote_generation, AutopsyEvolutionResponse, AutopsyFailureMode,
+    DecodedTradeAutopsy, GateAuditReport, FEATURE_NAMES_32,
+};
 pub use broker_bridge::{
     AlmgrenChrissExecutionSlicer, AlmgrenChrissSlicePlan, BrokerExecutionBridge,
     BrokerFillConfirmation, CrossVenueSmartRouter, MicrostructureChildSlice,
@@ -4357,6 +4363,7 @@ mod tests {
                 matched_option_contract: "AMD 2026-11-20 $138.00P".to_string(),
                 option_structure: "SINGLE_LEG_PUT".to_string(),
                 kelly_fraction_pct: 1.50,
+                execution_tier: "DAY_TRADE".to_string(),
                 is_actionable: true,
             },
             InstitutionalWatchlistRow {
@@ -4387,6 +4394,7 @@ mod tests {
                 matched_option_contract: "AMD 2026-12-18 $140.00C".to_string(),
                 option_structure: "DIAGONAL_SPREAD".to_string(),
                 kelly_fraction_pct: 1.20,
+                execution_tier: "SWING".to_string(),
                 is_actionable: true,
             },
         ];
@@ -4570,7 +4578,7 @@ mod tests {
         // F. POST /api/v1/scanner/webhooks/config (Runtime update and mask)
         let update_wh_payload = serde_json::json!({
             "discord_webhook_url": "https://discord.com/api/webhooks/1234567890/abcdefghij_secret_token",
-            "discord_enabled": true
+            "discord_enabled": false
         });
         let req_wh_post = axum::http::Request::builder()
             .uri("/api/v1/scanner/webhooks/config")
@@ -4625,5 +4633,318 @@ mod tests {
             "IMMUTABLE BASELINE INVARIANT VIOLATION: data/ledger_state.json must remain strictly at 173 trades!"
         );
         println!("\n  [BASELINE 🔒 FINAL VERIFICATION] data/ledger_state.json 100% UNTOUCHED at 173 trades!\n");
+    }
+
+    #[tokio::test]
+    async fn test_phase32_closed_loop_loss_autopsy_pareto_evolution_and_scalp_0dte() {
+        use tower::ServiceExt;
+        use crate::broker_bridge::ymd_to_epoch_seconds;
+        use crate::routes::{ExecutionSafetyMode, StageSundayOrdersErrorResponse, StageSundayOrdersResponse};
+
+        println!("\n=================================================================================================================================");
+        println!("  PHASE 32: CLOSED-LOOP LOSS-AUTOPSY REINFORCEMENT EVOLVER, 1M/0DTE SCALPING & PHASE 31.1 REMEDIATIONS");
+        println!("=================================================================================================================================");
+
+        // -----------------------------------------------------------------------------------------------------------------------------
+        // 1. PART A: ZERO EXTERNAL HTTP LEAKAGE — EPHEMERAL LOCAL AXUM MOCK RECEIVER
+        // -----------------------------------------------------------------------------------------------------------------------------
+        let mock_received_payloads = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let payloads_clone = mock_received_payloads.clone();
+        let mock_app = axum::Router::new().route(
+            "/mock-webhook",
+            axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let payloads = payloads_clone.clone();
+                async move {
+                    payloads.lock().await.push(payload);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let models_dir = Path::new("../../models");
+        let app_models_path = if models_dir.exists() {
+            Some(models_dir)
+        } else {
+            None
+        };
+        let state = AppState::new(app_models_path);
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+        assert!(state.ledger.load_from_disk(ledger_path));
+        let snap_initial = state.ledger.query_filtered_snapshot(&HyperFilterQuery::default());
+        for closed_row in &snap_initial.closed_trades {
+            state.ledger.sync_closed_row_to_precedent_knn(closed_row);
+        }
+        state.ledger.recompute_causal_plasticity();
+
+        let router = build_axum_router(state.clone());
+
+        // Configure webhook dispatcher to use the ephemeral local mock receiver
+        let mock_url = format!("http://{}/mock-webhook", mock_addr);
+        state.ledger.webhooks().update_config(crate::webhooks::WebhookChannelConfig {
+            discord_webhook_url: mock_url.clone(),
+            discord_enabled: true,
+            ..Default::default()
+        });
+
+        // Fire test ping via Axum router
+        let req_ping = axum::http::Request::builder()
+            .uri("/api/v1/scanner/webhooks/test-ping")
+            .method("POST")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"symbol":"NVDA"}"#))
+            .unwrap();
+        let resp_ping = router.clone().oneshot(req_ping).await.unwrap();
+        assert_eq!(resp_ping.status(), axum::http::StatusCode::OK);
+        let ping_bytes = axum::body::to_bytes(resp_ping.into_body(), usize::MAX).await.unwrap();
+        let ping_res: crate::webhooks::WebhookTestPingResponse = serde_json::from_slice(&ping_bytes).unwrap();
+        assert!(ping_res.delivery_status.contains("DELIVERED_200"));
+        let received_count = mock_received_payloads.lock().await.len();
+        println!("  [DEBUG RECEIVED PAYLOADS (count={})]: {:?}", received_count, *mock_received_payloads.lock().await);
+        assert!(received_count >= 1, "Mock webhook receiver must receive payloads with zero internet leakage!");
+        println!("  [PROOFS 1/6] ZERO EXTERNAL HTTP LEAKAGE: Delivered 200 OK to local ephemeral receiver at {} (payloads={})",
+            mock_addr, received_count);
+
+        // -----------------------------------------------------------------------------------------------------------------------------
+        // 2. PART A: REAL CONSTANT-TIME TOKEN VERIFICATION (>= 16 chars server secret)
+        // -----------------------------------------------------------------------------------------------------------------------------
+        // Unset token -> live: true MUST reject with 403 PAPER_SAFETY_LOCK_ACTIVE
+        unsafe { std::env::remove_var("ARGON_LIVE_CONFIRMATION_TOKEN"); }
+        let req_unauth = axum::http::Request::builder()
+            .uri("/api/v1/scanner/sunday-protocol/stage-orders")
+            .method("POST")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"live":true,"confirmation_token":"SOME_TOKEN_12345"}"#))
+            .unwrap();
+        let resp_unauth = router.clone().oneshot(req_unauth).await.unwrap();
+        assert_eq!(resp_unauth.status(), axum::http::StatusCode::FORBIDDEN);
+        let unauth_bytes = axum::body::to_bytes(resp_unauth.into_body(), usize::MAX).await.unwrap();
+        let unauth_res: StageSundayOrdersErrorResponse = serde_json::from_slice(&unauth_bytes).unwrap();
+        assert_eq!(unauth_res.error_code, "PAPER_SAFETY_LOCK_ACTIVE");
+
+        // Short token (< 16 chars) -> MUST reject
+        unsafe { std::env::set_var("ARGON_LIVE_CONFIRMATION_TOKEN", "SHORT_KEY_123"); }
+        let req_short = axum::http::Request::builder()
+            .uri("/api/v1/scanner/sunday-protocol/stage-orders")
+            .method("POST")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"live":true,"confirmation_token":"SHORT_KEY_123"}"#))
+            .unwrap();
+        let resp_short = router.clone().oneshot(req_short).await.unwrap();
+        assert_eq!(resp_short.status(), axum::http::StatusCode::FORBIDDEN);
+
+        // Valid secret length (>= 16 chars) but mismatched token -> constant_time_slice_eq fails
+        unsafe { std::env::set_var("ARGON_LIVE_CONFIRMATION_TOKEN", "ARGON_INSTITUTIONAL_KEY_9876543210"); }
+        let req_mismatch = axum::http::Request::builder()
+            .uri("/api/v1/scanner/sunday-protocol/stage-orders")
+            .method("POST")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"live":true,"confirmation_token":"ARGON_INSTITUTIONAL_KEY_9876543211"}"#))
+            .unwrap();
+        let resp_mismatch = router.clone().oneshot(req_mismatch).await.unwrap();
+        assert_eq!(resp_mismatch.status(), axum::http::StatusCode::FORBIDDEN);
+
+        // Valid secret length + matching token + live broker routing enabled -> Authorized
+        unsafe {
+            std::env::set_var("ARGON_ALLOW_LIVE_BROKER_ROUTING", "1");
+            std::env::set_var("ARGON_LIVE_CONFIRMATION_TOKEN", "ARGON_INSTITUTIONAL_KEY_9876543210");
+        }
+        let req_valid = axum::http::Request::builder()
+            .uri("/api/v1/scanner/sunday-protocol/stage-orders")
+            .method("POST")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"live":true,"confirmation_token":"ARGON_INSTITUTIONAL_KEY_9876543210","symbols":["NVDA"]}"#))
+            .unwrap();
+        let resp_valid = router.clone().oneshot(req_valid).await.unwrap();
+        assert_eq!(resp_valid.status(), axum::http::StatusCode::OK);
+        let valid_bytes = axum::body::to_bytes(resp_valid.into_body(), usize::MAX).await.unwrap();
+        let valid_res: StageSundayOrdersResponse = serde_json::from_slice(&valid_bytes).unwrap();
+        assert_eq!(valid_res.execution_safety_mode, ExecutionSafetyMode::LiveAuthorized);
+
+        // Reset env
+        unsafe {
+            std::env::remove_var("ARGON_ALLOW_LIVE_BROKER_ROUTING");
+            std::env::remove_var("ARGON_LIVE_CONFIRMATION_TOKEN");
+        }
+        println!("  [PROOFS 2/6] CONSTANT-TIME TOKEN GATE: Unset=403, Short(<16)=403, Mismatched=403, Exact(>=16)=200 LiveAuthorized");
+
+        // -----------------------------------------------------------------------------------------------------------------------------
+        // 3. PART A & B: EXACT 21:00 UTC SETTLEMENT & DAILY SPY/QQQ/IWM 0DTE/1DTE EXPIRATIONS
+        // -----------------------------------------------------------------------------------------------------------------------------
+        // Monday 2026-11-09 14:00:00 UTC (1794232800): 7.0 hours to 21:00 close -> 0DTE candidate
+        let mon_14_utc = ymd_to_epoch_seconds(2026, 11, 9) + 14 * 3600;
+        let (spy_exp_0dte, dte_0dte) = onnx_engine::OnnxMultiBrainEngine::compute_forward_cboe_expiration_for_symbol(
+            "SPY",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            mon_14_utc,
+        );
+        assert_eq!(spy_exp_0dte, "2026-11-09", "SPY 14:00 UTC on Monday must yield 0DTE (2026-11-09)");
+        assert!((dte_0dte - (7.0 / 24.0)).abs() < 0.05, "DTE must be exact fractional 7h/24h = {:.3}", dte_0dte);
+
+        // Monday 2026-11-09 19:30:00 UTC (1.5 hours remaining, < 2.0h floor) -> rolls to Tuesday 1DTE
+        let mon_1930_utc = ymd_to_epoch_seconds(2026, 11, 9) + 19 * 3600 + 1800;
+        let (spy_exp_1dte, _) = onnx_engine::OnnxMultiBrainEngine::compute_forward_cboe_expiration_for_symbol(
+            "SPY",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            mon_1930_utc,
+        );
+        assert_eq!(spy_exp_1dte, "2026-11-10", "SPY < 2.0h before close must roll to Tuesday 1DTE (2026-11-10)");
+
+        // US Exchange Holiday: Good Friday 2026 (April 3, 2026)
+        let good_friday_2026 = chrono::NaiveDate::from_ymd_opt(2026, 4, 3).unwrap();
+        assert!(onnx_engine::OnnxMultiBrainEngine::is_us_exchange_holiday(good_friday_2026), "Good Friday 2026-04-03 must be detected as exchange holiday!");
+        let tue_before_gf = ymd_to_epoch_seconds(2026, 3, 31) + 15 * 3600;
+        let (holiday_exp, _) = onnx_engine::OnnxMultiBrainEngine::compute_forward_cboe_expiration_for_symbol(
+            "AMD",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            tue_before_gf,
+        );
+        assert_eq!(holiday_exp, "2026-04-02", "Expiration on Good Friday week must fall back to Thursday (2026-04-02), got: {}", holiday_exp);
+        println!("  [PROOFS 3/6] 21:00 UTC SETTLEMENT & 0DTE: SPY @ 14:00 UTC -> 0DTE (DTE={:.3}d) | SPY @ 19:30 UTC -> 1DTE | Good Friday Fallback -> Thursday 2026-04-02", dte_0dte);
+
+        // -----------------------------------------------------------------------------------------------------------------------------
+        // 4. PART B: FORENSIC LOSS-AUTOPSY & 32-FEATURE BLAME ATTRIBUTION
+        // -----------------------------------------------------------------------------------------------------------------------------
+        let mut sim_loss_trade = snap_initial.closed_trades[0].clone();
+        sim_loss_trade.realized_r_multiple = -1.0;
+        sim_loss_trade.is_winner = false;
+        sim_loss_trade.entry_trap_similarity_score = 0.85; // triggers spread vacuum
+        sim_loss_trade.mfe_pct = 0.05;
+
+        let autopsy_1 = decode_trade_failure(&sim_loss_trade).expect("Losing trade must produce DecodedTradeAutopsy");
+        assert_eq!(autopsy_1.failure_mode, AutopsyFailureMode::EntryLiquidityVacuumTrap);
+        assert_eq!(autopsy_1.blame_attribution_32.len(), 32);
+        assert_eq!(autopsy_1.top_culprit_feature_indices.len(), 5);
+        println!("  [AUTOPSY DECODED #1] Symbol: {} | Failure Mode: {:?} | Top Culprits: {:?} | Mahalanobis Shift: {:.3}",
+            autopsy_1.symbol, autopsy_1.failure_mode, autopsy_1.top_culprit_names, autopsy_1.mahalanobis_distance_shift);
+
+        let mut sim_giveback_trade = snap_initial.closed_trades[1].clone();
+        sim_giveback_trade.entry_bars.clear();
+        let stop_dist_gb = (sim_giveback_trade.entry_price.to_f64() - sim_giveback_trade.initial_structural_stop.to_f64()).abs().max(0.01);
+        sim_giveback_trade.realized_r_multiple = 0.35;
+        sim_giveback_trade.is_winner = true;
+        sim_giveback_trade.mfe_pct = (2.4 * stop_dist_gb / sim_giveback_trade.entry_price.to_f64()) * 100.0; // 2.4R peak MFE, giveback > 35%
+        let autopsy_2 = decode_trade_failure(&sim_giveback_trade).expect("Giveback trade must produce DecodedTradeAutopsy");
+        assert_eq!(autopsy_2.failure_mode, AutopsyFailureMode::MfeStallGivebackExhaustion);
+        println!("  [AUTOPSY DECODED #2] Symbol: {} | Failure Mode: {:?} | Top Culprits: {:?} | Mahalanobis Shift: {:.3}",
+            autopsy_2.symbol, autopsy_2.failure_mode, autopsy_2.top_culprit_names, autopsy_2.mahalanobis_distance_shift);
+
+        // -----------------------------------------------------------------------------------------------------------------------------
+        // 5. PART B: ONLINE MIRROR-DESCENT CANDIDATE PROPOSAL & DUAL-GATE PARETO VERIFICATION
+        // -----------------------------------------------------------------------------------------------------------------------------
+        let current_states = state.ledger.precedent_knn().ordered_synaptic_plasticity_states();
+        let candidate_states = propose_candidate_generation(&current_states, &[autopsy_1.clone(), autopsy_2.clone()], 37);
+        assert_eq!(candidate_states[0].generation_id, 37);
+
+        // Verify Mirror-Descent normalized mean = 1.0
+        for st in &candidate_states {
+            let mean_w: f64 = st.synaptic_feature_weights_32.iter().sum::<f64>() / 32.0;
+            assert!((mean_w - 1.0).abs() < 0.05, "Online Mirror-Descent weights mean must normalize to 1.0, got: {}", mean_w);
+        }
+
+        // Test Promotion on Walk-Forward Cohort
+        let wf_cohort = vec![sim_loss_trade.clone(), sim_giveback_trade.clone()];
+        let (promoted, audit_report) = verify_and_promote_generation(&state.ledger, &candidate_states, &wf_cohort, 37);
+        assert!(promoted, "Gen 37 must be promoted when baseline winners preserved and overlay improved!");
+        assert!(audit_report.gate1_baseline_lock_passed);
+        assert_eq!(audit_report.gate1_baseline_winners_preserved, 116, "Gate 1: Exactly 116/116 baseline winners must remain intact!");
+        assert!(audit_report.gate2_walkforward_passed);
+        assert!(audit_report.gate2_candidate_walkforward_net_r > audit_report.gate2_current_walkforward_net_r);
+        println!("  [PROOFS 4/6] DUAL-GATE PARETO PROMOTION: Gate 1 Passed (116/116 Winners Preserved) | Gate 2 Passed (+{:.2}R Net Delta) -> PROMOTED TO CHAMPION GEN-37",
+            audit_report.gate2_candidate_walkforward_net_r - audit_report.gate2_current_walkforward_net_r);
+
+        // Test Deliberate Poisoned Mutation (Gate 1 Rejection & Auto-Rollback)
+        let mut poisoned_states = candidate_states.clone();
+        for st in &mut poisoned_states {
+            st.entry_veto_margin_delta = 0.500; // Intentionally over-aggressive veto threshold that kills baseline winners
+        }
+        let (poisoned_promoted, poisoned_audit) = verify_and_promote_generation(&state.ledger, &poisoned_states, &wf_cohort, 38);
+        assert!(!poisoned_promoted, "Poisoned candidate state MUST be rejected by Gate 1!");
+        assert!(!poisoned_audit.gate1_baseline_lock_passed, "Gate 1 must fail under poisoned false-positive winner vetoes!");
+        assert!(poisoned_audit.gate1_baseline_winners_preserved < 116, "Poisoned veto must have cut baseline winners!");
+        println!("  [PROOFS 5/6] POISONED MUTATION AUTO-ROLLBACK: Gate 1 FAILED ({} < 116 winners preserved) -> Cleanly Rolled Back to Prior Champion",
+            poisoned_audit.gate1_baseline_winners_preserved);
+
+        // -----------------------------------------------------------------------------------------------------------------------------
+        // 6. PART C & D: WATCHLIST SCALPING TIERS & ENDPOINTS INTEGRITY
+        // -----------------------------------------------------------------------------------------------------------------------------
+        let req_wl = axum::http::Request::builder()
+            .uri("/api/v1/scanner/watchlist")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_wl = router.clone().oneshot(req_wl).await.unwrap();
+        assert_eq!(resp_wl.status(), axum::http::StatusCode::OK);
+        let wl_bytes = axum::body::to_bytes(resp_wl.into_body(), usize::MAX).await.unwrap();
+        let wl_res: InstitutionalWatchlistResponse = serde_json::from_slice(&wl_bytes).unwrap();
+        assert!(wl_res.universe_size >= 24);
+
+        let mut found_scalp = false;
+        for row in &wl_res.watchlist {
+            assert!(!row.execution_tier.is_empty(), "Execution tier must be non-empty for all rows!");
+            if row.symbol == "SPY" || row.symbol == "QQQ" {
+                assert_eq!(row.execution_tier, "SCALP_0DTE", "SPY/QQQ must be tagged with SCALP_0DTE execution tier!");
+                found_scalp = true;
+            }
+        }
+        assert!(found_scalp, "Must find SCALP_0DTE rows in watchlist!");
+
+        // GET /api/v1/scanner/autopsy-evolution
+        let req_auto = axum::http::Request::builder()
+            .uri("/api/v1/scanner/autopsy-evolution")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_auto = router.clone().oneshot(req_auto).await.unwrap();
+        assert_eq!(resp_auto.status(), axum::http::StatusCode::OK);
+        let auto_bytes = axum::body::to_bytes(resp_auto.into_body(), usize::MAX).await.unwrap();
+        let auto_res: crate::autopsy_evolver::AutopsyEvolutionResponse = serde_json::from_slice(&auto_bytes).unwrap();
+        assert!(auto_res.candidate_generation_id >= 37);
+
+        // POST /api/v1/scanner/evolve-cycle
+        let req_cycle = axum::http::Request::builder()
+            .uri("/api/v1/scanner/evolve-cycle")
+            .method("POST")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_cycle = router.clone().oneshot(req_cycle).await.unwrap();
+        assert_eq!(resp_cycle.status(), axum::http::StatusCode::OK);
+        let cycle_bytes = axum::body::to_bytes(resp_cycle.into_body(), usize::MAX).await.unwrap();
+        let cycle_res: crate::autopsy_evolver::AutopsyEvolutionResponse = serde_json::from_slice(&cycle_bytes).unwrap();
+
+        // Export directly to web-terminal fixture path for Vitest parity
+        let fixture_dirs = [
+            Path::new("../../web-terminal/src/lib/state/__fixtures__"),
+            Path::new("web-terminal/src/lib/state/__fixtures__"),
+        ];
+        for dir in &fixture_dirs {
+            if dir.parent().map(|p| p.exists()).unwrap_or(false) {
+                let _ = std::fs::create_dir_all(dir);
+                let json_str = serde_json::to_string_pretty(&cycle_res).unwrap();
+                let _ = std::fs::write(dir.join("phase32_autopsy_wire_contract.json"), json_str);
+            }
+        }
+        println!("  [WIRE PARITY] Serialized Rust AutopsyEvolutionResponse written to phase32_autopsy_wire_contract.json");
+        println!("  [PROOFS 6/6] WATCHLIST SCALP_0DTE & API ENDPOINTS: Found SCALP_0DTE tiers on SPY/QQQ | GET & POST /autopsy-evolution returned 200 OK");
+
+        // Immutable Baseline Check: data/ledger_state.json untouched
+        let baseline_check = RealTimeLedgerEngine::new();
+        assert!(baseline_check.load_from_disk(ledger_path));
+        assert_eq!(
+            baseline_check.query_filtered_snapshot(&HyperFilterQuery::default()).closed_trades.len(),
+            173,
+            "IMMUTABLE BASELINE INVARIANT VIOLATION: data/ledger_state.json must remain strictly at 173 trades!"
+        );
+        println!("\n  [BASELINE 🔒 FINAL LOCK] data/ledger_state.json remains 100% UNTOUCHED at exactly 173 trades!\n");
     }
 }

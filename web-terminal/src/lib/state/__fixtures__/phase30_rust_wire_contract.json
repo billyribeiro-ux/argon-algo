@@ -1,5 +1,5 @@
 {
-  "timestamp_iso": "2026-11-10T13:24:06.305307+00:00",
+  "timestamp_iso": "2026-11-10T14:07:43.399266+00:00",
   "universe_size": 24,
   "actionable_setups_count": 16,
   "active_generation_id": 36,
@@ -37,7 +37,8 @@
       "matched_option_contract": "AMD 2026-11-13 $485.00P",
       "option_structure": "\"SINGLE_LEG_PUT\"",
       "kelly_fraction_pct": 0.4,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "DAY_TRADE"
     },
     {
       "rank": 2,
@@ -67,7 +68,8 @@
       "matched_option_contract": "SOFI 2026-11-13 $18.00C",
       "option_structure": "\"SINGLE_LEG_CALL\"",
       "kelly_fraction_pct": 0.42,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "DAY_TRADE"
     },
     {
       "rank": 3,
@@ -97,7 +99,8 @@
       "matched_option_contract": "SMCI 2026-11-13 $30.00P",
       "option_structure": "\"SINGLE_LEG_PUT\"",
       "kelly_fraction_pct": 0.39,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "DAY_TRADE"
     },
     {
       "rank": 4,
@@ -127,7 +130,8 @@
       "matched_option_contract": "CLOV 2026-11-13 $4.50/$5.50C",
       "option_structure": "\"CREDIT_SPREAD\"",
       "kelly_fraction_pct": 0.4,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "DAY_TRADE"
     },
     {
       "rank": 5,
@@ -157,7 +161,8 @@
       "matched_option_contract": "NVDA 2026-11-13 $205.00C",
       "option_structure": "\"SINGLE_LEG_CALL\"",
       "kelly_fraction_pct": 0.41,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "SCALP_0DTE"
     },
     {
       "rank": 6,
@@ -187,7 +192,8 @@
       "matched_option_contract": "KULR 2026-11-13 $1.50/$2.50C",
       "option_structure": "\"CREDIT_SPREAD\"",
       "kelly_fraction_pct": 0.43,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "DAY_TRADE"
     },
     {
       "rank": 7,
@@ -217,7 +223,8 @@
       "matched_option_contract": "MSFT 2027-01-15 $450.00C",
       "option_structure": "\"DEEP_ITM_LEAPS\"",
       "kelly_fraction_pct": 0.37,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "LONG_TERM_WEALTH"
     },
     {
       "rank": 8,
@@ -247,7 +254,8 @@
       "matched_option_contract": "MSFT 2026-12-11 $530.00C",
       "option_structure": "\"DIAGONAL_SPREAD\"",
       "kelly_fraction_pct": 0.36,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "SWING"
     },
     {
       "rank": 9,
@@ -277,7 +285,8 @@
       "matched_option_contract": "SPY 2027-01-15 $640.00C",
       "option_structure": "\"DEEP_ITM_LEAPS\"",
       "kelly_fraction_pct": 1.28,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "SCALP_0DTE"
     },
     {
       "rank": 10,
@@ -307,7 +316,8 @@
       "matched_option_contract": "PLTR 2026-11-27 $172.50/$167.50P",
       "option_structure": "\"CREDIT_SPREAD\"",
       "kelly_fraction_pct": 0.71,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "SWING"
     },
     {
       "rank": 11,
@@ -337,7 +347,8 @@
       "matched_option_contract": "SOUN 2026-11-13 $4.50/$5.50C",
       "option_structure": "\"CREDIT_SPREAD\"",
       "kelly_fraction_pct": 0.41,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "DAY_TRADE"
     },
     {
       "rank": 12,
@@ -367,7 +378,8 @@
       "matched_option_contract": "GS 2027-01-15 $1030.00P",
       "option_structure": "\"DEEP_ITM_LEAPS\"",
       "kelly_fraction_pct": 1.14,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "LONG_TERM_WEALTH"
     },
     {
       "rank": 13,
@@ -397,7 +409,8 @@
       "matched_option_contract": "MSTR 2026-11-27 $145.00/$150.00C",
       "option_structure": "\"CREDIT_SPREAD\"",
       "kelly_fraction_pct": 0.68,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "SWING"
     },
     {
       "rank": 14,
@@ -427,7 +440,8 @@
       "matched_option_contract": "IONQ 2026-11-27 $29.00/$27.00P",
       "option_structure": "\"CREDIT_SPREAD\"",
       "kelly_fraction_pct": 0.69,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "SWING"
     },
     {
       "rank": 15,
@@ -457,7 +471,8 @@
       "matched_option_contract": "COIN 2026-11-27 $152.50/$157.50C",
       "option_structure": "\"CREDIT_SPREAD\"",
       "kelly_fraction_pct": 0.63,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "SWING"
     },
     {
       "rank": 16,
@@ -487,7 +502,8 @@
       "matched_option_contract": "QQQ 2027-01-15 $580.00C",
       "option_structure": "\"DEEP_ITM_LEAPS\"",
       "kelly_fraction_pct": 1.28,
-      "is_actionable": true
+      "is_actionable": true,
+      "execution_tier": "SCALP_0DTE"
     },
     {
       "rank": 17,
@@ -517,7 +533,8 @@
       "matched_option_contract": "AMD 2026-12-11 $565.00C",
       "option_structure": "\"DIAGONAL_SPREAD\"",
       "kelly_fraction_pct": 1.84,
-      "is_actionable": false
+      "is_actionable": false,
+      "execution_tier": "SWING"
     },
     {
       "rank": 18,
@@ -547,7 +564,8 @@
       "matched_option_contract": "AAPL 2026-12-11 $350.00C",
       "option_structure": "\"DIAGONAL_SPREAD\"",
       "kelly_fraction_pct": 2.09,
-      "is_actionable": false
+      "is_actionable": false,
+      "execution_tier": "SWING"
     },
     {
       "rank": 19,
@@ -577,7 +595,8 @@
       "matched_option_contract": "TSLA 2026-11-13 $390.00C",
       "option_structure": "\"SINGLE_LEG_CALL\"",
       "kelly_fraction_pct": 0.68,
-      "is_actionable": false
+      "is_actionable": false,
+      "execution_tier": "SCALP_0DTE"
     },
     {
       "rank": 20,
@@ -607,7 +626,8 @@
       "matched_option_contract": "MARA 2026-11-13 $7.00C",
       "option_structure": "\"SINGLE_LEG_CALL\"",
       "kelly_fraction_pct": 0.72,
-      "is_actionable": false
+      "is_actionable": false,
+      "execution_tier": "DAY_TRADE"
     },
     {
       "rank": 21,
@@ -637,7 +657,8 @@
       "matched_option_contract": "META 2026-12-11 $625.00P",
       "option_structure": "\"DIAGONAL_SPREAD\"",
       "kelly_fraction_pct": 2.06,
-      "is_actionable": false
+      "is_actionable": false,
+      "execution_tier": "SWING"
     },
     {
       "rank": 22,
@@ -667,7 +688,8 @@
       "matched_option_contract": "NVDA 2026-12-11 $212.50P",
       "option_structure": "\"DIAGONAL_SPREAD\"",
       "kelly_fraction_pct": 2.12,
-      "is_actionable": false
+      "is_actionable": false,
+      "execution_tier": "SWING"
     },
     {
       "rank": 23,
@@ -697,7 +719,8 @@
       "matched_option_contract": "PLUG 2026-11-13 $1.50/$0.50P",
       "option_structure": "\"CREDIT_SPREAD\"",
       "kelly_fraction_pct": 0.71,
-      "is_actionable": false
+      "is_actionable": false,
+      "execution_tier": "DAY_TRADE"
     },
     {
       "rank": 24,
@@ -727,11 +750,12 @@
       "matched_option_contract": "AVGO 2026-11-27 $330.00/$320.00P",
       "option_structure": "\"CREDIT_SPREAD\"",
       "kelly_fraction_pct": 1.17,
-      "is_actionable": false
+      "is_actionable": false,
+      "execution_tier": "SWING"
     }
   ],
   "market_internals": {
-    "timestamp_ns": 1794317033000000000,
+    "timestamp_ns": 1794319658000000000,
     "nyse_tick": 950,
     "nasdaq_tick": 1120,
     "add": 2100,
@@ -740,13 +764,13 @@
     "vix_front_month": 18.318,
     "sector_flows": {
       "XLY": 0.65,
-      "XLI": 0.65,
       "SPY": 0.4732826503828446,
-      "XLK": 0.65,
-      "SMH": 0.65,
       "IGV": 0.65,
       "XLF": 0.65,
-      "XBI": 0.65
+      "XLK": 0.65,
+      "SMH": 0.65,
+      "XBI": 0.65,
+      "XLI": 0.65
     }
   }
 }

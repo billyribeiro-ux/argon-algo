@@ -1,8 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
+import rustWireFixture from './__fixtures__/phase30_rust_wire_contract.json';
 import {
   TerminalStore,
   formatSubPennyPrice,
-  CSV_LEDGER_HEADERS
+  CSV_LEDGER_HEADERS,
+  type StagedOrderReceipt,
+  type StageSundayOrdersResponse,
+  type StageSundayOrdersErrorResponse,
+  type RedactedWebhookConfigResponse,
+  type WebhookTestPingResponse
 } from './terminal.svelte';
 import { ExecutionAudioEngine } from '../audio/execution-audio';
 
@@ -2448,6 +2454,235 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
       expect(dispatchRes?.telegram_payload_queued).toBe(true);
       expect(dispatchRes?.conflicts_blocked).toBe(1);
       expect(store.lastDispatchResult).toEqual(dispatchMock);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('validates Rust-to-Svelte wire contract schema parity against real serde-serialized JSON fixture (#21)', async () => {
+    const store = new TerminalStore();
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/api/v1/scanner/institutional-watchlist')) {
+        return { ok: true, json: async () => rustWireFixture };
+      }
+      return { ok: false };
+    });
+
+    try {
+      const data = await store.fetchInstitutionalWatchlist();
+      expect(data).not.toBeNull();
+      // Verify root fields
+      expect(data?.universe_size).toBe(24);
+      expect(data?.actionable_setups_count).toBe(16);
+      expect(data?.active_generation_id).toBe(36);
+      expect(data?.active_generation).toBe('GEN-36');
+      expect(data?.total_allocated_kelly_pct).toBe(10.0);
+      expect(data?.net_portfolio_delta_beta_weighted).toBe(4.85);
+      expect(data?.cross_brain_conflicts_blocked).toBe(1);
+      // Zero hardcoded 45.2 proof: dynamic OCC TIMS margin relief
+      expect(data?.estimated_occ_tims_margin_relief_pct).toBe(41.47);
+      expect(data?.estimated_occ_tims_margin_relief_pct).not.toBe(45.2);
+
+      // Verify row-level wire contract parity
+      expect(data?.watchlist.length).toBe(24);
+      for (const row of data?.watchlist ?? []) {
+        expect(row.symbol).toBeDefined();
+        expect(row.brain_id).toMatch(/^BRAIN-0[1-5]$/);
+        expect(['LONG', 'SHORT']).toContain(row.direction);
+        expect(row.consensus_confidence_pct).toBeGreaterThan(0);
+        expect(row.entry_price).toBeGreaterThan(0);
+        expect(row.structural_stop_price).toBeGreaterThan(0);
+        expect(row.target_1_price).toBeGreaterThan(0);
+        expect(row.target_2_price).toBeGreaterThan(0);
+        expect(row.matched_option_contract).toMatch(/^[A-Z]+\s+\d{4}-\d{2}-\d{2}\s+\$[\d\.]+(\/\$[\d\.]+)*[CP]/);
+        expect(row.venue_ticket).toBeDefined();
+        expect(row.kelly_fraction_pct).toBeGreaterThan(0);
+        expect(typeof row.is_actionable).toBe('boolean');
+        expect(typeof row.action_status).toBe('string');
+        // Ensure zero undefined fields from snake_case / camelCase mismatch
+        expect(row.conformal_margin).toBeDefined();
+        expect(row.engine_a_confidence_pct).toBeDefined();
+        expect(row.engine_b_confidence_pct).toBeDefined();
+      }
+
+      // Verify Cross-Brain conflict netting in fixture
+      const blockedRow = data?.watchlist.find((r) => r.action_status === 'BLOCKED_CROSS_BRAIN_CONFLICT');
+      expect(blockedRow).toBeDefined();
+      expect(blockedRow?.is_actionable).toBe(false);
+      expect(blockedRow?.symbol).toBe('AMD');
+      expect(blockedRow?.brain_id).toBe('BRAIN-04');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('stages approved Sunday Alpha orders into isolated Paper-OMS with hardware safety lock and validates redacted webhook configuration + test ping (#22)', async () => {
+    const store = new TerminalStore();
+    const originalFetch = globalThis.fetch;
+
+    const paperReceiptMock: StagedOrderReceipt = {
+      client_order_id: 'PAPER-AMD-BRAIN-02-1762780824',
+      symbol: 'AMD',
+      brain_id: 'BRAIN-02',
+      direction: 'SHORT',
+      execution_safety_mode: 'PAPER_ISOLATED_ONLY',
+      execution_venue: 'IEX_DLIMIT_DAY',
+      limit_entry_price: 483.3,
+      structural_stop_loss: 488.29,
+      profit_target_1: 467.96,
+      profit_target_2: 461.83,
+      kelly_fraction_pct: 0.625,
+      allocated_notional_usd: 6250.0,
+      matched_cboe_contract: 'AMD 2026-11-20 $480.00P',
+      almgren_chriss_slices: [0.4, 0.35, 0.25],
+      staged_at_iso: '2026-11-10T13:20:24Z'
+    };
+
+    const stageSuccessMock: StageSundayOrdersResponse = {
+      status: 'SUCCESS',
+      execution_safety_mode: 'PAPER_ISOLATED_ONLY',
+      staged_orders_count: 1,
+      total_staged_kelly_pct: 0.625,
+      receipts: [paperReceiptMock],
+      open_paper_positions_count: 6,
+      ledger_baseline_trades_untouched: 173
+    };
+
+    const safetyLockErrorMock: StageSundayOrdersErrorResponse = {
+      status: 'REJECTED_SAFETY_LOCK',
+      error_code: 'PAPER_SAFETY_LOCK_ACTIVE',
+      message: 'Live brokerage routing blocked by hardware safety latch: ARGON_ALLOW_LIVE_BROKER_ROUTING=1 and token required',
+      execution_safety_mode: 'PAPER_ISOLATED_ONLY'
+    };
+
+    const redactedWebhookConfigMock: RedactedWebhookConfigResponse = {
+      discord_webhook_url_masked: 'https://discord.com/api/webhooks/1234...****abcd',
+      discord_configured: true,
+      discord_enabled: true,
+      telegram_bot_token_masked: '987654...****xyz',
+      telegram_chat_id_masked: '-100...****789',
+      telegram_configured: true,
+      telegram_enabled: true,
+      configured: true,
+      dry_run_mode: true,
+      outbox_count: 4,
+      active_channels: ['DISCORD', 'TELEGRAM']
+    };
+
+    const testPingMock: WebhookTestPingResponse = {
+      status: 'TEST_PING_ACCEPTED',
+      delivery_status: 'RECORDED_IN_OUTBOX_DRY_RUN',
+      receipt_id: 'PING-REC-1762780824',
+      dispatched_at_iso: '2026-11-10T13:20:24Z',
+      channels_targeted: ['DISCORD', 'TELEGRAM'],
+      dry_run_mode: true,
+      outbox_count: 5
+    };
+
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.includes('/api/v1/scanner/sunday-protocol/stage-orders')) {
+        const body = init?.body ? JSON.parse(init.body as string) : {};
+        if (body.live === true && !body.confirmation_token) {
+          return {
+            ok: false,
+            status: 403,
+            json: async () => safetyLockErrorMock
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => stageSuccessMock
+        };
+      }
+      if (url.includes('/api/v1/scanner/webhooks/config')) {
+        if (init?.method === 'POST') {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              ...redactedWebhookConfigMock,
+              outbox_count: 5
+            })
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => redactedWebhookConfigMock
+        };
+      }
+      if (url.includes('/api/v1/scanner/webhooks/test-ping')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => testPingMock
+        };
+      }
+      if (url.includes('/api/v1/scanner/paper-overlay')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            active_engine_mode: 'PAPER_OVERLAY_ACTIVE',
+            baseline_closed_count: 173,
+            overlay_closed_count: 0,
+            total_active_closed_count: 173,
+            open_paper_positions: 6,
+            paper_positions: []
+          })
+        };
+      }
+      return { ok: false };
+    });
+
+    try {
+      // 1. Hardware Safety Lock Enforcement: attempt unauthorized live routing -> must fail with 403
+      const liveAttempt = await store.stageSundayOrders({
+        symbols: ['AMD'],
+        live: true
+      });
+      expect(liveAttempt).toBeNull();
+      expect(store.lastStagingError).not.toBeNull();
+      expect(store.lastStagingError?.error_code).toBe('PAPER_SAFETY_LOCK_ACTIVE');
+      expect(store.lastStagingError?.execution_safety_mode).toBe('PAPER_ISOLATED_ONLY');
+
+      // 2. Paper-Isolated Staging: approved setup staged into isolated OMS
+      const paperOrder = await store.stageSundayOrders({
+        symbols: ['AMD']
+      });
+      expect(paperOrder).not.toBeNull();
+      expect(paperOrder?.status).toBe('SUCCESS');
+      expect(paperOrder?.execution_safety_mode).toBe('PAPER_ISOLATED_ONLY');
+      expect(paperOrder?.staged_orders_count).toBe(1);
+      expect(paperOrder?.ledger_baseline_trades_untouched).toBe(173);
+      expect(paperOrder?.receipts.length).toBe(1);
+      expect(paperOrder?.receipts[0]?.client_order_id).toBe('PAPER-AMD-BRAIN-02-1762780824');
+      expect(paperOrder?.receipts[0]?.almgren_chriss_slices).toEqual([0.4, 0.35, 0.25]);
+      expect(store.stagedOrdersReceipts.length).toBe(1);
+
+      // 3. Strict Secret Redaction: GET webhooks config must never expose raw credentials
+      const whConfig = await store.fetchWebhookConfig();
+      expect(whConfig).not.toBeNull();
+      expect(whConfig?.discord_webhook_url_masked).toContain('****');
+      expect(whConfig?.telegram_bot_token_masked).toContain('****');
+      expect(whConfig?.telegram_chat_id_masked).toContain('****');
+      expect(whConfig?.dry_run_mode).toBe(true);
+
+      // 4. Update Webhook Config & Execute Test Ping
+      const updatedConfig = await store.updateWebhookConfig({
+        discord_webhook_url: 'https://discord.com/api/webhooks/new-token-123456'
+      });
+      expect(updatedConfig).not.toBeNull();
+
+      const pingRes = await store.testPingWebhook();
+      expect(pingRes).not.toBeNull();
+      expect(pingRes?.status).toBe('TEST_PING_ACCEPTED');
+      expect(pingRes?.delivery_status).toBe('RECORDED_IN_OUTBOX_DRY_RUN');
+      expect(pingRes?.receipt_id).toBe('PING-REC-1762780824');
+      expect(store.lastTestPingResult).toEqual(testPingMock);
     } finally {
       globalThis.fetch = originalFetch;
     }

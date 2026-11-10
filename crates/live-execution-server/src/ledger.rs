@@ -3467,6 +3467,11 @@ impl RealTimeLedgerEngine {
         }
     }
 
+    /// Pushes a newly staged paper position into the isolated in-memory `positions_opened` table (Phase 31 Milestone 5).
+    pub fn push_paper_staged_position(&self, row: OpenPositionRow) {
+        self.positions_opened.write().push(row);
+    }
+
     /// Stages an institutional broker order ticket for `position_id` (`POST /api/v1/execution/stage/{position_id}`).
     pub fn stage_broker_ticket_for_position(
         &self,

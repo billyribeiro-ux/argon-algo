@@ -884,14 +884,16 @@ export interface InstitutionalWatchlistRow {
 export interface InstitutionalWatchlistResponse {
   universe_size: number;
   actionable_setups_count: number;
-  active_generation: string;
+  active_generation?: string;
+  active_generation_id?: number;
   total_allocated_kelly_pct: number;
   net_portfolio_delta_beta_weighted: number;
   cross_brain_conflicts_blocked: number;
   estimated_occ_tims_margin_relief_pct: number;
   timestamp_iso: string;
-  eval_epoch_s: number;
+  eval_epoch_s?: number;
   watchlist: InstitutionalWatchlistRow[];
+  market_internals?: any;
 }
 
 export interface SundayAlphaProtocolExportRow {
@@ -961,6 +963,86 @@ export interface SundayAlphaDispatchResponse {
   total_portfolio_kelly_pct: number;
   net_delta_beta_weighted: number;
   conflicts_blocked: number;
+}
+
+export type ExecutionSafetyMode = 'PAPER_ISOLATED_ONLY' | 'LIVE_AUTHORIZED';
+
+export interface StageSundayOrdersRequest {
+  symbols?: string[];
+  live?: boolean;
+  confirmation_token?: string;
+}
+
+export interface StagedOrderReceipt {
+  client_order_id: string;
+  symbol: string;
+  brain_id: string;
+  direction: string;
+  execution_safety_mode: ExecutionSafetyMode;
+  execution_venue: string;
+  limit_entry_price: number;
+  structural_stop_loss: number;
+  profit_target_1: number;
+  profit_target_2: number;
+  kelly_fraction_pct: number;
+  allocated_notional_usd: number;
+  matched_cboe_contract: string;
+  almgren_chriss_slices: number[];
+  staged_at_iso: string;
+}
+
+export interface StageSundayOrdersResponse {
+  status: string;
+  execution_safety_mode: ExecutionSafetyMode;
+  staged_orders_count: number;
+  total_staged_kelly_pct: number;
+  receipts: StagedOrderReceipt[];
+  open_paper_positions_count: number;
+  ledger_baseline_trades_untouched: number;
+}
+
+export interface StageSundayOrdersErrorResponse {
+  status: string;
+  error_code: string;
+  message: string;
+  execution_safety_mode: ExecutionSafetyMode;
+}
+
+export interface RedactedWebhookConfigResponse {
+  discord_webhook_url_masked: string;
+  discord_configured: boolean;
+  discord_enabled: boolean;
+  telegram_bot_token_masked: string;
+  telegram_chat_id_masked: string;
+  telegram_configured: boolean;
+  telegram_enabled: boolean;
+  configured: boolean;
+  dry_run_mode: boolean;
+  outbox_count: number;
+  active_channels: string[];
+}
+
+export interface ScannerWebhookConfigUpdateRequest {
+  discord_webhook_url?: string;
+  discord_enabled?: boolean;
+  telegram_bot_token?: string;
+  telegram_chat_id?: string;
+  telegram_enabled?: boolean;
+}
+
+export interface WebhookTestPingRequest {
+  symbol?: string;
+}
+
+export interface WebhookTestPingResponse {
+  status: string;
+  delivery_status: string;
+  receipt_id: string;
+  dispatched_at_iso: string;
+  channels_targeted: string[];
+  dry_run_mode: boolean;
+  outbox_count: number;
+  record?: any;
 }
 
 const API_BASE: string = import.meta.env.VITE_ARGON_API_BASE ?? 'http://127.0.0.1:8090';
@@ -1189,6 +1271,17 @@ export class TerminalStore {
   isDispatchingSundayWebhook = $state<boolean>(false);
   actionableWatchlistOnly = $state<boolean>(false);
   watchlistSearchQuery = $state<string>('');
+
+  // Phase 31 Milestone 5: Isolated Paper-OMS Order Staging & Redacted Webhook Configuration
+  stagedOrdersReceipts = $state<StagedOrderReceipt[]>([]);
+  isStagingOrders = $state<boolean>(false);
+  lastStagingResponse = $state<StageSundayOrdersResponse | null>(null);
+  lastStagingError = $state<StageSundayOrdersErrorResponse | null>(null);
+  webhookConfig = $state<RedactedWebhookConfigResponse | null>(null);
+  isLoadingWebhookConfig = $state<boolean>(false);
+  isUpdatingWebhookConfig = $state<boolean>(false);
+  isTestPingingWebhook = $state<boolean>(false);
+  lastTestPingResult = $state<WebhookTestPingResponse | null>(null);
   webhookStatus = $state<WebhookStatusPayload>({
     config: {
       discordWebhookUrl: '',
@@ -4756,6 +4849,109 @@ export class TerminalStore {
       // Offline fallback
     }
     return this.paperOverlayState;
+  }
+  /**
+   * Stages approved Sunday Alpha protocol orders into the isolated Paper-OMS (`POST /api/v1/scanner/sunday-protocol/stage-orders`).
+   * Hardware safety latch strictly defaults to PAPER_ISOLATED_ONLY.
+   */
+  public async stageSundayOrders(
+    params: StageSundayOrdersRequest = { live: false }
+  ): Promise<StageSundayOrdersResponse | null> {
+    this.isStagingOrders = true;
+    this.lastStagingError = null;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/sunday-protocol/stage-orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params)
+      });
+      if (res.ok) {
+        const data: StageSundayOrdersResponse = await res.json();
+        this.lastStagingResponse = data;
+        this.stagedOrdersReceipts = data.receipts;
+        await this.fetchPaperOverlayState();
+        return data;
+      } else {
+        const errData: StageSundayOrdersErrorResponse = await res.json();
+        this.lastStagingError = errData;
+        return null;
+      }
+    } catch {
+      // Offline fallback
+      return null;
+    } finally {
+      this.isStagingOrders = false;
+    }
+  }
+
+  /**
+   * Fetches secret-redacted webhook configuration via `GET /api/v1/scanner/webhooks/config`.
+   */
+  public async fetchWebhookConfig(): Promise<RedactedWebhookConfigResponse | null> {
+    this.isLoadingWebhookConfig = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/webhooks/config`);
+      if (res.ok) {
+        const data: RedactedWebhookConfigResponse = await res.json();
+        this.webhookConfig = data;
+        return data;
+      }
+    } catch {
+      // Offline fallback
+    } finally {
+      this.isLoadingWebhookConfig = false;
+    }
+    return this.webhookConfig;
+  }
+
+  /**
+   * Updates runtime in-memory webhook configuration via `POST /api/v1/scanner/webhooks/config`.
+   */
+  public async updateWebhookConfig(
+    req: ScannerWebhookConfigUpdateRequest
+  ): Promise<RedactedWebhookConfigResponse | null> {
+    this.isUpdatingWebhookConfig = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/webhooks/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req)
+      });
+      if (res.ok) {
+        const data: RedactedWebhookConfigResponse = await res.json();
+        this.webhookConfig = data;
+        return data;
+      }
+    } catch {
+      // Offline fallback
+    } finally {
+      this.isUpdatingWebhookConfig = false;
+    }
+    return null;
+  }
+
+  /**
+   * Dispatches a test alert across configured channels via `POST /api/v1/scanner/webhooks/test-ping`.
+   */
+  public async testPingWebhook(symbol?: string): Promise<WebhookTestPingResponse | null> {
+    this.isTestPingingWebhook = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scanner/webhooks/test-ping`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol })
+      });
+      if (res.ok) {
+        const data: WebhookTestPingResponse = await res.json();
+        this.lastTestPingResult = data;
+        return data;
+      }
+    } catch {
+      // Offline fallback
+    } finally {
+      this.isTestPingingWebhook = false;
+    }
+    return null;
   }
 }
 

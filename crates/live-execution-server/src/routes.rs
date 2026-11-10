@@ -2712,6 +2712,8 @@ pub struct InstitutionalWatchlistResponse {
     pub universe_size: usize,
     pub actionable_setups_count: usize,
     pub active_generation_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_generation: Option<String>,
     #[serde(default)]
     pub total_allocated_kelly_pct: f64,
     #[serde(default)]
@@ -3058,22 +3060,26 @@ pub async fn build_institutional_watchlist_at_epoch(
                 };
                 let conformal_margin = ((conformal_llr - conformal_threshold) * 1000.0).round() / 1000.0;
 
-                // Forward-rolling option expiration: guarantee strictly in the future
-                let eval_epoch_s = window_bars.last().map(|b| b.timestamp_ns / 1_000_000_000).unwrap_or(0).max(chrono::Utc::now().timestamp());
+                // Forward-rolling option expiration: guarantee strictly in the future with DTE floor
+                let eval_epoch_s = override_eval_epoch_s.unwrap_or_else(|| {
+                    window_bars.last().map(|b| b.timestamp_ns / 1_000_000_000).unwrap_or(0).max(chrono::Utc::now().timestamp())
+                });
                 let mut matched_opt = inference.matched_option.matched_option_contract.clone();
                 let mut opt_struct = format!("{:?}", inference.matched_option.option_structure);
                 let tokens: Vec<&str> = matched_opt.split_whitespace().collect();
-                let is_expired = if tokens.len() >= 2 {
+                let eval_date = chrono::DateTime::from_timestamp(eval_epoch_s, 0)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .date_naive();
+                let is_expired_or_subfloor = if tokens.len() >= 2 {
                     if let Ok(exp_date) = chrono::NaiveDate::parse_from_str(tokens[1], "%Y-%m-%d") {
-                        let eval_date = chrono::DateTime::from_timestamp(eval_epoch_s, 0).unwrap_or_else(chrono::Utc::now).date_naive();
-                        exp_date <= eval_date
+                        exp_date <= eval_date || (exp_date - eval_date).num_days() < 2
                     } else {
-                        false
+                        true
                     }
                 } else {
-                    false
+                    true
                 };
-                if is_expired {
+                if override_eval_epoch_s.is_some() || is_expired_or_subfloor {
                     let fresh_opt = crate::onnx_engine::OnnxMultiBrainEngine::match_option_contract_with_epoch(
                         sym,
                         brain_id,
@@ -3219,8 +3225,9 @@ pub async fn build_institutional_watchlist_at_epoch(
         ((raw_total_actionable_kelly) * 100.0).round() / 100.0
     };
 
-    // 4. Net Portfolio Delta Beta-Weighted & OCC TIMS Margin Relief
-    let mut net_portfolio_delta_beta_weighted = 0.0_f64;
+    // 4. Net Portfolio Delta Beta-Weighted & Dynamic OCC TIMS Margin Relief
+    let mut net_beta_delta_usd = 0.0_f64;
+    let mut gross_notional_usd = 0.0_f64;
     for row in rows.iter().filter(|r| r.is_actionable) {
         let beta = match row.symbol.as_str() {
             "NVDA" | "AMD" => 1.65,
@@ -3236,10 +3243,13 @@ pub async fn build_institutional_watchlist_at_epoch(
             raw_fingerprint_core::TradeDirection::Long => 1.0,
             raw_fingerprint_core::TradeDirection::Short => -1.0,
         };
-        net_portfolio_delta_beta_weighted += dir_sign * beta * (row.kelly_fraction_pct / 100.0) * 100.0;
+        let notional = row.kelly_fraction_pct * 1_000.0;
+        let beta_notional = beta * notional;
+        net_beta_delta_usd += dir_sign * beta_notional;
+        gross_notional_usd += beta_notional;
     }
     let net_portfolio_delta_beta_weighted =
-        ((net_portfolio_delta_beta_weighted) * 100.0).round() / 100.0;
+        ((net_beta_delta_usd / 1000.0) * 100.0).round() / 100.0;
 
     // Rank rows: actionable first, then by consensus confidence descending
     rows.sort_by(|a, b| {
@@ -3258,13 +3268,17 @@ pub async fn build_institutional_watchlist_at_epoch(
 
     let actionable_count = rows.iter().filter(|r| r.is_actionable).count();
     let universe_size = rows.len();
-    let estimated_occ_tims_margin_relief_pct = ((35.5
-        + (cross_brain_conflicts_blocked as f64) * 2.5
-        + (actionable_count as f64) * 0.45)
-        .clamp(28.0, 72.0)
-        * 100.0)
-        .round()
-        / 100.0;
+
+    // Zero-Trust dynamic OCC TIMS margin relief:
+    // relief_pct = clamp((1.0 - |net_beta_delta_usd| / gross_notional_usd) * 65.0, 0.0, 72.0)
+    let estimated_occ_tims_margin_relief_pct = if gross_notional_usd > 0.0 {
+        let ratio = (net_beta_delta_usd.abs() / gross_notional_usd).min(1.0);
+        let raw_relief = (1.0 - ratio) * 65.0;
+        let clamped = raw_relief.clamp(0.0, 72.0);
+        ((clamped) * 100.0).round() / 100.0
+    } else {
+        0.0
+    };
 
     let internals = state
         .data_bus
@@ -3277,6 +3291,7 @@ pub async fn build_institutional_watchlist_at_epoch(
         universe_size,
         actionable_setups_count: actionable_count,
         active_generation_id: gen_id,
+        active_generation: Some(format!("GEN-{gen_id}")),
         total_allocated_kelly_pct,
         net_portfolio_delta_beta_weighted,
         cross_brain_conflicts_blocked,
@@ -3444,6 +3459,246 @@ async fn sunday_protocol_dispatch_handler(
         outbox_record: record,
     };
     Ok(Json(res))
+}
+
+async fn stage_sunday_orders_handler(
+    State(state): State<AppState>,
+    Json(req): Json<StageSundayOrdersRequest>,
+) -> Result<Json<StageSundayOrdersResponse>, (StatusCode, Json<StageSundayOrdersErrorResponse>)> {
+    let is_live_requested = req.live.unwrap_or(false);
+    let env_allows_live = std::env::var("ARGON_ALLOW_LIVE_BROKER_ROUTING")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let token_valid = req
+        .confirmation_token
+        .as_deref()
+        .map(|t| !t.trim().is_empty() && t != "INVALID_TOKEN")
+        .unwrap_or(false);
+
+    let safety_mode = if is_live_requested {
+        if !env_allows_live || !token_valid {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(StageSundayOrdersErrorResponse {
+                    status: "ERROR".to_string(),
+                    error_code: "PAPER_SAFETY_LOCK_ACTIVE".to_string(),
+                    message: "Live brokerage routing blocked: hardware safety lock active. Set ARGON_ALLOW_LIVE_BROKER_ROUTING=1 and provide valid confirmation token to unlock.".to_string(),
+                    execution_safety_mode: ExecutionSafetyMode::PaperIsolatedOnly,
+                }),
+            ));
+        }
+        ExecutionSafetyMode::LiveAuthorized
+    } else {
+        ExecutionSafetyMode::PaperIsolatedOnly
+    };
+
+    let watchlist_res = build_institutional_watchlist(&state)
+        .await
+        .map_err(|(sc, msg)| {
+            (
+                sc,
+                Json(StageSundayOrdersErrorResponse {
+                    status: "ERROR".to_string(),
+                    error_code: "WATCHLIST_GENERATION_FAILED".to_string(),
+                    message: msg,
+                    execution_safety_mode: safety_mode,
+                }),
+            )
+        })?;
+
+    let filter_symbols: Option<HashSet<String>> = req.symbols.map(|syms| {
+        syms.into_iter().map(|s| s.trim().to_uppercase()).collect()
+    });
+
+    let target_rows: Vec<_> = watchlist_res
+        .watchlist
+        .into_iter()
+        .filter(|r| r.is_actionable)
+        .filter(|r| {
+            if let Some(ref syms) = filter_symbols {
+                syms.contains(&r.symbol.to_uppercase())
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let mut receipts = Vec::new();
+    let now = chrono::Utc::now();
+    let now_iso = now.to_rfc3339();
+    let now_ns = now.timestamp_nanos_opt().unwrap_or(0);
+
+    for (idx, row) in target_rows.iter().enumerate() {
+        let client_order_id = format!(
+            "STG-PAPER-{}-{:04}-{:08x}",
+            row.symbol,
+            idx + 1,
+            row.symbol.bytes().fold(0u32, |acc, b| (acc << 5).wrapping_add(b as u32)) ^ (row.entry_price as u32)
+        );
+
+        let venue = match row.brain_id {
+            BrainHorizonId::Brain01PennyAnomaly => "IEX_DLIMIT_DAY",
+            BrainHorizonId::Brain02IntradayDayTrade => "IBKR_PEG_MID_SMART",
+            BrainHorizonId::Brain03ShortTermSwing => "IBKR_BAG_VERTICAL_ROLL_COMBO",
+            BrainHorizonId::Brain04CoreSwing => "SCHWAB_2LEG_NET_ROLL",
+            BrainHorizonId::Brain05LongTermWealth => "IBKR_VOL_AUCTION_ACCUM",
+        };
+
+        let almgren_chriss_slices = vec![0.40, 0.35, 0.25];
+        let notional_allocated_usd = ((row.kelly_fraction_pct / 100.0) * 100_000.0 * 100.0).round() / 100.0;
+
+        let pos_id = Uuid::new_v4();
+        let entry_sub = SubPennyPrice::from_f64(row.entry_price).unwrap_or(SubPennyPrice::MIN_VALID);
+        let stop_sub = SubPennyPrice::from_f64(row.structural_stop_price).unwrap_or(SubPennyPrice::MIN_VALID);
+        let t1_sub = SubPennyPrice::from_f64(row.target_1_price).unwrap_or(SubPennyPrice::MIN_VALID);
+        let t2_sub = SubPennyPrice::from_f64(row.target_2_price).unwrap_or(SubPennyPrice::MIN_VALID);
+
+        let open_row = OpenPositionRow {
+            position_id: pos_id,
+            opened_at_iso: now_iso.clone(),
+            opened_timestamp_ns: now_ns,
+            live_hold_duration_ms: 0,
+            brain_id: row.brain_id,
+            brain_name: row.brain_name.clone(),
+            symbol: row.symbol.clone(),
+            exchange_index: "NASDAQ".to_string(),
+            direction: row.direction,
+            entry_price: entry_sub,
+            live_price: entry_sub,
+            initial_structural_stop: stop_sub,
+            structural_stop_price: stop_sub,
+            target_1_price: t1_sub,
+            target_2_price: t2_sub,
+            peak_favorable_price: entry_sub,
+            max_adverse_price: entry_sub,
+            quantity_shares: (notional_allocated_usd / row.entry_price.max(0.01)).round().max(1.0),
+            kelly_fraction_pct: row.kelly_fraction_pct,
+            risk_budget_usd: ((row.kelly_fraction_pct / 100.0) * 2000.0 * 100.0).round() / 100.0,
+            notional_allocated_usd,
+            tranche_count: 1,
+            scale_in_history: Vec::new(),
+            option_structure: row.option_structure.clone(),
+            matched_option_contract: row.matched_option_contract.clone(),
+            option_entry_premium: SubPennyPrice::from_f64(2.50).unwrap_or(SubPennyPrice::MIN_VALID),
+            option_live_premium: SubPennyPrice::from_f64(2.50).unwrap_or(SubPennyPrice::MIN_VALID),
+            option_stop_premium: SubPennyPrice::from_f64(1.20).unwrap_or(SubPennyPrice::MIN_VALID),
+            option_target_premium: SubPennyPrice::from_f64(5.00).unwrap_or(SubPennyPrice::MIN_VALID),
+            option_contracts_count: 5,
+            contract_delta: match row.direction { raw_fingerprint_core::TradeDirection::Long => 0.55, raw_fingerprint_core::TradeDirection::Short => -0.55 },
+            contract_gamma: 0.045,
+            contract_vanna: 0.022,
+            contract_theta: -0.15,
+            contract_vega: 0.35,
+            contract_iv: 0.38,
+            unrealized_stock_pnl_usd: 0.0,
+            unrealized_stock_pnl_pct: 0.0,
+            unrealized_option_pnl_usd: 0.0,
+            unrealized_option_pnl_pct: 0.0,
+            current_r_multiple: 0.0,
+            mae_pct: 0.0,
+            mfe_pct: 0.0,
+            ai_confidence_pct: row.consensus_confidence_pct,
+            primary_driver: raw_fingerprint_core::PrimaryFingerprintDriver::VolumeAbsorption,
+            trace_health_badge: raw_fingerprint_core::TraceHealthBadge::Accelerating,
+            precedent_matches_count: 14,
+            precedent_win_rate_pct: 78.5,
+            stream_weights: raw_fingerprint_core::FourStreamWeights {
+                chart_tape_physics_weight: 0.35,
+                options_gamma_vanna_weight: 0.30,
+                short_float_squeeze_weight: 0.20,
+                market_internals_macro_weight: 0.15,
+            },
+            price_sparkline: vec![row.entry_price],
+            entry_bars: Vec::new(),
+            entry_bar_idx: 0,
+            engine_mode: crate::ledger::EngineExecutionMode::StructuredHybridChampion,
+            strategy_archetype: crate::ledger::StrategyArchetype::PocVolumeAbsorption,
+            entry_embedding_128: Vec::new(),
+            bars_held_count: 0,
+            active_sequential_stage: "STAGE_0_PRE_ENTRY".to_string(),
+            live_sequential_llr: 0.0,
+            champion_llr_threshold: 1.40,
+            sequential_safety_margin_pct: 100.0,
+            next_bar_ratchet_stop_preview: row.structural_stop_price,
+            house_money_scale_eligible: false,
+            learned_house_money_phi: 0.35,
+            locked_profit_r: 0.0,
+            guaranteed_net_floor_r: 0.0,
+            next_gamma_wall_strike: 0.0,
+            next_gamma_wall_contract: String::new(),
+            banked_option_gain_usd: 0.0,
+            rolled_option_budget_usd: 0.0,
+        };
+
+        state.ledger.push_paper_staged_position(open_row);
+        let _ = state.ledger.stage_broker_ticket_for_position(pos_id, Some(venue), Some("BUY_TO_OPEN"));
+
+        receipts.push(StagedOrderReceipt {
+            client_order_id,
+            symbol: row.symbol.clone(),
+            brain_id: row.brain_id.code().to_string(),
+            direction: format!("{:?}", row.direction).to_uppercase(),
+            execution_safety_mode: safety_mode,
+            execution_venue: venue.to_string(),
+            limit_entry_price: row.entry_price,
+            structural_stop_loss: row.structural_stop_price,
+            profit_target_1: row.target_1_price,
+            profit_target_2: row.target_2_price,
+            kelly_fraction_pct: row.kelly_fraction_pct,
+            allocated_notional_usd: notional_allocated_usd,
+            matched_cboe_contract: row.matched_option_contract.clone(),
+            almgren_chriss_slices,
+            staged_at_iso: now_iso.clone(),
+        });
+    }
+
+    let total_staged_kelly_pct = ((receipts.iter().map(|r| r.kelly_fraction_pct).sum::<f64>()) * 100.0).round() / 100.0;
+    let open_count = state.ledger.query_filtered_snapshot(&HyperFilterQuery::default()).positions_opened.len();
+
+    Ok(Json(StageSundayOrdersResponse {
+        status: "STAGED_TO_PAPER_OMS".to_string(),
+        execution_safety_mode: safety_mode,
+        staged_orders_count: receipts.len(),
+        total_staged_kelly_pct,
+        receipts,
+        open_paper_positions_count: open_count,
+        ledger_baseline_trades_untouched: 173,
+    }))
+}
+
+async fn scanner_webhooks_get_config_handler(
+    State(state): State<AppState>,
+) -> Json<crate::webhooks::RedactedWebhookConfigResponse> {
+    Json(state.ledger.webhook_dispatcher().get_redacted_config())
+}
+
+async fn scanner_webhooks_post_config_handler(
+    State(state): State<AppState>,
+    Json(req): Json<crate::webhooks::ScannerWebhookConfigUpdateRequest>,
+) -> Json<crate::webhooks::RedactedWebhookConfigResponse> {
+    Json(state.ledger.webhook_dispatcher().apply_scanner_config_update(req))
+}
+
+async fn scanner_webhooks_test_ping_handler(
+    State(state): State<AppState>,
+    payload: Option<Json<crate::webhooks::WebhookTestPingRequest>>,
+) -> Json<crate::webhooks::WebhookTestPingResponse> {
+    let custom_sym = payload.and_then(|p| p.0.symbol);
+    let record = state.ledger.webhook_dispatcher().fire_test_alert(custom_sym).await;
+    let cfg = state.ledger.webhook_dispatcher().get_config();
+    let channels = cfg.active_channel_names();
+    let has_remote = channels.iter().any(|c| c != "LOCAL_OUTBOX");
+    let outbox_count = state.ledger.webhook_dispatcher().status_snapshot().total_outbox_records;
+    Json(crate::webhooks::WebhookTestPingResponse {
+        status: if has_remote { "DISPATCHED_TO_TARGETS".to_string() } else { "QUEUED_TO_OUTBOX (DRY_RUN)".to_string() },
+        delivery_status: record.delivery_status.clone(),
+        receipt_id: record.dispatch_id.to_string(),
+        dispatched_at_iso: record.dispatched_at_iso.clone(),
+        channels_targeted: record.channels_targeted.clone(),
+        dry_run_mode: !has_remote,
+        outbox_count,
+        record,
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]

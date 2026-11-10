@@ -197,6 +197,26 @@ pub struct ScannerWebhookConfigUpdateRequest {
     pub telegram_enabled: Option<bool>,
 }
 
+/// Request payload for `POST /api/v1/scanner/webhooks/test-ping`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebhookTestPingRequest {
+    #[serde(default)]
+    pub symbol: Option<String>,
+}
+
+/// Response payload for `POST /api/v1/scanner/webhooks/test-ping`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookTestPingResponse {
+    pub status: String,
+    pub delivery_status: String,
+    pub receipt_id: String,
+    pub dispatched_at_iso: String,
+    pub channels_targeted: Vec<String>,
+    pub dry_run_mode: bool,
+    pub outbox_count: usize,
+    pub record: WebhookDispatchRecord,
+}
+
 /// Input telemetry for constructing a multi-channel execution alert.
 #[derive(Debug, Clone)]
 pub struct WebhookEventPayload {

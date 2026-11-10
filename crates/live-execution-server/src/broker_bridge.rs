@@ -5,6 +5,10 @@ use raw_fingerprint_core::{BrainHorizonId, SubPennyPrice, TradeDirection};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub fn ymd_to_epoch_seconds(year: i64, month: i64, day: i64) -> i64 {
+    BrokerExecutionBridge::ymd_to_epoch_seconds(year, month, day)
+}
+
 /// Phase 23 & 24 Upgrade 1: Single Almgren-Chriss & Cross-Venue SOR Child Execution Slice (`MicrostructureChildSlice`).
 /// Routes child orders across `IEX_DLIMIT`, `IBKR_PEG_MID` (`IBKR_PEG_MID_ISLAND_PRIMARY_OFFSET`),
 /// `MEMX_MIDPOINT`, and `CBOE_EDGX_LIT` (`IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005` for options).

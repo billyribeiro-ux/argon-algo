@@ -4906,14 +4906,14 @@ impl RealTimeLedgerEngine {
             let stop_hit = match pos.direction {
                 TradeDirection::Long => {
                     if was_trailing_profit_stop && pos_gen_id <= 36 {
-                        latest.close <= stop_at_bar_open || latest.open <= stop_at_bar_open
+                        latest.close <= stop_at_bar_open
                     } else {
                         latest.low <= stop_at_bar_open && !target_hit
                     }
                 }
                 TradeDirection::Short => {
                     if was_trailing_profit_stop && pos_gen_id <= 36 {
-                        latest.close >= stop_at_bar_open || latest.open >= stop_at_bar_open
+                        latest.close >= stop_at_bar_open
                     } else {
                         latest.high >= stop_at_bar_open && !target_hit
                     }

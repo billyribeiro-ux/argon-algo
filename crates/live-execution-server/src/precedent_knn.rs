@@ -572,6 +572,18 @@ impl PrecedentKnnIndex {
             .iter_mut()
             .find(|t| t.loss_trade_id == record.loss_trade_id)
         {
+            let promoted_to_stage0 = existing.root_cause_category != record.root_cause_category
+                && record.root_cause_category == "ENTRY_LIQUIDITY_VACUUM_TRAP";
+            if promoted_to_stage0 {
+                existing.root_cause_category = record.root_cause_category;
+                existing.culprit_feature_indices = record.culprit_feature_indices;
+                existing.culprit_feature_signs = record.culprit_feature_signs;
+                existing.culprit_anomaly_weights_32 = record.culprit_anomaly_weights_32;
+                if record.entry_features_32.len() >= 32 {
+                    existing.entry_features_32 = record.entry_features_32;
+                }
+                return TrapUpsertOutcome::NewlyInserted;
+            }
             existing.observation_count = existing.observation_count.saturating_add(1);
             return TrapUpsertOutcome::ReinforcedExisting;
         }
@@ -671,6 +683,7 @@ impl PrecedentKnnIndex {
             for (idx, existing) in guard.iter().enumerate() {
                 if existing.brain_id == record.brain_id
                     && existing.direction == record.direction
+                    && existing.root_cause_category == record.root_cause_category
                     && !existing.quarantined
                     && existing.entry_features_32.len() >= 32
                 {

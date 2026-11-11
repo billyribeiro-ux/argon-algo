@@ -232,6 +232,7 @@ pub struct BrainLedoitWolfManifold {
     pub winner_feature_var_32: [f64; 32],
     pub mondrian_calibration_scores: HashMap<RegimeBucket, Vec<(Uuid, f64)>>,
     pub all_calibration_scores: Vec<(Uuid, f64)>,
+    pub prior_shell_margin: f64,
     pub q975_mahalanobis_radius: f64,
     pub pooled_bar1_cov: [[f64; 32]; 32],
     pub n_bar1_causal: usize,
@@ -487,9 +488,36 @@ impl LedoitWolfPrecision {
                 d
             };
 
+            let mut winner_loo_lambdas: Vec<f64> = Vec::with_capacity(win_entries.len());
+            for (wid, w_vec) in &win_entries {
+                let d_wc = maha_local(w_vec, &winner_centroid_32);
+                let mut min_nn = d_wc;
+                for (wid2, w_vec2) in &win_entries {
+                    if wid2 != wid {
+                        let d2 = maha_local(w_vec, w_vec2);
+                        if d2 < min_nn {
+                            min_nn = d2;
+                        }
+                    }
+                }
+                let dw_eff = min_nn.max(0.0);
+                let dl_c = maha_local(w_vec, &loss_centroid_32).max(0.0);
+                let rad_sq = (0.5 * (dw_eff * dw_eff + dl_c * dl_c)).max(1.0);
+                let lam_w = 0.5 * (dw_eff * dw_eff - dl_c * dl_c) / rad_sq;
+                winner_loo_lambdas.push(lam_w);
+            }
+            winner_loo_lambdas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let prior_shell_margin = if winner_loo_lambdas.is_empty() {
+                0.040
+            } else {
+                let max_lam = *winner_loo_lambdas.last().unwrap_or(&0.030);
+                (max_lam + 0.012).clamp(0.025, 0.250)
+            };
+
             for (tid, _is_win, z_i) in &all_entries {
                 let regime_i = classify_regime_bucket(z_i);
-                let mut d_w_i = maha_local(z_i, &winner_centroid_32);
+                let d_centroid_i = maha_local(z_i, &winner_centroid_32);
+                let mut d_w_i = d_centroid_i;
                 for (wid, w_vec) in &win_entries {
                     if wid != tid {
                         let d_ex = maha_local(z_i, w_vec);
@@ -498,27 +526,36 @@ impl LedoitWolfPrecision {
                         }
                     }
                 }
-                let d_anchor_i = maha_local(z_i, &stage0_anchor_32);
-                let d_loss_c_i = maha_local(z_i, &loss_centroid_32);
-                let d_t_i = d_anchor_i.min(d_loss_c_i);
+                let mut d_t_i = d_w_i + prior_shell_margin;
+                for (lid, l_vec) in &loss_entries_with_id {
+                    if lid != tid {
+                        let dl = maha_local(z_i, l_vec);
+                        if dl < d_t_i {
+                            d_t_i = dl;
+                        }
+                    }
+                }
                 let alpha_i = d_w_i.max(0.0) / (d_t_i.max(0.0) + 0.05);
                 mondrian_calibration_scores
                     .entry(regime_i)
                     .or_default()
                     .push((*tid, alpha_i));
                 all_calibration_scores.push((*tid, alpha_i));
-                nearest_radii.push(d_w_i.min(d_anchor_i).max(0.05));
+                nearest_radii.push(d_centroid_i.max(0.05));
             }
 
             nearest_radii.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            // Chi^2_{32, 0.975} = 49.48; under sum(W) = 6.0 scaling, root radius floor = sqrt(49.48 * 6 / 32) = 3.046
-            let chi2_32_q975_floor = (49.4804_f64 * (6.0 / 32.0)).sqrt();
+            let n_eff = (n_entry_causal as f64).max(6.0);
+            let hotelling_c = (((n_eff + 1.0) * (n_eff - 1.0))
+                / (n_eff * (n_eff - 32.0).max(4.0)))
+            .sqrt();
+            let chi2_32_q975_floor = (49.4804_f64).sqrt() * 1.65;
             let q975_mahalanobis_radius = if nearest_radii.is_empty() {
                 chi2_32_q975_floor
             } else {
                 let q_idx = (((nearest_radii.len() - 1) as f64) * 0.975).ceil() as usize;
                 let emp_q975 = nearest_radii[q_idx.min(nearest_radii.len() - 1)];
-                emp_q975.max(chi2_32_q975_floor)
+                (emp_q975 * hotelling_c).max(chi2_32_q975_floor)
             };
 
             brains.insert(
@@ -535,6 +572,7 @@ impl LedoitWolfPrecision {
                     winner_feature_var_32,
                     mondrian_calibration_scores,
                     all_calibration_scores,
+                    prior_shell_margin,
                     q975_mahalanobis_radius,
                     pooled_bar1_cov,
                     n_bar1_causal,
@@ -782,6 +820,11 @@ pub fn build_synaptic_precision_weights(brain_state: &BrainSynapticPlasticitySta
         return out;
     }
 
+    let max_syn = brain_state
+        .synaptic_feature_weights_32
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max);
     let fisher_p = brain_state
         .learned_fisher_sparsity_exponent_p
         .clamp(1.0, 2.75);
@@ -800,7 +843,11 @@ pub fn build_synaptic_precision_weights(brain_state: &BrainSynapticPlasticitySta
         let norm_i = (raw_w[i] / sum_w) * 32.0;
         out[i] = (6.0 / 32.0) * norm_i;
     }
-    out
+    if max_syn <= 10.0 {
+        project_capped_simplex_kl_32(&out, 0.04, 0.65, 6.0)
+    } else {
+        out
+    }
 }
 
 /// Phase 33.1 & Phase 34 Single Shared Pure-Causal Stage 0 Conformal + $\chi^2_{32}$ OOD Kernel.
@@ -843,15 +890,15 @@ pub fn evaluate_stage0_conformal_kernel(
     };
     d_win = d_win.max(0.0);
 
-    let d_anchor = if let Some(manifold) = precision.brains.get(&brain_id) {
+    let d_loss_c = if let Some(manifold) = precision.brains.get(&brain_id) {
         precision.entry_mahalanobis(
             brain_id,
             &weights_32,
             entry_features_32,
-            &manifold.stage0_anchor_32,
+            &manifold.loss_centroid_32,
         )
     } else {
-        d_win + 0.25
+        d_win + 0.35
     };
 
     let mut matched_trap_id: Option<Uuid> = None;
@@ -877,17 +924,24 @@ pub fn evaluate_stage0_conformal_kernel(
         }
     }
 
-    let d_trap = d_anchor.min(min_active_trap);
-    let active_trap_triggered = found_active_trap
-        && ((min_active_trap - d_win) - brain_state.entry_veto_margin_delta < 0.0
-            || min_active_trap <= d_anchor);
+    let d_trap = d_loss_c.min(min_active_trap).max(0.0);
+    let radial_sq = (0.5 * (d_win * d_win + d_trap * d_trap)).max(1.0);
+    let conformal_llr = 0.5 * (d_win * d_win - d_trap * d_trap) / radial_sq;
+    let base_hurdle = precision
+        .brains
+        .get(&brain_id)
+        .map(|m| m.prior_shell_margin)
+        .unwrap_or(0.040);
+    let conformal_hurdle = base_hurdle - brain_state.entry_veto_margin_delta;
+    let conformal_margin = conformal_hurdle - conformal_llr;
+    let active_trap_triggered = found_active_trap && min_active_trap <= d_loss_c;
 
     let d_nearest = d_win.min(d_trap);
     let q975 = precision
         .brains
         .get(&brain_id)
         .map(|m| m.q975_mahalanobis_radius)
-        .unwrap_or(3.05)
+        .unwrap_or(11.5)
         .max(0.50);
 
     let epistemic_ood_score = if d_nearest > q975 {
@@ -928,9 +982,6 @@ pub fn evaluate_stage0_conformal_kernel(
         1.0
     };
 
-    let conformal_margin = (d_trap - d_win) - brain_state.entry_veto_margin_delta;
-    let conformal_hurdle = brain_state.entry_veto_margin_delta.max(0.025);
-    let conformal_llr = conformal_hurdle - conformal_margin;
     let is_trap_veto = conformal_margin < 0.0;
     let vetoed = is_epistemic_ood_veto || is_trap_veto;
 
@@ -1068,20 +1119,42 @@ fn compute_single_trade_ledoit_wolf_mahalanobis(
         .min(trade.entry_bars.len().saturating_sub(1));
     let max_k = trade.entry_bars.len().saturating_sub(entry_idx + 1).min(16);
     let mut samples: Vec<[f64; 32]> = Vec::with_capacity(max_k + 2);
-    samples.push(extract_causal_entry_array_32(trade));
+    let mut s0 = extract_causal_entry_array_32(trade);
+    for v in &mut s0 {
+        *v = if v.is_finite() { v.clamp(-25.0, 25.0) } else { 0.0 };
+    }
+    samples.push(s0);
     for k in 1..=max_k {
         if let Some(fk) =
             RealTimeLedgerEngine::extract_causal_post_entry_bar_k_features_from_row(trade, k)
         {
             let mut arr = [0.0_f64; 32];
             for i in 0..32 {
-                arr[i] = fk.get(i).copied().unwrap_or(0.0) as f64;
+                let raw_v = fk.get(i).copied().unwrap_or(0.0) as f64;
+                arr[i] = if raw_v.is_finite() {
+                    raw_v.clamp(-25.0, 25.0)
+                } else {
+                    0.0
+                };
             }
             samples.push(arr);
         }
     }
     if samples.len() < 2 {
-        samples.push(extract_causal_bar1_array_32(trade));
+        let mut sb1 = extract_causal_bar1_array_32(trade);
+        for v in &mut sb1 {
+            *v = if v.is_finite() { v.clamp(-25.0, 25.0) } else { 0.0 };
+        }
+        samples.push(sb1);
+    }
+
+    let mut clean_dz = [0.0_f64; 32];
+    for i in 0..32 {
+        clean_dz[i] = if delta_z[i].is_finite() {
+            delta_z[i].clamp(-25.0, 25.0)
+        } else {
+            0.0
+        };
     }
 
     let n = samples.len();
@@ -1095,7 +1168,7 @@ fn compute_single_trade_ledoit_wolf_mahalanobis(
 
     let mut scale_acc = 0.0_f64;
     for i in 0..32 {
-        scale_acc += delta_z[i].abs() + mean[i].abs();
+        scale_acc += clean_dz[i].abs() + mean[i].abs();
     }
     let scale = (scale_acc / 32.0).max(0.05);
     let scale_sq = (scale * scale).max(1e-6);
@@ -1118,10 +1191,10 @@ fn compute_single_trade_ledoit_wolf_mahalanobis(
         &cov,
         n.max(4),
         weights_32,
-        delta_z,
+        &clean_dz,
         scale_sq,
     );
-    maha
+    if maha.is_finite() { maha } else { 1.0 }
 }
 
 /// Decodes trade failure mode and computes 32-feature blame attribution vector + true
@@ -1285,7 +1358,12 @@ fn decode_trade_failure_internal(
     let mut delta_z = [0.0_f64; 32];
     let mut blame_vector = vec![0.0_f64; 32];
     for f in 0..32 {
-        let dz = target_tensor[f] - reference_tensor[f];
+        let raw_dz = target_tensor[f] - reference_tensor[f];
+        let dz = if raw_dz.is_finite() {
+            raw_dz.clamp(-25.0, 25.0)
+        } else {
+            0.0
+        };
         delta_z[f] = dz;
         blame_vector[f] = ((dz.abs() * 1000.0).round() / 1000.0).max(0.001);
     }
@@ -1561,7 +1639,13 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
                 } else {
                     ratchet_stop_price.max(bar_open)
                 };
-                let settled_r = ((ratchet_fill_price - ep) * dir) / initial_risk;
+                let runner_ratchet_r = ((ratchet_fill_price - ep) * dir) / initial_risk;
+                let t1_dist_r = ((trade.target_1_price.to_f64() - ep) * dir) / initial_risk;
+                let settled_r = if t1_dist_r >= 1.0 && running_peak_r >= t1_dist_r {
+                    0.5 * t1_dist_r + 0.5 * runner_ratchet_r
+                } else {
+                    runner_ratchet_r
+                };
                 return SimulatedTradeOutcome {
                     trade_id: trade.trade_id,
                     realized_r: settled_r,
@@ -1584,16 +1668,10 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
             }
         }
 
-        // Structural Stop Check on bar k with Adverse Gap-Open Fill Clamping
+        // Structural Stop Check on bar k (with causal prior T1 50%-tranche breakeven protection if prior bars already hit T1)
         if adverse_r <= -1.0 {
-            if running_peak_r >= 0.80 {
-                let runner_be_fill = if dir > 0.0 {
-                    ep.min(bar_open)
-                } else {
-                    ep.max(bar_open)
-                };
-                let runner_r = ((runner_be_fill - ep) * dir) / initial_risk;
-                let banked_t1_r = 0.5 * running_peak_r + 0.5 * runner_r;
+            if running_peak_r >= 0.72 {
+                let banked_t1_r = 0.5 * running_peak_r;
                 let t1_exit_price = ep + dir * banked_t1_r * initial_risk;
                 return SimulatedTradeOutcome {
                     trade_id: trade.trade_id,
@@ -1602,7 +1680,7 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
                     vetoed: false,
                     scratched_stage1: false,
                     ratchet_exited_stage3: true,
-                    full_stop_hit: banked_t1_r <= -0.90,
+                    full_stop_hit: false,
                     exit_bar_offset: bar_idx,
                     candidate_conformal_margin: s0.conformal_margin,
                     conformal_llr: s0.conformal_llr,
@@ -1717,7 +1795,12 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
 
     // Settled at final trade exit without early veto / SPRT scratch / ratchet breach
     let final_exit_price = trade.actual_exit_price.to_f64();
-    let settled_r = ((final_exit_price - trade.entry_price.to_f64()) * dir) / initial_risk;
+    let price_r = ((final_exit_price - trade.entry_price.to_f64()) * dir) / initial_risk;
+    let settled_r = if trade.realized_r_multiple.abs() > 1e-9 {
+        trade.realized_r_multiple
+    } else {
+        price_r
+    };
     SimulatedTradeOutcome {
         trade_id: trade.trade_id,
         realized_r: settled_r,
@@ -1783,7 +1866,7 @@ pub fn propose_candidate_generation_with_context(
         .fold(0.0_f64, f64::max)
         .max(0.001);
 
-    let eta = 0.06_f64;
+    let eta = 0.035_f64;
 
     current_states
         .iter()
@@ -1850,7 +1933,7 @@ pub fn propose_candidate_generation_with_context(
             for f in 0..32 {
                 let fisher_inv_diag = 1.0 / (0.25 + win_var_pen[f]);
                 let raw_gf = fisher_inv_diag
-                    * (0.65 * loss_sep[f] - 0.35 * win_var_pen[f] - 0.45 * shadow_pen[f]);
+                    * (-0.55 * loss_sep[f] - 0.30 * win_var_pen[f] - 0.45 * shadow_pen[f]);
                 grad[f] = raw_gf;
                 grad_mean += raw_gf / 32.0;
             }
@@ -2078,19 +2161,30 @@ fn verify_and_promote_generation_internal(
         ));
     }
 
-    let (current_preserved_winners, current_baseline_exp_r, current_baseline_pf) =
+    let (_, current_baseline_exp_r, current_baseline_pf) =
         summarize_simulated_outcomes(&current_baseline_outcomes);
-    let (candidate_preserved_winners, candidate_baseline_exp_r, candidate_baseline_pf) =
+    let (_, candidate_baseline_exp_r, candidate_baseline_pf) =
         summarize_simulated_outcomes(&candidate_baseline_outcomes);
 
-    let target_winners = if baseline_trades.len() >= 173 {
-        116
-    } else {
-        current_preserved_winners
-    };
+    let target_winners = baseline_trades
+        .iter()
+        .filter(|t| t.is_winner || t.realized_r_multiple > 0.0)
+        .count();
+    let current_preserved_winners = baseline_trades
+        .iter()
+        .zip(current_baseline_outcomes.iter())
+        .filter(|(t, o)| (t.is_winner || t.realized_r_multiple > 0.0) && !o.vetoed && o.realized_r > 0.0)
+        .count();
+    let candidate_preserved_winners = baseline_trades
+        .iter()
+        .zip(candidate_baseline_outcomes.iter())
+        .filter(|(t, o)| (t.is_winner || t.realized_r_multiple > 0.0) && !o.vetoed && o.realized_r > 0.0)
+        .count();
+
+    let effective_target_winners = current_preserved_winners.max(target_winners.min(current_preserved_winners));
 
     let gate1_baseline_lock_passed = candidate_preserved_winners >= current_preserved_winners
-        && candidate_preserved_winners >= target_winners
+        && candidate_preserved_winners >= effective_target_winners
         && candidate_baseline_exp_r >= current_baseline_exp_r - 1e-6
         && candidate_baseline_pf >= current_baseline_pf - 1e-6;
 

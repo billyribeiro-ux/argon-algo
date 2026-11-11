@@ -880,6 +880,10 @@ export interface InstitutionalWatchlistRow {
   kelly_fraction_pct: number;
   is_actionable: boolean;
   execution_tier?: string;
+  regime_bucket?: string;
+  conformal_p_value?: number;
+  epistemic_ood_score?: number;
+  kelly_epistemic_multiplier?: number;
 }
 
 export interface InstitutionalWatchlistResponse {
@@ -1093,6 +1097,10 @@ export interface GateAuditReport {
   gate2_offending_losses_reduced: number;
   gate2_walkforward_winners_preserved: boolean;
   hard_negative_traps_added_count: number;
+  shadow_vetoed_evaluated_count?: number;
+  shadow_net_veto_alpha_r?: number;
+  quarantined_traps_count?: number;
+  mirror_descent_kl_divergence?: number;
   all_gates_passed: boolean;
   decision_rationale: string;
 }
@@ -1106,6 +1114,10 @@ export interface AutopsyEvolutionResponse {
   is_promoted: boolean;
   total_trades_inspected: number;
   hard_negative_traps_added_count: number;
+  shadow_vetoed_evaluated_count?: number;
+  shadow_net_veto_alpha_r?: number;
+  quarantined_traps_count?: number;
+  mirror_descent_kl_divergence?: number;
   autopsies_decoded: DecodedTradeAutopsy[];
   gate_audit: GateAuditReport;
   updated_synaptic_states: any[];

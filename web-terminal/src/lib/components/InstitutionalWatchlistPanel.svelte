@@ -184,6 +184,18 @@
       }, 6000);
     }
   }
+
+  function formatRegimeBucket(bucket?: string): string {
+    switch (bucket) {
+      case 'NEG_GAMMA_MOMENTUM_TREND':
+        return 'NEG-Γ TREND';
+      case 'LIQUIDITY_VACUUM_HIGH_TOXICITY':
+        return 'LIQ VACUUM';
+      case 'POS_GAMMA_PIN_MEAN_REVERT':
+      default:
+        return 'POS-Γ PIN';
+    }
+  }
 </script>
 
 <section
@@ -525,6 +537,34 @@
               </div>
             </div>
           </div>
+
+          <div class="gate-card gate-pass">
+            <div class="gate-card-title">
+              <Cpu size={14} weight="bold" />
+              <span>PHASE 34: SHADOW BANDIT &amp; MIRROR KL</span>
+              <span class="badge badge-gate">ACTIVE</span>
+            </div>
+            <div class="gate-card-body">
+              <div class="gate-stat">
+                <span class="gate-stat-label">Shadow Vetoed Evals</span>
+                <span class="gate-stat-val">{autopsyEvolution?.shadow_vetoed_evaluated_count ?? autopsyEvolution?.gate_audit?.shadow_vetoed_evaluated_count ?? 0} Settled</span>
+              </div>
+              <div class="gate-stat">
+                <span class="gate-stat-label">Shadow Net Veto Alpha</span>
+                <span class="gate-stat-val {(autopsyEvolution?.shadow_net_veto_alpha_r ?? autopsyEvolution?.gate_audit?.shadow_net_veto_alpha_r ?? 0) >= 0 ? 'pnl-positive' : 'pnl-negative'}">
+                  {(autopsyEvolution?.shadow_net_veto_alpha_r ?? autopsyEvolution?.gate_audit?.shadow_net_veto_alpha_r ?? 0) >= 0 ? '+' : ''}{(autopsyEvolution?.shadow_net_veto_alpha_r ?? autopsyEvolution?.gate_audit?.shadow_net_veto_alpha_r ?? 0).toFixed(2)}R
+                </span>
+              </div>
+              <div class="gate-stat">
+                <span class="gate-stat-label">Auto-Quarantined Traps</span>
+                <span class="gate-stat-val">{autopsyEvolution?.quarantined_traps_count ?? autopsyEvolution?.gate_audit?.quarantined_traps_count ?? 0} Quarantined</span>
+              </div>
+              <div class="gate-stat">
+                <span class="gate-stat-label">Simplex Mirror KL (D_KL)</span>
+                <span class="gate-stat-val">{(autopsyEvolution?.mirror_descent_kl_divergence ?? autopsyEvolution?.gate_audit?.mirror_descent_kl_divergence ?? 0).toFixed(5)} nats</span>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- Decoded Failure Autopsies -->
@@ -630,6 +670,7 @@
           <th>Tier</th>
           <th>Dir</th>
           <th>Archetype</th>
+          <th>Regime &amp; OOD</th>
           <th data-numeric="true">Eng A %</th>
           <th data-numeric="true">Eng B %</th>
           <th data-numeric="true">Consensus</th>
@@ -637,10 +678,10 @@
           <th data-numeric="true">Stop Px</th>
           <th data-numeric="true">Target 1</th>
           <th data-numeric="true">Target 2</th>
-          <th data-numeric="true">Stage 0 Margin</th>
+          <th data-numeric="true">Stage 0 &amp; p-Val</th>
           <th>CBOE Contract</th>
           <th>Venue Ticket</th>
-          <th data-numeric="true">Kelly %</th>
+          <th data-numeric="true">Kelly % (×κ)</th>
           <th>Action Status</th>
           <th>Paper OMS Staging</th>
         </tr>
@@ -671,6 +712,16 @@
             <td>
               <span class="badge badge-archetype">{row.strategy_archetype}</span>
             </td>
+            <td class="regime-cell">
+              <span class="badge badge-regime" title="Mondrian Regime Partition: {row.regime_bucket ?? 'POS_GAMMA_PIN_MEAN_REVERT'}">
+                {formatRegimeBucket(row.regime_bucket)}
+              </span>
+              {#if (row.epistemic_ood_score ?? 0) > 0}
+                <span class="ood-tag" title="Chi^2_32 Epistemic OOD Score">
+                  OOD {(row.epistemic_ood_score ?? 0).toFixed(2)}
+                </span>
+              {/if}
+            </td>
             <td data-numeric="true" class="tabular-num">
               {row.engine_a_confidence_pct.toFixed(1)}%
             </td>
@@ -694,12 +745,12 @@
             </td>
             <td data-numeric="true" class="tabular-num conformal-cell">
               {#if row.stage0_conformal_status === 'PASS'}
-                <span class="conformal-pass" title="Conformal LLR: {row.conformal_llr.toFixed(3)} >= {row.conformal_threshold.toFixed(3)}">
-                  +{row.conformal_margin.toFixed(3)} PASS
+                <span class="conformal-pass" title="Conformal LLR: {row.conformal_llr.toFixed(3)} < {row.conformal_threshold.toFixed(3)} | Mondrian p={(row.conformal_p_value ?? 1.0).toFixed(3)}">
+                  +{row.conformal_margin.toFixed(3)} (p={(row.conformal_p_value ?? 1.0).toFixed(2)})
                 </span>
               {:else}
-                <span class="conformal-veto" title="Conformal LLR: {row.conformal_llr.toFixed(3)} < {row.conformal_threshold.toFixed(3)}">
-                  {row.conformal_margin.toFixed(3)} VETO
+                <span class="conformal-veto" title="Conformal LLR: {row.conformal_llr.toFixed(3)} >= {row.conformal_threshold.toFixed(3)} | Mondrian p={(row.conformal_p_value ?? 0.0).toFixed(3)}">
+                  {row.conformal_margin.toFixed(3)} VETO (p={(row.conformal_p_value ?? 0.0).toFixed(2)})
                 </span>
               {/if}
             </td>
@@ -711,6 +762,11 @@
             </td>
             <td data-numeric="true" class="tabular-num kelly-cell">
               {row.kelly_fraction_pct.toFixed(2)}%
+              {#if (row.kelly_epistemic_multiplier ?? 1.0) < 0.999}
+                <span class="kelly-mult" title="OOD Epistemic Kelly Multiplier">
+                  ×{(row.kelly_epistemic_multiplier ?? 1.0).toFixed(2)}
+                </span>
+              {/if}
             </td>
             <td>
               {#if row.action_status === 'ACTIONABLE_STAGE_READY'}
@@ -1422,8 +1478,36 @@
 
   .gate-cards-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
     gap: 12px;
+  }
+
+  .regime-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .badge-regime {
+    background: oklch(0.22 0.06 210);
+    color: oklch(0.92 0.06 210);
+    border: 1px solid oklch(0.38 0.08 210 / 0.6);
+  }
+
+  .ood-tag {
+    font-family: var(--font-mono, monospace);
+    font-size: 0.58rem;
+    font-weight: 700;
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: oklch(0.26 0.1 45 / 0.8);
+    color: oklch(0.95 0.1 45);
+  }
+
+  .kelly-mult {
+    font-size: 0.6rem;
+    color: oklch(0.85 0.1 75);
+    margin-left: 3px;
   }
 
   .gate-card {

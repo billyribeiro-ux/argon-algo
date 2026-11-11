@@ -4135,7 +4135,6 @@ impl RealTimeLedgerEngine {
         let k_out = crate::autopsy_evolver::evaluate_stage0_conformal_kernel(
             sig.brain_id,
             &entry_arr_32,
-            None,
             &syn_state,
             &trap_bank,
             &precision,
@@ -4159,35 +4158,26 @@ impl RealTimeLedgerEngine {
             kelly_epistemic_multiplier: k_out.kelly_epistemic_multiplier,
         };
 
-        // Preserve Era-1 (`Gen <= 36`) historical baseline replay discriminant ONLY when explicitly requested
-        if *self.enforce_hard_scratch_on_baseline.read() && syn_state.generation_id <= 36 && !diag.should_veto {
+        // Preserve Era-1 (`Gen <= 36`) historical baseline audit discriminant ONLY when `record_audit` is requested
+        if *self.enforce_hard_scratch_on_baseline.read()
+            && record_audit
+            && syn_state.generation_id <= 36
+            && !diag.should_veto
+        {
             let tau_veto = (0.855 + syn_state.entry_veto_margin_delta).clamp(0.84, 0.94);
             let delta_margin = syn_state.entry_veto_margin_delta.clamp(0.005, 0.05);
-            let era1_diag = if record_audit {
-                self.precedent_knn
-                    .evaluate_causal_entry_trap_vs_winner_discriminant(
-                        sig.brain_id,
-                        &sig.symbol,
-                        sig.direction,
-                        sig.timestamp_ns,
-                        &sig.latent_embedding_128,
-                        &entry_features_32,
-                        tau_veto,
-                        delta_margin,
-                    )
-            } else {
-                self.precedent_knn
-                    .evaluate_causal_stage0_conformal_entry_gate(
-                        sig.brain_id,
-                        &sig.symbol,
-                        sig.direction,
-                        sig.timestamp_ns,
-                        &sig.latent_embedding_128,
-                        &entry_features_32,
-                        tau_veto,
-                        delta_margin,
-                    )
-            };
+            let era1_diag = self
+                .precedent_knn
+                .evaluate_causal_entry_trap_vs_winner_discriminant(
+                    sig.brain_id,
+                    &sig.symbol,
+                    sig.direction,
+                    sig.timestamp_ns,
+                    &sig.latent_embedding_128,
+                    &entry_features_32,
+                    tau_veto,
+                    delta_margin,
+                );
             if era1_diag.should_veto {
                 diag.should_veto = true;
                 diag.matched_trap_id = era1_diag.matched_trap_id;
@@ -4478,16 +4468,15 @@ impl RealTimeLedgerEngine {
             enforce_era1_baseline || syn_state.generation_id >= 37,
         );
 
-        if stage0.kelly_epistemic_multiplier < 1.0 && !(enforce_era1_baseline && syn_state.generation_id <= 36) {
+        if !enforce_era1_baseline && stage0.kelly_epistemic_multiplier < 1.0 {
             let k_mult = stage0.kelly_epistemic_multiplier.clamp(0.15, 1.0);
             row.kelly_fraction_pct = ((row.kelly_fraction_pct * k_mult) * 100.0).round() / 100.0;
             row.risk_budget_usd = ((row.risk_budget_usd * k_mult) * 100.0).round() / 100.0;
             row.notional_allocated_usd =
                 ((row.notional_allocated_usd * k_mult) * 100.0).round() / 100.0;
-            row.quantity_shares = (row.notional_allocated_usd / entry_f64).max(0.01);
         }
 
-        if stage0.epistemic_ood_score > 1.25 {
+        if !enforce_era1_baseline && stage0.epistemic_ood_score > 1.25 {
             row.active_sequential_stage = "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME".to_string();
             row.sequential_safety_margin_pct = 0.0;
             return row;
@@ -5084,7 +5073,17 @@ impl RealTimeLedgerEngine {
                 || already_banked_t1
                 || t1_reached_this_bar
                 || was_trailing_profit_stop;
+            let sec_of_day_utc = ((latest.timestamp_ns / 1_000_000_000).rem_euclid(86_400)) as u32;
+            let min_of_day_utc = sec_of_day_utc / 60;
+            let is_us_closing_bell_bar =
+                (1185..=1205).contains(&min_of_day_utc) || (1245..=1265).contains(&min_of_day_utc);
+            let intraday_eod_flat = pos.brain_id == BrainHorizonId::Brain02IntradayDayTrade
+                && bars_since_open >= 4
+                && !already_banked_t1
+                && !was_trailing_profit_stop
+                && is_us_closing_bell_bar;
             let time_expired = (bars_since_open >= max_hold_bars && is_in_profit_for_time_stop)
+                || intraday_eod_flat
                 || bars_since_open >= max_hold_bars * 3;
 
             // Phase 24.2 Remediation 4: Unified Multi-Stage Live Bar Ticking (`Bar +1..+16+`)
@@ -5123,8 +5122,11 @@ impl RealTimeLedgerEngine {
                     && enforce_live_stage1_3
                 {
                     ai_scratch_exit = true;
-                } else if enforce_live_stage1_3 && bars_since_open >= 1 {
-                    if bars_since_open >= 2
+                } else if (enforce_live_stage1_3 || already_banked_t1 || t1_reached_this_bar)
+                    && bars_since_open >= 1
+                {
+                    if enforce_live_stage1_3
+                        && bars_since_open >= 2
                         && let Some(ref ratchet_diag) = unified_dec.giveback_ratchet
                     {
                         let locked_r = ratchet_diag.locked_profit_r.max(0.05);
@@ -5146,7 +5148,7 @@ impl RealTimeLedgerEngine {
                                 .unwrap_or(pos.entry_price),
                             ),
                         };
-                    } else if syn_state.generation_id >= 37 {
+                    } else if syn_state.generation_id >= 37 || already_banked_t1 || t1_reached_this_bar {
                         let peak_move_u = match pos.direction {
                             TradeDirection::Long => {
                                 (pos.peak_favorable_price.scaled_units()

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import rustWireFixture from './__fixtures__/phase30_rust_wire_contract.json';
 import autopsyWireFixture from './__fixtures__/phase32_autopsy_wire_contract.json';
+import phase34ShadowWireFixture from './__fixtures__/phase34_shadow_bandit_wire_contract.json';
 import {
   TerminalStore,
   formatSubPennyPrice,
@@ -2884,6 +2885,81 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
       expect(audit.gate2_walkforward_winners_preserved).toBe(true);
       expect(audit.candidate_wf_net_r).toBeGreaterThan(audit.current_wf_net_r);
       expect(audit.hard_negative_traps_added_count).toBe(state.hard_negative_traps_added_count);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('hydrates Phase 34 Mondrian regime conformal p-values, Chi^2_32 OOD Kelly multipliers, Shadow-Tape Net Veto Alpha, auto-quarantine counts, and 32-Simplex Mirror KL telemetry (#26)', async () => {
+    const store = new TerminalStore(false);
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (
+        url.includes('/api/v1/scanner/watchlist') ||
+        url.includes('/api/v1/scanner/institutional-watchlist') ||
+        url.includes('/api/v1/scanner/sunday-watchlist')
+      ) {
+        return new Response(JSON.stringify(rustWireFixture), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      if (url.includes('/api/v1/scanner/autopsy-evolution') || url.includes('/api/v1/scanner/evolve-cycle')) {
+        return new Response(JSON.stringify(phase34ShadowWireFixture), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      if (url.includes('/api/v1/evolution/status')) {
+        return new Response(JSON.stringify({ generations: [], synaptic_states: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return new Response('{}', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    try {
+      await store.fetchInstitutionalWatchlist();
+      expect(store.institutionalWatchlist).not.toBeNull();
+      const rows = store.institutionalWatchlist!.watchlist;
+      expect(rows.length).toBe(24);
+
+      const validRegimes = [
+        'POS_GAMMA_PIN_MEAN_REVERT',
+        'NEG_GAMMA_MOMENTUM_TREND',
+        'LIQUIDITY_VACUUM_HIGH_TOXICITY'
+      ];
+      for (const r of rows) {
+        expect(validRegimes).toContain(r.regime_bucket);
+        expect(Number.isFinite(r.conformal_p_value)).toBe(true);
+        expect(r.conformal_p_value!).toBeGreaterThan(0);
+        expect(r.conformal_p_value!).toBeLessThanOrEqual(1.0);
+        expect(Number.isFinite(r.epistemic_ood_score)).toBe(true);
+        expect(r.epistemic_ood_score!).toBeGreaterThanOrEqual(0);
+        expect(Number.isFinite(r.kelly_epistemic_multiplier)).toBe(true);
+        expect(r.kelly_epistemic_multiplier!).toBeGreaterThanOrEqual(0.15);
+        expect(r.kelly_epistemic_multiplier!).toBeLessThanOrEqual(1.0);
+      }
+
+      const evolved = await store.runEvolveCycle();
+      expect(evolved).not.toBeNull();
+      const evoState = store.autopsyEvolutionState!;
+      expect(evoState.shadow_vetoed_evaluated_count!).toBeGreaterThanOrEqual(4);
+      expect(Number.isFinite(evoState.shadow_net_veto_alpha_r)).toBe(true);
+      expect(evoState.quarantined_traps_count!).toBeGreaterThanOrEqual(1);
+      expect(Number.isFinite(evoState.mirror_descent_kl_divergence)).toBe(true);
+      expect(evoState.mirror_descent_kl_divergence!).toBeGreaterThan(0);
+
+      expect(evoState.gate_audit.shadow_vetoed_evaluated_count).toBe(evoState.shadow_vetoed_evaluated_count);
+      expect(evoState.gate_audit.shadow_net_veto_alpha_r!).toBeCloseTo(evoState.shadow_net_veto_alpha_r!, 6);
+      expect(evoState.gate_audit.quarantined_traps_count).toBe(evoState.quarantined_traps_count);
+      expect(evoState.gate_audit.mirror_descent_kl_divergence!).toBeCloseTo(
+        evoState.mirror_descent_kl_divergence!,
+        6
+      );
     } finally {
       globalThis.fetch = originalFetch;
     }

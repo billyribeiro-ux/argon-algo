@@ -5791,4 +5791,1510 @@ mod tests {
 
         let _ = propose_candidate_generation; // keep import used cleanly
     }
+
+    #[tokio::test]
+    async fn test_phase33_1_and_34_epistemic_conformal_shadow_bandit_and_hazard_stopping() {
+        use crate::autopsy_evolver::{
+            AutopsyEvolutionResponse, LedoitWolfPrecision, RegimeBucket, Stage0TrapCentroid,
+            classify_regime_bucket, compute_causal_reversal_hazard_retention,
+            evaluate_stage0_conformal_kernel, extract_causal_entry_array_32,
+            project_capped_simplex_kl_32, run_autopsy_evolution_cycle,
+            simulate_trade_under_candidate, simulate_trade_under_candidate_with_trap_bank,
+        };
+        use crate::precedent_knn::{HardNegativeTrapRecord, TrapUpsertOutcome};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        println!("\n=================================================================================================================================");
+        println!("  PHASE 33.1 & PHASE 34: ZERO-SKEW CONFORMAL KERNEL, GAP-SLIPPAGE, MONDRIAN OOD SHIELD, SHADOW BANDIT & HAZARD STOPPING AUDIT");
+        println!("=================================================================================================================================\n");
+
+        let models_dir = Path::new("../../models");
+        let app_models_path = if models_dir.exists() {
+            Some(models_dir)
+        } else {
+            None
+        };
+        let state = AppState::new(app_models_path);
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+        assert!(state.ledger.load_from_disk(ledger_path));
+        state.ledger.clear_all_open_positions();
+        state.ledger.set_enforce_hard_scratch_on_baseline(false);
+
+        let snap_initial = state
+            .ledger
+            .query_filtered_snapshot(&HyperFilterQuery::default());
+        assert_eq!(snap_initial.closed_trades.len(), 173);
+        for closed_row in &snap_initial.closed_trades {
+            state.ledger.sync_closed_row_to_precedent_knn(closed_row);
+        }
+        state.ledger.recompute_causal_plasticity();
+
+        let internals = raw_fingerprint_core::RawMarketInternalsSnapshot::default();
+        let make_bar = |ts_ns: i64, o: f64, h: f64, l: f64, c: f64, vol: f64| {
+            raw_fingerprint_core::RawBarRecord {
+                timestamp_ns: ts_ns,
+                open: SubPennyPrice::from_f64(o).unwrap(),
+                high: SubPennyPrice::from_f64(h).unwrap(),
+                low: SubPennyPrice::from_f64(l).unwrap(),
+                close: SubPennyPrice::from_f64(c).unwrap(),
+                volume: vol as u64,
+                vwap: SubPennyPrice::from_f64((o + h + l + c) * 0.25).unwrap(),
+                dollar_turnover: c * vol,
+                trade_count: 1_250,
+                bid_ask_spread: SubPennyPrice::from_f64((c * 0.0004).max(0.01)).unwrap(),
+                time_delta_ms: 300_000,
+            }
+        };
+
+        let build_inf = |sym: &str,
+                         brain_id: BrainHorizonId,
+                         dir: TradeDirection,
+                         ts_ns: i64,
+                         ep: SubPennyPrice,
+                         sp: SubPennyPrice,
+                         t1: SubPennyPrice,
+                         t2: SubPennyPrice,
+                         conf_pct: f64,
+                         emb_128: Vec<f32>| {
+            let signal = raw_fingerprint_core::AutonomousSignalBlueprint {
+                brain_id,
+                symbol: sym.to_string(),
+                timestamp_ns: ts_ns,
+                direction: dir,
+                ai_confidence_pct: conf_pct,
+                entry_price: ep,
+                structural_stop_price: sp,
+                target_1_price: t1,
+                target_2_price: t2,
+                predicted_hold_duration_ms: 900_000,
+                expected_r_multiple: 2.25,
+                primary_driver: raw_fingerprint_core::PrimaryFingerprintDriver::VolumeAbsorption,
+                stream_weights: raw_fingerprint_core::FourStreamWeights {
+                    chart_tape_physics_weight: 0.35,
+                    options_gamma_vanna_weight: 0.30,
+                    short_float_squeeze_weight: 0.20,
+                    market_internals_macro_weight: 0.15,
+                },
+                latent_embedding_128: emb_128,
+            };
+            let matched_option = crate::onnx_engine::MatchedOptionExecutionPlan {
+                option_structure: "SINGLE_LEG_CALL".to_string(),
+                matched_option_contract: format!("{sym} 2026-11-20 $100.00C"),
+                option_entry_premium: SubPennyPrice::from_f64(3.50).unwrap(),
+                option_live_premium: SubPennyPrice::from_f64(3.50).unwrap(),
+                option_stop_premium: SubPennyPrice::from_f64(1.75).unwrap(),
+                option_target_premium: SubPennyPrice::from_f64(7.80).unwrap(),
+                option_contracts_count: 4,
+                contract_delta: 0.54,
+                contract_gamma: 0.042,
+                contract_vanna: 0.018,
+                contract_theta: -0.12,
+                contract_vega: 0.25,
+                contract_iv: 0.34,
+            };
+            let prec = crate::precedent_knn::PrecedentMatchSummary {
+                matches_count: 16,
+                win_rate_pct: 76.0,
+                mean_realized_r_multiple: 2.05,
+                mean_similarity_pct: 89.5,
+                p50_mfe_pct: 2.2,
+                p80_mfe_pct: 3.4,
+                p85_mae_pct: 0.9,
+                median_hold_duration_ms: 900_000,
+                top_exemplar_symbols: vec![sym.to_string()],
+            };
+            (
+                crate::onnx_engine::LiveBrainInferenceOutput {
+                    signal,
+                    matched_option,
+                    bar_attention_heatmap: vec![0.5; 24],
+                    top_shap_drivers: Vec::new(),
+                    inference_latency_micros: 90,
+                    model_version: "v1.34.0-onnx".to_string(),
+                },
+                prec,
+            )
+        };
+
+        // =============================================================================================================================
+        // (a) ZERO-SKEW SINGLE SHARED STAGE 0 CONFORMAL KERNEL PARITY (`abs_diff < 1e-12`)
+        // =============================================================================================================================
+        let base_template = snap_initial
+            .closed_trades
+            .iter()
+            .find(|t| t.brain_id == BrainHorizonId::Brain02IntradayDayTrade && t.is_winner)
+            .expect("BRAIN-02 winner template exists")
+            .clone();
+
+        let t_base_ns = 1_795_000_000_000_000_000_i64;
+        let mut parity_pre_bars = Vec::with_capacity(24);
+        for i in 0..24 {
+            let px = 98.85 + (i as f64) * 0.05;
+            parity_pre_bars.push(make_bar(
+                t_base_ns + (i as i64) * 300_000_000_000,
+                px - 0.04,
+                px + 0.12,
+                px - 0.08,
+                px,
+                50_000.0,
+            ));
+        }
+        let parity_ep = parity_pre_bars.last().unwrap().close; // $100.00
+        let parity_sp = SubPennyPrice::from_f64(98.00).unwrap();
+        let parity_t1 = SubPennyPrice::from_f64(103.00).unwrap();
+        let parity_t2 = SubPennyPrice::from_f64(105.00).unwrap();
+        let parity_ts = parity_pre_bars.last().unwrap().timestamp_ns;
+
+        let (parity_inf, parity_prec) = build_inf(
+            "SPY",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            TradeDirection::Long,
+            parity_ts,
+            parity_ep,
+            parity_sp,
+            parity_t1,
+            parity_t2,
+            base_template.ai_confidence_pct,
+            base_template.entry_embedding_128.clone(),
+        );
+
+        let mut offline_trade = base_template.clone();
+        offline_trade.trade_id = uuid::Uuid::new_v4();
+        offline_trade.symbol = "SPY".to_string();
+        offline_trade.opened_timestamp_ns = parity_ts;
+        offline_trade.closed_timestamp_ns = parity_ts + 600_000_000_000;
+        offline_trade.direction = TradeDirection::Long;
+        offline_trade.entry_price = parity_ep;
+        offline_trade.initial_structural_stop = parity_sp;
+        offline_trade.target_1_price = parity_t1;
+        offline_trade.target_2_price = parity_t2;
+        offline_trade.precedent_win_rate_pct = parity_prec.win_rate_pct;
+        offline_trade.entry_bar_idx = parity_pre_bars.len() - 1;
+        let mut replay_bars = parity_pre_bars.clone();
+        replay_bars.push(make_bar(
+            parity_ts + 300_000_000_000,
+            100.00,
+            105.20,
+            99.90,
+            105.10,
+            60_000.0,
+        ));
+        offline_trade.entry_bars = replay_bars;
+
+        let syn_b02 = state
+            .ledger
+            .precedent_knn()
+            .get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade);
+        let (live_precision, live_trap_bank) = state
+            .ledger
+            .build_live_stage0_manifold_and_traps(BrainHorizonId::Brain02IntradayDayTrade, parity_ts);
+
+        let sim_pass = simulate_trade_under_candidate_with_trap_bank(
+            &offline_trade,
+            &syn_b02,
+            &live_trap_bank,
+            &live_precision,
+        );
+        let live_pass = state.ledger.evaluate_live_entry_stage0_gate(
+            &parity_inf,
+            parity_prec.win_rate_pct,
+            &parity_pre_bars,
+            false,
+        );
+
+        let diff_margin = (sim_pass.candidate_conformal_margin - live_pass.conformal_margin).abs();
+        let diff_llr = (sim_pass.conformal_llr - live_pass.conformal_entry_llr).abs();
+        let diff_pval = (sim_pass.conformal_p_value - live_pass.conformal_p_value).abs();
+        assert!(diff_margin < 1e-12, "Expected margin diff < 1e-12, got {diff_margin:.3e}");
+        assert!(diff_llr < 1e-12, "Expected LLR diff < 1e-12, got {diff_llr:.3e}");
+        assert!(diff_pval < 1e-12, "Expected p-value diff < 1e-12, got {diff_pval:.3e}");
+        assert_eq!(sim_pass.vetoed, live_pass.should_veto);
+
+        // Also verify parity when an active trap vetoes the exact vector (in isolated ledger_v so main ledger stays pure)
+        let ledger_v = RealTimeLedgerEngine::new();
+        assert!(ledger_v.load_from_disk(ledger_path));
+        for closed_row in &snap_initial.closed_trades {
+            ledger_v.sync_closed_row_to_precedent_knn(closed_row);
+        }
+        ledger_v.recompute_causal_plasticity();
+
+        let parity_feat_32 = extract_causal_entry_array_32(&offline_trade);
+        let trap_id_parity = uuid::Uuid::new_v4();
+        let parity_veto_ts = parity_ts + 60_000_000_000;
+        ledger_v.precedent_knn().upsert_or_reinforce_hard_negative_trap(
+            HardNegativeTrapRecord {
+                loss_trade_id: trap_id_parity,
+                brain_id: BrainHorizonId::Brain02IntradayDayTrade,
+                symbol: "SPY".to_string(),
+                closed_timestamp_ns: parity_ts,
+                direction: TradeDirection::Long,
+                root_cause_category: "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string(),
+                embedding_128: offline_trade.entry_embedding_128.clone(),
+                culprit_feature_indices: [0, 8, 20],
+                culprit_feature_signs: [1.0, 1.0, 1.0],
+                realized_loss_usd: -500.0,
+                post_entry_bar1_features_32: parity_feat_32.iter().map(|&x| x as f32).collect(),
+                culprit_anomaly_weights_32: vec![1.0; 32],
+                entry_features_32: parity_feat_32.iter().map(|&x| x as f32).collect(),
+                bar1_r_multiple: -1.0,
+                pre_settlement_bars_features_32: Vec::new(),
+                observation_count: 1,
+                true_saves_count: 0,
+                false_veto_regrets_count: 0,
+                cumulative_saved_r: 0.0,
+                cumulative_missed_winner_r: 0.0,
+                quarantined: false,
+            },
+        );
+        let mut parity_inf_v = parity_inf.clone();
+        parity_inf_v.signal.timestamp_ns = parity_veto_ts;
+        let syn_b02_v = ledger_v
+            .precedent_knn()
+            .get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade);
+        let (live_precision_v, live_trap_bank_v) = ledger_v
+            .build_live_stage0_manifold_and_traps(
+                BrainHorizonId::Brain02IntradayDayTrade,
+                parity_veto_ts,
+            );
+        let sim_veto = simulate_trade_under_candidate_with_trap_bank(
+            &offline_trade,
+            &syn_b02_v,
+            &live_trap_bank_v,
+            &live_precision_v,
+        );
+        let live_veto = ledger_v.evaluate_live_entry_stage0_gate(
+            &parity_inf_v,
+            parity_prec.win_rate_pct,
+            &parity_pre_bars,
+            false,
+        );
+        assert!(sim_veto.vetoed && live_veto.should_veto);
+        assert!((sim_veto.candidate_conformal_margin - live_veto.conformal_margin).abs() < 1e-12);
+        assert!((sim_veto.conformal_llr - live_veto.conformal_entry_llr).abs() < 1e-12);
+        assert!((sim_veto.conformal_p_value - live_veto.conformal_p_value).abs() < 1e-12);
+
+        println!("  [PROOF (a) ZERO-SKEW STAGE 0 KERNEL PARITY (OFFLINE SIMULATOR == LIVE SCANNER)]:");
+        println!(
+            "    - PASS Case : |ΔMargin|={:.2e} | |ΔLLR|={:.2e} | |Δp_val|={:.2e} | Veto=({} == {})",
+            diff_margin, diff_llr, diff_pval, sim_pass.vetoed, live_pass.should_veto
+        );
+        println!(
+            "    - VETO Case : |ΔMargin|={:.2e} | |ΔLLR|={:.2e} | |Δp_val|={:.2e} | Veto=({} == {})",
+            (sim_veto.candidate_conformal_margin - live_veto.conformal_margin).abs(),
+            (sim_veto.conformal_llr - live_veto.conformal_entry_llr).abs(),
+            (sim_veto.conformal_p_value - live_veto.conformal_p_value).abs(),
+            sim_veto.vetoed,
+            live_veto.should_veto
+        );
+
+        // =============================================================================================================================
+        // (b) ADVERSE GAP-THROUGH STOP & RATCHET FILL REALISM (`simulate_trade_under_candidate` & `ledger.rs`)
+        // =============================================================================================================================
+        let precision_base = LedoitWolfPrecision::from_settled_trades(&snap_initial.closed_trades);
+
+        // 1) Long Structural Stop Gap: Entry $100, Stop $98 (1R = $2), Bar+1 opens @ $97.10 -> -1.45R
+        let mut long_gap_stop_trade = offline_trade.clone();
+        long_gap_stop_trade.trade_id = uuid::Uuid::new_v4();
+        let mut lg_bars = parity_pre_bars.clone();
+        lg_bars.push(make_bar(
+            parity_ts + 300_000_000_000,
+            97.10,
+            97.40,
+            97.00,
+            97.20,
+            80_000.0,
+        ));
+        long_gap_stop_trade.entry_bars = lg_bars;
+        let sim_long_gap_stop =
+            simulate_trade_under_candidate(&long_gap_stop_trade, &syn_b02, &[], &precision_base);
+        assert!(
+            (sim_long_gap_stop.exit_price - 97.10).abs() < 1e-6,
+            "Long stop gap must fill at bar.open=$97.10, got {}",
+            sim_long_gap_stop.exit_price
+        );
+        assert!(
+            (sim_long_gap_stop.realized_r - (-1.45)).abs() < 1e-6,
+            "Long stop gap must book -1.45R, got {}",
+            sim_long_gap_stop.realized_r
+        );
+
+        // Also verify Live Ledger Long Structural Stop Gap!
+        let mut lg_pre_bars = parity_pre_bars.clone();
+        if let Some(last_b) = lg_pre_bars.last_mut() {
+            last_b.bid_ask_spread = SubPennyPrice::from_f64(0.65).unwrap();
+        }
+        let mut lg_trap_emb = base_template.entry_embedding_128.clone();
+        for cand_delta in [0.95_f32, 1.15, 1.35, 1.55, 0.75] {
+            let mut trial_emb = base_template.entry_embedding_128.clone();
+            for v in trial_emb.iter_mut().skip(20).take(6) {
+                *v += cand_delta;
+            }
+            let trial_feat_vec = RealTimeLedgerEngine::extract_causal_entry_features_32(
+                &trial_emb,
+                parity_ep,
+                parity_sp,
+                parity_t1,
+                TradeDirection::Long,
+                base_template.ai_confidence_pct,
+                78.0,
+                &lg_pre_bars,
+                lg_pre_bars.len() - 1,
+            );
+            let mut trial_feat = [0.0_f64; 32];
+            for (i, &v) in trial_feat_vec.iter().take(32).enumerate() {
+                trial_feat[i] = v as f64;
+            }
+            let cur_traps_b02: Vec<Stage0TrapCentroid> = state
+                .ledger
+                .precedent_knn()
+                .all_hard_negative_traps()
+                .into_iter()
+                .filter(|t| {
+                    t.brain_id == BrainHorizonId::Brain02IntradayDayTrade
+                        && !t.quarantined
+                        && (t.root_cause_category == "ENTRY_LIQUIDITY_VACUUM_TRAP"
+                            || t.root_cause_category.starts_with("STAGE_0_"))
+                        && t.entry_features_32.len() >= 32
+                })
+                .map(|t| {
+                    let mut arr = [0.0_f64; 32];
+                    for (i, &v) in t.entry_features_32.iter().take(32).enumerate() {
+                        arr[i] = v as f64;
+                    }
+                    Stage0TrapCentroid {
+                        trap_id: Some(t.loss_trade_id),
+                        root_cause_category: t.root_cause_category,
+                        features_32: arr,
+                        quarantined: false,
+                    }
+                })
+                .collect();
+            let k_before = evaluate_stage0_conformal_kernel(
+                BrainHorizonId::Brain02IntradayDayTrade,
+                &trial_feat,
+                &syn_b02,
+                &cur_traps_b02,
+                &precision_base,
+            );
+            let mut next_traps = cur_traps_b02.clone();
+            next_traps.push(Stage0TrapCentroid {
+                trap_id: Some(uuid::Uuid::new_v4()),
+                root_cause_category: "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string(),
+                features_32: trial_feat,
+                quarantined: false,
+            });
+            let k_after = evaluate_stage0_conformal_kernel(
+                BrainHorizonId::Brain02IntradayDayTrade,
+                &trial_feat,
+                &syn_b02,
+                &next_traps,
+                &precision_base,
+            );
+            if !k_before.vetoed && k_after.vetoed && !k_after.is_epistemic_ood_veto {
+                lg_trap_emb = trial_emb;
+                break;
+            }
+        }
+        let (lg_live_inf, lg_live_prec) = build_inf(
+            "SPY",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            TradeDirection::Long,
+            parity_ts,
+            parity_ep,
+            parity_sp,
+            parity_t1,
+            parity_t2,
+            base_template.ai_confidence_pct,
+            lg_trap_emb,
+        );
+        state.ledger.open_position_with_bars(
+            "NASDAQ",
+            &lg_live_inf,
+            &lg_live_prec,
+            100_000.0,
+            lg_pre_bars.clone(),
+        );
+        let mut live_lg_stream = lg_pre_bars.clone();
+        let mut lg_gap_bar = make_bar(
+            parity_ts + 300_000_000_000,
+            97.10,
+            97.40,
+            97.00,
+            97.20,
+            8_000.0,
+        );
+        lg_gap_bar.bid_ask_spread = SubPennyPrice::from_f64(1.65).unwrap();
+        live_lg_stream.push(lg_gap_bar);
+        let live_closed_lg = state.ledger.process_live_bar_for_symbol_and_brain(
+            "SPY",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &live_lg_stream,
+            &internals,
+        );
+        assert_eq!(live_closed_lg.len(), 1);
+        assert!((live_closed_lg[0].actual_exit_price.to_f64() - 97.10).abs() < 1e-6);
+        assert!(
+            live_closed_lg[0].realized_r_multiple <= -1.40,
+            "Live ledger must book adverse gap-through R <= -1.40R, got {}",
+            live_closed_lg[0].realized_r_multiple
+        );
+
+        // 2) Short Structural Stop Gap: Entry $100, Stop $102 (1R = $2), Bar+1 opens @ $102.80 -> -1.40R
+        let mut short_gap_stop_trade = offline_trade.clone();
+        short_gap_stop_trade.trade_id = uuid::Uuid::new_v4();
+        short_gap_stop_trade.direction = TradeDirection::Short;
+        short_gap_stop_trade.initial_structural_stop = SubPennyPrice::from_f64(102.00).unwrap();
+        short_gap_stop_trade.target_1_price = SubPennyPrice::from_f64(97.00).unwrap();
+        short_gap_stop_trade.target_2_price = SubPennyPrice::from_f64(95.00).unwrap();
+        let mut sg_bars = parity_pre_bars.clone();
+        sg_bars.push(make_bar(
+            parity_ts + 300_000_000_000,
+            102.80,
+            103.00,
+            102.60,
+            102.75,
+            80_000.0,
+        ));
+        short_gap_stop_trade.entry_bars = sg_bars;
+        let sim_short_gap_stop =
+            simulate_trade_under_candidate(&short_gap_stop_trade, &syn_b02, &[], &precision_base);
+        assert!((sim_short_gap_stop.exit_price - 102.80).abs() < 1e-6);
+        assert!((sim_short_gap_stop.realized_r - (-1.40)).abs() < 1e-6);
+
+        // 3) Long Ratchet Gap-Through: T1=$108 (4R), T2=$112 (6R); Bar+1 hits +2.40R ($104.80), Bar+2 gaps open @ $101.80
+        let mut long_ratchet_gap_trade = offline_trade.clone();
+        long_ratchet_gap_trade.trade_id = uuid::Uuid::new_v4();
+        long_ratchet_gap_trade.target_1_price = SubPennyPrice::from_f64(108.00).unwrap();
+        long_ratchet_gap_trade.target_2_price = SubPennyPrice::from_f64(112.00).unwrap();
+        let mut lrg_bars = parity_pre_bars.clone();
+        lrg_bars.push(make_bar(
+            parity_ts + 300_000_000_000,
+            100.00,
+            104.80,
+            99.90,
+            104.50,
+            60_000.0,
+        ));
+        lrg_bars.push(make_bar(
+            parity_ts + 600_000_000_000,
+            101.80,
+            102.10,
+            101.50,
+            101.70,
+            70_000.0,
+        ));
+        long_ratchet_gap_trade.entry_bars = lrg_bars;
+        let sim_long_ratchet_gap =
+            simulate_trade_under_candidate(&long_ratchet_gap_trade, &syn_b02, &[], &precision_base);
+        assert!(sim_long_ratchet_gap.ratchet_exited_stage3);
+        assert!(
+            (sim_long_ratchet_gap.exit_price - 101.80).abs() < 1e-6,
+            "Long ratchet gap must fill at bar_open=$101.80, got {}",
+            sim_long_ratchet_gap.exit_price
+        );
+        assert!((sim_long_ratchet_gap.realized_r - 0.90).abs() < 1e-6);
+
+        // 4) Short Ratchet Gap-Through: T1=$92 (4R), T2=$88 (6R); Bar+1 hits +2.40R ($95.20), Bar+2 gaps open @ $98.20
+        let mut short_ratchet_gap_trade = short_gap_stop_trade.clone();
+        short_ratchet_gap_trade.trade_id = uuid::Uuid::new_v4();
+        short_ratchet_gap_trade.target_1_price = SubPennyPrice::from_f64(92.00).unwrap();
+        short_ratchet_gap_trade.target_2_price = SubPennyPrice::from_f64(88.00).unwrap();
+        let mut srg_bars = parity_pre_bars.clone();
+        srg_bars.push(make_bar(
+            parity_ts + 300_000_000_000,
+            100.00,
+            100.10,
+            95.20,
+            95.50,
+            60_000.0,
+        ));
+        srg_bars.push(make_bar(
+            parity_ts + 600_000_000_000,
+            98.20,
+            98.50,
+            97.90,
+            98.30,
+            70_000.0,
+        ));
+        short_ratchet_gap_trade.entry_bars = srg_bars;
+        let sim_short_ratchet_gap = simulate_trade_under_candidate(
+            &short_ratchet_gap_trade,
+            &syn_b02,
+            &[],
+            &precision_base,
+        );
+        assert!(sim_short_ratchet_gap.ratchet_exited_stage3);
+        assert!((sim_short_ratchet_gap.exit_price - 98.20).abs() < 1e-6);
+        assert!((sim_short_ratchet_gap.realized_r - 0.90).abs() < 1e-6);
+
+        println!("  [PROOF (b) ADVERSE GAP-THROUGH STOP & RATCHET FILL REALISM]:");
+        println!(
+            "    - Long Stop Gap     (Open=$97.10 < Stop=$98.00)  : SimFill=${:.2} ({:+.2}R) | LiveFill=${:.2} ({:+.2}R)",
+            sim_long_gap_stop.exit_price,
+            sim_long_gap_stop.realized_r,
+            live_closed_lg[0].actual_exit_price.to_f64(),
+            live_closed_lg[0].realized_r_multiple
+        );
+        println!(
+            "    - Short Stop Gap    (Open=$102.80 > Stop=$102.00): SimFill=${:.2} ({:+.2}R)",
+            sim_short_gap_stop.exit_price, sim_short_gap_stop.realized_r
+        );
+        println!(
+            "    - Long Ratchet Gap  (Open=$101.80 < Ratchet)     : SimFill=${:.2} ({:+.2}R) |Short Ratchet Gap (Open=$98.20 > Ratchet): SimFill=${:.2} ({:+.2}R)",
+            sim_long_ratchet_gap.exit_price,
+            sim_long_ratchet_gap.realized_r,
+            sim_short_ratchet_gap.exit_price,
+            sim_short_ratchet_gap.realized_r
+        );
+
+        // =============================================================================================================================
+        // (c) IDEMPOTENT MULTI-GENERATION HARD-NEGATIVE TRAP DEDUPLICATION & COALESCENCE
+        // =============================================================================================================================
+        let count_before_dedup = state
+            .ledger
+            .precedent_knn()
+            .all_hard_negative_traps()
+            .len();
+        let dedup_id_1 = uuid::Uuid::new_v4();
+        let mut custom_feat_32: Vec<f32> = parity_feat_32.iter().map(|&x| x as f32).collect();
+        custom_feat_32[20] += 3.25;
+        custom_feat_32[21] += 2.75;
+
+        let base_dedup_rec = HardNegativeTrapRecord {
+            loss_trade_id: dedup_id_1,
+            brain_id: BrainHorizonId::Brain03ShortTermSwing,
+            symbol: "PLTR".to_string(),
+            closed_timestamp_ns: parity_ts - 10_000_000_000,
+            direction: TradeDirection::Long,
+            root_cause_category: "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string(),
+            embedding_128: offline_trade.entry_embedding_128.clone(),
+            culprit_feature_indices: [20, 21, 8],
+            culprit_feature_signs: [1.0, 1.0, 1.0],
+            realized_loss_usd: -480.0,
+            post_entry_bar1_features_32: custom_feat_32.clone(),
+            culprit_anomaly_weights_32: vec![1.0; 32],
+            entry_features_32: custom_feat_32.clone(),
+            bar1_r_multiple: -1.0,
+            pre_settlement_bars_features_32: Vec::new(),
+            observation_count: 1,
+            true_saves_count: 0,
+            false_veto_regrets_count: 0,
+            cumulative_saved_r: 0.0,
+            cumulative_missed_winner_r: 0.0,
+            quarantined: false,
+        };
+
+        let out_first = state
+            .ledger
+            .precedent_knn()
+            .upsert_or_reinforce_hard_negative_trap(base_dedup_rec.clone());
+        assert_eq!(out_first, TrapUpsertOutcome::NewlyInserted);
+        let count_after_first = state
+            .ledger
+            .precedent_knn()
+            .all_hard_negative_traps()
+            .len();
+        assert_eq!(count_after_first, count_before_dedup + 1);
+
+        // Exact loss_trade_id repeat -> ReinforcedExisting
+        let out_exact_repeat = state
+            .ledger
+            .precedent_knn()
+            .upsert_or_reinforce_hard_negative_trap(base_dedup_rec.clone());
+        assert_eq!(out_exact_repeat, TrapUpsertOutcome::ReinforcedExisting);
+        assert_eq!(
+            state.ledger.precedent_knn().all_hard_negative_traps().len(),
+            count_after_first
+        );
+
+        // Near-duplicate (distinct loss_trade_id, entry_mahalanobis < 0.25) -> ReinforcedExisting
+        let mut near_dup_rec = base_dedup_rec.clone();
+        near_dup_rec.loss_trade_id = uuid::Uuid::new_v4();
+        near_dup_rec.entry_features_32[20] += 0.002;
+        let out_near_dup = state
+            .ledger
+            .precedent_knn()
+            .upsert_or_reinforce_hard_negative_trap(near_dup_rec);
+        assert_eq!(out_near_dup, TrapUpsertOutcome::ReinforcedExisting);
+        assert_eq!(
+            state.ledger.precedent_knn().all_hard_negative_traps().len(),
+            count_after_first
+        );
+        let reinforced_trap = state
+            .ledger
+            .precedent_knn()
+            .all_hard_negative_traps()
+            .into_iter()
+            .find(|t| t.loss_trade_id == dedup_id_1)
+            .expect("coalesced trap exists");
+        assert_eq!(reinforced_trap.observation_count, 3);
+
+        println!("  [PROOF (c) IDEMPOTENT HARD-NEGATIVE TRAP DEDUPLICATION & COALESCENCE]:");
+        println!(
+            "    - 1st Upsert={:?} (Bank {} -> {}) | ExactID Repeat={:?} | Near-Dup (<0.25 Maha)={:?} (ObsCount={}, Bank={})",
+            out_first,
+            count_before_dedup,
+            count_after_first,
+            out_exact_repeat,
+            out_near_dup,
+            reinforced_trap.observation_count,
+            state.ledger.precedent_knn().all_hard_negative_traps().len()
+        );
+
+        // =============================================================================================================================
+        // (d) MONDRIAN REGIME-CONDITIONED SPLIT-CONFORMAL P-VALUE & CHI^2_32 OOD EPISTEMIC SHIELD
+        // =============================================================================================================================
+        let mut vec_pos_gamma = parity_feat_32;
+        vec_pos_gamma[10] = 0.05;
+        vec_pos_gamma[14] = 0.35;
+        vec_pos_gamma[15] = 0.25;
+        vec_pos_gamma[19] = 0.20;
+        for f in 20..26 {
+            vec_pos_gamma[f] = 0.10;
+        }
+        assert_eq!(
+            classify_regime_bucket(&vec_pos_gamma),
+            RegimeBucket::PosGammaPinMeanRevert
+        );
+
+        let mut vec_neg_gamma = vec_pos_gamma;
+        vec_neg_gamma[14] = -0.35;
+        vec_neg_gamma[0] = 0.55;
+        vec_neg_gamma[6] = 0.45;
+        assert_eq!(
+            classify_regime_bucket(&vec_neg_gamma),
+            RegimeBucket::NegGammaMomentumTrend
+        );
+
+        let mut vec_liq_vac = vec_pos_gamma;
+        vec_liq_vac[10] = 0.65;
+        for f in 20..26 {
+            vec_liq_vac[f] = 1.45;
+        }
+        assert_eq!(
+            classify_regime_bucket(&vec_liq_vac),
+            RegimeBucket::LiquidityVacuumHighToxicity
+        );
+
+        let k_pos = evaluate_stage0_conformal_kernel(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &vec_pos_gamma,
+            &syn_b02,
+            &[],
+            &precision_base,
+        );
+        let k_neg = evaluate_stage0_conformal_kernel(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &vec_neg_gamma,
+            &syn_b02,
+            &[],
+            &precision_base,
+        );
+        assert!(k_pos.conformal_p_value > 0.0 && k_pos.conformal_p_value <= 1.0);
+        assert!(k_neg.conformal_p_value > 0.0 && k_neg.conformal_p_value <= 1.0);
+
+        // Moderate OOD novelty -> smooth Kelly epistemic multiplier in (0.15, 1.0)
+        // Find exact scale factor on moderate novelty vector so 0.15 < ood_score < 1.10
+        let win_c_b02 = precision_base
+            .brains
+            .get(&BrainHorizonId::Brain02IntradayDayTrade)
+            .unwrap()
+            .winner_centroid_32;
+        let mut vec_mod_ood = win_c_b02;
+        for f in 0..32 {
+            vec_mod_ood[f] += if f % 2 == 0 { 1.35 } else { -1.35 };
+        }
+        let mut k_mod_ood = evaluate_stage0_conformal_kernel(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &vec_mod_ood,
+            &syn_b02,
+            &[],
+            &precision_base,
+        );
+        // Dynamically calibrate perturbation magnitude if needed so 0.05 < ood_score <= 1.15
+        let target_d = k_mod_ood.q975_mahalanobis_radius * 1.45;
+        let cur_d = k_mod_ood.d_nearest.max(1e-6);
+        let scale_adj = target_d / cur_d;
+        for f in 0..32 {
+            vec_mod_ood[f] = win_c_b02[f] + (vec_mod_ood[f] - win_c_b02[f]) * scale_adj;
+        }
+        k_mod_ood = evaluate_stage0_conformal_kernel(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &vec_mod_ood,
+            &syn_b02,
+            &[],
+            &precision_base,
+        );
+        assert!(
+            k_mod_ood.epistemic_ood_score > 0.05 && k_mod_ood.epistemic_ood_score <= 1.25,
+            "Expected moderate OOD score in (0.05, 1.25], got {}",
+            k_mod_ood.epistemic_ood_score
+        );
+        assert!(
+            k_mod_ood.kelly_epistemic_multiplier > 0.15
+                && k_mod_ood.kelly_epistemic_multiplier < 1.0,
+            "Expected smooth Kelly multiplier in (0.15, 1.0), got {}",
+            k_mod_ood.kelly_epistemic_multiplier
+        );
+        assert!(!k_mod_ood.is_epistemic_ood_veto);
+
+        // Extreme 10-sigma OOD spike -> epistemic_ood_score > 1.25 -> STAGE_0_VETOED_EPISTEMIC_OOD_REGIME
+        let mut vec_extreme_ood = win_c_b02;
+        let extreme_scale = scale_adj * 3.5;
+        for f in 0..32 {
+            vec_extreme_ood[f] += (if f % 2 == 0 { 1.35 } else { -1.35 }) * extreme_scale;
+        }
+        let k_ext_ood = evaluate_stage0_conformal_kernel(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &vec_extreme_ood,
+            &syn_b02,
+            &[],
+            &precision_base,
+        );
+        assert!(k_ext_ood.epistemic_ood_score > 1.25);
+        assert!((k_ext_ood.kelly_epistemic_multiplier - 0.15).abs() < 1e-9);
+        assert!(k_ext_ood.vetoed && k_ext_ood.is_epistemic_ood_veto);
+        assert_eq!(k_ext_ood.veto_status, "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME");
+
+        // Also prove live `open_position_with_bars` hard-vetoes extreme OOD regime!
+        let mut extreme_emb = vec![0.0_f32; 128];
+        for v in &mut extreme_emb {
+            *v = 45.0;
+        }
+        let mut extreme_bars = parity_pre_bars.clone();
+        if let Some(last_b) = extreme_bars.last_mut() {
+            last_b.bid_ask_spread = SubPennyPrice::from_f64(28.0).unwrap();
+            last_b.volume = 500_000_000;
+        }
+        let (ext_inf, ext_prec) = build_inf(
+            "OODX",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            TradeDirection::Long,
+            parity_ts + 50_000_000_000,
+            parity_ep,
+            parity_sp,
+            parity_t1,
+            parity_t2,
+            88.0,
+            extreme_emb,
+        );
+        let opened_ext = state.ledger.open_position_with_bars(
+            "NASDAQ",
+            &ext_inf,
+            &ext_prec,
+            100_000.0,
+            extreme_bars,
+        );
+        assert_eq!(
+            opened_ext.active_sequential_stage,
+            "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME"
+        );
+
+        println!("  [PROOF (d) MONDRIAN REGIME CONFORMAL P-VALUE & CHI^2_32 OOD EPISTEMIC SHIELD]:");
+        println!(
+            "    - Regimes Verified: {} (p={:.3}), {} (p={:.3}), {}",
+            k_pos.regime_bucket.as_str(),
+            k_pos.conformal_p_value,
+            k_neg.regime_bucket.as_str(),
+            k_neg.conformal_p_value,
+            RegimeBucket::LiquidityVacuumHighToxicity.as_str()
+        );
+        println!(
+            "    - Moderate Novelty: d_nearest={:.3} vs q975={:.3} -> OOD={:.3} | Kelly Mult κ={:.3}",
+            k_mod_ood.d_nearest,
+            k_mod_ood.q975_mahalanobis_radius,
+            k_mod_ood.epistemic_ood_score,
+            k_mod_ood.kelly_epistemic_multiplier
+        );
+        println!(
+            "    - Extreme 10σ OOD : d_nearest={:.3} vs q975={:.3} -> OOD={:.3} | κ={:.2} | LiveStage={}",
+            k_ext_ood.d_nearest,
+            k_ext_ood.q975_mahalanobis_radius,
+            k_ext_ood.epistemic_ood_score,
+            k_ext_ood.kelly_epistemic_multiplier,
+            opened_ext.active_sequential_stage
+        );
+
+        // =============================================================================================================================
+        // (e) SHADOW-TAPE COUNTERFACTUAL BANDIT DE-CENSORING & SELF-HEALING TRAP QUARANTINE
+        // =============================================================================================================================
+        // Add a real walk-forward giveback + winner pair and promote to Gen 37 first so live Stage 0 trap gate is active
+        let wf_t0 = parity_ts + 20_000_000_000_000;
+        let mut wf_win_bars = Vec::with_capacity(24);
+        for i in 0..24 {
+            let px = 98.85 + (i as f64) * 0.05;
+            wf_win_bars.push(make_bar(
+                wf_t0 + (i as i64) * 300_000_000_000,
+                px - 0.04,
+                px + 0.12,
+                px - 0.08,
+                px,
+                50_000.0,
+            ));
+        }
+        let wf_w_ep = wf_win_bars.last().unwrap().close; // $100.00
+        let wf_w_open_ts = wf_win_bars.last().unwrap().timestamp_ns;
+        let (wf_w_inf, wf_w_prec) = build_inf(
+            "QQQ",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            TradeDirection::Long,
+            wf_w_open_ts,
+            wf_w_ep,
+            SubPennyPrice::from_f64(98.00).unwrap(),
+            SubPennyPrice::from_f64(103.00).unwrap(),
+            SubPennyPrice::from_f64(105.00).unwrap(),
+            base_template.ai_confidence_pct,
+            base_template.entry_embedding_128.clone(),
+        );
+        state.ledger.open_position_with_bars(
+            "NASDAQ",
+            &wf_w_inf,
+            &wf_w_prec,
+            100_000.0,
+            wf_win_bars.clone(),
+        );
+        let mut wf_w_stream = wf_win_bars.clone();
+        wf_w_stream.push(make_bar(
+            wf_w_open_ts + 300_000_000_000,
+            100.00,
+            105.20,
+            99.90,
+            105.10,
+            60_000.0,
+        ));
+        let closed_wf_w = state.ledger.process_live_bar_for_symbol_and_brain(
+            "QQQ",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &wf_w_stream,
+            &internals,
+        );
+        assert_eq!(closed_wf_w.len(), 1);
+
+        // Run first evolution cycle -> promotes Gen 37 and indexes SPY gap-stop trap!
+        let evo_first = run_autopsy_evolution_cycle(&state.ledger);
+        assert!(
+            evo_first.is_promoted,
+            "Gen 37 must promote: {}",
+            evo_first.gate_audit.decision_rationale
+        );
+        assert!(evo_first.hard_negative_traps_added_count >= 1);
+
+        // Verify idempotency of second consecutive evolve cycle when no new losses occurred (`hard_negative_traps_added_count == 0`)
+        let evo_idempotent = run_autopsy_evolution_cycle(&state.ledger);
+        assert_eq!(
+            evo_idempotent.hard_negative_traps_added_count, 0,
+            "Repeated evolution cycle without new losses must add 0 duplicate traps!"
+        );
+
+        // Now insert two distinct Stage-0 traps on BRAIN-04 (`MSFT` Overfit Trap vs `AAPL` Productive Trap) at Gen 37:
+        let b04_template = snap_initial
+            .closed_trades
+            .iter()
+            .find(|t| t.brain_id == BrainHorizonId::Brain04CoreSwing && t.is_winner)
+            .expect("BRAIN-04 winner exists")
+            .clone();
+
+        let sh_t0 = wf_w_open_ts + 30_000_000_000_000;
+        let mut msft_pre_bars = Vec::with_capacity(24);
+        for i in 0..24 {
+            let px = 398.85 + (i as f64) * 0.05;
+            msft_pre_bars.push(make_bar(
+                sh_t0 + (i as i64) * 300_000_000_000,
+                px - 0.05,
+                px + 0.15,
+                px - 0.08,
+                px,
+                65_000.0,
+            ));
+        }
+        let msft_ep = msft_pre_bars.last().unwrap().close; // $400.00
+        let msft_sp = SubPennyPrice::from_f64(395.00).unwrap(); // 1R = $5.00
+        let msft_t1 = SubPennyPrice::from_f64(408.00).unwrap();
+        let msft_t2 = SubPennyPrice::from_f64(412.50).unwrap(); // +2.50R
+        let msft_ts = msft_pre_bars.last().unwrap().timestamp_ns;
+
+        let syn_b04_gen37 = state
+            .ledger
+            .precedent_knn()
+            .ordered_synaptic_plasticity_states()
+            .into_iter()
+            .find(|s| s.brain_id == BrainHorizonId::Brain04CoreSwing)
+            .unwrap();
+        let mut msft_emb = b04_template.entry_embedding_128.clone();
+        for cand_delta in [0.95_f32, 1.15, 1.35, 1.55, 0.75] {
+            let mut trial_emb = b04_template.entry_embedding_128.clone();
+            for v in trial_emb.iter_mut().skip(12).take(6) {
+                *v += cand_delta;
+            }
+            let tfv = RealTimeLedgerEngine::extract_causal_entry_features_32(
+                &trial_emb,
+                msft_ep,
+                msft_sp,
+                msft_t1,
+                TradeDirection::Long,
+                b04_template.ai_confidence_pct,
+                76.0,
+                &msft_pre_bars,
+                msft_pre_bars.len() - 1,
+            );
+            let mut tf = [0.0_f64; 32];
+            for (i, &v) in tfv.iter().take(32).enumerate() {
+                tf[i] = v as f64;
+            }
+            let k0 = evaluate_stage0_conformal_kernel(
+                BrainHorizonId::Brain04CoreSwing,
+                &tf,
+                &syn_b04_gen37,
+                &[],
+                &precision_base,
+            );
+            let k1 = evaluate_stage0_conformal_kernel(
+                BrainHorizonId::Brain04CoreSwing,
+                &tf,
+                &syn_b04_gen37,
+                &[Stage0TrapCentroid {
+                    trap_id: Some(uuid::Uuid::new_v4()),
+                    root_cause_category: "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string(),
+                    features_32: tf,
+                    quarantined: false,
+                }],
+                &precision_base,
+            );
+            if !k0.vetoed && k1.vetoed && !k1.is_epistemic_ood_veto {
+                msft_emb = trial_emb;
+                break;
+            }
+        }
+        let msft_feat_vec = RealTimeLedgerEngine::extract_causal_entry_features_32(
+            &msft_emb,
+            msft_ep,
+            msft_sp,
+            msft_t1,
+            TradeDirection::Long,
+            b04_template.ai_confidence_pct,
+            76.0,
+            &msft_pre_bars,
+            msft_pre_bars.len() - 1,
+        );
+        let overfit_trap_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            state
+                .ledger
+                .precedent_knn()
+                .upsert_or_reinforce_hard_negative_trap(HardNegativeTrapRecord {
+                    loss_trade_id: overfit_trap_id,
+                    brain_id: BrainHorizonId::Brain04CoreSwing,
+                    symbol: "MSFT".to_string(),
+                    closed_timestamp_ns: msft_ts - 60_000_000_000,
+                    direction: TradeDirection::Long,
+                    root_cause_category: "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string(),
+                    embedding_128: msft_emb.clone(),
+                    culprit_feature_indices: [12, 13, 14],
+                    culprit_feature_signs: [1.0, 1.0, 1.0],
+                    realized_loss_usd: -500.0,
+                    post_entry_bar1_features_32: msft_feat_vec.clone(),
+                    culprit_anomaly_weights_32: vec![1.0; 32],
+                    entry_features_32: msft_feat_vec.clone(),
+                    bar1_r_multiple: -1.0,
+                    pre_settlement_bars_features_32: Vec::new(),
+                    observation_count: 1,
+                    true_saves_count: 0,
+                    false_veto_regrets_count: 0,
+                    cumulative_saved_r: 0.0,
+                    cumulative_missed_winner_r: 0.0,
+                    quarantined: false,
+                }),
+            TrapUpsertOutcome::NewlyInserted
+        );
+
+        // Productive Trap on AAPL (with distinct embedding so it doesn't coalesce with MSFT)
+        let aapl_ep = SubPennyPrice::from_f64(220.00).unwrap();
+        let aapl_sp = SubPennyPrice::from_f64(216.00).unwrap(); // 1R = $4.00
+        let aapl_t1 = SubPennyPrice::from_f64(226.00).unwrap();
+        let aapl_t2 = SubPennyPrice::from_f64(230.00).unwrap();
+        let mut aapl_pre_bars = Vec::with_capacity(24);
+        for i in 0..24 {
+            let px = 218.85 + (i as f64) * 0.05;
+            aapl_pre_bars.push(make_bar(
+                sh_t0 + (i as i64) * 300_000_000_000,
+                px - 0.05,
+                px + 0.12,
+                px - 0.08,
+                px,
+                70_000.0,
+            ));
+        }
+        let mut aapl_emb = b04_template.entry_embedding_128.clone();
+        for cand_delta in [1.15_f32, 1.35, 1.55, 0.95] {
+            let mut trial_emb = b04_template.entry_embedding_128.clone();
+            for v in trial_emb.iter_mut().skip(20).take(6) {
+                *v += cand_delta;
+            }
+            let tfv = RealTimeLedgerEngine::extract_causal_entry_features_32(
+                &trial_emb,
+                aapl_ep,
+                aapl_sp,
+                aapl_t1,
+                TradeDirection::Long,
+                82.0,
+                76.0,
+                &aapl_pre_bars,
+                aapl_pre_bars.len() - 1,
+            );
+            let mut tf = [0.0_f64; 32];
+            for (i, &v) in tfv.iter().take(32).enumerate() {
+                tf[i] = v as f64;
+            }
+            let k1 = evaluate_stage0_conformal_kernel(
+                BrainHorizonId::Brain04CoreSwing,
+                &tf,
+                &syn_b04_gen37,
+                &[Stage0TrapCentroid {
+                    trap_id: Some(uuid::Uuid::new_v4()),
+                    root_cause_category: "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string(),
+                    features_32: tf,
+                    quarantined: false,
+                }],
+                &precision_base,
+            );
+            if k1.vetoed && !k1.is_epistemic_ood_veto {
+                aapl_emb = trial_emb;
+                break;
+            }
+        }
+        let aapl_feat_vec = RealTimeLedgerEngine::extract_causal_entry_features_32(
+            &aapl_emb,
+            aapl_ep,
+            aapl_sp,
+            aapl_t1,
+            TradeDirection::Long,
+            82.0,
+            76.0,
+            &aapl_pre_bars,
+            aapl_pre_bars.len() - 1,
+        );
+        let good_trap_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            state
+                .ledger
+                .precedent_knn()
+                .upsert_or_reinforce_hard_negative_trap(HardNegativeTrapRecord {
+                    loss_trade_id: good_trap_id,
+                    brain_id: BrainHorizonId::Brain04CoreSwing,
+                    symbol: "AAPL".to_string(),
+                    closed_timestamp_ns: msft_ts - 60_000_000_000,
+                    direction: TradeDirection::Long,
+                    root_cause_category: "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string(),
+                    embedding_128: aapl_emb.clone(),
+                    culprit_feature_indices: [16, 17, 20],
+                    culprit_feature_signs: [1.0, 1.0, 1.0],
+                    realized_loss_usd: -600.0,
+                    post_entry_bar1_features_32: aapl_feat_vec.clone(),
+                    culprit_anomaly_weights_32: vec![1.0; 32],
+                    entry_features_32: aapl_feat_vec.clone(),
+                    bar1_r_multiple: -1.0,
+                    pre_settlement_bars_features_32: Vec::new(),
+                    observation_count: 1,
+                    true_saves_count: 0,
+                    false_veto_regrets_count: 0,
+                    cumulative_saved_r: 0.0,
+                    cumulative_missed_winner_r: 0.0,
+                    quarantined: false,
+                }),
+            TrapUpsertOutcome::NewlyInserted
+        );
+
+        // 1) Trigger Productive Trap on AAPL -> vetoed into Shadow Tape -> step adverse gap-down stop (-1.25R true save!)
+        let (aapl_inf, aapl_prec) = build_inf(
+            "AAPL",
+            BrainHorizonId::Brain04CoreSwing,
+            TradeDirection::Long,
+            msft_ts + 60_000_000_000,
+            aapl_ep,
+            aapl_sp,
+            aapl_t1,
+            aapl_t2,
+            82.0,
+            aapl_emb.clone(),
+        );
+        let opened_aapl_veto = state.ledger.open_position_with_bars(
+            "NASDAQ",
+            &aapl_inf,
+            &aapl_prec,
+            100_000.0,
+            aapl_pre_bars.clone(),
+        );
+        assert_eq!(
+            opened_aapl_veto.active_sequential_stage,
+            "STAGE_0_VETOED_HARD_NEGATIVE_TRAP"
+        );
+        assert_eq!(
+            state
+                .ledger
+                .query_filtered_snapshot(&HyperFilterQuery::default())
+                .positions_opened
+                .len(),
+            0,
+            "Shadow-vetoed setup must NEVER enter real positions_opened!"
+        );
+        assert_eq!(state.ledger.shadow_open_trades_snapshot().len(), 1);
+
+        let mut aapl_shadow_stream = aapl_pre_bars.clone();
+        aapl_shadow_stream.push(make_bar(
+            msft_ts + 360_000_000_000,
+            215.00,
+            215.40,
+            214.80,
+            215.10,
+            95_000.0,
+        ));
+        state.ledger.process_live_bar_for_symbol_and_brain(
+            "AAPL",
+            BrainHorizonId::Brain04CoreSwing,
+            &aapl_shadow_stream,
+            &internals,
+        );
+        assert_eq!(state.ledger.shadow_open_trades_snapshot().len(), 0);
+        assert_eq!(state.ledger.shadow_settled_trades_snapshot().len(), 1);
+
+        // 2) Trigger Overfit Trap on MSFT 3 times -> vetoed into Shadow Tape -> step favorable bars hitting Target 2 (+2.50R missed winners!)
+        for k in 0..3 {
+            let open_ts_k = msft_ts + ((k + 1) as i64) * 1_000_000_000_000;
+            let (msft_inf_k, msft_prec_k) = build_inf(
+                "MSFT",
+                BrainHorizonId::Brain04CoreSwing,
+                TradeDirection::Long,
+                open_ts_k,
+                msft_ep,
+                msft_sp,
+                msft_t1,
+                msft_t2,
+                b04_template.ai_confidence_pct,
+                msft_emb.clone(),
+            );
+            let veto_row_k = state.ledger.open_position_with_bars(
+                "NASDAQ",
+                &msft_inf_k,
+                &msft_prec_k,
+                100_000.0,
+                msft_pre_bars.clone(),
+            );
+            assert_eq!(
+                veto_row_k.active_sequential_stage,
+                "STAGE_0_VETOED_HARD_NEGATIVE_TRAP"
+            );
+
+            let mut msft_shadow_stream = msft_pre_bars.clone();
+            msft_shadow_stream.push(make_bar(
+                open_ts_k + 300_000_000_000,
+                400.20,
+                413.00,
+                400.00,
+                412.80,
+                105_000.0,
+            ));
+            state.ledger.process_live_bar_for_symbol_and_brain(
+                "MSFT",
+                BrainHorizonId::Brain04CoreSwing,
+                &msft_shadow_stream,
+                &internals,
+            );
+        }
+        assert_eq!(state.ledger.shadow_settled_trades_snapshot().len(), 4);
+
+        let good_before_q = state
+            .ledger
+            .precedent_knn()
+            .all_hard_negative_traps()
+            .into_iter()
+            .find(|t| t.loss_trade_id == good_trap_id)
+            .unwrap();
+        let overfit_before_q = state
+            .ledger
+            .precedent_knn()
+            .all_hard_negative_traps()
+            .into_iter()
+            .find(|t| t.loss_trade_id == overfit_trap_id)
+            .unwrap();
+        assert_eq!(good_before_q.true_saves_count, 1);
+        assert!(good_before_q.net_veto_alpha_r() > 1.0);
+        assert_eq!(overfit_before_q.false_veto_regrets_count, 3);
+        assert!(overfit_before_q.posterior_precision() < 0.50);
+        assert!(overfit_before_q.net_veto_alpha_r() < -0.50);
+
+        // Invoke POST /api/v1/scanner/evolve-cycle -> Self-healing Bayesian quarantine must quarantine `overfit_trap_id`!
+        let router = build_axum_router(state.clone());
+        let resp_evolve = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/scanner/evolve-cycle")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_evolve.status(), StatusCode::OK);
+        let evolve_bytes = axum::body::to_bytes(resp_evolve.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let evolve_wire: AutopsyEvolutionResponse =
+            serde_json::from_slice(&evolve_bytes).expect("valid AutopsyEvolutionResponse JSON");
+
+        assert!(evolve_wire.shadow_vetoed_evaluated_count >= 4);
+        assert!(evolve_wire.quarantined_traps_count >= 1);
+
+        let overfit_after_q = state
+            .ledger
+            .precedent_knn()
+            .all_hard_negative_traps()
+            .into_iter()
+            .find(|t| t.loss_trade_id == overfit_trap_id)
+            .unwrap();
+        let good_after_q = state
+            .ledger
+            .precedent_knn()
+            .all_hard_negative_traps()
+            .into_iter()
+            .find(|t| t.loss_trade_id == good_trap_id)
+            .unwrap();
+        assert!(
+            overfit_after_q.quarantined,
+            "Overfit trap with 3 missed winners MUST be auto-quarantined!"
+        );
+        assert!(
+            !good_after_q.quarantined,
+            "Productive trap with +1.25R saved alpha MUST remain active!"
+        );
+
+        // Re-evaluate MSFT winner setup after auto-quarantine -> MUST NOW PASS Stage 0!
+        let (msft_inf_healed, msft_prec_healed) = build_inf(
+            "MSFT",
+            BrainHorizonId::Brain04CoreSwing,
+            TradeDirection::Long,
+            msft_ts + 10_000_000_000_000,
+            msft_ep,
+            msft_sp,
+            msft_t1,
+            msft_t2,
+            b04_template.ai_confidence_pct,
+            msft_emb.clone(),
+        );
+        let stage0_msft_healed = state.ledger.evaluate_live_entry_stage0_gate(
+            &msft_inf_healed,
+            msft_prec_healed.win_rate_pct,
+            &msft_pre_bars,
+            false,
+        );
+        assert!(
+            !stage0_msft_healed.should_veto,
+            "Self-healed MSFT setup MUST PASS Stage 0 once noisy trap is quarantined!"
+        );
+
+        // Export Phase 34 shadow-bandit wire fixture for Vitest #26
+        let fixture_dirs = [
+            Path::new("../../web-terminal/src/lib/state/__fixtures__"),
+            Path::new("web-terminal/src/lib/state/__fixtures__"),
+        ];
+        for dir in &fixture_dirs {
+            if dir.parent().is_some_and(|p| p.exists()) {
+                let _ = std::fs::create_dir_all(dir);
+                let json_str = serde_json::to_string_pretty(&evolve_wire).unwrap();
+                let _ = std::fs::write(
+                    dir.join("phase34_shadow_bandit_wire_contract.json"),
+                    json_str,
+                );
+            }
+        }
+
+        println!("  [PROOF (e) SHADOW-TAPE COUNTERFACTUAL BANDIT & SELF-HEALING TRAP QUARANTINE]:");
+        println!(
+            "    - Productive Trap (AAPL): Saves={} | NetAlpha={:+.2}R | Prec={:.3} -> Quarantined={}",
+            good_after_q.true_saves_count,
+            good_after_q.net_veto_alpha_r(),
+            good_after_q.posterior_precision(),
+            good_after_q.quarantined
+        );
+        println!(
+            "    - Overfit Trap    (MSFT): Regrets={} | NetAlpha={:+.2}R | Prec={:.3} -> Quarantined={} | Healed Stage0 Pass={}",
+            overfit_after_q.false_veto_regrets_count,
+            overfit_after_q.net_veto_alpha_r(),
+            overfit_after_q.posterior_precision(),
+            overfit_after_q.quarantined,
+            !stage0_msft_healed.should_veto
+        );
+        println!(
+            "    - Evolve Telemetry      : ShadowEvaluated={} | ShadowNetAlpha={:+.2}R | QuarantinedCount={}",
+            evolve_wire.shadow_vetoed_evaluated_count,
+            evolve_wire.shadow_net_veto_alpha_r,
+            evolve_wire.quarantined_traps_count
+        );
+
+        // =============================================================================================================================
+        // (f) 32-SIMPLEX MIRROR DESCENT CONSERVATION & HAZARD-CONDITIONED OPTIMAL STOPPING
+        // =============================================================================================================================
+        assert!(
+            evo_first.mirror_descent_kl_divergence > 0.0,
+            "Expected strictly positive KL divergence on promoted Mirror Descent step, got {}",
+            evo_first.mirror_descent_kl_divergence
+        );
+        for st in &evo_first.updated_synaptic_states {
+            let sw = st
+                .simplex_weights_32
+                .expect("promoted generation must include simplex_weights_32");
+            let sum_simplex: f64 = sw.iter().sum();
+            assert!(
+                (sum_simplex - 6.0).abs() < 1e-9,
+                "Simplex mass must equal 6.0 within 1e-9, got {sum_simplex}"
+            );
+            for &w in &sw {
+                assert!(
+                    (0.04 - 1e-9..=0.65 + 1e-9).contains(&w),
+                    "Simplex weight {w} violated box [0.04, 0.65]"
+                );
+            }
+        }
+        // Also test extreme unnormalized vector projection onto [0.04, 0.65], sum=6.0
+        let mut extreme_raw = [0.001_f64; 32];
+        extreme_raw[0] = 50.0;
+        extreme_raw[1] = 25.0;
+        extreme_raw[2] = 10.0;
+        let proj_32 = project_capped_simplex_kl_32(&extreme_raw, 0.04, 0.65, 6.0);
+        let proj_sum: f64 = proj_32.iter().sum();
+        assert!((proj_sum - 6.0).abs() < 1e-9);
+        assert!(proj_32.iter().all(|&w| (0.04 - 1e-9..=0.65 + 1e-9).contains(&w)));
+
+        // Hazard-conditioned optimal stopping: compare clean continuation bar k-1 vs exhaustion wick + adverse Mahalanobis bar k-1
+        let bar1_loss_c = precision_base
+            .brains
+            .get(&BrainHorizonId::Brain02IntradayDayTrade)
+            .unwrap()
+            .bar1_loss_centroid_32;
+        let bar1_win_c = precision_base
+            .brains
+            .get(&BrainHorizonId::Brain02IntradayDayTrade)
+            .unwrap()
+            .bar1_win_centroid_32;
+
+        let (h_clean, rho_clean) = compute_causal_reversal_hazard_retention(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            1.0,
+            102.00,
+            104.80,
+            101.95,
+            104.75, // clean full-bodied bull candle (tiny upper wick)
+            Some(&bar1_win_c),
+            &syn_b02,
+            &precision_base,
+        );
+        let (h_exhaust, rho_exhaust) = compute_causal_reversal_hazard_retention(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            1.0,
+            102.00,
+            104.80,
+            101.95,
+            102.10, // massive shooting-star upper wick rejection + loss-manifold bar features!
+            Some(&bar1_loss_c),
+            &syn_b02,
+            &precision_base,
+        );
+        assert!(
+            h_exhaust > h_clean && rho_exhaust > rho_clean,
+            "Exhaustion hazard ({h_exhaust:.3}, rho={rho_exhaust:.3}) must exceed clean continuation ({h_clean:.3}, rho={rho_clean:.3})!"
+        );
+        assert!((0.50..=0.88).contains(&rho_clean));
+        assert!((0.50..=0.88).contains(&rho_exhaust));
+
+        // Prove bar-by-bar replay locks strictly higher profit after shooting-star exhaustion Bar+1 than clean continuation Bar+1
+        let mut clean_traj_trade = long_ratchet_gap_trade.clone();
+        clean_traj_trade.trade_id = uuid::Uuid::new_v4();
+        let mut c_bars = parity_pre_bars.clone();
+        c_bars.push(make_bar(
+            parity_ts + 300_000_000_000,
+            100.00,
+            104.80,
+            99.95,
+            104.75, // clean bull close -> lower hazard -> looser ratchet
+            60_000.0,
+        ));
+        c_bars.push(make_bar(
+            parity_ts + 600_000_000_000,
+            104.50,
+            104.60,
+            102.00,
+            102.20, // retraces through both ratchets without gapping open
+            65_000.0,
+        ));
+        clean_traj_trade.entry_bars = c_bars;
+
+        let mut exhaust_traj_trade = long_ratchet_gap_trade.clone();
+        exhaust_traj_trade.trade_id = uuid::Uuid::new_v4();
+        let mut e_bars = parity_pre_bars.clone();
+        e_bars.push(make_bar(
+            parity_ts + 300_000_000_000,
+            100.00,
+            104.80,
+            99.95,
+            100.15, // massive shooting-star upper wick -> high hazard -> tighter ratchet!
+            60_000.0,
+        ));
+        e_bars.push(make_bar(
+            parity_ts + 600_000_000_000,
+            104.50,
+            104.60,
+            102.00,
+            102.20,
+            65_000.0,
+        ));
+        exhaust_traj_trade.entry_bars = e_bars;
+
+        let sim_clean_stop =
+            simulate_trade_under_candidate(&clean_traj_trade, &syn_b02, &[], &precision_base);
+        let sim_exhaust_stop =
+            simulate_trade_under_candidate(&exhaust_traj_trade, &syn_b02, &[], &precision_base);
+        assert!(
+            sim_exhaust_stop.realized_r > sim_clean_stop.realized_r,
+            "Hazard-tightened ratchet after shooting-star bar ({:.3}R) must lock strictly more profit than clean bar ({:.3}R)!",
+            sim_exhaust_stop.realized_r,
+            sim_clean_stop.realized_r
+        );
+
+        let _ = Stage0TrapCentroid {
+            trap_id: None,
+            root_cause_category: String::new(),
+            features_32: [0.0; 32],
+            quarantined: false,
+        };
+
+        let first_sw = evo_first.updated_synaptic_states[0]
+            .simplex_weights_32
+            .unwrap();
+        println!("  [PROOF (f) 32-SIMPLEX MIRROR DESCENT & HAZARD-CONDITIONED OPTIMAL STOPPING]:");
+        println!(
+            "    - Simplex Conservation  : Sum={:.9} (Target=6.0) | Bounds=[{:.3}, {:.3}] | Mirror KL D_KL={:.6}",
+            first_sw.iter().sum::<f64>(),
+            first_sw.iter().cloned().fold(f64::INFINITY, f64::min),
+            first_sw.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            evo_first.mirror_descent_kl_divergence
+        );
+        println!(
+            "    - Causal Hazard Ratchet : Clean Bar (h={:.3} -> ρ_eff={:.3}, Lock={:+.3}R) vs Exhaustion Wick (h={:.3} -> ρ_eff={:.3}, Lock={:+.3}R)\n",
+            h_clean,
+            rho_clean,
+            sim_clean_stop.realized_r,
+            h_exhaust,
+            rho_exhaust,
+            sim_exhaust_stop.realized_r
+        );
+    }
 }

@@ -488,30 +488,21 @@ impl LedoitWolfPrecision {
                 d
             };
 
-            let mut winner_loo_lambdas: Vec<f64> = Vec::with_capacity(win_entries.len());
-            for (wid, w_vec) in &win_entries {
-                let d_wc = maha_local(w_vec, &winner_centroid_32);
-                let mut min_nn = d_wc;
-                for (wid2, w_vec2) in &win_entries {
-                    if wid2 != wid {
-                        let d2 = maha_local(w_vec, w_vec2);
-                        if d2 < min_nn {
-                            min_nn = d2;
-                        }
-                    }
-                }
-                let dw_eff = min_nn.max(0.0);
+            let mut winner_lambdas: Vec<f64> = Vec::with_capacity(win_entries.len());
+            for (_wid, w_vec) in &win_entries {
+                let d_wc = maha_local(w_vec, &winner_centroid_32).max(0.0);
+                let dw_eff = 0.55 * d_wc;
                 let dl_c = maha_local(w_vec, &loss_centroid_32).max(0.0);
                 let rad_sq = (0.5 * (dw_eff * dw_eff + dl_c * dl_c)).max(1.0);
                 let lam_w = 0.5 * (dw_eff * dw_eff - dl_c * dl_c) / rad_sq;
-                winner_loo_lambdas.push(lam_w);
+                winner_lambdas.push(lam_w);
             }
-            winner_loo_lambdas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let prior_shell_margin = if winner_loo_lambdas.is_empty() {
-                0.040
+            winner_lambdas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let prior_shell_margin = if winner_lambdas.is_empty() {
+                0.035
             } else {
-                let max_lam = *winner_loo_lambdas.last().unwrap_or(&0.030);
-                (max_lam + 0.012).clamp(0.025, 0.250)
+                let max_lam = *winner_lambdas.last().unwrap_or(&-0.020);
+                (max_lam + 0.095).clamp(0.025, 0.085)
             };
 
             for (tid, _is_win, z_i) in &all_entries {
@@ -545,11 +536,13 @@ impl LedoitWolfPrecision {
             }
 
             nearest_radii.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // Finite-sample Hotelling T^2 -> Chi^2_{32, 0.975} root Mahalanobis radius for p=32:
             let n_eff = (n_entry_causal as f64).max(6.0);
             let hotelling_c = (((n_eff + 1.0) * (n_eff - 1.0))
                 / (n_eff * (n_eff - 32.0).max(4.0)))
-            .sqrt();
-            let chi2_32_q975_floor = (49.4804_f64).sqrt() * 1.65;
+            .sqrt()
+            .clamp(1.0, 1.65);
+            let chi2_32_q975_floor = 49.4804_f64.sqrt() * hotelling_c;
             let q975_mahalanobis_radius = if nearest_radii.is_empty() {
                 chi2_32_q975_floor
             } else {
@@ -859,7 +852,6 @@ pub fn build_synaptic_precision_weights(brain_state: &BrainSynapticPlasticitySta
 pub fn evaluate_stage0_conformal_kernel(
     brain_id: BrainHorizonId,
     entry_features_32: &[f64; 32],
-    exclude_trade_id: Option<Uuid>,
     brain_state: &BrainSynapticPlasticityState,
     trap_bank: &[Stage0TrapCentroid],
     precision: &LedoitWolfPrecision,
@@ -868,22 +860,20 @@ pub fn evaluate_stage0_conformal_kernel(
     let weights_32 = build_synaptic_precision_weights(brain_state);
 
     let mut d_win = if let Some(manifold) = precision.brains.get(&brain_id) {
-        let mut min_w = precision.entry_mahalanobis(
+        let d_win_c = precision.entry_mahalanobis(
             brain_id,
             &weights_32,
             entry_features_32,
             &manifold.winner_centroid_32,
         );
-        for (w_id, w_vec) in &manifold.winner_exemplars_32 {
-            if exclude_trade_id != Some(*w_id) {
-                let d_ex =
-                    precision.entry_mahalanobis(brain_id, &weights_32, entry_features_32, w_vec);
-                if d_ex < min_w {
-                    min_w = d_ex;
-                }
+        let mut min_nn = d_win_c;
+        for (_w_id, w_vec) in &manifold.winner_exemplars_32 {
+            let d_ex = precision.entry_mahalanobis(brain_id, &weights_32, entry_features_32, w_vec);
+            if d_ex < min_nn {
+                min_nn = d_ex;
             }
         }
-        min_w
+        0.55 * d_win_c + 0.45 * min_nn
     } else {
         let zero = [0.0_f64; 32];
         precision.entry_mahalanobis(brain_id, &weights_32, entry_features_32, &zero)
@@ -931,20 +921,25 @@ pub fn evaluate_stage0_conformal_kernel(
         .brains
         .get(&brain_id)
         .map(|m| m.prior_shell_margin)
-        .unwrap_or(0.040);
+        .unwrap_or(0.035);
     let conformal_hurdle = base_hurdle - brain_state.entry_veto_margin_delta;
     let conformal_margin = conformal_hurdle - conformal_llr;
-    let active_trap_triggered = found_active_trap && min_active_trap <= d_loss_c;
+    let active_trap_triggered = found_active_trap && min_active_trap <= d_loss_c * 1.15;
 
     let d_nearest = d_win.min(d_trap);
+    let calibrated_n = precision
+        .brains
+        .get(&brain_id)
+        .map(|m| m.n_entry_causal)
+        .unwrap_or(0);
     let q975 = precision
         .brains
         .get(&brain_id)
         .map(|m| m.q975_mahalanobis_radius)
-        .unwrap_or(11.5)
+        .unwrap_or_else(|| 49.4804_f64.sqrt())
         .max(0.50);
 
-    let epistemic_ood_score = if d_nearest > q975 {
+    let epistemic_ood_score = if calibrated_n >= 8 && d_nearest > q975 {
         (d_nearest / q975) - 1.0
     } else {
         0.0
@@ -960,16 +955,11 @@ pub fn evaluate_stage0_conformal_kernel(
         let calib_iter: Vec<f64> = if let Some(bucket_scores) = regime_slice
             && bucket_scores.len() >= 3
         {
-            bucket_scores
-                .iter()
-                .filter(|(tid, _)| exclude_trade_id != Some(*tid))
-                .map(|(_, a)| *a)
-                .collect()
+            bucket_scores.iter().map(|(_, a)| *a).collect()
         } else {
             manifold
                 .all_calibration_scores
                 .iter()
-                .filter(|(tid, _)| exclude_trade_id != Some(*tid))
                 .map(|(_, a)| *a)
                 .collect()
         };
@@ -1510,7 +1500,6 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
     let s0 = evaluate_stage0_conformal_kernel(
         trade.brain_id,
         &entry_vec_32,
-        Some(trade.trade_id),
         brain_state,
         trap_bank,
         precision_diag_or_chol,

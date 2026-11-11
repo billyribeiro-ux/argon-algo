@@ -2718,6 +2718,24 @@ pub struct InstitutionalWatchlistRow {
     #[serde(default)]
     pub kelly_epistemic_multiplier: f64,
     #[serde(default)]
+    pub conformal_kelly_scalar: f64,
+    #[serde(default)]
+    pub unified_stage0_kelly_multiplier: f64,
+    #[serde(default)]
+    pub eigen_kelly_multiplier: f64,
+    #[serde(default)]
+    pub marginal_correlation_penalty: f64,
+    #[serde(default)]
+    pub contextual_brain_weight_pi: f64,
+    #[serde(default)]
+    pub posterior_t_sharpe: f64,
+    #[serde(default)]
+    pub recommended_option_structure: String,
+    #[serde(default)]
+    pub gamma_theta_efficiency: f64,
+    #[serde(default)]
+    pub theta_burn_hazard: f64,
+    #[serde(default)]
     pub action_status: String,
     #[serde(default)]
     pub venue_ticket: String,
@@ -2729,7 +2747,7 @@ pub struct InstitutionalWatchlistRow {
     pub execution_tier: String,
 }
 
-/// Phase 29 & 30: Institutional Watchlist Response returned by `GET /api/v1/scanner/watchlist`
+/// Phase 29, 30 & 35: Institutional Watchlist Response returned by `GET /api/v1/scanner/watchlist`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstitutionalWatchlistResponse {
     pub timestamp_iso: String,
@@ -2746,6 +2764,14 @@ pub struct InstitutionalWatchlistResponse {
     pub cross_brain_conflicts_blocked: usize,
     #[serde(default)]
     pub estimated_occ_tims_margin_relief_pct: f64,
+    #[serde(default)]
+    pub absorption_ratio: f64,
+    #[serde(default)]
+    pub effective_independent_bets_neff: f64,
+    #[serde(default)]
+    pub eigen_kelly_multiplier: f64,
+    #[serde(default)]
+    pub contextual_nig_allocations: Vec<crate::portfolio_eigen_risk::BrainContextualAllocationRow>,
     pub watchlist: Vec<InstitutionalWatchlistRow>,
     pub market_internals: UnifiedMarketInternals,
 }
@@ -2902,11 +2928,24 @@ pub async fn build_institutional_watchlist_at_epoch(
     override_eval_epoch_s: Option<i64>,
 ) -> Result<InstitutionalWatchlistResponse, (StatusCode, String)> {
     let mut rows = Vec::new();
+    let mut row_close_series: Vec<Vec<f64>> = Vec::new();
+    let mut row_veto_categories: Vec<String> = Vec::new();
     let gen_id = state
         .ledger
         .precedent_knn()
         .get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade)
         .generation_id;
+    let nig_allocator = state.ledger.build_contextual_nig_meta_allocator();
+    let base_snap = state
+        .ledger
+        .query_filtered_snapshot(&HyperFilterQuery::default());
+    let base_open_legs: Vec<crate::portfolio_eigen_risk::EigenPositionSeries> = base_snap
+        .positions_opened
+        .iter()
+        .map(crate::portfolio_eigen_risk::EigenPositionSeries::from_open_row)
+        .collect();
+    let base_heat_fraction =
+        (base_snap.portfolio_heat_telemetry.current_heat_pct / 6.0).clamp(0.0, 2.0);
 
     // 1. Establish Canonical Underlying Spot Map: resolve single latest authoritative spot per symbol
     let mut canonical_spot_map: HashMap<String, (i64, f64)> = HashMap::new();

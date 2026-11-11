@@ -238,6 +238,10 @@ pub struct EntryTrapVsWinnerDiagnostic {
     pub epistemic_ood_score: f64,
     #[serde(default = "default_kelly_epistemic_multiplier")]
     pub kelly_epistemic_multiplier: f64,
+    #[serde(default = "default_kelly_epistemic_multiplier")]
+    pub conformal_kelly_scalar: f64,
+    #[serde(default = "default_kelly_epistemic_multiplier")]
+    pub unified_stage0_kelly_multiplier: f64,
 }
 
 /// Phase 27 Live Dual-Engine (`ENGINE-A` Structured Champion vs. `ENGINE-B` Self-Learned Synaptic ML vs. `CONSENSUS`)
@@ -1483,6 +1487,8 @@ impl PrecedentKnnIndex {
                 regime_bucket: "POS_GAMMA_PIN_MEAN_REVERT".to_string(),
                 epistemic_ood_score: 0.0,
                 kelly_epistemic_multiplier: 1.0,
+                conformal_kelly_scalar: 1.0,
+                unified_stage0_kelly_multiplier: 1.0,
             };
         }
 
@@ -1705,6 +1711,8 @@ impl PrecedentKnnIndex {
             regime_bucket: "POS_GAMMA_PIN_MEAN_REVERT".to_string(),
             epistemic_ood_score: 0.0,
             kelly_epistemic_multiplier: 1.0,
+            conformal_kelly_scalar: 1.0,
+            unified_stage0_kelly_multiplier: 1.0,
         }
     }
 
@@ -1731,13 +1739,11 @@ impl PrecedentKnnIndex {
     }
 
     #[allow(clippy::needless_range_loop)]
-    pub fn solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+    pub fn factor_ledoit_wolf_cholesky_32_scaled(
         sample_cov: &[[f64; 32]; 32],
         n_causal: usize,
-        culprit_weights: &[f64; 32],
-        diff: &[f64; 32],
         scale_sq: f64,
-    ) -> (f64, f64) {
+    ) -> ([[f64; 32]; 32], f64, f64) {
         let lambda = (4.0 / ((n_causal as f64) + 4.0)).clamp(0.15, 0.85);
         let s_sq = scale_sq.max(1e-18);
         let min_diag = 0.0016 * s_sq;
@@ -1772,8 +1778,17 @@ impl PrecedentKnnIndex {
                 }
             }
         }
+        (chol_l, chol_std_eps, lambda)
+    }
 
-        // Forward substitution: solve L * y = delta, where delta_i = sqrt(w_i) * diff_i
+    #[allow(clippy::needless_range_loop)]
+    #[inline]
+    pub fn solve_precomputed_cholesky_mahalanobis_32(
+        chol_l: &[[f64; 32]; 32],
+        chol_std_eps: f64,
+        culprit_weights: &[f64; 32],
+        diff: &[f64; 32],
+    ) -> f64 {
         let mut y = [0.0_f64; 32];
         let mut maha_sq = 0.0_f64;
         for i in 0..32 {
@@ -1786,8 +1801,26 @@ impl PrecedentKnnIndex {
             y[i] = y_i;
             maha_sq += y_i * y_i;
         }
+        maha_sq.max(0.0).sqrt()
+    }
 
-        (maha_sq.max(0.0).sqrt(), lambda)
+    #[allow(clippy::needless_range_loop)]
+    pub fn solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+        sample_cov: &[[f64; 32]; 32],
+        n_causal: usize,
+        culprit_weights: &[f64; 32],
+        diff: &[f64; 32],
+        scale_sq: f64,
+    ) -> (f64, f64) {
+        let (chol_l, chol_std_eps, lambda) =
+            Self::factor_ledoit_wolf_cholesky_32_scaled(sample_cov, n_causal, scale_sq);
+        let dist = Self::solve_precomputed_cholesky_mahalanobis_32(
+            &chol_l,
+            chol_std_eps,
+            culprit_weights,
+            diff,
+        );
+        (dist, lambda)
     }
 
     /// Dual-Distribution Bayesian Log-Likelihood Ratio (`Loss Breakdown Centroid` vs. `Winner Pullback Centroid`):

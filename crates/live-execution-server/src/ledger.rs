@@ -2575,6 +2575,16 @@ pub struct ShadowVetoedTrade {
     pub bars_held: usize,
     pub max_hold_bars: usize,
     pub entry_features_32: [f64; 32],
+    #[serde(default)]
+    pub entry_embedding_128: Vec<f32>,
+    #[serde(default)]
+    pub ai_confidence_pct: f64,
+    #[serde(default)]
+    pub precedent_win_rate_pct: f64,
+    #[serde(default)]
+    pub causal_bars: Vec<RawBarRecord>,
+    #[serde(default)]
+    pub entry_bar_idx: usize,
     pub prev_bar_record: Option<RawBarRecord>,
     pub settled: bool,
     pub outcome_label: String,
@@ -2586,6 +2596,9 @@ pub struct RealTimeLedgerEngine {
     precedent_knn: Arc<PrecedentKnnIndex>,
     positions_opened: RwLock<Vec<OpenPositionRow>>,
     closed_ledger: RwLock<Vec<ClosedTradeRow>>,
+    closed_ledger_len: std::sync::atomic::AtomicUsize,
+    cached_stage0_precision:
+        RwLock<Option<(usize, u32, Arc<crate::autopsy_evolver::LedoitWolfPrecision>)>>,
     running_net_profit_usd: RwLock<f64>,
     autopsy_runs_count: RwLock<u64>,
     last_autopsy_iso: RwLock<String>,
@@ -2620,6 +2633,8 @@ impl RealTimeLedgerEngine {
             precedent_knn,
             positions_opened: RwLock::new(Vec::with_capacity(128)),
             closed_ledger: RwLock::new(Vec::with_capacity(4096)),
+            closed_ledger_len: std::sync::atomic::AtomicUsize::new(0),
+            cached_stage0_precision: RwLock::new(None),
             running_net_profit_usd: RwLock::new(0.0),
             autopsy_runs_count: RwLock::new(1),
             last_autopsy_iso: RwLock::new(Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string()),
@@ -2703,6 +2718,100 @@ impl RealTimeLedgerEngine {
         out
     }
 
+    /// Returns a cached `Arc<LedoitWolfPrecision>` keyed by `(baseline_len, active_generation_id)`.
+    /// On cache hit, runs in $O(1)$ atomic/RwLock read without acquiring `closed_ledger.read()` or
+    /// re-factoring $32 \times 32$ Cholesky matrices.
+    pub fn get_or_build_cached_stage0_precision(
+        &self,
+        active_generation_id: u32,
+    ) -> Arc<crate::autopsy_evolver::LedoitWolfPrecision> {
+        if active_generation_id == 0 {
+            return Arc::new(crate::autopsy_evolver::LedoitWolfPrecision {
+                brains: std::collections::HashMap::new(),
+            });
+        }
+        let baseline_len = 173.min(
+            self.closed_ledger_len
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        if let Some((cached_len, cached_gen, ref arc_prec)) = *self.cached_stage0_precision.read()
+            && cached_len == baseline_len
+            && cached_gen == active_generation_id
+        {
+            return Arc::clone(arc_prec);
+        }
+
+        let closed_snap = self.closed_ledger.read();
+        let actual_len = closed_snap.len();
+        self.closed_ledger_len
+            .store(actual_len, std::sync::atomic::Ordering::Release);
+        let baseline_count = 173.min(actual_len);
+        let built = Arc::new(
+            crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
+                &closed_snap[0..baseline_count],
+            ),
+        );
+        drop(closed_snap);
+
+        *self.cached_stage0_precision.write() =
+            Some((baseline_count, active_generation_id, Arc::clone(&built)));
+        built
+    }
+
+    /// Evaluates live book-level or candidate-level Eigen-Correlation & Crowding (`Phase 35`).
+    pub fn evaluate_book_eigen_risk(
+        &self,
+        candidate: Option<&crate::portfolio_eigen_risk::EigenPositionSeries>,
+    ) -> crate::portfolio_eigen_risk::PortfolioEigenRiskReport {
+        let open_rows = self.positions_opened.read().clone();
+        let live_equity = (100_000.0 + *self.running_net_profit_usd.read()).max(50_000.0);
+        let heat = PortfolioHeatRiskEngine::compute_telemetry(&open_rows, live_equity);
+        let gross_heat_fraction =
+            (heat.current_heat_pct / PortfolioHeatRiskEngine::MAX_PORTFOLIO_HEAT_PCT).clamp(0.0, 2.0);
+        let open_legs: Vec<crate::portfolio_eigen_risk::EigenPositionSeries> = open_rows
+            .iter()
+            .map(crate::portfolio_eigen_risk::EigenPositionSeries::from_open_row)
+            .collect();
+        crate::portfolio_eigen_risk::PortfolioEigenCrowdingEngine::evaluate_portfolio_eigen_crowding(
+            &open_legs,
+            candidate,
+            gross_heat_fraction,
+        )
+    }
+
+    /// Builds the live Regime-Contextual Normal-Inverse-Gamma (NIG) Cross-Brain Capital Meta-Allocator
+    /// from causal settled trades and counterfactual shadow-tape `false_veto_regrets` (`Phase 35`).
+    pub fn build_contextual_nig_meta_allocator(
+        &self,
+    ) -> crate::portfolio_eigen_risk::ContextualNigMetaAllocator {
+        let closed_snap = self.closed_ledger.read().clone();
+        let settled_shadows = self.shadow_settled_trades.read().clone();
+        let mut regrets = Vec::new();
+        for sh in &settled_shadows {
+            if let Some(r) = sh.realized_r
+                && r >= 1.0
+            {
+                let regime =
+                    crate::autopsy_evolver::classify_regime_bucket(&sh.entry_features_32);
+                let is_0dte = matches!(sh.symbol.as_str(), "SPY" | "QQQ" | "IWM")
+                    && sh.brain_id == BrainHorizonId::Brain02IntradayDayTrade;
+                let slot = if is_0dte {
+                    crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::Scalp0Dte
+                } else {
+                    crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::from_brain_and_tier(
+                        sh.brain_id,
+                        "STANDARD",
+                    )
+                };
+                regrets.push((slot, regime, r));
+            }
+        }
+        crate::portfolio_eigen_risk::ContextualNigMetaAllocator::from_causal_ledger(
+            &closed_snap,
+            &regrets,
+        )
+    }
+
     /// Builds the causal `LedoitWolfPrecision` manifold and active non-quarantined `Stage0TrapCentroid`
     /// slice so live scanner/ledger Stage 0 calls the exact same `evaluate_stage0_conformal_kernel`
     /// as offline `simulate_trade_under_candidate`.
@@ -2714,21 +2823,25 @@ impl RealTimeLedgerEngine {
         crate::autopsy_evolver::LedoitWolfPrecision,
         Vec<crate::autopsy_evolver::Stage0TrapCentroid>,
     ) {
+        let (arc_prec, traps) =
+            self.build_live_stage0_manifold_and_traps_arc(brain_id, causal_before_ts_ns);
+        ((*arc_prec).clone(), traps)
+    }
+
+    /// Zero-clone cached `Arc<LedoitWolfPrecision>` + active causal `Stage0TrapCentroid` slice.
+    pub fn build_live_stage0_manifold_and_traps_arc(
+        &self,
+        brain_id: BrainHorizonId,
+        causal_before_ts_ns: i64,
+    ) -> (
+        Arc<crate::autopsy_evolver::LedoitWolfPrecision>,
+        Vec<crate::autopsy_evolver::Stage0TrapCentroid>,
+    ) {
         let gen_id = self
             .precedent_knn
             .get_synaptic_plasticity_state(brain_id)
             .generation_id;
-        let precision = if gen_id == 0 {
-            crate::autopsy_evolver::LedoitWolfPrecision {
-                brains: std::collections::HashMap::new(),
-            }
-        } else {
-            let closed_snap = self.closed_ledger.read();
-            let baseline_count = 173.min(closed_snap.len());
-            crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
-                &closed_snap[0..baseline_count],
-            )
-        };
+        let precision = self.get_or_build_cached_stage0_precision(gen_id);
 
         let trap_bank: Vec<crate::autopsy_evolver::Stage0TrapCentroid> = self
             .precedent_knn
@@ -2783,7 +2896,11 @@ impl RealTimeLedgerEngine {
     }
 
     pub fn replace_closed_trades_for_audit(&self, trades: Vec<ClosedTradeRow>) {
+        let len = trades.len();
         *self.closed_ledger.write() = trades;
+        self.closed_ledger_len
+            .store(len, std::sync::atomic::Ordering::Release);
+        *self.cached_stage0_precision.write() = None;
     }
 
     pub fn set_enforce_hard_scratch_on_baseline(&self, enabled: bool) {
@@ -3273,6 +3390,9 @@ impl RealTimeLedgerEngine {
     pub fn clear_all(&self) {
         self.positions_opened.write().clear();
         self.closed_ledger.write().clear();
+        self.closed_ledger_len
+            .store(0, std::sync::atomic::Ordering::Release);
+        *self.cached_stage0_precision.write() = None;
         self.era1_calibrations.write().clear();
         self.era1_symbol_median_stops.write().clear();
         self.vetoed_repeat_traps.write().clear();
@@ -3845,11 +3965,16 @@ impl RealTimeLedgerEngine {
             .retain(|v| !(v.symbol.eq_ignore_ascii_case(symbol) && v.brain_id == brain_id));
         let mut closed = self.closed_ledger.write();
         closed.retain(|t| !(t.symbol.eq_ignore_ascii_case(symbol) && t.brain_id == brain_id));
+        let new_len = closed.len();
         let mut running = 0.0_f64;
         for row in closed.iter_mut() {
             running += row.net_pnl_usd;
             row.cumulative_net_profit_usd = running;
         }
+        drop(closed);
+        self.closed_ledger_len
+            .store(new_len, std::sync::atomic::Ordering::Release);
+        *self.cached_stage0_precision.write() = None;
         *self.running_net_profit_usd.write() = running;
     }
 
@@ -4144,13 +4269,14 @@ impl RealTimeLedgerEngine {
 
         let syn_state = self.precedent_knn.get_synaptic_plasticity_state(sig.brain_id);
         let (precision, trap_bank) =
-            self.build_live_stage0_manifold_and_traps(sig.brain_id, sig.timestamp_ns);
+            self.build_live_stage0_manifold_and_traps_arc(sig.brain_id, sig.timestamp_ns);
         let k_out = crate::autopsy_evolver::evaluate_stage0_conformal_kernel(
             sig.brain_id,
             &entry_arr_32,
             &syn_state,
             &trap_bank,
             &precision,
+            None,
         );
 
         let trap_sim = 1.0 / (1.0 + k_out.d_trap * 0.35);
@@ -4169,6 +4295,8 @@ impl RealTimeLedgerEngine {
             regime_bucket: k_out.regime_bucket.as_str().to_string(),
             epistemic_ood_score: k_out.epistemic_ood_score,
             kelly_epistemic_multiplier: k_out.kelly_epistemic_multiplier,
+            conformal_kelly_scalar: k_out.conformal_kelly_scalar,
+            unified_stage0_kelly_multiplier: k_out.unified_stage0_kelly_multiplier,
         };
 
         // Preserve Era-1 (`Gen <= 36`) historical baseline audit discriminant ONLY when `record_audit` is requested
@@ -4481,8 +4609,8 @@ impl RealTimeLedgerEngine {
             enforce_era1_baseline || syn_state.generation_id >= 37,
         );
 
-        if !enforce_era1_baseline && stage0.kelly_epistemic_multiplier < 1.0 {
-            let k_mult = stage0.kelly_epistemic_multiplier.clamp(0.15, 1.0);
+        if !enforce_era1_baseline && stage0.unified_stage0_kelly_multiplier < 1.0 {
+            let k_mult = stage0.unified_stage0_kelly_multiplier.clamp(0.10, 1.0);
             row.kelly_fraction_pct = ((row.kelly_fraction_pct * k_mult) * 100.0).round() / 100.0;
             row.risk_budget_usd = ((row.risk_budget_usd * k_mult) * 100.0).round() / 100.0;
             row.notional_allocated_usd =
@@ -4491,6 +4619,15 @@ impl RealTimeLedgerEngine {
 
         if !enforce_era1_baseline && stage0.epistemic_ood_score > 1.25 {
             row.active_sequential_stage = "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME".to_string();
+            row.sequential_safety_margin_pct = 0.0;
+            return row;
+        }
+
+        if !enforce_era1_baseline
+            && stage0.should_veto
+            && stage0.root_cause_category == "STAGE_0_VETOED_MONDRIAN_NONCONFORMITY"
+        {
+            row.active_sequential_stage = "STAGE_0_VETOED_MONDRIAN_NONCONFORMITY".to_string();
             row.sequential_safety_margin_pct = 0.0;
             return row;
         }
@@ -4539,11 +4676,35 @@ impl RealTimeLedgerEngine {
                 bars_held: 0,
                 max_hold_bars,
                 entry_features_32: entry_arr_32,
+                entry_embedding_128: row.entry_embedding_128.clone(),
+                ai_confidence_pct: row.ai_confidence_pct,
+                precedent_win_rate_pct: row.precedent_win_rate_pct,
+                causal_bars: row.entry_bars.clone(),
+                entry_bar_idx: row.entry_bar_idx,
                 prev_bar_record: row.entry_bars.last().copied(),
                 settled: false,
                 outcome_label: "SHADOW_OPEN".to_string(),
             });
             return row;
+        }
+
+        // Phase 35 Deliverable 1: Cross-Position Eigen-Covariance & Absorption-Ratio Crowding Gate
+        if !enforce_era1_baseline && syn_state.generation_id >= 36 {
+            let cand_series = crate::portfolio_eigen_risk::EigenPositionSeries::from_open_row(&row);
+            let eigen_rep = self.evaluate_book_eigen_risk(Some(&cand_series));
+            if eigen_rep.vetoed {
+                row.active_sequential_stage =
+                    "PORTFOLIO_VETOED_EIGEN_CORRELATION_CROWDING".to_string();
+                row.sequential_safety_margin_pct = 0.0;
+                return row;
+            }
+            if eigen_rep.eigen_kelly_multiplier < 1.0 {
+                let em = eigen_rep.eigen_kelly_multiplier.clamp(0.25, 1.0);
+                row.kelly_fraction_pct = ((row.kelly_fraction_pct * em) * 100.0).round() / 100.0;
+                row.risk_budget_usd = ((row.risk_budget_usd * em) * 100.0).round() / 100.0;
+                row.notional_allocated_usd =
+                    ((row.notional_allocated_usd * em) * 100.0).round() / 100.0;
+            }
         }
 
         self.positions_opened.write().push(row.clone());
@@ -4623,17 +4784,7 @@ impl RealTimeLedgerEngine {
             .precedent_knn
             .get_synaptic_plasticity_state(sample_brain)
             .generation_id;
-        let precision = if gen_id == 0 {
-            crate::autopsy_evolver::LedoitWolfPrecision {
-                brains: std::collections::HashMap::new(),
-            }
-        } else {
-            let closed_snap = self.closed_ledger.read();
-            let baseline_count = 173.min(closed_snap.len());
-            crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
-                &closed_snap[0..baseline_count],
-            )
-        };
+        let precision = self.get_or_build_cached_stage0_precision(gen_id);
 
         let mut newly_settled = Vec::new();
         let mut idx = 0;
@@ -4673,10 +4824,35 @@ impl RealTimeLedgerEngine {
 
             let mut settled_outcome: Option<(f64, f64, &str)> = None;
 
-            // 1. Causal Stage 3 Hazard-Conditioned Ratchet Check (from prior bars 1..=k-1 ONLY)
+            // 1. Causal Stage 3 Hazard-Conditioned Ratchet Check with Full 32-Feature Parity (from prior bars 1..=k-1 ONLY)
             if sh.running_peak_r >= 1.0
                 && let Some(ref prev_b) = sh.prev_bar_record
             {
+                let prev_bar_offset = sh.bars_held.saturating_sub(1);
+                let prev_feat_arr: Option<[f64; 32]> = if prev_bar_offset >= 1 {
+                    Self::extract_causal_post_entry_bar_k_features_32(
+                        sh.direction,
+                        sh.entry_price,
+                        sh.initial_structural_stop,
+                        sh.target_1_price,
+                        sh.ai_confidence_pct,
+                        sh.precedent_win_rate_pct,
+                        &sh.entry_embedding_128,
+                        &sh.causal_bars,
+                        sh.entry_bar_idx,
+                        prev_bar_offset,
+                    )
+                    .map(|fk| {
+                        let mut arr = [0.0_f64; 32];
+                        for (i, &v) in fk.iter().take(32).enumerate() {
+                            arr[i] = v as f64;
+                        }
+                        arr
+                    })
+                } else {
+                    None
+                };
+
                 let (_h_prev, rho_eff) =
                     crate::autopsy_evolver::compute_causal_reversal_hazard_retention(
                         sh.brain_id,
@@ -4685,7 +4861,7 @@ impl RealTimeLedgerEngine {
                         prev_b.high.to_f64(),
                         prev_b.low.to_f64(),
                         prev_b.close.to_f64(),
-                        None,
+                        prev_feat_arr.as_ref(),
                         &syn_state,
                         &precision,
                     );
@@ -4757,6 +4933,11 @@ impl RealTimeLedgerEngine {
             } else {
                 if favorable_r > sh.running_peak_r {
                     sh.running_peak_r = favorable_r;
+                }
+                sh.causal_bars.push(*latest);
+                if sh.causal_bars.len() > 96 {
+                    sh.causal_bars.remove(0);
+                    sh.entry_bar_idx = sh.entry_bar_idx.saturating_sub(1);
                 }
                 sh.prev_bar_record = Some(*latest);
                 idx += 1;
@@ -5593,7 +5774,16 @@ impl RealTimeLedgerEngine {
             }
         }
 
-        self.closed_ledger.write().push(row.clone());
+        let new_closed_len = {
+            let mut cl = self.closed_ledger.write();
+            cl.push(row.clone());
+            cl.len()
+        };
+        self.closed_ledger_len
+            .store(new_closed_len, std::sync::atomic::Ordering::Release);
+        if new_closed_len <= 173 {
+            *self.cached_stage0_precision.write() = None;
+        }
         self.sync_closed_row_to_precedent_knn(&row);
         self.recompute_causal_plasticity();
 
@@ -8257,7 +8447,11 @@ impl RealTimeLedgerEngine {
                 self.compute_causal_plasticity_state_for_prefix(b, &settled_prior, active_gen);
             self.precedent_knn.set_synaptic_plasticity_state(final_state);
         }
+        let final_closed_len = closed.len();
         drop(closed);
+        self.closed_ledger_len
+            .store(final_closed_len, std::sync::atomic::Ordering::Release);
+        *self.cached_stage0_precision.write() = None;
 
         // Refresh open-position sequential telemetry against the active generation's synaptic state
         let mut open_guard = self.positions_opened.write();
@@ -10051,7 +10245,11 @@ impl RealTimeLedgerEngine {
             return false;
         }
         *self.positions_opened.write() = parsed.positions_opened;
+        let loaded_closed_len = parsed.closed_ledger.len();
         *self.closed_ledger.write() = parsed.closed_ledger;
+        self.closed_ledger_len
+            .store(loaded_closed_len, std::sync::atomic::Ordering::Release);
+        *self.cached_stage0_precision.write() = None;
         *self.running_net_profit_usd.write() = parsed.running_net_profit_usd;
         *self.autopsy_runs_count.write() = parsed.autopsy_runs_count.max(1);
         *self.last_autopsy_iso.write() = parsed.last_autopsy_iso;

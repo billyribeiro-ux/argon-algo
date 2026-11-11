@@ -150,6 +150,10 @@ fn default_conformal_alpha() -> f64 {
     0.05
 }
 
+fn default_mondrian_conformal_alpha_floor() -> f64 {
+    0.04
+}
+
 fn default_conformal_veto_quantile() -> f64 {
     0.958
 }
@@ -293,6 +297,9 @@ pub struct BrainSynapticPlasticityState {
     /// Phase 34 Deliverable 3: KL Divergence $D_{\text{KL}}(w^{(t+1)}/6 \,\|\, w^{(t)}/6)$ from previous generation
     #[serde(default)]
     pub mirror_descent_kl_divergence: f64,
+    /// Phase 34.1 Deliverable 2: Active Mondrian Regime-Conditioned Split-Conformal significance floor $\alpha_{\text{Mondrian}, b}$
+    #[serde(default = "default_mondrian_conformal_alpha_floor")]
+    pub mondrian_conformal_alpha_floor: f64,
     pub top_boosted_warning_features: Vec<SynapticFeatureMutation>,
     pub top_slashed_deceiver_features: Vec<SynapticFeatureMutation>,
 }
@@ -350,6 +357,7 @@ impl BrainSynapticPlasticityState {
             learned_recovery_velocity_guard_quantile: 0.020,
             simplex_weights_32: None,
             mirror_descent_kl_divergence: 0.0,
+            mondrian_conformal_alpha_floor: default_mondrian_conformal_alpha_floor(),
             top_boosted_warning_features: Vec::new(),
             top_slashed_deceiver_features: Vec::new(),
         }

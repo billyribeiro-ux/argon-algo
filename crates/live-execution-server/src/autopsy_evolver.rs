@@ -187,8 +187,11 @@ pub struct Stage0ConformalKernelOutput {
     pub conformal_hurdle: f64,
     pub epistemic_ood_score: f64,
     pub kelly_epistemic_multiplier: f64,
+    pub conformal_kelly_scalar: f64,
+    pub unified_stage0_kelly_multiplier: f64,
     pub vetoed: bool,
     pub is_epistemic_ood_veto: bool,
+    pub is_mondrian_conformal_veto: bool,
     pub matched_trap_id: Option<Uuid>,
     pub veto_status: String,
     pub root_cause_category: String,
@@ -211,6 +214,8 @@ pub struct SimulatedTradeOutcome {
     pub conformal_p_value: f64,
     pub epistemic_ood_score: f64,
     pub kelly_epistemic_multiplier: f64,
+    pub conformal_kelly_scalar: f64,
+    pub unified_stage0_kelly_multiplier: f64,
     pub regime_bucket: RegimeBucket,
     pub max_wald_sprt_llr: f64,
     pub max_reversal_hazard: f64,
@@ -222,6 +227,8 @@ pub struct SimulatedTradeOutcome {
 #[derive(Debug, Clone)]
 pub struct BrainLedoitWolfManifold {
     pub pooled_entry_cov: [[f64; 32]; 32],
+    pub entry_chol_l_32: [[f64; 32]; 32],
+    pub entry_chol_std_eps: f64,
     pub n_entry_causal: usize,
     pub scale_entry_sq: f64,
     pub winner_centroid_32: [f64; 32],
@@ -235,6 +242,8 @@ pub struct BrainLedoitWolfManifold {
     pub prior_shell_margin: f64,
     pub q975_mahalanobis_radius: f64,
     pub pooled_bar1_cov: [[f64; 32]; 32],
+    pub bar1_chol_l_32: [[f64; 32]; 32],
+    pub bar1_chol_std_eps: f64,
     pub n_bar1_causal: usize,
     pub scale_bar1_sq: f64,
     pub bar1_win_centroid_32: [f64; 32],
@@ -463,8 +472,21 @@ impl LedoitWolfPrecision {
             let n_entry_causal = (win_entries.len() + loss_entries.len()).max(4);
             let n_bar1_causal = (win_bar1.len() + loss_bar1.len()).max(4);
 
-            // Phase 34 Deliverable 1: Mondrian per-(brain_id, RegimeBucket) leave-one-out calibration
-            // nonconformity scores alpha_i = d_LW(z_i, W_{-i}) / (d_LW(z_i, T) + 0.05) and empirical q975 radius
+            let (entry_chol_l_32, entry_chol_std_eps, _) =
+                PrecedentKnnIndex::factor_ledoit_wolf_cholesky_32_scaled(
+                    &pooled_entry_cov,
+                    n_entry_causal,
+                    scale_entry_sq,
+                );
+            let (bar1_chol_l_32, bar1_chol_std_eps, _) =
+                PrecedentKnnIndex::factor_ledoit_wolf_cholesky_32_scaled(
+                    &pooled_bar1_cov,
+                    n_bar1_causal,
+                    scale_bar1_sq,
+                );
+
+            // Phase 34 & 34.1: Mondrian per-(brain_id, RegimeBucket) strict Leave-One-Out calibration
+            // nonconformity scores alpha_i = d_win_loo(z_i, W_{-i}) / (d_trap_loo(z_i, T_{-i}) + 0.05) and q975 radius
             let uniform_simplex_w = [6.0 / 32.0; 32];
             let mut mondrian_calibration_scores: HashMap<RegimeBucket, Vec<(Uuid, f64)>> =
                 HashMap::new();
@@ -477,21 +499,27 @@ impl LedoitWolfPrecision {
                 for k in 0..32 {
                     diff[k] = x[k] - y[k];
                 }
-                let (d, _) =
-                    PrecedentKnnIndex::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
-                        &pooled_entry_cov,
-                        n_entry_causal,
-                        &uniform_simplex_w,
-                        &diff,
-                        scale_entry_sq,
-                    );
-                d
+                PrecedentKnnIndex::solve_precomputed_cholesky_mahalanobis_32(
+                    &entry_chol_l_32,
+                    entry_chol_std_eps,
+                    &uniform_simplex_w,
+                    &diff,
+                )
             };
 
             let mut winner_lambdas: Vec<f64> = Vec::with_capacity(win_entries.len());
-            for (_wid, w_vec) in &win_entries {
+            for (wid, w_vec) in &win_entries {
                 let d_wc = maha_local(w_vec, &winner_centroid_32).max(0.0);
-                let dw_eff = 0.55 * d_wc;
+                let mut min_nn_loo = d_wc;
+                for (other_id, other_vec) in &win_entries {
+                    if other_id != wid {
+                        let d_ex = maha_local(w_vec, other_vec);
+                        if d_ex < min_nn_loo {
+                            min_nn_loo = d_ex;
+                        }
+                    }
+                }
+                let dw_eff = 0.55 * d_wc + 0.45 * min_nn_loo;
                 let dl_c = maha_local(w_vec, &loss_centroid_32).max(0.0);
                 let rad_sq = (0.5 * (dw_eff * dw_eff + dl_c * dl_c)).max(1.0);
                 let lam_w = 0.5 * (dw_eff * dw_eff - dl_c * dl_c) / rad_sq;
@@ -502,31 +530,24 @@ impl LedoitWolfPrecision {
                 0.035
             } else {
                 let max_lam = *winner_lambdas.last().unwrap_or(&-0.020);
-                (max_lam + 0.095).clamp(0.025, 0.085)
+                (max_lam + 0.095).clamp(0.025, 0.38)
             };
 
             for (tid, _is_win, z_i) in &all_entries {
                 let regime_i = classify_regime_bucket(z_i);
-                let d_centroid_i = maha_local(z_i, &winner_centroid_32);
-                let mut d_w_i = d_centroid_i;
+                let d_centroid_i = maha_local(z_i, &winner_centroid_32).max(0.0);
+                let mut min_nn_i = d_centroid_i;
                 for (wid, w_vec) in &win_entries {
                     if wid != tid {
                         let d_ex = maha_local(z_i, w_vec);
-                        if d_ex < d_w_i {
-                            d_w_i = d_ex;
+                        if d_ex < min_nn_i {
+                            min_nn_i = d_ex;
                         }
                     }
                 }
-                let mut d_t_i = d_w_i + prior_shell_margin;
-                for (lid, l_vec) in &loss_entries_with_id {
-                    if lid != tid {
-                        let dl = maha_local(z_i, l_vec);
-                        if dl < d_t_i {
-                            d_t_i = dl;
-                        }
-                    }
-                }
-                let alpha_i = d_w_i.max(0.0) / (d_t_i.max(0.0) + 0.05);
+                let dw_eff_i = (0.55 * d_centroid_i + 0.45 * min_nn_i).max(0.0);
+                let dt_loss_c_i = maha_local(z_i, &loss_centroid_32).max(0.0);
+                let alpha_i = dw_eff_i / (dt_loss_c_i + 0.05);
                 mondrian_calibration_scores
                     .entry(regime_i)
                     .or_default()
@@ -555,6 +576,8 @@ impl LedoitWolfPrecision {
                 brain_id,
                 BrainLedoitWolfManifold {
                     pooled_entry_cov,
+                    entry_chol_l_32,
+                    entry_chol_std_eps,
                     n_entry_causal,
                     scale_entry_sq,
                     winner_centroid_32,
@@ -568,6 +591,8 @@ impl LedoitWolfPrecision {
                     prior_shell_margin,
                     q975_mahalanobis_radius,
                     pooled_bar1_cov,
+                    bar1_chol_l_32,
+                    bar1_chol_std_eps,
                     n_bar1_causal,
                     scale_bar1_sq,
                     bar1_win_centroid_32,
@@ -579,7 +604,7 @@ impl LedoitWolfPrecision {
     }
 
     /// Computes true 32x32 Ledoit-Wolf Cholesky precision-weighted Mahalanobis distance
-    /// $\sqrt{\Delta z^\top W^{1/2} \Sigma_{\text{LW}}^{-1} W^{1/2} \Delta z}$ via `PrecedentKnnIndex`.
+    /// $\sqrt{\Delta z^\top W^{1/2} \Sigma_{\text{LW}}^{-1} W^{1/2} \Delta z}$ via precomputed Cholesky factor $L$.
     #[allow(clippy::needless_range_loop)]
     pub fn entry_mahalanobis(
         &self,
@@ -593,14 +618,12 @@ impl LedoitWolfPrecision {
             diff[i] = a[i] - b[i];
         }
         if let Some(m) = self.brains.get(&brain_id) {
-            let (dist, _) = PrecedentKnnIndex::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
-                &m.pooled_entry_cov,
-                m.n_entry_causal,
+            PrecedentKnnIndex::solve_precomputed_cholesky_mahalanobis_32(
+                &m.entry_chol_l_32,
+                m.entry_chol_std_eps,
                 weights_32,
                 &diff,
-                m.scale_entry_sq,
-            );
-            dist
+            )
         } else {
             let mut unit_cov = [[0.0_f64; 32]; 32];
             for i in 0..32 {
@@ -617,7 +640,7 @@ impl LedoitWolfPrecision {
         }
     }
 
-    /// Computes post-entry (`Bar 1..3`) 32x32 Ledoit-Wolf Cholesky Mahalanobis distance.
+    /// Computes post-entry (`Bar 1..3`) 32x32 Ledoit-Wolf Cholesky Mahalanobis distance via precomputed $L_{\text{bar1}}$.
     #[allow(clippy::needless_range_loop)]
     pub fn bar1_mahalanobis(
         &self,
@@ -631,14 +654,12 @@ impl LedoitWolfPrecision {
             diff[i] = a[i] - b[i];
         }
         if let Some(m) = self.brains.get(&brain_id) {
-            let (dist, _) = PrecedentKnnIndex::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
-                &m.pooled_bar1_cov,
-                m.n_bar1_causal,
+            PrecedentKnnIndex::solve_precomputed_cholesky_mahalanobis_32(
+                &m.bar1_chol_l_32,
+                m.bar1_chol_std_eps,
                 weights_32,
                 &diff,
-                m.scale_bar1_sq,
-            );
-            dist
+            )
         } else {
             self.entry_mahalanobis(brain_id, weights_32, a, b)
         }
@@ -843,18 +864,20 @@ pub fn build_synaptic_precision_weights(brain_state: &BrainSynapticPlasticitySta
     }
 }
 
-/// Phase 33.1 & Phase 34 Single Shared Pure-Causal Stage 0 Conformal + $\chi^2_{32}$ OOD Kernel.
+/// Phase 33.1, Phase 34 & Phase 34.1 Single Shared Pure-Causal Stage 0 Conformal + $\chi^2_{32}$ OOD Kernel.
 ///
-/// Invoked identically by BOTH offline `simulate_trade_under_candidate` (Gate 1 & Gate 2) AND
-/// live `RealTimeLedgerEngine::evaluate_live_entry_stage0_gate` / watchlist scanner, guaranteeing
-/// `< 1e-12` zero-skew parity across `conformal_margin`, `conformal_llr`, `conformal_p_value`,
-/// `epistemic_ood_score`, `kelly_epistemic_multiplier`, and `vetoed` decisions.
+/// Invoked identically by BOTH offline `simulate_trade_under_candidate` (`exclude_trade_id = Some(trade.trade_id)`)
+/// AND live `RealTimeLedgerEngine::evaluate_live_entry_stage0_gate` / watchlist scanner (`exclude_trade_id = None`),
+/// guaranteeing strict Leave-One-Out zero self-match leakage and `< 1e-12` parity across `conformal_margin`,
+/// `conformal_llr`, `conformal_p_value`, `epistemic_ood_score`, `kelly_epistemic_multiplier`,
+/// `conformal_kelly_scalar`, `unified_stage0_kelly_multiplier`, and `vetoed` decisions.
 pub fn evaluate_stage0_conformal_kernel(
     brain_id: BrainHorizonId,
     entry_features_32: &[f64; 32],
     brain_state: &BrainSynapticPlasticityState,
     trap_bank: &[Stage0TrapCentroid],
     precision: &LedoitWolfPrecision,
+    exclude_trade_id: Option<Uuid>,
 ) -> Stage0ConformalKernelOutput {
     let regime_bucket = classify_regime_bucket(entry_features_32);
     let weights_32 = build_synaptic_precision_weights(brain_state);
@@ -867,7 +890,10 @@ pub fn evaluate_stage0_conformal_kernel(
             &manifold.winner_centroid_32,
         );
         let mut min_nn = d_win_c;
-        for (_w_id, w_vec) in &manifold.winner_exemplars_32 {
+        for (w_id, w_vec) in &manifold.winner_exemplars_32 {
+            if exclude_trade_id == Some(*w_id) {
+                continue;
+            }
             let d_ex = precision.entry_mahalanobis(brain_id, &weights_32, entry_features_32, w_vec);
             if d_ex < min_nn {
                 min_nn = d_ex;
@@ -897,7 +923,7 @@ pub fn evaluate_stage0_conformal_kernel(
     let mut found_active_trap = false;
 
     for trap in trap_bank {
-        if trap.quarantined {
+        if trap.quarantined || (exclude_trade_id.is_some() && trap.trap_id == exclude_trade_id) {
             continue;
         }
         found_active_trap = true;
@@ -947,38 +973,85 @@ pub fn evaluate_stage0_conformal_kernel(
     let kelly_epistemic_multiplier = (-1.5 * epistemic_ood_score.max(0.0)).exp().clamp(0.15, 1.0);
     let is_epistemic_ood_veto = epistemic_ood_score > 1.25;
 
-    // Mondrian Regime-Conditioned Split-Conformal p-value:
-    // p = (1 + #{i in C_{b,r} : alpha_i >= alpha_cand}) / (1 + |C_{b,r}|)
+    // Phase 34.1 Active Mondrian Regime-Conditioned Split-Conformal p-value (strict Leave-One-Out):
+    // p = (1 + #{i in C_{b,r,-id} : alpha_i >= alpha_cand}) / (1 + |C_{b,r,-id}|)
+    let alpha_floor = brain_state.mondrian_conformal_alpha_floor.clamp(0.005, 0.20);
+    let min_stratum_n = ((1.0 / alpha_floor).ceil() as usize).max(12);
     let candidate_nonconformity_alpha = d_win / (d_trap + 0.05);
     let p_mondrian = if let Some(manifold) = precision.brains.get(&brain_id) {
-        let regime_slice = manifold.mondrian_calibration_scores.get(&regime_bucket);
-        let calib_iter: Vec<f64> = if let Some(bucket_scores) = regime_slice
-            && bucket_scores.len() >= 3
-        {
-            bucket_scores.iter().map(|(_, a)| *a).collect()
+        let regime_filtered: Vec<f64> = manifold
+            .mondrian_calibration_scores
+            .get(&regime_bucket)
+            .map(|scores| {
+                scores
+                    .iter()
+                    .filter(|(item_id, _)| exclude_trade_id != Some(*item_id))
+                    .map(|(_, a)| *a)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let calib_iter: Vec<f64> = if regime_filtered.len() >= min_stratum_n {
+            regime_filtered
         } else {
-            manifold
+            let all_filtered: Vec<f64> = manifold
                 .all_calibration_scores
                 .iter()
+                .filter(|(item_id, _)| exclude_trade_id != Some(*item_id))
                 .map(|(_, a)| *a)
-                .collect()
+                .collect();
+            if all_filtered.len() >= regime_filtered.len() {
+                all_filtered
+            } else {
+                regime_filtered
+            }
         };
+
         let geq_count = calib_iter
             .iter()
             .filter(|&&alpha_i| alpha_i >= candidate_nonconformity_alpha)
             .count();
-        (1.0 + geq_count as f64) / (1.0 + calib_iter.len() as f64)
+        let base_p = (1.0 + geq_count as f64) / (1.0 + calib_iter.len() as f64);
+        if geq_count == 0 && calib_iter.len() >= 12 {
+            let max_calib_alpha = calib_iter
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max)
+                .max(1e-6);
+            if candidate_nonconformity_alpha > max_calib_alpha {
+                (base_p * (max_calib_alpha / candidate_nonconformity_alpha)).clamp(0.001, base_p)
+            } else {
+                base_p
+            }
+        } else {
+            base_p
+        }
     } else {
         1.0
     };
 
+    let conformal_kelly_scalar = (p_mondrian / 0.25).clamp(0.35, 1.0);
+    let unified_stage0_kelly_multiplier =
+        (kelly_epistemic_multiplier * conformal_kelly_scalar).clamp(0.10, 1.0);
+
+    let is_mondrian_conformal_veto = calibrated_n >= 12 && p_mondrian < alpha_floor;
     let is_trap_veto = conformal_margin < 0.0;
-    let vetoed = is_epistemic_ood_veto || is_trap_veto;
+    let vetoed = is_epistemic_ood_veto || is_trap_veto || is_mondrian_conformal_veto;
 
     let (veto_status, root_cause_category) = if is_epistemic_ood_veto {
         (
             "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME".to_string(),
             "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME".to_string(),
+        )
+    } else if is_trap_veto && active_trap_triggered {
+        (
+            "STAGE_0_VETOED_HARD_NEGATIVE_TRAP".to_string(),
+            matched_category,
+        )
+    } else if is_mondrian_conformal_veto {
+        (
+            "STAGE_0_VETOED_MONDRIAN_NONCONFORMITY".to_string(),
+            "STAGE_0_VETOED_MONDRIAN_NONCONFORMITY".to_string(),
         )
     } else if is_trap_veto {
         (
@@ -1002,8 +1075,11 @@ pub fn evaluate_stage0_conformal_kernel(
         conformal_hurdle,
         epistemic_ood_score,
         kelly_epistemic_multiplier,
+        conformal_kelly_scalar,
+        unified_stage0_kelly_multiplier,
         vetoed,
         is_epistemic_ood_veto,
+        is_mondrian_conformal_veto,
         matched_trap_id: if is_trap_veto && active_trap_triggered {
             matched_trap_id
         } else {
@@ -1014,14 +1090,11 @@ pub fn evaluate_stage0_conformal_kernel(
     }
 }
 
-/// Phase 34 Deliverable 4: Pure-Causal Bar-`k` Reversal Hazard Score $h_{k-1} \in [0, 1]$ and
-/// Hazard-Conditioned Dynamic Stage 3 Continuation Retention Floor $\rho_{\text{eff}}(k) \in [0.50, 0.88]$.
-///
-/// Uses strictly causal observations up to bar `k - 1` (`prev_bar` OHLC rejection wick + `prev_bar_features_32`
-/// post-entry Mahalanobis win/loss separation):
-/// $$h_{k-1} = \operatorname{sigmoid}\big(1.25 \cdot (d_{\text{bar\_win}} - d_{\text{bar\_loss}}) + 1.50 \cdot \text{wick\_exhaustion}_{k-1}\big)$$
-/// $$\rho_{\text{eff}}(k) = \operatorname{clamp}\big(\rho_{\text{base}} + 0.14 \cdot (h_{k-1} - 0.50),\; 0.50,\; 0.88\big)$$
-pub fn compute_causal_reversal_hazard_retention(
+/// Phase 34 Deliverable 4 & Phase 35 Deliverable 3: Pure-Causal Bar-`k` Reversal Hazard Score $h_{k-1} \in [0, 1]$
+/// and Hazard-Conditioned Dynamic Stage 3 Continuation Retention Floor $\rho_{\text{eff}}(k) \in [0.50, 0.88]$,
+/// optionally coupled with cumulative 0DTE Theta-bleed ratio $\tau_{k-1} \ge 0$.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_causal_reversal_hazard_retention_with_theta(
     brain_id: BrainHorizonId,
     dir: f64,
     prev_open: f64,
@@ -1029,6 +1102,7 @@ pub fn compute_causal_reversal_hazard_retention(
     prev_low: f64,
     prev_close: f64,
     prev_bar_features_32: Option<&[f64; 32]>,
+    cumulative_theta_burn_ratio: f64,
     brain_state: &BrainSynapticPlasticityState,
     precision: &LedoitWolfPrecision,
 ) -> (f64, f64) {
@@ -1052,11 +1126,39 @@ pub fn compute_causal_reversal_hazard_retention(
         0.0
     };
 
-    let logit_h = 1.25 * maha_delta + 1.50 * wick_exhaustion_prev;
+    let theta_logit = 2.40 * cumulative_theta_burn_ratio.clamp(0.0, 2.0);
+    let logit_h = 1.25 * maha_delta + 1.50 * wick_exhaustion_prev + theta_logit;
     let h_prev = 1.0 / (1.0 + (-logit_h).exp());
     let rho_base = brain_state.learned_giveback_retention_ratio;
     let rho_eff = (rho_base + 0.14 * (h_prev - 0.50)).clamp(0.50, 0.88);
     (h_prev, rho_eff)
+}
+
+/// Pure-Causal Bar-`k` Reversal Hazard Score $h_{k-1} \in [0, 1]$ without 0DTE Theta coupling (`tau = 0.0`).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_causal_reversal_hazard_retention(
+    brain_id: BrainHorizonId,
+    dir: f64,
+    prev_open: f64,
+    prev_high: f64,
+    prev_low: f64,
+    prev_close: f64,
+    prev_bar_features_32: Option<&[f64; 32]>,
+    brain_state: &BrainSynapticPlasticityState,
+    precision: &LedoitWolfPrecision,
+) -> (f64, f64) {
+    compute_causal_reversal_hazard_retention_with_theta(
+        brain_id,
+        dir,
+        prev_open,
+        prev_high,
+        prev_low,
+        prev_close,
+        prev_bar_features_32,
+        0.0,
+        brain_state,
+        precision,
+    )
 }
 
 /// Helper to compute peak post-entry MFE in R units from trade execution levels and `replay_bars`.
@@ -1496,13 +1598,14 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
     let entry_vec_32 = extract_causal_entry_array_32(trade);
     let weights_32 = build_synaptic_precision_weights(brain_state);
 
-    // --- STAGE 0: Single Shared Pure-Causal Conformal + OOD Kernel ---
+    // --- STAGE 0: Single Shared Pure-Causal Conformal + OOD Kernel (Strict Leave-One-Out) ---
     let s0 = evaluate_stage0_conformal_kernel(
         trade.brain_id,
         &entry_vec_32,
         brain_state,
         trap_bank,
         precision_diag_or_chol,
+        Some(trade.trade_id),
     );
     if s0.vetoed {
         return SimulatedTradeOutcome {
@@ -1519,6 +1622,8 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
             conformal_p_value: s0.conformal_p_value,
             epistemic_ood_score: s0.epistemic_ood_score,
             kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+            conformal_kelly_scalar: s0.conformal_kelly_scalar,
+            unified_stage0_kelly_multiplier: s0.unified_stage0_kelly_multiplier,
             regime_bucket: s0.regime_bucket,
             max_wald_sprt_llr: 0.0,
             max_reversal_hazard: 0.0,
@@ -1554,12 +1659,19 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
             conformal_p_value: s0.conformal_p_value,
             epistemic_ood_score: s0.epistemic_ood_score,
             kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+            conformal_kelly_scalar: s0.conformal_kelly_scalar,
+            unified_stage0_kelly_multiplier: s0.unified_stage0_kelly_multiplier,
             regime_bucket: s0.regime_bucket,
             max_wald_sprt_llr: 0.0,
             max_reversal_hazard: 0.0,
             effective_retention_ratio: brain_state.learned_giveback_retention_ratio,
         };
     }
+
+    let is_0dte_scalp_trade = matches!(trade.symbol.as_str(), "SPY" | "QQQ" | "IWM")
+        && trade.brain_id == BrainHorizonId::Brain02IntradayDayTrade
+        && trade.hold_duration_ms <= 3_600_000;
+    let per_bar_0dte_theta_ratio = if is_0dte_scalp_trade { 0.085 } else { 0.0 };
 
     let mut running_peak_r = 0.0_f64;
     let mut wald_llr = 0.0_f64;
@@ -1599,7 +1711,8 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
                         }
                         arr
                     });
-            let (h_prev, rho_eff) = compute_causal_reversal_hazard_retention(
+            let tau_prev = (idx as f64) * per_bar_0dte_theta_ratio;
+            let (h_prev, rho_eff) = compute_causal_reversal_hazard_retention_with_theta(
                 trade.brain_id,
                 dir,
                 prev_bar.open.to_f64(),
@@ -1607,6 +1720,7 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
                 prev_bar.low.to_f64(),
                 prev_bar.close.to_f64(),
                 prev_feat_opt.as_ref(),
+                tau_prev,
                 brain_state,
                 precision_diag_or_chol,
             );
@@ -1649,6 +1763,8 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
                     conformal_p_value: s0.conformal_p_value,
                     epistemic_ood_score: s0.epistemic_ood_score,
                     kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+                    conformal_kelly_scalar: s0.conformal_kelly_scalar,
+                    unified_stage0_kelly_multiplier: s0.unified_stage0_kelly_multiplier,
                     regime_bucket: s0.regime_bucket,
                     max_wald_sprt_llr,
                     max_reversal_hazard,
@@ -1657,9 +1773,11 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
             }
         }
 
-        // Structural Stop Check on bar k (with causal prior T1 50%-tranche breakeven protection if prior bars already hit T1)
+        // Structural Stop Check on bar k (with causal prior T1 50%-tranche breakeven protection derived from trade.target_1_price)
         if adverse_r <= -1.0 {
-            if running_peak_r >= 0.72 {
+            let t1_trigger_r =
+                (((trade.target_1_price.to_f64() - ep) * dir) / initial_risk).clamp(0.50, 1.50);
+            if running_peak_r >= t1_trigger_r {
                 let banked_t1_r = 0.5 * running_peak_r;
                 let t1_exit_price = ep + dir * banked_t1_r * initial_risk;
                 return SimulatedTradeOutcome {
@@ -1676,6 +1794,8 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
                     conformal_p_value: s0.conformal_p_value,
                     epistemic_ood_score: s0.epistemic_ood_score,
                     kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+                    conformal_kelly_scalar: s0.conformal_kelly_scalar,
+                    unified_stage0_kelly_multiplier: s0.unified_stage0_kelly_multiplier,
                     regime_bucket: s0.regime_bucket,
                     max_wald_sprt_llr,
                     max_reversal_hazard,
@@ -1703,6 +1823,8 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
                 conformal_p_value: s0.conformal_p_value,
                 epistemic_ood_score: s0.epistemic_ood_score,
                 kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+                conformal_kelly_scalar: s0.conformal_kelly_scalar,
+                unified_stage0_kelly_multiplier: s0.unified_stage0_kelly_multiplier,
                 regime_bucket: s0.regime_bucket,
                 max_wald_sprt_llr,
                 max_reversal_hazard,
@@ -1768,6 +1890,8 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
                     conformal_p_value: s0.conformal_p_value,
                     epistemic_ood_score: s0.epistemic_ood_score,
                     kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+                    conformal_kelly_scalar: s0.conformal_kelly_scalar,
+                    unified_stage0_kelly_multiplier: s0.unified_stage0_kelly_multiplier,
                     regime_bucket: s0.regime_bucket,
                     max_wald_sprt_llr,
                     max_reversal_hazard,
@@ -1804,6 +1928,8 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
         conformal_p_value: s0.conformal_p_value,
         epistemic_ood_score: s0.epistemic_ood_score,
         kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+        conformal_kelly_scalar: s0.conformal_kelly_scalar,
+        unified_stage0_kelly_multiplier: s0.unified_stage0_kelly_multiplier,
         regime_bucket: s0.regime_bucket,
         max_wald_sprt_llr,
         max_reversal_hazard,

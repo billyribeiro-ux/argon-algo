@@ -509,7 +509,12 @@ impl LedoitWolfPrecision {
 
             let mut winner_lambdas: Vec<f64> = Vec::with_capacity(win_entries.len());
             for (wid, w_vec) in &win_entries {
-                let d_wc = maha_local(w_vec, &winner_centroid_32).max(0.0);
+                let mu_w_loo = compute_rank1_loo_centroid_32(
+                    &winner_centroid_32,
+                    &win_entries,
+                    Some(*wid),
+                );
+                let d_wc = maha_local(w_vec, &mu_w_loo).max(0.0);
                 let mut min_nn_loo = d_wc;
                 for (other_id, other_vec) in &win_entries {
                     if other_id != wid {
@@ -521,7 +526,12 @@ impl LedoitWolfPrecision {
                 }
                 let dw_eff = 0.92 * d_wc + 0.08 * min_nn_loo;
 
-                let dl_cent = maha_local(w_vec, &loss_centroid_32).max(0.0);
+                let mu_l_loo = compute_rank1_loo_centroid_32(
+                    &loss_centroid_32,
+                    &loss_entries_with_id,
+                    Some(*wid),
+                );
+                let dl_cent = maha_local(w_vec, &mu_l_loo).max(0.0);
                 let mut min_loss_nn_loo = dl_cent;
                 for (lid, l_vec) in &loss_entries_with_id {
                     if lid != wid {
@@ -542,12 +552,17 @@ impl LedoitWolfPrecision {
                 0.035
             } else {
                 let max_lam = *winner_lambdas.last().unwrap_or(&-0.020);
-                (max_lam + 0.038).clamp(0.035, 0.35)
+                (max_lam + 0.038).clamp(0.035, 0.38)
             };
 
             for (tid, _is_win, z_i) in &all_entries {
                 let regime_i = classify_regime_bucket(z_i);
-                let d_centroid_i = maha_local(z_i, &winner_centroid_32).max(0.0);
+                let mu_w_i = compute_rank1_loo_centroid_32(
+                    &winner_centroid_32,
+                    &win_entries,
+                    Some(*tid),
+                );
+                let d_centroid_i = maha_local(z_i, &mu_w_i).max(0.0);
                 let mut min_nn_i = d_centroid_i;
                 for (wid, w_vec) in &win_entries {
                     if wid != tid {
@@ -559,7 +574,12 @@ impl LedoitWolfPrecision {
                 }
                 let dw_eff_i = (0.92 * d_centroid_i + 0.08 * min_nn_i).max(0.0);
 
-                let dl_cent_i = maha_local(z_i, &loss_centroid_32).max(0.0);
+                let mu_l_i = compute_rank1_loo_centroid_32(
+                    &loss_centroid_32,
+                    &loss_entries_with_id,
+                    Some(*tid),
+                );
+                let dl_cent_i = maha_local(z_i, &mu_l_i).max(0.0);
                 let mut min_loss_nn_i = dl_cent_i;
                 for (lid, l_vec) in &loss_entries_with_id {
                     if lid != tid {
@@ -887,13 +907,39 @@ pub fn build_synaptic_precision_weights(brain_state: &BrainSynapticPlasticitySta
     }
 }
 
-/// Phase 33.1, Phase 34 & Phase 34.1 Single Shared Pure-Causal Stage 0 Conformal + $\chi^2_{32}$ OOD Kernel.
+/// Phase 35.1 Exact $O(32)$ Rank-1 Leave-One-Out Centroid Downdate:
+/// $$\mu_{-i}[f] = \frac{N \cdot \mu[f] - z_{\text{excl}}[f]}{N - 1}$$
+/// When `exclude_trade_id == Some(excl_id)` matches a stored exemplar `(excl_id, z_excl)` and $N > 1$,
+/// removes the exact $\frac{1}{N}$ self-contribution in $O(32)$; when `None`, returns `*full_centroid` untouched.
+#[inline]
+#[allow(clippy::needless_range_loop)]
+pub fn compute_rank1_loo_centroid_32(
+    full_centroid: &[f64; 32],
+    exemplars: &[(Uuid, [f64; 32])],
+    exclude_trade_id: Option<Uuid>,
+) -> [f64; 32] {
+    if let Some(excl_id) = exclude_trade_id
+        && exemplars.len() > 1
+        && let Some((_, z_excl)) = exemplars.iter().find(|(id, _)| *id == excl_id)
+    {
+        let n = exemplars.len() as f64;
+        let inv_nm1 = 1.0 / (n - 1.0);
+        let mut out = [0.0_f64; 32];
+        for f in 0..32 {
+            out[f] = (n * full_centroid[f] - z_excl[f]) * inv_nm1;
+        }
+        return out;
+    }
+    *full_centroid
+}
+
+/// Phase 33.1, Phase 34, Phase 34.1 & Phase 35.1 Single Shared Pure-Causal Stage 0 Conformal + $\chi^2_{32}$ OOD Kernel.
 ///
 /// Invoked identically by BOTH offline `simulate_trade_under_candidate` (`exclude_trade_id = Some(trade.trade_id)`)
 /// AND live `RealTimeLedgerEngine::evaluate_live_entry_stage0_gate` / watchlist scanner (`exclude_trade_id = None`),
-/// guaranteeing strict Leave-One-Out zero self-match leakage and `< 1e-12` parity across `conformal_margin`,
-/// `conformal_llr`, `conformal_p_value`, `epistemic_ood_score`, `kelly_epistemic_multiplier`,
-/// `conformal_kelly_scalar`, `unified_stage0_kelly_multiplier`, and `vetoed` decisions.
+/// guaranteeing exact $O(32)$ rank-1 LOO centroid downdate $\mu_{W,-i}, \mu_{L,-i}$, zero self-match leakage,
+/// and `< 1e-12` parity across `conformal_margin`, `conformal_llr`, `conformal_p_value`, `epistemic_ood_score`,
+/// `kelly_epistemic_multiplier`, `conformal_kelly_scalar`, `unified_stage0_kelly_multiplier`, and `vetoed` decisions.
 pub fn evaluate_stage0_conformal_kernel(
     brain_id: BrainHorizonId,
     entry_features_32: &[f64; 32],
@@ -906,11 +952,16 @@ pub fn evaluate_stage0_conformal_kernel(
     let weights_32 = build_synaptic_precision_weights(brain_state);
 
     let mut d_win = if let Some(manifold) = precision.brains.get(&brain_id) {
+        let mu_w_eff = compute_rank1_loo_centroid_32(
+            &manifold.winner_centroid_32,
+            &manifold.winner_exemplars_32,
+            exclude_trade_id,
+        );
         let d_win_c = precision.entry_mahalanobis(
             brain_id,
             &weights_32,
             entry_features_32,
-            &manifold.winner_centroid_32,
+            &mu_w_eff,
         );
         let mut min_nn = d_win_c;
         for (w_id, w_vec) in &manifold.winner_exemplars_32 {
@@ -930,11 +981,16 @@ pub fn evaluate_stage0_conformal_kernel(
     d_win = d_win.max(0.0);
 
     let d_loss_c = if let Some(manifold) = precision.brains.get(&brain_id) {
+        let mu_l_eff = compute_rank1_loo_centroid_32(
+            &manifold.loss_centroid_32,
+            &manifold.loss_exemplars_32,
+            exclude_trade_id,
+        );
         let dl_cent = precision.entry_mahalanobis(
             brain_id,
             &weights_32,
             entry_features_32,
-            &manifold.loss_centroid_32,
+            &mu_l_eff,
         );
         let mut min_loss_nn = dl_cent;
         for (l_id, l_vec) in &manifold.loss_exemplars_32 {

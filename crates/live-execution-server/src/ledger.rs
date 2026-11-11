@@ -2614,6 +2614,7 @@ pub struct RealTimeLedgerEngine {
     last_autopsy_evolution: RwLock<Option<crate::autopsy_evolver::AutopsyEvolutionResponse>>,
     shadow_open_trades: RwLock<Vec<ShadowVetoedTrade>>,
     shadow_settled_trades: RwLock<Vec<ShadowVetoedTrade>>,
+    martingale_shield: RwLock<crate::martingale_shield::VilleMartingaleAlphaShield>,
 }
 
 impl Default for RealTimeLedgerEngine {
@@ -2648,7 +2649,34 @@ impl RealTimeLedgerEngine {
             last_autopsy_evolution: RwLock::new(None),
             shadow_open_trades: RwLock::new(Vec::with_capacity(128)),
             shadow_settled_trades: RwLock::new(Vec::with_capacity(512)),
+            martingale_shield: RwLock::new(
+                crate::martingale_shield::VilleMartingaleAlphaShield::new(),
+            ),
         }
+    }
+
+    pub fn martingale_shield_snapshot(
+        &self,
+    ) -> Vec<crate::martingale_shield::BrainMartingaleState> {
+        self.martingale_shield.read().snapshot_all()
+    }
+
+    pub fn martingale_state_for_slot(
+        &self,
+        slot: crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot,
+    ) -> crate::martingale_shield::BrainMartingaleState {
+        self.martingale_shield.read().state_for_slot(slot)
+    }
+
+    pub fn observe_martingale_trade(
+        &self,
+        slot: crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot,
+        realized_r: f64,
+        is_shadow_counterfactual: bool,
+    ) -> crate::martingale_shield::BrainMartingaleState {
+        self.martingale_shield
+            .write()
+            .observe_trade(slot, realized_r, is_shadow_counterfactual)
     }
 
     pub fn shadow_open_trades_snapshot(&self) -> Vec<ShadowVetoedTrade> {
@@ -2898,6 +2926,8 @@ impl RealTimeLedgerEngine {
 
     pub fn replace_closed_trades_for_audit(&self, trades: Vec<ClosedTradeRow>) {
         let len = trades.len();
+        *self.martingale_shield.write() =
+            crate::martingale_shield::VilleMartingaleAlphaShield::from_causal_ledger(&trades);
         *self.closed_ledger.write() = trades;
         self.closed_ledger_len
             .store(len, std::sync::atomic::Ordering::Release);
@@ -3402,6 +3432,8 @@ impl RealTimeLedgerEngine {
         *self.last_autopsy_evolution.write() = None;
         self.shadow_open_trades.write().clear();
         self.shadow_settled_trades.write().clear();
+        *self.martingale_shield.write() =
+            crate::martingale_shield::VilleMartingaleAlphaShield::new();
         self.webhook_dispatcher.clear_outbox();
         *self.running_net_profit_usd.write() = 0.0;
     }
@@ -4696,8 +4728,85 @@ impl RealTimeLedgerEngine {
             return row;
         }
 
-        // Phase 35 Deliverable 1: Cross-Position Eigen-Covariance & Absorption-Ratio Crowding Gate
+        // Phase 35 Deliverable 1 + Phase 36 Pillar 3: Ville Martingale Probation & Eigen-Risk Gate
         if !enforce_era1_baseline && syn_state.generation_id >= 37 {
+            let is_0dte_slot = matches!(row.symbol.as_str(), "SPY" | "QQQ" | "IWM")
+                && row.brain_id == BrainHorizonId::Brain02IntradayDayTrade;
+            let m_slot = if is_0dte_slot {
+                crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::Scalp0Dte
+            } else {
+                crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::from_brain_and_tier(
+                    row.brain_id,
+                    "STANDARD",
+                )
+            };
+            let m_state = self.martingale_shield.read().state_for_slot(m_slot);
+            if m_state.probation_shadow_only {
+                row.active_sequential_stage =
+                    "PROBATION_SHADOW_ONLY_MARTINGALE_QUARANTINE".to_string();
+                row.sequential_safety_margin_pct = 0.0;
+
+                let entry_features_vec = Self::extract_causal_entry_features_32(
+                    &sig.latent_embedding_128,
+                    sig.entry_price,
+                    sig.structural_stop_price,
+                    sig.target_1_price,
+                    sig.direction,
+                    sig.ai_confidence_pct,
+                    precedents.win_rate_pct,
+                    &row.entry_bars,
+                    row.entry_bar_idx,
+                );
+                let mut entry_arr_32 = [0.0_f64; 32];
+                for (i, &v) in entry_features_vec.iter().take(32).enumerate() {
+                    entry_arr_32[i] = v as f64;
+                }
+                let max_hold_bars = match row.brain_id {
+                    BrainHorizonId::Brain01PennyAnomaly => 24,
+                    BrainHorizonId::Brain02IntradayDayTrade => 28,
+                    BrainHorizonId::Brain03ShortTermSwing => 32,
+                    BrainHorizonId::Brain04CoreSwing => 38,
+                    BrainHorizonId::Brain05LongTermWealth => 44,
+                };
+                self.shadow_open_trades.write().push(ShadowVetoedTrade {
+                    shadow_id: Uuid::new_v4(),
+                    offending_trap_id: None,
+                    brain_id: row.brain_id,
+                    symbol: row.symbol.clone(),
+                    direction: row.direction,
+                    opened_timestamp_ns: row.opened_timestamp_ns,
+                    closed_timestamp_ns: None,
+                    entry_price: row.entry_price,
+                    initial_structural_stop: row.initial_structural_stop,
+                    target_1_price: row.target_1_price,
+                    target_2_price: row.target_2_price,
+                    exit_price: None,
+                    realized_r: None,
+                    running_peak_r: 0.0,
+                    bars_held: 0,
+                    max_hold_bars,
+                    entry_features_32: entry_arr_32,
+                    entry_embedding_128: row.entry_embedding_128.clone(),
+                    ai_confidence_pct: row.ai_confidence_pct,
+                    precedent_win_rate_pct: row.precedent_win_rate_pct,
+                    causal_bars: row.entry_bars.clone(),
+                    entry_bar_idx: row.entry_bar_idx,
+                    prev_bar_record: row.entry_bars.last().copied(),
+                    settled: false,
+                    outcome_label: "SHADOW_PROBATION_OPEN".to_string(),
+                });
+                return row;
+            }
+            if m_state.martingale_kelly_multiplier < 1.0 {
+                let km = m_state.martingale_kelly_multiplier.clamp(0.15, 1.0);
+                row.kelly_fraction_pct =
+                    (((row.kelly_fraction_pct * km) * 100.0).round() / 100.0).max(0.25);
+                row.risk_budget_usd =
+                    (((row.risk_budget_usd * km) * 100.0).round() / 100.0).max(250.0);
+                row.notional_allocated_usd =
+                    (((row.notional_allocated_usd * km) * 100.0).round() / 100.0).max(2_500.0);
+            }
+
             let cand_series = crate::portfolio_eigen_risk::EigenPositionSeries::from_open_row(&row);
             let eigen_rep = self.evaluate_book_eigen_risk(Some(&cand_series));
             if eigen_rep.vetoed {
@@ -4938,6 +5047,18 @@ impl RealTimeLedgerEngine {
                 done.outcome_label = label.to_string();
                 if let Some(trap_id) = done.offending_trap_id {
                     self.precedent_knn.record_trap_shadow_outcome(trap_id, r_val);
+                } else {
+                    let is_0dte_slot = matches!(done.symbol.as_str(), "SPY" | "QQQ" | "IWM")
+                        && done.brain_id == BrainHorizonId::Brain02IntradayDayTrade;
+                    let m_slot = if is_0dte_slot {
+                        crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::Scalp0Dte
+                    } else {
+                        crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::from_brain_and_tier(
+                            done.brain_id,
+                            "STANDARD",
+                        )
+                    };
+                    self.martingale_shield.write().observe_trade(m_slot, r_val, true);
                 }
                 newly_settled.push(done);
             } else {
@@ -5795,6 +5916,22 @@ impl RealTimeLedgerEngine {
             *self.cached_stage0_precision.write() = None;
         }
         self.sync_closed_row_to_precedent_knn(&row);
+        {
+            let is_0dte_slot = matches!(row.symbol.as_str(), "SPY" | "QQQ" | "IWM")
+                && row.hold_duration_ms <= 3_600_000
+                && row.brain_id == BrainHorizonId::Brain02IntradayDayTrade;
+            let m_slot = if is_0dte_slot {
+                crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::Scalp0Dte
+            } else {
+                crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::from_brain_and_tier(
+                    row.brain_id,
+                    "STANDARD",
+                )
+            };
+            self.martingale_shield
+                .write()
+                .observe_trade(m_slot, row.realized_r_multiple, false);
+        }
         self.recompute_causal_plasticity();
 
         self.webhook_dispatcher
@@ -10256,6 +10393,10 @@ impl RealTimeLedgerEngine {
         }
         *self.positions_opened.write() = parsed.positions_opened;
         let loaded_closed_len = parsed.closed_ledger.len();
+        *self.martingale_shield.write() =
+            crate::martingale_shield::VilleMartingaleAlphaShield::from_causal_ledger(
+                &parsed.closed_ledger,
+            );
         *self.closed_ledger.write() = parsed.closed_ledger;
         self.closed_ledger_len
             .store(loaded_closed_len, std::sync::atomic::Ordering::Release);

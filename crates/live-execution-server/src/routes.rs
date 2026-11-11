@@ -2736,6 +2736,34 @@ pub struct InstitutionalWatchlistRow {
     #[serde(default)]
     pub theta_burn_hazard: f64,
     #[serde(default)]
+    pub optimal_long_strike: f64,
+    #[serde(default)]
+    pub optimal_short_strike: Option<f64>,
+    #[serde(default)]
+    pub net_delta: f64,
+    #[serde(default)]
+    pub net_gamma: f64,
+    #[serde(default)]
+    pub net_theta_per_bar: f64,
+    #[serde(default)]
+    pub net_vanna: f64,
+    #[serde(default)]
+    pub net_charm: f64,
+    #[serde(default)]
+    pub execution_tactic: String,
+    #[serde(default)]
+    pub microprice_limit_price: f64,
+    #[serde(default)]
+    pub execution_urgency_score: f64,
+    #[serde(default)]
+    pub expected_slippage_bps: f64,
+    #[serde(default)]
+    pub martingale_e_value: f64,
+    #[serde(default)]
+    pub martingale_kelly_multiplier: f64,
+    #[serde(default)]
+    pub probation_shadow_only: bool,
+    #[serde(default)]
     pub action_status: String,
     #[serde(default)]
     pub venue_ticket: String,
@@ -2772,6 +2800,14 @@ pub struct InstitutionalWatchlistResponse {
     pub eigen_kelly_multiplier: f64,
     #[serde(default)]
     pub contextual_nig_allocations: Vec<crate::portfolio_eigen_risk::BrainContextualAllocationRow>,
+    #[serde(default)]
+    pub bocpd_changepoint_prob: f64,
+    #[serde(default)]
+    pub bocpd_expected_run_length: f64,
+    #[serde(default)]
+    pub adaptive_forgetting_gamma: f64,
+    #[serde(default)]
+    pub martingale_shield_states: Vec<crate::martingale_shield::BrainMartingaleState>,
     pub watchlist: Vec<InstitutionalWatchlistRow>,
     pub market_internals: UnifiedMarketInternals,
 }
@@ -2936,6 +2972,8 @@ pub async fn build_institutional_watchlist_at_epoch(
         .get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade)
         .generation_id;
     let nig_allocator = state.ledger.build_contextual_nig_meta_allocator();
+    let bocpd_tel = nig_allocator.bocpd_telemetry();
+    let martingale_shield_states = state.ledger.martingale_shield_snapshot();
     let base_snap = state
         .ledger
         .query_filtered_snapshot(&HyperFilterQuery::default());
@@ -3268,8 +3306,61 @@ pub async fn build_institutional_watchlist_at_epoch(
                         },
                     );
 
-                let final_actionable = is_actionable && !eigen_cand.vetoed;
-                let init_action_status = if eigen_cand.vetoed {
+                let m_state = state.ledger.martingale_state_for_slot(meta_slot);
+
+                let (bid_px, ask_px, q_bid, q_ask, vpin_tox) = if let Some(last_b) = window_bars.last()
+                {
+                    let b_open = last_b.open.to_f64();
+                    let b_high = last_b.high.to_f64();
+                    let b_low = last_b.low.to_f64();
+                    let b_close = last_b.close.to_f64();
+                    let b_range = (b_high - b_low).max(1e-4);
+                    let clv = ((b_close - b_low) / b_range).clamp(0.0, 1.0);
+                    let eff_sp = last_b
+                        .bid_ask_spread
+                        .to_f64()
+                        .max(entry_p * 0.0004)
+                        .max(0.01);
+                    let q_tot = (last_b.volume as f64).sqrt().clamp(20.0, 5_000.0);
+                    let vpin = (0.55 * ((b_close - b_open).abs() / b_range)
+                        + 0.45 * raw_sf.intraday_short_volume_ratio.clamp(0.0, 1.0))
+                    .clamp(0.05, 0.98);
+                    (
+                        (entry_p - 0.5 * eff_sp).max(0.0001),
+                        entry_p + 0.5 * eff_sp,
+                        q_tot * (0.15 + 0.70 * clv),
+                        q_tot * (0.85 - 0.70 * clv),
+                        vpin,
+                    )
+                } else {
+                    let eff_sp = (entry_p * 0.0005).max(0.01);
+                    (
+                        (entry_p - 0.5 * eff_sp).max(0.0001),
+                        entry_p + 0.5 * eff_sp,
+                        100.0,
+                        100.0,
+                        0.50,
+                    )
+                };
+                let exec_plan = crate::execution_microstructure::MicropriceExecutionRouter::route_order(
+                    &crate::execution_microstructure::MicrostructureQuoteInput {
+                        bid_price: bid_px,
+                        ask_price: ask_px,
+                        bid_size: q_bid,
+                        ask_size: q_ask,
+                        orderflow_toxicity_vpin: vpin_tox,
+                        atr_bar,
+                        structural_risk_per_share: (entry_p - stop_p).abs().max(0.01),
+                        direction: inference.signal.direction,
+                        regime_bucket: regime_enum,
+                    },
+                );
+
+                let final_actionable =
+                    is_actionable && !eigen_cand.vetoed && !m_state.probation_shadow_only;
+                let init_action_status = if m_state.probation_shadow_only {
+                    "PROBATION_SHADOW_ONLY_MARTINGALE_QUARANTINE".to_string()
+                } else if eigen_cand.vetoed {
                     "PORTFOLIO_VETOED_EIGEN_CORRELATION_CROWDING".to_string()
                 } else {
                     String::new()
@@ -3286,6 +3377,7 @@ pub async fn build_institutional_watchlist_at_epoch(
                 let combined_kelly_pct = ((kelly_plan.kelly_fraction_pct
                     * stage0.unified_stage0_kelly_multiplier.clamp(0.10, 1.0)
                     * eigen_cand.eigen_kelly_multiplier.clamp(0.25, 1.0)
+                    * m_state.martingale_kelly_multiplier.clamp(0.15, 1.0)
                     * nig_kelly_mult.clamp(0.75, 1.35))
                     * 100.0)
                     .round()
@@ -3346,6 +3438,29 @@ pub async fn build_institutional_watchlist_at_epoch(
                         / 10_000.0,
                     theta_burn_hazard: (convexity_eval.theta_burn_hazard * 10_000.0).round()
                         / 10_000.0,
+                    optimal_long_strike: (convexity_eval.optimal_long_strike * 100.0).round()
+                        / 100.0,
+                    optimal_short_strike: convexity_eval
+                        .optimal_short_strike
+                        .map(|k| (k * 100.0).round() / 100.0),
+                    net_delta: (convexity_eval.net_delta * 10_000.0).round() / 10_000.0,
+                    net_gamma: (convexity_eval.net_gamma * 10_000.0).round() / 10_000.0,
+                    net_theta_per_bar: (convexity_eval.net_theta_per_bar * 1_000_000.0).round()
+                        / 1_000_000.0,
+                    net_vanna: (convexity_eval.net_vanna * 10_000.0).round() / 10_000.0,
+                    net_charm: (convexity_eval.net_charm * 10_000.0).round() / 10_000.0,
+                    execution_tactic: exec_plan.execution_tactic.as_str().to_string(),
+                    microprice_limit_price: (exec_plan.microprice_limit_price * 10_000.0).round()
+                        / 10_000.0,
+                    execution_urgency_score: (exec_plan.execution_urgency_score * 10_000.0).round()
+                        / 10_000.0,
+                    expected_slippage_bps: (exec_plan.expected_slippage_bps * 100.0).round()
+                        / 100.0,
+                    martingale_e_value: (m_state.martingale_e_value * 10_000.0).round() / 10_000.0,
+                    martingale_kelly_multiplier: (m_state.martingale_kelly_multiplier * 10_000.0)
+                        .round()
+                        / 10_000.0,
+                    probation_shadow_only: m_state.probation_shadow_only,
                     action_status: init_action_status,
                     venue_ticket: venue_ticket.to_string(),
                     matched_option_contract: matched_opt,
@@ -3571,6 +3686,11 @@ pub async fn build_institutional_watchlist_at_epoch(
         eigen_kelly_multiplier: (book_eigen_rep.eigen_kelly_multiplier * 10_000.0).round()
             / 10_000.0,
         contextual_nig_allocations,
+        bocpd_changepoint_prob: (bocpd_tel.bocpd_changepoint_prob * 10_000.0).round() / 10_000.0,
+        bocpd_expected_run_length: (bocpd_tel.bocpd_expected_run_length * 100.0).round() / 100.0,
+        adaptive_forgetting_gamma: (bocpd_tel.adaptive_forgetting_gamma * 10_000.0).round()
+            / 10_000.0,
+        martingale_shield_states,
         watchlist: rows,
         market_internals: internals,
     })

@@ -6,23 +6,34 @@
 pub mod autopsy_evolver;
 pub mod broker_bridge;
 pub mod evolution;
+pub mod execution_microstructure;
 pub mod exporter;
 pub mod ledger;
+pub mod martingale_shield;
 pub mod onnx_engine;
 pub mod options_convexity;
 pub mod portfolio_eigen_risk;
 pub mod precedent_knn;
+pub mod regime_bocpd;
 pub mod routes;
 pub mod webhooks;
 
+pub use execution_microstructure::{
+    ExecutionTactic, MicropriceExecutionPlan, MicropriceExecutionRouter, MicrostructureQuoteInput,
+};
+pub use martingale_shield::{BrainMartingaleState, VilleMartingaleAlphaShield};
 pub use options_convexity::{
-    OptionConvexityEvaluation, OptionConvexityStructure, OptionGreeksConvexityInput,
-    OptionsConvexityEngine, ZeroDteOptionSimOutcome,
+    BsmSurfaceLegGreeks, OptionConvexityEvaluation, OptionConvexityStructure,
+    OptionGreeksConvexityInput, OptionsConvexityEngine, SolvedOptionStructurePlan,
+    ZeroDteOptionSimOutcome,
 };
 pub use portfolio_eigen_risk::{
     BrainContextualAllocationRow, ContextualNigMetaAllocator, EigenPositionSeries,
     MetaAllocatorHorizonSlot, NigPosteriorStats, PortfolioEigenCrowdingEngine,
     PortfolioEigenRiskReport, project_capped_simplex_kl,
+};
+pub use regime_bocpd::{
+    AdamsMacKayBocpdEngine, BocpdStepTelemetry, compute_adaptive_forgetting_gamma,
 };
 
 pub use autopsy_evolver::{
@@ -4383,6 +4394,20 @@ mod tests {
                 recommended_option_structure: "SINGLE_LONG_CONVEX".to_string(),
                 gamma_theta_efficiency: 1.85,
                 theta_burn_hazard: 0.12,
+                optimal_long_strike: 138.0,
+                optimal_short_strike: None,
+                net_delta: -0.52,
+                net_gamma: 0.045,
+                net_theta_per_bar: -0.0012,
+                net_vanna: 0.014,
+                net_charm: -0.008,
+                execution_tactic: "ADAPTIVE_MICROPRICE_PEG".to_string(),
+                microprice_limit_price: 138.49,
+                execution_urgency_score: 0.54,
+                expected_slippage_bps: 1.25,
+                martingale_e_value: 0.85,
+                martingale_kelly_multiplier: 1.0,
+                probation_shadow_only: false,
                 action_status: String::new(),
                 venue_ticket: "IBKR_PEG_MID_SMART".to_string(),
                 matched_option_contract: "AMD 2026-11-20 $138.00P".to_string(),
@@ -4427,6 +4452,20 @@ mod tests {
                 recommended_option_structure: "DEFINED_RISK_VERTICAL_BAG".to_string(),
                 gamma_theta_efficiency: 1.05,
                 theta_burn_hazard: 0.18,
+                optimal_long_strike: 138.5,
+                optimal_short_strike: Some(142.0),
+                net_delta: 0.34,
+                net_gamma: 0.022,
+                net_theta_per_bar: -0.0005,
+                net_vanna: 0.006,
+                net_charm: -0.003,
+                execution_tactic: "PASSIVE_MID_PEG_LIMIT".to_string(),
+                microprice_limit_price: 138.50,
+                execution_urgency_score: 0.31,
+                expected_slippage_bps: 0.65,
+                martingale_e_value: 0.92,
+                martingale_kelly_multiplier: 1.0,
+                probation_shadow_only: false,
                 action_status: String::new(),
                 venue_ticket: "SCHWAB_2LEG_NET_ROLL".to_string(),
                 matched_option_contract: "AMD 2026-12-18 $140.00C".to_string(),

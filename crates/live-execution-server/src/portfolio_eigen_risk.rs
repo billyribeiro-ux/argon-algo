@@ -4,6 +4,9 @@
 
 use crate::autopsy_evolver::RegimeBucket;
 use crate::ledger::{ClosedTradeRow, OpenPositionRow};
+use crate::regime_bocpd::{
+    compute_adaptive_forgetting_gamma, AdamsMacKayBocpdEngine, BocpdStepTelemetry,
+};
 use raw_fingerprint_core::BrainHorizonId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -420,13 +423,14 @@ impl MetaAllocatorHorizonSlot {
 }
 
 /// Conjugate Normal-Inverse-Gamma $(\mu_n, \kappa_n, \alpha_n, \beta_n)$ posterior cell
-/// with exponential forgetting $\gamma = 0.97$ for regime non-stationarity.
+/// with BOCPD-coupled adaptive forgetting $\gamma_t = \operatorname{clamp}(0.992 - 0.22 \cdot p_{\text{cp}, t},\; 0.76,\; 0.992)$.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NigPosteriorStats {
     pub mu_n: f64,
     pub kappa_n: f64,
     pub alpha_n: f64,
     pub beta_n: f64,
+    pub last_forgetting_gamma: f64,
     pub observations_count: usize,
     pub false_veto_regrets_penalized: usize,
 }
@@ -438,6 +442,7 @@ impl Default for NigPosteriorStats {
             kappa_n: 2.0,
             alpha_n: 2.5,
             beta_n: 1.25,
+            last_forgetting_gamma: compute_adaptive_forgetting_gamma(0.06),
             observations_count: 0,
             false_veto_regrets_penalized: 0,
         }
@@ -445,15 +450,31 @@ impl Default for NigPosteriorStats {
 }
 
 impl NigPosteriorStats {
-    pub const FORGETTING_GAMMA: f64 = 0.97;
-
     /// Assimilates a causal settled trade's risk-adjusted return
-    /// $y_t = \text{realized\_r}_t / \max(0.35, \text{mae\_r}_t)$.
-    pub fn observe_settled_trade(&mut self, realized_r: f64, mae_r: f64) {
+    /// $y_t = \text{realized\_r}_t / \max(0.35, \text{mae\_r}_t)$ using BOCPD structural
+    /// changepoint probability $p_{\text{cp}, t} \in [0, 1]$ to set dynamic forgetting $\gamma_t$.
+    pub fn observe_settled_trade_adaptive(&mut self, realized_r: f64, mae_r: f64, p_cp: f64) {
+        let gamma_t = compute_adaptive_forgetting_gamma(p_cp);
+        self.observe_settled_trade_with_gamma(realized_r, mae_r, gamma_t);
+    }
+
+    /// Assimilates a causal settled trade with an explicit forgetting factor $\gamma_t \in (0, 1)$.
+    /// Contracts effective pre-observation pseudo-count $\tilde{\kappa}$ by the geometric memory
+    /// horizon $\frac{\gamma_t}{1 - \gamma_t}$ so structural Gamma-Flip shocks ($\gamma_t \le 0.85$)
+    /// shed stale pre-break inertia immediately while preserving variance scale $\beta_n / \alpha_n$.
+    pub fn observe_settled_trade_with_gamma(
+        &mut self,
+        realized_r: f64,
+        mae_r: f64,
+        gamma_t: f64,
+    ) {
+        let g = gamma_t.clamp(0.50, 0.999);
         let y_t = (realized_r / mae_r.abs().max(0.35)).clamp(-5.0, 8.0);
-        let k_tilde = (Self::FORGETTING_GAMMA * self.kappa_n).max(1.5);
-        let a_tilde = (Self::FORGETTING_GAMMA * self.alpha_n).max(2.0);
-        let b_tilde = (Self::FORGETTING_GAMMA * self.beta_n).max(0.25);
+        let asymptotic_horizon = (g / (1.0 - g)).max(1.5);
+        let k_tilde = (g * self.kappa_n).min(asymptotic_horizon).max(1.5);
+        let contraction_ratio = (k_tilde / self.kappa_n.max(1e-6)).clamp(0.05, 1.0);
+        let a_tilde = (self.alpha_n * contraction_ratio).max(2.0);
+        let b_tilde = (self.beta_n * contraction_ratio).max(0.25);
 
         let kappa_next = k_tilde + 1.0;
         let diff = y_t - self.mu_n;
@@ -465,7 +486,13 @@ impl NigPosteriorStats {
         self.kappa_n = kappa_next;
         self.alpha_n = alpha_next;
         self.beta_n = beta_next;
+        self.last_forgetting_gamma = g;
         self.observations_count += 1;
+    }
+
+    /// Default causal observation entry point using baseline calm changepoint prior ($p_{\text{cp}} = 0.06$).
+    pub fn observe_settled_trade(&mut self, realized_r: f64, mae_r: f64) {
+        self.observe_settled_trade_adaptive(realized_r, mae_r, 0.06);
     }
 
     /// Penalizes posterior mean and dispersion when a hard-negative trap censors a counterfactual winner.
@@ -500,20 +527,32 @@ pub struct BrainContextualAllocationRow {
     pub false_veto_regrets_penalized: usize,
 }
 
-/// Regime-Contextual Normal-Inverse-Gamma (NIG) Cross-Brain Capital Meta-Allocator.
+/// Regime-Contextual Normal-Inverse-Gamma (NIG) Cross-Brain Capital Meta-Allocator
+/// coupled with online Adams-MacKay BOCPD adaptive forgetting.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextualNigMetaAllocator {
     cells: BTreeMap<(MetaAllocatorHorizonSlot, String), NigPosteriorStats>,
+    bocpd_engine: AdamsMacKayBocpdEngine,
 }
 
 impl ContextualNigMetaAllocator {
     pub fn new() -> Self {
         Self {
             cells: BTreeMap::new(),
+            bocpd_engine: AdamsMacKayBocpdEngine::default(),
         }
     }
 
-    /// Builds causal NIG posteriors from settled `ClosedTradeRow`s and settled counterfactual shadow regrets.
+    pub fn bocpd_telemetry(&self) -> BocpdStepTelemetry {
+        self.bocpd_engine.telemetry()
+    }
+
+    pub fn bocpd_engine_mut(&mut self) -> &mut AdamsMacKayBocpdEngine {
+        &mut self.bocpd_engine
+    }
+
+    /// Builds causal NIG posteriors from settled `ClosedTradeRow`s and settled counterfactual shadow regrets,
+    /// stepping `AdamsMacKayBocpdEngine` chronologically to adapt $\gamma_t$ on every structural shift.
     pub fn from_causal_ledger(
         closed_trades: &[ClosedTradeRow],
         shadow_regrets: &[(MetaAllocatorHorizonSlot, RegimeBucket, f64)],
@@ -521,11 +560,10 @@ impl ContextualNigMetaAllocator {
         let mut alloc = Self::new();
         for row in closed_trades {
             let entry_vec = crate::autopsy_evolver::extract_causal_entry_array_32(row);
+            let bocpd_step = alloc.bocpd_engine.observe_features_32(&entry_vec);
             let regime = crate::autopsy_evolver::classify_regime_bucket(&entry_vec);
-            let is_0dte_scalp = matches!(
-                row.symbol.as_str(),
-                "SPY" | "QQQ" | "IWM"
-            ) && row.hold_duration_ms <= 3_600_000
+            let is_0dte_scalp = matches!(row.symbol.as_str(), "SPY" | "QQQ" | "IWM")
+                && row.hold_duration_ms <= 3_600_000
                 && row.brain_id == BrainHorizonId::Brain02IntradayDayTrade;
             let slot = if is_0dte_scalp {
                 MetaAllocatorHorizonSlot::Scalp0Dte
@@ -537,12 +575,46 @@ impl ContextualNigMetaAllocator {
                 * 100.0)
                 .max(0.10);
             let mae_r = (row.mae_pct / risk_pct).max(0.35);
-            alloc.observe(slot, regime, row.realized_r_multiple, mae_r);
+            alloc.observe_adaptive(
+                slot,
+                regime,
+                row.realized_r_multiple,
+                mae_r,
+                bocpd_step.bocpd_changepoint_prob,
+            );
         }
         for &(slot, regime, missed_r) in shadow_regrets {
             alloc.penalize_regret(slot, regime, missed_r);
         }
         alloc
+    }
+
+    pub fn observe_adaptive(
+        &mut self,
+        slot: MetaAllocatorHorizonSlot,
+        regime: RegimeBucket,
+        realized_r: f64,
+        mae_r: f64,
+        p_cp: f64,
+    ) {
+        self.cells
+            .entry((slot, regime.as_str().to_string()))
+            .or_default()
+            .observe_settled_trade_adaptive(realized_r, mae_r, p_cp);
+    }
+
+    pub fn observe_with_fixed_gamma(
+        &mut self,
+        slot: MetaAllocatorHorizonSlot,
+        regime: RegimeBucket,
+        realized_r: f64,
+        mae_r: f64,
+        fixed_gamma: f64,
+    ) {
+        self.cells
+            .entry((slot, regime.as_str().to_string()))
+            .or_default()
+            .observe_settled_trade_with_gamma(realized_r, mae_r, fixed_gamma);
     }
 
     pub fn observe(
@@ -552,10 +624,8 @@ impl ContextualNigMetaAllocator {
         realized_r: f64,
         mae_r: f64,
     ) {
-        self.cells
-            .entry((slot, regime.as_str().to_string()))
-            .or_default()
-            .observe_settled_trade(realized_r, mae_r);
+        let p_cp = self.bocpd_engine.telemetry().bocpd_changepoint_prob;
+        self.observe_adaptive(slot, regime, realized_r, mae_r, p_cp);
     }
 
     pub fn penalize_regret(

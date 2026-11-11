@@ -2944,8 +2944,9 @@ pub async fn build_institutional_watchlist_at_epoch(
         .iter()
         .map(crate::portfolio_eigen_risk::EigenPositionSeries::from_open_row)
         .collect();
-    let base_heat_fraction =
-        (base_snap.portfolio_heat_telemetry.current_heat_pct / 6.0).clamp(0.0, 2.0);
+    let base_heat_fraction = (base_snap.portfolio_heat_telemetry.aggregate_open_risk_pct
+        / base_snap.portfolio_heat_telemetry.portfolio_heat_cap_pct.max(0.10))
+    .clamp(0.0, 2.0);
 
     // 1. Establish Canonical Underlying Spot Map: resolve single latest authoritative spot per symbol
     let mut canonical_spot_map: HashMap<String, (i64, f64)> = HashMap::new();
@@ -3127,8 +3128,9 @@ pub async fn build_institutional_watchlist_at_epoch(
                 let eval_epoch_s = override_eval_epoch_s.unwrap_or_else(|| {
                     window_bars.last().map(|b| b.timestamp_ns / 1_000_000_000).unwrap_or(0).max(chrono::Utc::now().timestamp())
                 });
-                let mut matched_opt = inference.matched_option.matched_option_contract.clone();
-                let mut opt_struct = format!("{:?}", inference.matched_option.option_structure);
+                let mut active_opt_meta = inference.matched_option.clone();
+                let mut matched_opt = active_opt_meta.matched_option_contract.clone();
+                let mut opt_struct = active_opt_meta.option_structure.clone();
                 let tokens: Vec<&str> = matched_opt.split_whitespace().collect();
                 let eval_date = chrono::DateTime::from_timestamp(eval_epoch_s, 0)
                     .unwrap_or_else(chrono::Utc::now)
@@ -3155,9 +3157,123 @@ pub async fn build_institutional_watchlist_at_epoch(
                         raw_opts.net_dealer_vanna,
                         eval_epoch_s,
                     );
-                    matched_opt = fresh_opt.matched_option_contract;
-                    opt_struct = fresh_opt.option_structure;
+                    matched_opt = fresh_opt.matched_option_contract.clone();
+                    opt_struct = fresh_opt.option_structure.clone();
+                    active_opt_meta = fresh_opt;
                 }
+
+                let execution_tier = if sym == "SPY"
+                    || sym == "QQQ"
+                    || ((sym == "NVDA" || sym == "TSLA")
+                        && (brain_id == BrainHorizonId::Brain02IntradayDayTrade
+                            || brain_id == BrainHorizonId::Brain01PennyAnomaly))
+                {
+                    "SCALP_0DTE".to_string()
+                } else if brain_id == BrainHorizonId::Brain01PennyAnomaly
+                    || brain_id == BrainHorizonId::Brain02IntradayDayTrade
+                {
+                    "DAY_TRADE".to_string()
+                } else if brain_id == BrainHorizonId::Brain03ShortTermSwing
+                    || brain_id == BrainHorizonId::Brain04CoreSwing
+                {
+                    "SWING".to_string()
+                } else {
+                    "LONG_TERM_WEALTH".to_string()
+                };
+
+                let regime_enum = match stage0.regime_bucket.as_str() {
+                    "NEG_GAMMA_MOMENTUM_TREND" => {
+                        crate::autopsy_evolver::RegimeBucket::NegGammaMomentumTrend
+                    }
+                    "LIQUIDITY_VACUUM_HIGH_TOXICITY" => {
+                        crate::autopsy_evolver::RegimeBucket::LiquidityVacuumHighToxicity
+                    }
+                    _ => crate::autopsy_evolver::RegimeBucket::PosGammaPinMeanRevert,
+                };
+                let meta_slot =
+                    crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::from_brain_and_tier(
+                        brain_id,
+                        &execution_tier,
+                    );
+                let (pi_weight, post_sharpe, nig_kelly_mult) =
+                    nig_allocator.weight_and_sharpe_for_slot(meta_slot, regime_enum);
+
+                let close_vec: Vec<f64> = window_bars.iter().map(|b| b.close.to_f64()).collect();
+                let cand_leg = crate::portfolio_eigen_risk::EigenPositionSeries {
+                    symbol: sym.to_string(),
+                    direction_sign: inference.signal.direction.sign(),
+                    risk_weight: (kelly_plan.kelly_fraction_pct * 1_000.0).max(100.0),
+                    close_prices: close_vec.clone(),
+                };
+                let eigen_cand =
+                    crate::portfolio_eigen_risk::PortfolioEigenCrowdingEngine::evaluate_portfolio_eigen_crowding(
+                        &base_open_legs,
+                        Some(&cand_leg),
+                        base_heat_fraction,
+                    );
+
+                let bar_session_frac = match tf {
+                    Timeframe::Tick => 0.1 / 390.0,
+                    Timeframe::M1 => 1.0 / 390.0,
+                    Timeframe::M3 => 3.0 / 390.0,
+                    Timeframe::M5 => 5.0 / 390.0,
+                    Timeframe::M15 => 15.0 / 390.0,
+                    Timeframe::H1 => 60.0 / 390.0,
+                    Timeframe::H4 => 240.0 / 390.0,
+                    Timeframe::D1 => 1.0,
+                    Timeframe::W1 => 5.0,
+                    Timeframe::Mo1 => 21.0,
+                };
+                let dte_days = matched_opt
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|d_str| chrono::NaiveDate::parse_from_str(d_str, "%Y-%m-%d").ok())
+                    .map(|exp_d| {
+                        let exp_epoch = exp_d
+                            .and_hms_opt(21, 0, 0)
+                            .map(|dt| dt.and_utc().timestamp())
+                            .unwrap_or(eval_epoch_s + 86_400);
+                        ((exp_epoch - eval_epoch_s) as f64 / 86_400.0).max(0.15)
+                    })
+                    .unwrap_or(5.0);
+                let atr_bar = crate::options_convexity::OptionsConvexityEngine::compute_causal_atr_bar(
+                    window_bars,
+                    entry_p,
+                );
+                let iv_val = active_opt_meta.contract_iv.max(0.18);
+                let iv_rank_causal =
+                    crate::options_convexity::OptionsConvexityEngine::derive_causal_iv_rank(
+                        window_bars,
+                        iv_val,
+                        bar_session_frac,
+                    );
+                let convexity_eval =
+                    crate::options_convexity::OptionsConvexityEngine::evaluate_option_convexity(
+                        &crate::options_convexity::OptionGreeksConvexityInput {
+                            direction: inference.signal.direction,
+                            spot_price: entry_p,
+                            structural_stop_price: stop_p,
+                            atr_bar,
+                            option_entry_premium: active_opt_meta.option_entry_premium.to_f64().max(0.25),
+                            contract_delta: active_opt_meta.contract_delta,
+                            contract_gamma: active_opt_meta.contract_gamma.abs().max(0.005),
+                            contract_theta_daily: -active_opt_meta.contract_theta.abs().max(0.02),
+                            contract_vega: active_opt_meta.contract_vega.abs().max(0.02),
+                            contract_iv: iv_val,
+                            iv_rank: iv_rank_causal,
+                            dte_days,
+                            bar_session_fraction: bar_session_frac,
+                            regime_bucket: regime_enum,
+                            is_scalp_0dte: execution_tier == "SCALP_0DTE",
+                        },
+                    );
+
+                let final_actionable = is_actionable && !eigen_cand.vetoed;
+                let init_action_status = if eigen_cand.vetoed {
+                    "PORTFOLIO_VETOED_EIGEN_CORRELATION_CROWDING".to_string()
+                } else {
+                    String::new()
+                };
 
                 let venue_ticket = match brain_id {
                     BrainHorizonId::Brain01PennyAnomaly => "IEX_DLIMIT_DAY",
@@ -3166,6 +3282,17 @@ pub async fn build_institutional_watchlist_at_epoch(
                     BrainHorizonId::Brain04CoreSwing => "SCHWAB_2LEG_NET_ROLL",
                     BrainHorizonId::Brain05LongTermWealth => "IBKR_VOL_AUCTION_ACCUM",
                 };
+
+                let combined_kelly_pct = ((kelly_plan.kelly_fraction_pct
+                    * stage0.unified_stage0_kelly_multiplier.clamp(0.10, 1.0)
+                    * eigen_cand.eigen_kelly_multiplier.clamp(0.25, 1.0)
+                    * nig_kelly_mult.clamp(0.75, 1.35))
+                    * 100.0)
+                    .round()
+                    / 100.0;
+
+                row_close_series.push(close_vec);
+                row_veto_categories.push(stage0.root_cause_category.clone());
 
                 rows.push(InstitutionalWatchlistRow {
                     rank: 0,
@@ -3196,29 +3323,36 @@ pub async fn build_institutional_watchlist_at_epoch(
                     kelly_epistemic_multiplier: (stage0.kelly_epistemic_multiplier * 10_000.0)
                         .round()
                         / 10_000.0,
-                    action_status: String::new(),
+                    conformal_kelly_scalar: (stage0.conformal_kelly_scalar * 10_000.0).round()
+                        / 10_000.0,
+                    unified_stage0_kelly_multiplier: (stage0.unified_stage0_kelly_multiplier
+                        * 10_000.0)
+                        .round()
+                        / 10_000.0,
+                    eigen_kelly_multiplier: (eigen_cand.eigen_kelly_multiplier * 10_000.0).round()
+                        / 10_000.0,
+                    marginal_correlation_penalty: (eigen_cand.marginal_correlation_penalty
+                        * 10_000.0)
+                        .round()
+                        / 10_000.0,
+                    contextual_brain_weight_pi: (pi_weight * 10_000.0).round() / 10_000.0,
+                    posterior_t_sharpe: (post_sharpe * 10_000.0).round() / 10_000.0,
+                    recommended_option_structure: convexity_eval
+                        .recommended_option_structure
+                        .as_str()
+                        .to_string(),
+                    gamma_theta_efficiency: (convexity_eval.gamma_theta_efficiency * 10_000.0)
+                        .round()
+                        / 10_000.0,
+                    theta_burn_hazard: (convexity_eval.theta_burn_hazard * 10_000.0).round()
+                        / 10_000.0,
+                    action_status: init_action_status,
                     venue_ticket: venue_ticket.to_string(),
                     matched_option_contract: matched_opt,
                     option_structure: opt_struct,
-                    kelly_fraction_pct: ((kelly_plan.kelly_fraction_pct
-                        * stage0.kelly_epistemic_multiplier.clamp(0.15, 1.0))
-                        * 100.0)
-                        .round()
-                        / 100.0,
-                    is_actionable,
-                    execution_tier: if sym == "SPY"
-                        || sym == "QQQ"
-                        || ((sym == "NVDA" || sym == "TSLA")
-                            && (brain_id == BrainHorizonId::Brain02IntradayDayTrade || brain_id == BrainHorizonId::Brain01PennyAnomaly))
-                    {
-                        "SCALP_0DTE".to_string()
-                    } else if brain_id == BrainHorizonId::Brain01PennyAnomaly || brain_id == BrainHorizonId::Brain02IntradayDayTrade {
-                        "DAY_TRADE".to_string()
-                    } else if brain_id == BrainHorizonId::Brain03ShortTermSwing || brain_id == BrainHorizonId::Brain04CoreSwing {
-                        "SWING".to_string()
-                    } else {
-                        "LONG_TERM_WEALTH".to_string()
-                    },
+                    kelly_fraction_pct: combined_kelly_pct,
+                    is_actionable: final_actionable,
+                    execution_tier,
                 });
             }
         }
@@ -3282,12 +3416,15 @@ pub async fn build_institutional_watchlist_at_epoch(
     }
 
     // Set remaining action statuses
-    for row in &mut rows {
+    for (idx, row) in rows.iter_mut().enumerate() {
         if row.action_status.is_empty() {
+            let v_cat = row_veto_categories.get(idx).map(String::as_str).unwrap_or("");
             row.action_status = if row.is_actionable {
                 "ACTIONABLE_STAGE_READY".to_string()
             } else if row.epistemic_ood_score > 1.25 {
                 "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME".to_string()
+            } else if v_cat == "STAGE_0_VETOED_MONDRIAN_NONCONFORMITY" {
+                "STAGE_0_VETOED_MONDRIAN_NONCONFORMITY".to_string()
             } else if row.stage0_conformal_status == "VETO" {
                 "STAGE_0_VETOED_HARD_NEGATIVE_TRAP".to_string()
             } else {
@@ -3295,6 +3432,44 @@ pub async fn build_institutional_watchlist_at_epoch(
             };
         }
     }
+
+    // 2b. Book + Actionable Watchlist Eigen-Risk Telemetry & Contextual NIG Regime Allocation
+    let mut eigen_pool_legs = base_open_legs.clone();
+    if eigen_pool_legs.len() < 2 {
+        for (idx, row) in rows.iter().enumerate() {
+            if row.is_actionable
+                && let Some(closes) = row_close_series.get(idx)
+                && closes.len() >= 4
+            {
+                eigen_pool_legs.push(crate::portfolio_eigen_risk::EigenPositionSeries {
+                    symbol: row.symbol.clone(),
+                    direction_sign: row.direction.sign(),
+                    risk_weight: (row.kelly_fraction_pct * 1_000.0).max(100.0),
+                    close_prices: closes.clone(),
+                });
+            }
+        }
+    }
+    let book_eigen_rep =
+        crate::portfolio_eigen_risk::PortfolioEigenCrowdingEngine::evaluate_portfolio_eigen_crowding(
+            &eigen_pool_legs,
+            None,
+            base_heat_fraction,
+        );
+    let dominant_regime = rows
+        .iter()
+        .find(|r| r.is_actionable)
+        .map(|r| match r.regime_bucket.as_str() {
+            "NEG_GAMMA_MOMENTUM_TREND" => {
+                crate::autopsy_evolver::RegimeBucket::NegGammaMomentumTrend
+            }
+            "LIQUIDITY_VACUUM_HIGH_TOXICITY" => {
+                crate::autopsy_evolver::RegimeBucket::LiquidityVacuumHighToxicity
+            }
+            _ => crate::autopsy_evolver::RegimeBucket::PosGammaPinMeanRevert,
+        })
+        .unwrap_or(crate::autopsy_evolver::RegimeBucket::PosGammaPinMeanRevert);
+    let contextual_nig_allocations = nig_allocator.allocate_for_regime(dominant_regime);
 
     // 3. Portfolio-Level Kelly Heat Allocator: Capped at 10.0% gross
     let raw_total_actionable_kelly: f64 = rows
@@ -3339,13 +3514,17 @@ pub async fn build_institutional_watchlist_at_epoch(
     let net_portfolio_delta_beta_weighted =
         ((net_beta_delta_usd / 1000.0) * 100.0).round() / 100.0;
 
-    // Rank rows: actionable first, then by consensus confidence descending
+    // Rank rows: actionable first, then by regime-contextual NIG meta-allocated conviction descending
     rows.sort_by(|a, b| {
         b.is_actionable
             .cmp(&a.is_actionable)
             .then_with(|| {
-                b.consensus_confidence_pct
-                    .partial_cmp(&a.consensus_confidence_pct)
+                let score_a =
+                    a.consensus_confidence_pct * (0.85 + 0.90 * a.contextual_brain_weight_pi);
+                let score_b =
+                    b.consensus_confidence_pct * (0.85 + 0.90 * b.contextual_brain_weight_pi);
+                score_b
+                    .partial_cmp(&score_a)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
@@ -3384,6 +3563,13 @@ pub async fn build_institutional_watchlist_at_epoch(
         net_portfolio_delta_beta_weighted,
         cross_brain_conflicts_blocked,
         estimated_occ_tims_margin_relief_pct,
+        absorption_ratio: (book_eigen_rep.absorption_ratio * 10_000.0).round() / 10_000.0,
+        effective_independent_bets_neff: (book_eigen_rep.effective_independent_bets_neff * 10_000.0)
+            .round()
+            / 10_000.0,
+        eigen_kelly_multiplier: (book_eigen_rep.eigen_kelly_multiplier * 10_000.0).round()
+            / 10_000.0,
+        contextual_nig_allocations,
         watchlist: rows,
         market_internals: internals,
     })

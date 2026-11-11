@@ -2766,8 +2766,9 @@ impl RealTimeLedgerEngine {
         let open_rows = self.positions_opened.read().clone();
         let live_equity = (100_000.0 + *self.running_net_profit_usd.read()).max(50_000.0);
         let heat = PortfolioHeatRiskEngine::compute_telemetry(&open_rows, live_equity);
-        let gross_heat_fraction =
-            (heat.current_heat_pct / PortfolioHeatRiskEngine::MAX_PORTFOLIO_HEAT_PCT).clamp(0.0, 2.0);
+        let gross_heat_fraction = (heat.aggregate_open_risk_pct
+            / heat.portfolio_heat_cap_pct.max(0.10))
+        .clamp(0.0, 2.0);
         let open_legs: Vec<crate::portfolio_eigen_risk::EigenPositionSeries> = open_rows
             .iter()
             .map(crate::portfolio_eigen_risk::EigenPositionSeries::from_open_row)

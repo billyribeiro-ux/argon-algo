@@ -9,9 +9,21 @@ pub mod evolution;
 pub mod exporter;
 pub mod ledger;
 pub mod onnx_engine;
+pub mod options_convexity;
+pub mod portfolio_eigen_risk;
 pub mod precedent_knn;
 pub mod routes;
 pub mod webhooks;
+
+pub use options_convexity::{
+    OptionConvexityEvaluation, OptionConvexityStructure, OptionGreeksConvexityInput,
+    OptionsConvexityEngine, ZeroDteOptionSimOutcome,
+};
+pub use portfolio_eigen_risk::{
+    BrainContextualAllocationRow, ContextualNigMetaAllocator, EigenPositionSeries,
+    MetaAllocatorHorizonSlot, NigPosteriorStats, PortfolioEigenCrowdingEngine,
+    PortfolioEigenRiskReport, project_capped_simplex_kl,
+};
 
 pub use autopsy_evolver::{
     decode_trade_failure, propose_candidate_generation, run_autopsy_evolution_cycle,
@@ -4362,6 +4374,15 @@ mod tests {
                 conformal_p_value: 0.68,
                 epistemic_ood_score: 0.0,
                 kelly_epistemic_multiplier: 1.0,
+                conformal_kelly_scalar: 1.0,
+                unified_stage0_kelly_multiplier: 1.0,
+                eigen_kelly_multiplier: 1.0,
+                marginal_correlation_penalty: 0.0,
+                contextual_brain_weight_pi: 0.20,
+                posterior_t_sharpe: 0.85,
+                recommended_option_structure: "SINGLE_LONG_CONVEX".to_string(),
+                gamma_theta_efficiency: 1.85,
+                theta_burn_hazard: 0.12,
                 action_status: String::new(),
                 venue_ticket: "IBKR_PEG_MID_SMART".to_string(),
                 matched_option_contract: "AMD 2026-11-20 $138.00P".to_string(),
@@ -4397,6 +4418,15 @@ mod tests {
                 conformal_p_value: 0.54,
                 epistemic_ood_score: 0.0,
                 kelly_epistemic_multiplier: 1.0,
+                conformal_kelly_scalar: 1.0,
+                unified_stage0_kelly_multiplier: 1.0,
+                eigen_kelly_multiplier: 1.0,
+                marginal_correlation_penalty: 0.0,
+                contextual_brain_weight_pi: 0.18,
+                posterior_t_sharpe: 0.72,
+                recommended_option_structure: "DEFINED_RISK_VERTICAL_BAG".to_string(),
+                gamma_theta_efficiency: 1.05,
+                theta_burn_hazard: 0.18,
                 action_status: String::new(),
                 venue_ticket: "SCHWAB_2LEG_NET_ROLL".to_string(),
                 matched_option_contract: "AMD 2026-12-18 $140.00C".to_string(),
@@ -6183,6 +6213,7 @@ mod tests {
                 &syn_b02,
                 &cur_traps_b02,
                 &precision_base,
+                None,
             );
             let mut next_traps = cur_traps_b02.clone();
             next_traps.push(Stage0TrapCentroid {
@@ -6197,6 +6228,7 @@ mod tests {
                 &syn_b02,
                 &next_traps,
                 &precision_base,
+                None,
             );
             if !k_before.vetoed && k_after.vetoed && !k_after.is_epistemic_ood_veto {
                 lg_trap_emb = trial_emb;
@@ -6490,6 +6522,7 @@ mod tests {
             &syn_b02,
             &[],
             &precision_base,
+            None,
         );
         let k_neg = evaluate_stage0_conformal_kernel(
             BrainHorizonId::Brain02IntradayDayTrade,
@@ -6497,6 +6530,7 @@ mod tests {
             &syn_b02,
             &[],
             &precision_base,
+            None,
         );
         assert!(k_pos.conformal_p_value > 0.0 && k_pos.conformal_p_value <= 1.0);
         assert!(k_neg.conformal_p_value > 0.0 && k_neg.conformal_p_value <= 1.0);
@@ -6518,6 +6552,7 @@ mod tests {
             &syn_b02,
             &[],
             &precision_base,
+            None,
         );
         // Dynamically calibrate perturbation magnitude if needed so 0.05 < ood_score <= 1.15
         let target_d = k_mod_ood.q975_mahalanobis_radius * 1.45;
@@ -6532,6 +6567,7 @@ mod tests {
             &syn_b02,
             &[],
             &precision_base,
+            None,
         );
         assert!(
             k_mod_ood.epistemic_ood_score > 0.05 && k_mod_ood.epistemic_ood_score <= 1.25,
@@ -6558,6 +6594,7 @@ mod tests {
             &syn_b02,
             &[],
             &precision_base,
+            None,
         );
         assert!(k_ext_ood.epistemic_ood_score > 1.25);
         assert!((k_ext_ood.kelly_epistemic_multiplier - 0.15).abs() < 1e-9);
@@ -6770,6 +6807,7 @@ mod tests {
                 &syn_b04_gen37,
                 &[],
                 &precision_base,
+                None,
             );
             let k1 = evaluate_stage0_conformal_kernel(
                 BrainHorizonId::Brain04CoreSwing,
@@ -6782,6 +6820,7 @@ mod tests {
                     quarantined: false,
                 }],
                 &precision_base,
+                None,
             );
             if !k0.vetoed && k1.vetoed && !k1.is_epistemic_ood_veto {
                 msft_emb = trial_emb;
@@ -6879,6 +6918,7 @@ mod tests {
                     quarantined: false,
                 }],
                 &precision_base,
+                None,
             );
             if k1.vetoed && !k1.is_epistemic_ood_veto {
                 aapl_emb = trial_emb;
@@ -7310,6 +7350,638 @@ mod tests {
             h_exhaust,
             rho_exhaust,
             sim_exhaust_stop.realized_r
+        );
+    }
+
+    #[tokio::test]
+    async fn test_phase34_1_and_35_loo_purity_eigen_crowding_contextual_thompson_and_0dte_convexity() {
+        use crate::autopsy_evolver::{
+            LedoitWolfPrecision, RegimeBucket, compute_causal_reversal_hazard_retention_with_theta,
+            evaluate_stage0_conformal_kernel, extract_causal_entry_array_32,
+            simulate_trade_under_candidate_with_trap_bank,
+        };
+        use crate::options_convexity::{
+            OptionConvexityStructure, OptionGreeksConvexityInput, OptionsConvexityEngine,
+        };
+        use crate::portfolio_eigen_risk::{
+            ContextualNigMetaAllocator, EigenPositionSeries, MetaAllocatorHorizonSlot,
+            PortfolioEigenCrowdingEngine,
+        };
+        use axum::body::Body;
+        use raw_fingerprint_core::{BrainHorizonId, RawBarRecord, SubPennyPrice, TradeDirection};
+        use std::path::Path;
+        use tower::ServiceExt;
+
+        let models_dir = Path::new("../../models");
+        let state = AppState::new(if models_dir.exists() {
+            Some(models_dir)
+        } else {
+            None
+        });
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+        assert!(state.ledger.load_from_disk(ledger_path));
+        state.ledger.set_enforce_hard_scratch_on_baseline(false);
+        for row in &state.ledger.closed_trades_snapshot() {
+            state.ledger.sync_closed_row_to_precedent_knn(row);
+        }
+        state.ledger.recompute_causal_plasticity();
+
+        let app = routes::build_axum_router(state.clone());
+
+        let closed_snap = state.ledger.closed_trades_snapshot();
+        assert_eq!(closed_snap.len(), 173, "Baseline must contain 173 settled trades");
+        let precision_base = LedoitWolfPrecision::from_settled_trades(&closed_snap);
+
+        let make_bar = |ts: i64, o: f64, h: f64, l: f64, c: f64, vol: f64| RawBarRecord {
+            timestamp_ns: ts,
+            open: SubPennyPrice::from_f64(o).unwrap(),
+            high: SubPennyPrice::from_f64(h).unwrap(),
+            low: SubPennyPrice::from_f64(l).unwrap(),
+            close: SubPennyPrice::from_f64(c).unwrap(),
+            volume: vol as u64,
+            vwap: SubPennyPrice::from_f64((h + l + c) / 3.0).unwrap(),
+            dollar_turnover: c * vol,
+            trade_count: 420,
+            bid_ask_spread: SubPennyPrice::from_f64(0.02).unwrap(),
+            time_delta_ms: 300_000,
+        };
+
+        // =========================================================================
+        // (a) Leave-One-Out Purity, Active Mondrian Nonconformity Veto & Cached Arc Precision
+        // =========================================================================
+        let mut loo_winners_preserved = 0usize;
+        let mut total_baseline_winners = 0usize;
+        let mut min_loo_d_win = f64::INFINITY;
+        let mut max_self_diff = 0.0_f64;
+
+        for tr in &closed_snap {
+            let syn_st = state.ledger.precedent_knn().get_synaptic_plasticity_state(tr.brain_id);
+            let entry_v = extract_causal_entry_array_32(tr);
+            let k_loo = evaluate_stage0_conformal_kernel(
+                tr.brain_id,
+                &entry_v,
+                &syn_st,
+                &[],
+                &precision_base,
+                Some(tr.trade_id),
+            );
+            let k_self = evaluate_stage0_conformal_kernel(
+                tr.brain_id,
+                &entry_v,
+                &syn_st,
+                &[],
+                &precision_base,
+                None,
+            );
+            assert!(
+                k_loo.d_win > 0.0,
+                "Leave-One-Out d_win for trade {} must be strictly > 0.0 (no self-match!), got {}",
+                tr.trade_id,
+                k_loo.d_win
+            );
+            if tr.is_winner || tr.realized_r_multiple > 0.0 {
+                total_baseline_winners += 1;
+                if k_loo.d_win < min_loo_d_win {
+                    min_loo_d_win = k_loo.d_win;
+                }
+                let diff = (k_loo.d_win - k_self.d_win).abs();
+                if diff > max_self_diff {
+                    max_self_diff = diff;
+                }
+                let sim_loo =
+                    simulate_trade_under_candidate_with_trap_bank(tr, &syn_st, &[], &precision_base);
+                if !sim_loo.vetoed && sim_loo.realized_r > 0.0 {
+                    loo_winners_preserved += 1;
+                }
+            }
+        }
+        assert_eq!(total_baseline_winners, 116);
+        assert_eq!(
+            loo_winners_preserved, 116,
+            "All 116/116 baseline winners MUST remain preserved under strict Leave-One-Out!"
+        );
+        assert!(
+            max_self_diff > 1e-4,
+            "Leave-One-Out exclusion must genuinely exclude self-exemplars (max |d_win_loo - d_win_self| = {max_self_diff})"
+        );
+
+        // Prove Active Mondrian Nonconformity Gate (`p_mondrian < mondrian_conformal_alpha_floor` -> `STAGE_0_VETOED_MONDRIAN_NONCONFORMITY`)
+        // Construct a candidate near `loss_centroid_32` with elevated `mondrian_conformal_alpha_floor` / loose `entry_veto_margin_delta`
+        // or pure loss-tail nonconformity without any active HardNegativeTrapRecord UUID:
+        let b02_man = precision_base
+            .brains
+            .get(&BrainHorizonId::Brain02IntradayDayTrade)
+            .unwrap();
+        let mut mondrian_state = state
+            .ledger
+            .precedent_knn()
+            .get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade);
+        // Set loose conformal hurdle delta so conformal_margin >= 0 while Mondrian alpha floor (0.04) catches tail nonconformity!
+        mondrian_state.entry_veto_margin_delta = -2.50;
+        mondrian_state.mondrian_conformal_alpha_floor = 0.04;
+
+        let mut nonconforming_vec = [0.0_f64; 32];
+        for f in 0..32 {
+            // Interpolate close to `loss_centroid_32` so `d_trap` (to `loss_centroid_32`) is tiny (~0.02 -> d_nearest < q975, NOT OOD!)
+            // while `d_win` is large -> `candidate_nonconformity_alpha = d_win / (d_trap + 0.05)` exceeds all calibration scores -> `p_mondrian < 0.04`!
+            nonconforming_vec[f] = b02_man.loss_centroid_32[f]
+                + 0.03 * (b02_man.loss_centroid_32[f] - b02_man.winner_centroid_32[f]);
+        }
+        let k_mondrian = evaluate_stage0_conformal_kernel(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &nonconforming_vec,
+            &mondrian_state,
+            &[],
+            &precision_base,
+            None,
+        );
+        assert!(
+            !k_mondrian.is_epistemic_ood_veto,
+            "Mondrian nonconforming point near loss_centroid must not be OOD, got ood={}",
+            k_mondrian.epistemic_ood_score
+        );
+        assert!(
+            k_mondrian.conformal_p_value < 0.04,
+            "Expected Mondrian p-value < 0.04, got {}",
+            k_mondrian.conformal_p_value
+        );
+        assert!(k_mondrian.vetoed && k_mondrian.is_mondrian_conformal_veto);
+        assert_eq!(
+            k_mondrian.veto_status,
+            "STAGE_0_VETOED_MONDRIAN_NONCONFORMITY"
+        );
+        assert!(
+            (k_mondrian.conformal_kelly_scalar - 0.35).abs() < 1e-9,
+            "Expected conformal_kelly_scalar clamped at 0.35 for p_mondrian < 0.04, got {}",
+            k_mondrian.conformal_kelly_scalar
+        );
+
+        // Prove O(1) cached `Arc<LedoitWolfPrecision>` pointer identity on repeated live calls
+        let arc_p1 = state.ledger.get_or_build_cached_stage0_precision(36);
+        let arc_p2 = state.ledger.get_or_build_cached_stage0_precision(36);
+        assert!(
+            std::sync::Arc::ptr_eq(&arc_p1, &arc_p2),
+            "Cached Stage 0 precision snapshot must return identical Arc pointer without re-factoring Cholesky!"
+        );
+
+        // =========================================================================
+        // (b) Cross-Position Eigen-Correlation & Absorption-Ratio Crowding Proof
+        // =========================================================================
+        let n_bars = 40usize;
+        let mut s_orth_1 = Vec::with_capacity(n_bars);
+        let mut s_orth_2 = Vec::with_capacity(n_bars);
+        let mut s_orth_3 = Vec::with_capacity(n_bars);
+        let mut s_orth_4 = Vec::with_capacity(n_bars);
+        let mut p1 = 100.0_f64;
+        let mut p2 = 100.0_f64;
+        let mut p3 = 100.0_f64;
+        let mut p4 = 100.0_f64;
+        for t in 0..n_bars {
+            let x = t as f64;
+            let r1 = 0.006 * (0.31 * x).sin();
+            let r2 = 0.006 * (0.31 * x).cos();
+            let r3 = 0.006 * (0.79 * x).sin();
+            let r4 = 0.006 * (1.37 * x).cos();
+            p1 *= (r1).exp();
+            p2 *= (r2).exp();
+            p3 *= (r3).exp();
+            p4 *= (r4).exp();
+            s_orth_1.push(p1);
+            s_orth_2.push(p2);
+            s_orth_3.push(p3);
+            s_orth_4.push(p4);
+        }
+        let orth_open = vec![
+            EigenPositionSeries {
+                symbol: "NVDA".to_string(),
+                direction_sign: 1.0,
+                risk_weight: 1_000.0,
+                close_prices: s_orth_1.clone(),
+            },
+            EigenPositionSeries {
+                symbol: "XOM".to_string(),
+                direction_sign: 1.0,
+                risk_weight: 1_000.0,
+                close_prices: s_orth_2,
+            },
+            EigenPositionSeries {
+                symbol: "UNH".to_string(),
+                direction_sign: -1.0,
+                risk_weight: 1_000.0,
+                close_prices: s_orth_3,
+            },
+        ];
+        let orth_cand = EigenPositionSeries {
+            symbol: "GLD".to_string(),
+            direction_sign: 1.0,
+            risk_weight: 1_000.0,
+            close_prices: s_orth_4,
+        };
+        let rep_orth = PortfolioEigenCrowdingEngine::evaluate_portfolio_eigen_crowding(
+            &orth_open,
+            Some(&orth_cand),
+            0.72,
+        );
+        assert!(
+            rep_orth.absorption_ratio < 0.55,
+            "Orthogonal 4-leg book must have AR < 0.55, got {}",
+            rep_orth.absorption_ratio
+        );
+        assert!(
+            rep_orth.effective_independent_bets_neff > 2.5,
+            "Orthogonal 4-leg book must have N_eff > 2.5, got {}",
+            rep_orth.effective_independent_bets_neff
+        );
+        assert!(!rep_orth.vetoed);
+        assert!(rep_orth.eigen_kelly_multiplier > 0.90);
+
+        // Now construct 4 co-directional highly correlated (r > 0.90) momentum legs under > 65% gross heat
+        let mut s_co_2 = Vec::with_capacity(n_bars);
+        let mut s_co_3 = Vec::with_capacity(n_bars);
+        let mut s_co_4 = Vec::with_capacity(n_bars);
+        let mut c2 = 150.0_f64;
+        let mut c3 = 200.0_f64;
+        let mut c4 = 90.0_f64;
+        s_co_2.push(c2);
+        s_co_3.push(c3);
+        s_co_4.push(c4);
+        for t in 1..n_bars {
+            let base_ret = (s_orth_1[t] / s_orth_1[t - 1]).ln();
+            let x = t as f64;
+            c2 *= (0.98 * base_ret + 0.0005 * (0.7 * x).sin()).exp();
+            c3 *= (1.03 * base_ret + 0.0005 * (1.1 * x).cos()).exp();
+            c4 *= (0.96 * base_ret + 0.0004 * (1.5 * x).sin()).exp();
+            s_co_2.push(c2);
+            s_co_3.push(c3);
+            s_co_4.push(c4);
+        }
+        let crowded_open = vec![
+            EigenPositionSeries {
+                symbol: "NVDA".to_string(),
+                direction_sign: 1.0,
+                risk_weight: 1_200.0,
+                close_prices: s_orth_1.clone(),
+            },
+            EigenPositionSeries {
+                symbol: "AMD".to_string(),
+                direction_sign: 1.0,
+                risk_weight: 1_200.0,
+                close_prices: s_co_2,
+            },
+            EigenPositionSeries {
+                symbol: "AVGO".to_string(),
+                direction_sign: 1.0,
+                risk_weight: 1_200.0,
+                close_prices: s_co_3,
+            },
+        ];
+        let crowded_cand = EigenPositionSeries {
+            symbol: "SMCI".to_string(),
+            direction_sign: 1.0,
+            risk_weight: 1_200.0,
+            close_prices: s_co_4,
+        };
+        let rep_crowded = PortfolioEigenCrowdingEngine::evaluate_portfolio_eigen_crowding(
+            &crowded_open,
+            Some(&crowded_cand),
+            0.74,
+        );
+        assert!(
+            rep_crowded.absorption_ratio > 0.78 && rep_crowded.marginal_correlation_penalty > 0.90,
+            "Crowded 4-leg tech book must have AR > 0.78 and r_marginal > 0.90, got AR={} r={}",
+            rep_crowded.absorption_ratio,
+            rep_crowded.marginal_correlation_penalty
+        );
+        assert!(rep_crowded.vetoed);
+        assert_eq!(
+            rep_crowded.veto_reason,
+            "PORTFOLIO_VETOED_EIGEN_CORRELATION_CROWDING"
+        );
+        assert!(rep_crowded.eigen_kelly_multiplier < rep_orth.eigen_kelly_multiplier);
+
+        // =========================================================================
+        // (c) Regime-Contextual NIG Capital Meta-Allocator Proof
+        // =========================================================================
+        let mut nig = ContextualNigMetaAllocator::from_causal_ledger(&closed_snap, &[]);
+        // Feed causal regime-specific outperformance:
+        // - In NegGammaTrendExpansion: Scalp0Dte & Brain02 outperform (+2.4R low MAE), Brain05 lags (-0.6R)
+        // - In PosGammaPinMeanRevert: Brain04 Core Swing outperforms (+2.2R low MAE), Scalp0Dte bleeds (-0.8R) + false_veto_regret
+        for _ in 0..8 {
+            nig.observe(
+                MetaAllocatorHorizonSlot::Scalp0Dte,
+                RegimeBucket::NegGammaMomentumTrend,
+                2.45,
+                0.42,
+            );
+            nig.observe(
+                MetaAllocatorHorizonSlot::Brain02IntradayDayTrade,
+                RegimeBucket::NegGammaMomentumTrend,
+                2.10,
+                0.45,
+            );
+            nig.observe(
+                MetaAllocatorHorizonSlot::Brain05LongTermWealth,
+                RegimeBucket::NegGammaMomentumTrend,
+                -0.65,
+                1.00,
+            );
+
+            nig.observe(
+                MetaAllocatorHorizonSlot::Brain04CoreSwing,
+                RegimeBucket::PosGammaPinMeanRevert,
+                2.25,
+                0.40,
+            );
+            nig.observe(
+                MetaAllocatorHorizonSlot::Scalp0Dte,
+                RegimeBucket::PosGammaPinMeanRevert,
+                -0.80,
+                0.95,
+            );
+        }
+        nig.penalize_regret(
+            MetaAllocatorHorizonSlot::Scalp0Dte,
+            RegimeBucket::PosGammaPinMeanRevert,
+            1.85,
+        );
+
+        let alloc_neg_gamma = nig.allocate_for_regime(RegimeBucket::NegGammaMomentumTrend);
+        let alloc_pos_gamma = nig.allocate_for_regime(RegimeBucket::PosGammaPinMeanRevert);
+
+        let sum_neg: f64 = alloc_neg_gamma.iter().map(|r| r.capital_weight_pi).sum();
+        let sum_pos: f64 = alloc_pos_gamma.iter().map(|r| r.capital_weight_pi).sum();
+        assert!((sum_neg - 1.0).abs() < 1e-6, "Simplex sum must equal 1.0, got {sum_neg}");
+        assert!((sum_pos - 1.0).abs() < 1e-6, "Simplex sum must equal 1.0, got {sum_pos}");
+        for row in alloc_neg_gamma.iter().chain(alloc_pos_gamma.iter()) {
+            assert!(
+                row.capital_weight_pi >= 0.10 - 1e-6 && row.capital_weight_pi <= 0.42 + 1e-6,
+                "Slot {} weight {} out of [0.10, 0.42]",
+                row.slot_id,
+                row.capital_weight_pi
+            );
+        }
+
+        let scalp_w_neg = alloc_neg_gamma
+            .iter()
+            .find(|r| r.slot_id == "SCALP_0DTE")
+            .unwrap()
+            .capital_weight_pi;
+        let scalp_w_pos = alloc_pos_gamma
+            .iter()
+            .find(|r| r.slot_id == "SCALP_0DTE")
+            .unwrap()
+            .capital_weight_pi;
+        let b04_w_pos = alloc_pos_gamma
+            .iter()
+            .find(|r| r.slot_id == "BRAIN-04")
+            .unwrap()
+            .capital_weight_pi;
+        let b04_w_neg = alloc_neg_gamma
+            .iter()
+            .find(|r| r.slot_id == "BRAIN-04")
+            .unwrap()
+            .capital_weight_pi;
+        assert!(
+            scalp_w_neg > scalp_w_pos + 0.08,
+            "SCALP_0DTE weight must shift higher in NegGammaTrendExpansion ({scalp_w_neg:.4}) vs PosGammaPinMeanRevert ({scalp_w_pos:.4})"
+        );
+        assert!(
+            b04_w_pos > b04_w_neg + 0.05,
+            "BRAIN-04 weight must shift higher in PosGammaPinMeanRevert ({b04_w_pos:.4}) vs NegGammaTrendExpansion ({b04_w_neg:.4})"
+        );
+
+        // =========================================================================
+        // (d) Causal Options Greeks Convexity Router & 0DTE Theta-Bleed Stall Exit Proof
+        // =========================================================================
+        let low_iv_trend_input = OptionGreeksConvexityInput {
+            direction: TradeDirection::Long,
+            spot_price: 590.0,
+            structural_stop_price: 588.20,
+            atr_bar: 1.45,
+            option_entry_premium: 2.40,
+            contract_delta: 0.52,
+            contract_gamma: 0.14,
+            contract_theta_daily: -0.85,
+            contract_vega: 0.18,
+            contract_iv: 0.19,
+            iv_rank: 0.24,
+            dte_days: 0.85,
+            bar_session_fraction: 5.0 / 390.0,
+            regime_bucket: RegimeBucket::NegGammaMomentumTrend,
+            is_scalp_0dte: true,
+        };
+        let high_iv_pin_input = OptionGreeksConvexityInput {
+            iv_rank: 0.82,
+            atr_bar: 0.55,
+            contract_gamma: 0.04,
+            contract_theta_daily: -1.65,
+            regime_bucket: RegimeBucket::PosGammaPinMeanRevert,
+            ..low_iv_trend_input
+        };
+
+        let conv_low_iv = OptionsConvexityEngine::evaluate_option_convexity(&low_iv_trend_input);
+        let conv_high_iv = OptionsConvexityEngine::evaluate_option_convexity(&high_iv_pin_input);
+        assert_eq!(
+            conv_low_iv.recommended_option_structure,
+            OptionConvexityStructure::SingleLongConvex
+        );
+        assert!(conv_low_iv.gamma_theta_efficiency > 1.15);
+        assert_eq!(
+            conv_high_iv.recommended_option_structure,
+            OptionConvexityStructure::DefinedRiskVerticalBag
+        );
+
+        // Simulate a 12-bar flat chop 0DTE option setup (underlying hovers flat +/- $0.15 for 12 5m bars while Theta + mild IV crush bleed premium!)
+        let zero_dte_chop_input = OptionGreeksConvexityInput {
+            direction: TradeDirection::Long,
+            spot_price: 590.0,
+            structural_stop_price: 588.50,
+            atr_bar: 1.40,
+            option_entry_premium: 1.80,
+            contract_delta: 0.50,
+            contract_gamma: 0.16,
+            contract_theta_daily: -4.80,
+            contract_vega: 0.22,
+            contract_iv: 0.22,
+            iv_rank: 0.28,
+            dte_days: 0.18,
+            bar_session_fraction: 5.0 / 390.0,
+            regime_bucket: RegimeBucket::NegGammaMomentumTrend,
+            is_scalp_0dte: true,
+        };
+        let mut flat_chop_bars = Vec::with_capacity(12);
+        let base_ts = 1_762_900_000_000_000_000_i64;
+        for b in 0..12 {
+            let drift = if b % 2 == 0 { 0.08 } else { -0.10 };
+            let px = 590.0 + drift;
+            flat_chop_bars.push(make_bar(
+                base_ts + ((b + 1) as i64) * 300_000_000_000,
+                px - 0.04,
+                px + 0.15,
+                px - 0.18,
+                px,
+                120_000.0,
+            ));
+        }
+        let iv_crush = vec![-0.004_f64; 12];
+        let sim_guarded = OptionsConvexityEngine::simulate_0dte_option_bars(
+            &zero_dte_chop_input,
+            &flat_chop_bars,
+            Some(&iv_crush),
+            true,
+        );
+        let sim_unguarded = OptionsConvexityEngine::simulate_0dte_option_bars(
+            &zero_dte_chop_input,
+            &flat_chop_bars,
+            Some(&iv_crush),
+            false,
+        );
+        let r_saved_0dte = sim_guarded.realized_option_r - sim_unguarded.realized_option_r;
+        assert!(sim_guarded.exited_via_theta_stall);
+        assert_eq!(sim_guarded.exit_bar_index, 4);
+        assert!(
+            r_saved_0dte > 0.35,
+            "4-bar flat 0DTE Theta-burn stall exit ({:.3}R) must save > 0.35R vs holding passive 12-bar decay ({:.3}R), saved {:.3}R!",
+            sim_guarded.realized_option_r,
+            sim_unguarded.realized_option_r,
+            r_saved_0dte
+        );
+
+        // Also verify Theta-bleed coupling into Stage 3 reversal hazard retention (`h_theta > h_zero`, `rho_theta > rho_zero`)
+        let syn_b02 = state
+            .ledger
+            .precedent_knn()
+            .get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade);
+        let (h_no_theta, rho_no_theta) = compute_causal_reversal_hazard_retention_with_theta(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            1.0,
+            591.50,
+            591.80,
+            591.30,
+            591.60,
+            None,
+            0.0,
+            &syn_b02,
+            &precision_base,
+        );
+        let (h_with_theta, rho_with_theta) = compute_causal_reversal_hazard_retention_with_theta(
+            BrainHorizonId::Brain02IntradayDayTrade,
+            1.0,
+            591.50,
+            591.80,
+            591.30,
+            591.60,
+            None,
+            sim_guarded.cumulative_theta_burn_ratio,
+            &syn_b02,
+            &precision_base,
+        );
+        assert!(h_with_theta > h_no_theta && rho_with_theta > rho_no_theta);
+
+        // Export real HTTP `GET /api/v1/scanner/watchlist` wire fixture for Vitest #27
+        let wl_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/scanner/watchlist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wl_resp.status(), axum::http::StatusCode::OK);
+        let wl_bytes = axum::body::to_bytes(wl_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let wl_json: serde_json::Value = serde_json::from_slice(&wl_bytes).unwrap();
+        assert!(wl_json.get("absorption_ratio").is_some());
+        assert!(wl_json.get("effective_independent_bets_neff").is_some());
+        assert!(wl_json.get("contextual_nig_allocations").is_some());
+
+        let fixture_path = Path::new(
+            "../../web-terminal/src/lib/state/__fixtures__/phase35_portfolio_eigen_convexity_wire_contract.json",
+        );
+        if let Some(parent) = fixture_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let combined_fixture = serde_json::json!({
+            "watchlist_response": wl_json,
+            "eigen_orthogonal_report": rep_orth,
+            "eigen_crowded_report": rep_crowded,
+            "nig_neg_gamma_allocations": alloc_neg_gamma,
+            "nig_pos_gamma_allocations": alloc_pos_gamma,
+            "convexity_low_iv_trend": conv_low_iv,
+            "convexity_high_iv_pin": conv_high_iv,
+            "zero_dte_stall_guarded": sim_guarded,
+            "zero_dte_stall_unguarded": sim_unguarded
+        });
+        std::fs::write(
+            fixture_path,
+            serde_json::to_string_pretty(&combined_fixture).unwrap(),
+        )
+        .expect("Write Phase 35 wire fixture");
+
+        println!("\n======================================================================");
+        println!("PHASE 34.1 & PHASE 35 ZERO-TRUST AUDIT TELEMETRY");
+        println!("======================================================================");
+        println!(
+            "  [PROOF (a) LEAVE-ONE-OUT PURITY & ACTIVE MONDRIAN NONCONFORMITY GATE]:"
+        );
+        println!(
+            "    - LOO Baseline Winners  : {}/{} Preserved | min(d_win_loo)={:.6} > 0.0 | max|d_loo - d_self|={:.6}",
+            loo_winners_preserved, total_baseline_winners, min_loo_d_win, max_self_diff
+        );
+        println!(
+            "    - Active Mondrian Veto  : p_mondrian={:.4} < alpha=0.04 -> {} | KellyConformal={:.2}x | Arc Cache ptr_eq=true",
+            k_mondrian.conformal_p_value, k_mondrian.veto_status, k_mondrian.conformal_kelly_scalar
+        );
+        println!(
+            "  [PROOF (b) CROSS-POSITION EIGEN-COVARIANCE & ABSORPTION-RATIO CROWDING]:"
+        );
+        println!(
+            "    - Orthogonal 4-Leg Book : AR={:.4} (< 0.55) | N_eff={:.4} (> 2.50) | kappa_eigen={:.4} | Veto={}",
+            rep_orth.absorption_ratio, rep_orth.effective_independent_bets_neff, rep_orth.eigen_kelly_multiplier, rep_orth.veto_reason
+        );
+        println!(
+            "    - Correlated 4-Leg Book : AR={:.4} (> 0.78) | N_eff={:.4} | r_marginal={:.4} | kappa_eigen={:.4} | Veto={}",
+            rep_crowded.absorption_ratio, rep_crowded.effective_independent_bets_neff, rep_crowded.marginal_correlation_penalty, rep_crowded.eigen_kelly_multiplier, rep_crowded.veto_reason
+        );
+        println!(
+            "  [PROOF (c) REGIME-CONTEXTUAL NIG CROSS-BRAIN CAPITAL META-ALLOCATOR]:"
+        );
+        println!(
+            "    - NegGammaTrendExpansion: Sum={:.6} | SCALP_0DTE pi={:.4} | BRAIN-04 pi={:.4}",
+            sum_neg, scalp_w_neg, b04_w_neg
+        );
+        println!(
+            "    - PosGammaPinMeanRevert : Sum={:.6} | SCALP_0DTE pi={:.4} | BRAIN-04 pi={:.4}",
+            sum_pos, scalp_w_pos, b04_w_pos
+        );
+        println!(
+            "  [PROOF (d) CAUSAL OPTIONS CONVEXITY ROUTER & 0DTE THETA-BLEED HAZARD]:"
+        );
+        println!(
+            "    - Structure Router      : Low-IV Trend eta={:.3} -> {} | High-IV Pin eta={:.3} -> {}",
+            conv_low_iv.gamma_theta_efficiency,
+            conv_low_iv.recommended_option_structure.as_str(),
+            conv_high_iv.gamma_theta_efficiency,
+            conv_high_iv.recommended_option_structure.as_str()
+        );
+        println!(
+            "    - 0DTE 4-Bar Stall Exit : Guarded={:+.3}R (Bar {}) vs Unguarded={:+.3}R (Bar {}) | Saved={:+.3}R (> +0.35R) | Stage3 rho: {:.3} -> {:.3}\n",
+            sim_guarded.realized_option_r,
+            sim_guarded.exit_bar_index,
+            sim_unguarded.realized_option_r,
+            sim_unguarded.exit_bar_index,
+            r_saved_0dte,
+            rho_no_theta,
+            rho_with_theta
         );
     }
 }

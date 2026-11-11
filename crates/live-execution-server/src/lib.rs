@@ -7458,6 +7458,12 @@ mod tests {
                     simulate_trade_under_candidate_with_trap_bank(tr, &syn_st, &[], &precision_base);
                 if !sim_loo.vetoed && sim_loo.realized_r > 0.0 {
                     loo_winners_preserved += 1;
+                } else {
+                    println!(
+                        "DEBUG_LOO_WINNER_VETO: {} {:?} {:?} llr={:.4} hurdle={:.4} p={:.4} ood={:.4} status={} r={:.3}",
+                        tr.symbol, tr.brain_id, tr.direction, k_loo.conformal_llr, k_loo.conformal_hurdle,
+                        k_loo.conformal_p_value, k_loo.epistemic_ood_score, k_loo.veto_status, sim_loo.realized_r
+                    );
                 }
             }
         }

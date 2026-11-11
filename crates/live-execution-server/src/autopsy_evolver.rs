@@ -542,7 +542,7 @@ impl LedoitWolfPrecision {
                 0.035
             } else {
                 let max_lam = *winner_lambdas.last().unwrap_or(&-0.020);
-                (max_lam + 0.025).clamp(0.025, 0.25)
+                (max_lam + 0.025).clamp(0.025, 0.072)
             };
 
             for (tid, _is_win, z_i) in &all_entries {

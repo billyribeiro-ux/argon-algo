@@ -1,6 +1,6 @@
 {
   "status": "PROMOTED_CHAMPION",
-  "timestamp_iso": "2026-11-11T18:49:07.090024+00:00",
+  "timestamp_iso": "2026-11-11T19:59:11.970157+00:00",
   "current_generation_id": 38,
   "candidate_generation_id": 39,
   "promoted_generation_id": 39,
@@ -13,7 +13,7 @@
   "mirror_descent_kl_divergence": 0.000137,
   "autopsies_decoded": [
     {
-      "trade_id": "9ee236f9-46b8-4d5c-a6cc-2b970da02a92",
+      "trade_id": "cc39d0e9-8000-42dc-90e1-ffc68f0cb134",
       "symbol": "SPY",
       "brain_id": "BRAIN-02",
       "realized_r": -1.45,
@@ -71,7 +71,7 @@
       ],
       "mahalanobis_distance_shift": 4.734,
       "collapse_bar_offset": 1,
-      "summary": "Trade 9ee236f9 on SPY (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [close_log_ret] (MFE: +0.00R -> Realized: -1.45R, Giveback: 0.0%, LW-Mahalanobis Shift: 4.734)",
+      "summary": "Trade cc39d0e9 on SPY (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [close_log_ret] (MFE: +0.00R -> Realized: -1.45R, Giveback: 0.0%, LW-Mahalanobis Shift: 4.734)",
       "entry_features_32": [
         0.8153846,
         0.025,
@@ -112,14 +112,14 @@
     "gate1_baseline_lock_passed": true,
     "gate1_baseline_winners_preserved": 116,
     "gate1_baseline_winners_target": 116,
-    "gate1_current_expectancy_r": 0.3816,
-    "gate1_candidate_expectancy_r": 0.3816,
-    "gate1_current_pf": 2.9334,
-    "gate1_candidate_pf": 2.9335,
-    "current_baseline_exp_r": 0.3816,
-    "candidate_baseline_exp_r": 0.3816,
-    "current_baseline_pf": 2.9334,
-    "candidate_baseline_pf": 2.9335,
+    "gate1_current_expectancy_r": 0.2585,
+    "gate1_candidate_expectancy_r": 0.2585,
+    "gate1_current_pf": 1.8068,
+    "gate1_candidate_pf": 1.8069,
+    "current_baseline_exp_r": 0.2585,
+    "candidate_baseline_exp_r": 0.2585,
+    "current_baseline_pf": 1.8068,
+    "candidate_baseline_pf": 1.8069,
     "gate2_walkforward_passed": true,
     "gate2_current_walkforward_net_r": 0.3,
     "gate2_candidate_walkforward_net_r": 1.75,
@@ -133,7 +133,7 @@
     "quarantined_traps_count": 1,
     "mirror_descent_kl_divergence": 0.000137,
     "all_gates_passed": true,
-    "decision_rationale": "PROMOTED Gen 39: Gate 1 passed (116/116 baseline winners, Exp: 0.3816R -> 0.3816R, PF: 2.933 -> 2.933) & Gate 2 passed (WF Net R: 0.300R -> 1.750R, Full stops: 1 -> 0, New traps: +0, Quarantined: 1)"
+    "decision_rationale": "PROMOTED Gen 39: Gate 1 passed (116/116 baseline winners, Exp: 0.2585R -> 0.2585R, PF: 1.807 -> 1.807) & Gate 2 passed (WF Net R: 0.300R -> 1.750R, Full stops: 1 -> 0, New traps: +0, Quarantined: 1)"
   },
   "updated_synaptic_states": [
     {
@@ -275,6 +275,7 @@
         0.18520880048410404
       ],
       "mirror_descent_kl_divergence": 0.00010493666356297196,
+      "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
           "feature_index": 18,
@@ -451,10 +452,10 @@
         "72c628a1-b359-4cc6-9a01-328e920fe9ee": 1.1148,
         "760f0c60-4ab0-4a3d-9a8d-21b5fc78de52": 1.0357,
         "9e123dab-246a-42c1-9e06-f5f0e5dd7456": 1.1369,
-        "9ee236f9-46b8-4d5c-a6cc-2b970da02a92": 0.9925,
         "a3f24427-7572-4e8f-abd5-c385666dbe16": 1.09,
         "b5d1ab65-d397-4301-b040-5d1820a1b16b": 1.136,
         "c657bf95-c630-46d2-8e05-77f55fbe4841": 1.1405,
+        "cc39d0e9-8000-42dc-90e1-ffc68f0cb134": 0.9925,
         "df3ee90f-2c41-4037-a8cb-6642df100a05": 1.0352,
         "e69f2515-f284-4f09-84ee-dc0bd5a9a663": 1.0728,
         "ec3688f8-debd-4bb5-b2ee-7778b57457d7": 1.027,
@@ -535,6 +536,7 @@
         0.18169581301970436
       ],
       "mirror_descent_kl_divergence": 0.00013335865527925288,
+      "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
           "feature_index": 17,
@@ -784,6 +786,7 @@
         0.1863359782809989
       ],
       "mirror_descent_kl_divergence": 0.00011445101032175864,
+      "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
           "feature_index": 18,
@@ -1036,6 +1039,7 @@
         0.1866613578869489
       ],
       "mirror_descent_kl_divergence": 0.0001942130788597423,
+      "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
           "feature_index": 18,
@@ -1281,6 +1285,7 @@
         0.17507615354658668
       ],
       "mirror_descent_kl_divergence": 0.00014029142998053194,
+      "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
           "feature_index": 4,

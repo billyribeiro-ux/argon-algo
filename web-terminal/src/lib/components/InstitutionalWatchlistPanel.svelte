@@ -322,6 +322,24 @@
     </div>
 
     <div class="telemetry-metric">
+      <span class="metric-label">ABSORPTION RATIO (AR)</span>
+      <span
+        class="metric-value {(watchlist?.absorption_ratio ?? 0.44) > 0.78 ? 'pnl-negative' : 'pnl-positive'}"
+      >
+        {(watchlist?.absorption_ratio ?? 0.44).toFixed(3)}
+        <span class="metric-sub">/ 0.78 CROWD</span>
+      </span>
+    </div>
+
+    <div class="telemetry-metric">
+      <span class="metric-label">EFFECTIVE BETS (N_EFF)</span>
+      <span class="metric-value">
+        {(watchlist?.effective_independent_bets_neff ?? 5.9).toFixed(2)}
+        <span class="metric-sub">×{(watchlist?.eigen_kelly_multiplier ?? 1.0).toFixed(2)} κ_EIG</span>
+      </span>
+    </div>
+
+    <div class="telemetry-metric">
       <span class="metric-label">PAPER OVERLAY DELTA</span>
       <span class="metric-value">
         +{paperOverlay?.overlay_closed_count ?? 0} TRADES
@@ -329,6 +347,24 @@
       </span>
     </div>
   </div>
+
+  {#if watchlist?.contextual_nig_allocations && watchlist.contextual_nig_allocations.length > 0}
+    <div class="nig-allocator-strip" aria-label="Contextual NIG Regime Capital Meta-Allocator">
+      <span class="nig-strip-title">
+        CONTEXTUAL NIG SIMPLEX ({formatRegimeBucket(watchlist.contextual_nig_allocations[0]?.regime_bucket)}):
+      </span>
+      {#each watchlist.contextual_nig_allocations as alloc (alloc.slot_id + alloc.regime_bucket)}
+        <span
+          class="nig-chip"
+          title="{alloc.slot_id} | Posterior Student-t Sharpe={alloc.posterior_t_sharpe.toFixed(2)} | mu_n={alloc.mu_n.toFixed(2)}R | N={alloc.observations_count}"
+        >
+          <strong>{alloc.slot_id}</strong>
+          {(alloc.capital_weight_pi * 100).toFixed(1)}%
+          <small>SR {alloc.posterior_t_sharpe.toFixed(2)}</small>
+        </span>
+      {/each}
+    </div>
+  {/if}
 
   <!-- Outbox Dispatch Feedback Banner -->
   {#if dispatchBanner}
@@ -679,7 +715,7 @@
           <th data-numeric="true">Target 1</th>
           <th data-numeric="true">Target 2</th>
           <th data-numeric="true">Stage 0 &amp; p-Val</th>
-          <th>CBOE Contract</th>
+          <th>CBOE Contract &amp; Convexity</th>
           <th>Venue Ticket</th>
           <th data-numeric="true">Kelly % (×κ)</th>
           <th>Action Status</th>
@@ -756,15 +792,31 @@
             </td>
             <td class="contract-cell">
               <code>{row.matched_option_contract}</code>
+              {#if row.recommended_option_structure}
+                <div class="convexity-meta">
+                  <span
+                    class="badge {row.recommended_option_structure === 'SINGLE_LONG_CONVEX' ? 'badge-convex-single' : 'badge-convex-bag'}"
+                    title="Gamma/Theta Efficiency η={(row.gamma_theta_efficiency ?? 0).toFixed(2)} | 0DTE Theta-Burn Hazard={(row.theta_burn_hazard ?? 0).toFixed(3)}"
+                  >
+                    {row.recommended_option_structure === 'SINGLE_LONG_CONVEX' ? 'CONVEX 1-LEG' : 'VERT BAG 2-LEG'}
+                  </span>
+                  <span class="convexity-stat">
+                    η={(row.gamma_theta_efficiency ?? 0).toFixed(2)} · τ={(row.theta_burn_hazard ?? 0).toFixed(2)}
+                  </span>
+                </div>
+              {/if}
             </td>
             <td>
               <span class="badge badge-venue">{row.venue_ticket}</span>
             </td>
             <td data-numeric="true" class="tabular-num kelly-cell">
               {row.kelly_fraction_pct.toFixed(2)}%
-              {#if (row.kelly_epistemic_multiplier ?? 1.0) < 0.999}
-                <span class="kelly-mult" title="OOD Epistemic Kelly Multiplier">
-                  ×{(row.kelly_epistemic_multiplier ?? 1.0).toFixed(2)}
+              {#if (row.kelly_epistemic_multiplier ?? 1.0) < 0.999 || (row.eigen_kelly_multiplier ?? 1.0) < 0.999}
+                <span
+                  class="kelly-mult"
+                  title="Stage 0 ×{(row.unified_stage0_kelly_multiplier ?? row.kelly_epistemic_multiplier ?? 1.0).toFixed(2)} | Eigen κ ×{(row.eigen_kelly_multiplier ?? 1.0).toFixed(2)} | Contextual π={((row.contextual_brain_weight_pi ?? 0.167) * 100).toFixed(1)}%"
+                >
+                  ×{((row.unified_stage0_kelly_multiplier ?? row.kelly_epistemic_multiplier ?? 1.0) * (row.eigen_kelly_multiplier ?? 1.0)).toFixed(2)}
                 </span>
               {/if}
             </td>
@@ -1651,6 +1703,70 @@
     font-size: 0.68rem;
     color: oklch(0.65 0.03 250);
     font-style: italic;
+  }
+
+  .nig-allocator-strip {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    background: oklch(0.14 0.02 260 / 0.8);
+    border: 1px solid oklch(0.28 0.04 260 / 0.45);
+    border-radius: 4px;
+    font-size: 0.66rem;
+  }
+
+  .nig-strip-title {
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: oklch(0.76 0.05 250);
+  }
+
+  .nig-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    background: oklch(0.2 0.03 250 / 0.85);
+    border: 1px solid oklch(0.34 0.05 250 / 0.5);
+    border-radius: 3px;
+    font-family: var(--font-mono, monospace);
+    color: oklch(0.92 0.03 250);
+  }
+
+  .nig-chip small {
+    color: oklch(0.72 0.06 165);
+    font-size: 0.6rem;
+  }
+
+  .convexity-meta {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 2px;
+  }
+
+  .badge-convex-single {
+    background: oklch(0.25 0.09 155 / 0.85);
+    color: oklch(0.94 0.06 155);
+    border: 1px solid oklch(0.45 0.12 155 / 0.6);
+    font-size: 0.58rem;
+    padding: 0 4px;
+  }
+
+  .badge-convex-bag {
+    background: oklch(0.25 0.07 240 / 0.85);
+    color: oklch(0.92 0.05 240);
+    border: 1px solid oklch(0.42 0.1 240 / 0.6);
+    font-size: 0.58rem;
+    padding: 0 4px;
+  }
+
+  .convexity-stat {
+    font-family: var(--font-mono, monospace);
+    font-size: 0.6rem;
+    color: oklch(0.74 0.03 250);
   }
 
   :global(.spin-icon) {

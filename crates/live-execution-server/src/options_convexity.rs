@@ -230,7 +230,7 @@ impl OptionsConvexityEngine {
         let stall_logit = 4.5 * (cumulative_tau - 0.28) - 1.8 * running_peak_r.max(0.0);
         let theta_hazard = 1.0 / (1.0 + (-stall_logit).exp());
         let should_exit_theta_stall =
-            completed_bars_count >= 4 && running_peak_r < 0.45 && cumulative_tau >= 0.30;
+            completed_bars_count >= 4 && running_peak_r < 0.45 && cumulative_tau >= 0.26;
         (cumulative_tau, theta_hazard, should_exit_theta_stall)
     }
 

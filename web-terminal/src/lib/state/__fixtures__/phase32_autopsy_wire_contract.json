@@ -1,6 +1,6 @@
 {
   "status": "PROMOTED_CHAMPION",
-  "timestamp_iso": "2026-11-11T18:49:04.884353+00:00",
+  "timestamp_iso": "2026-11-11T19:41:07.185958+00:00",
   "current_generation_id": 36,
   "candidate_generation_id": 37,
   "promoted_generation_id": 37,
@@ -13,7 +13,7 @@
   "mirror_descent_kl_divergence": 0.000076,
   "autopsies_decoded": [
     {
-      "trade_id": "78912539-922a-4e53-aae2-099044569d86",
+      "trade_id": "13ce91d9-b8e5-4bef-bbac-3f6ee89979bc",
       "symbol": "NVDA",
       "brain_id": "BRAIN-02",
       "realized_r": -1.0,
@@ -71,7 +71,7 @@
       ],
       "mahalanobis_distance_shift": 8.857,
       "collapse_bar_offset": 1,
-      "summary": "Trade 78912539 on NVDA (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [float_rotation_log] (MFE: +0.03R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 8.857)",
+      "summary": "Trade 13ce91d9 on NVDA (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [float_rotation_log] (MFE: +0.03R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 8.857)",
       "entry_features_32": [
         0.5588235,
         0.025,
@@ -108,7 +108,7 @@
       ]
     },
     {
-      "trade_id": "a21a53a9-e0b8-42d5-b8aa-59f2ad17984f",
+      "trade_id": "b4769a7c-011c-4190-abf4-cc9a7212410d",
       "symbol": "AMD",
       "brain_id": "BRAIN-02",
       "realized_r": -1.0,
@@ -166,7 +166,7 @@
       ],
       "mahalanobis_distance_shift": 4.825,
       "collapse_bar_offset": 2,
-      "summary": "Trade a21a53a9 on AMD (BRAIN-02) failed via POST_ENTRY_ORDERFLOW_TOXICITY_REVERSAL at Bar +2: top culprit [close_log_ret] (MFE: +0.35R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 4.825)",
+      "summary": "Trade b4769a7c on AMD (BRAIN-02) failed via POST_ENTRY_ORDERFLOW_TOXICITY_REVERSAL at Bar +2: top culprit [close_log_ret] (MFE: +0.35R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 4.825)",
       "entry_features_32": [
         0.8208955,
         0.025,
@@ -203,7 +203,7 @@
       ]
     },
     {
-      "trade_id": "d1ad7ca1-8d9a-4d5f-9557-e39d7aa7fd47",
+      "trade_id": "fc0399ac-4c0d-4154-a524-24cb64aaed2b",
       "symbol": "QQQ",
       "brain_id": "BRAIN-02",
       "realized_r": 1.472425,
@@ -261,7 +261,7 @@
       ],
       "mahalanobis_distance_shift": 6.191,
       "collapse_bar_offset": 3,
-      "summary": "Trade d1ad7ca1 on QQQ (BRAIN-02) failed via MFE_STALL_GIVEBACK_EXHAUSTION at Bar +3: top culprit [close_log_ret] (MFE: +2.45R -> Realized: 1.47R, Giveback: 39.9%, LW-Mahalanobis Shift: 6.191)",
+      "summary": "Trade fc0399ac on QQQ (BRAIN-02) failed via MFE_STALL_GIVEBACK_EXHAUSTION at Bar +3: top culprit [close_log_ret] (MFE: +2.45R -> Realized: 1.47R, Giveback: 39.9%, LW-Mahalanobis Shift: 6.191)",
       "entry_features_32": [
         0.84126985,
         0.025,
@@ -302,20 +302,20 @@
     "gate1_baseline_lock_passed": true,
     "gate1_baseline_winners_preserved": 116,
     "gate1_baseline_winners_target": 116,
-    "gate1_current_expectancy_r": 0.3815,
-    "gate1_candidate_expectancy_r": 0.3823,
-    "gate1_current_pf": 2.9332,
-    "gate1_candidate_pf": 2.945,
-    "current_baseline_exp_r": 0.3815,
-    "candidate_baseline_exp_r": 0.3823,
-    "current_baseline_pf": 2.9332,
-    "candidate_baseline_pf": 2.945,
+    "gate1_current_expectancy_r": 0.2088,
+    "gate1_candidate_expectancy_r": 0.2096,
+    "gate1_current_pf": 1.5641,
+    "gate1_candidate_pf": 1.5675,
+    "current_baseline_exp_r": 0.2088,
+    "candidate_baseline_exp_r": 0.2096,
+    "current_baseline_pf": 1.5641,
+    "candidate_baseline_pf": 1.5675,
     "gate2_walkforward_passed": true,
     "gate2_current_walkforward_net_r": 1.1224,
-    "gate2_candidate_walkforward_net_r": 2.8148,
+    "gate2_candidate_walkforward_net_r": 1.849,
     "current_wf_net_r": 1.1224,
-    "candidate_wf_net_r": 2.8148,
-    "gate2_offending_losses_reduced": 2,
+    "candidate_wf_net_r": 1.849,
+    "gate2_offending_losses_reduced": 1,
     "gate2_walkforward_winners_preserved": true,
     "hard_negative_traps_added_count": 1,
     "shadow_vetoed_evaluated_count": 0,
@@ -323,7 +323,7 @@
     "quarantined_traps_count": 0,
     "mirror_descent_kl_divergence": 0.000076,
     "all_gates_passed": true,
-    "decision_rationale": "PROMOTED Gen 37: Gate 1 passed (116/116 baseline winners, Exp: 0.3815R -> 0.3823R, PF: 2.933 -> 2.945) & Gate 2 passed (WF Net R: 1.122R -> 2.815R, Full stops: 2 -> 0, New traps: +1, Quarantined: 0)"
+    "decision_rationale": "PROMOTED Gen 37: Gate 1 passed (116/116 baseline winners, Exp: 0.2088R -> 0.2096R, PF: 1.564 -> 1.567) & Gate 2 passed (WF Net R: 1.122R -> 1.849R, Full stops: 2 -> 1, New traps: +1, Quarantined: 0)"
   },
   "updated_synaptic_states": [
     {
@@ -465,6 +465,7 @@
         0.1938478641423788
       ],
       "mirror_descent_kl_divergence": 0.00007343561073808083,
+      "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
           "feature_index": 18,
@@ -630,6 +631,7 @@
       "entry_veto_margin_delta": 0.021,
       "trap_conviction_weights": {
         "0b6d9498-3edc-4231-b974-762301b8659c": 1.001,
+        "13ce91d9-b8e5-4bef-bbac-3f6ee89979bc": 1.0298,
         "1ffa1890-0e4a-40ea-8642-2c8fffad6630": 0.9998,
         "274cfa64-a4da-4a4e-b8c1-583c95203b6b": 1.0017,
         "2c5e547e-a32a-40bf-ba8e-d126823a6bd0": 0.9994,
@@ -640,10 +642,9 @@
         "6d9b0291-466c-42b5-9f10-3001a20f2915": 0.9912,
         "72c628a1-b359-4cc6-9a01-328e920fe9ee": 1.0065,
         "760f0c60-4ab0-4a3d-9a8d-21b5fc78de52": 0.9971,
-        "78912539-922a-4e53-aae2-099044569d86": 1.0298,
         "9e123dab-246a-42c1-9e06-f5f0e5dd7456": 0.994,
-        "a21a53a9-e0b8-42d5-b8aa-59f2ad17984f": 0.9883,
         "a3f24427-7572-4e8f-abd5-c385666dbe16": 0.9955,
+        "b4769a7c-011c-4190-abf4-cc9a7212410d": 0.9883,
         "b5d1ab65-d397-4301-b040-5d1820a1b16b": 0.9908,
         "c657bf95-c630-46d2-8e05-77f55fbe4841": 0.9913,
         "df3ee90f-2c41-4037-a8cb-6642df100a05": 0.9953,
@@ -726,6 +727,7 @@
         0.18852760130963744
       ],
       "mirror_descent_kl_divergence": 0.00008027973381197835,
+      "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
           "feature_index": 12,
@@ -975,6 +977,7 @@
         0.19319348845689027
       ],
       "mirror_descent_kl_divergence": 0.00006906304119305644,
+      "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
           "feature_index": 18,
@@ -1227,6 +1230,7 @@
         0.1934393283361234
       ],
       "mirror_descent_kl_divergence": 0.00007564970902260474,
+      "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
           "feature_index": 18,
@@ -1472,6 +1476,7 @@
         0.1830110992423425
       ],
       "mirror_descent_kl_divergence": 0.00008027051081191375,
+      "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
           "feature_index": 9,

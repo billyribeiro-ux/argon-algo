@@ -850,6 +850,16 @@ export interface StagedOptionRollUpTicketEntry {
   alpacaRollPayloadJson: string;
 }
 
+export interface BrainContextualAllocationRow {
+  slot_id: string;
+  regime_bucket: string;
+  capital_weight_pi: number;
+  posterior_t_sharpe: number;
+  mu_n: number;
+  observations_count: number;
+  false_veto_regrets_penalized: number;
+}
+
 export interface InstitutionalWatchlistRow {
   rank: number;
   symbol: string;
@@ -884,6 +894,15 @@ export interface InstitutionalWatchlistRow {
   conformal_p_value?: number;
   epistemic_ood_score?: number;
   kelly_epistemic_multiplier?: number;
+  conformal_kelly_scalar?: number;
+  unified_stage0_kelly_multiplier?: number;
+  eigen_kelly_multiplier?: number;
+  marginal_correlation_penalty?: number;
+  contextual_brain_weight_pi?: number;
+  posterior_t_sharpe?: number;
+  recommended_option_structure?: string;
+  gamma_theta_efficiency?: number;
+  theta_burn_hazard?: number;
 }
 
 export interface InstitutionalWatchlistResponse {
@@ -895,6 +914,10 @@ export interface InstitutionalWatchlistResponse {
   net_portfolio_delta_beta_weighted: number;
   cross_brain_conflicts_blocked: number;
   estimated_occ_tims_margin_relief_pct: number;
+  absorption_ratio?: number;
+  effective_independent_bets_neff?: number;
+  eigen_kelly_multiplier?: number;
+  contextual_nig_allocations?: BrainContextualAllocationRow[];
   timestamp_iso: string;
   eval_epoch_s?: number;
   watchlist: InstitutionalWatchlistRow[];

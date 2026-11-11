@@ -530,7 +530,7 @@ impl LedoitWolfPrecision {
                 0.035
             } else {
                 let max_lam = *winner_lambdas.last().unwrap_or(&-0.020);
-                (max_lam + 0.095).clamp(0.025, 0.38)
+                (max_lam + 0.18).clamp(0.025, 0.65)
             };
 
             for (tid, _is_win, z_i) in &all_entries {
@@ -978,63 +978,66 @@ pub fn evaluate_stage0_conformal_kernel(
     let alpha_floor = brain_state.mondrian_conformal_alpha_floor.clamp(0.005, 0.20);
     let min_stratum_n = ((1.0 / alpha_floor).ceil() as usize).max(12);
     let candidate_nonconformity_alpha = d_win / (d_trap + 0.05);
-    let p_mondrian = if let Some(manifold) = precision.brains.get(&brain_id) {
-        let regime_filtered: Vec<f64> = manifold
-            .mondrian_calibration_scores
-            .get(&regime_bucket)
-            .map(|scores| {
-                scores
+    let (p_mondrian, exceeds_finite_loo_envelope) =
+        if let Some(manifold) = precision.brains.get(&brain_id) {
+            let regime_filtered: Vec<f64> = manifold
+                .mondrian_calibration_scores
+                .get(&regime_bucket)
+                .map(|scores| {
+                    scores
+                        .iter()
+                        .filter(|(item_id, _)| exclude_trade_id != Some(*item_id))
+                        .map(|(_, a)| *a)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let calib_iter: Vec<f64> = if regime_filtered.len() >= min_stratum_n {
+                regime_filtered
+            } else {
+                let all_filtered: Vec<f64> = manifold
+                    .all_calibration_scores
                     .iter()
                     .filter(|(item_id, _)| exclude_trade_id != Some(*item_id))
                     .map(|(_, a)| *a)
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .collect();
+                if all_filtered.len() >= regime_filtered.len() {
+                    all_filtered
+                } else {
+                    regime_filtered
+                }
+            };
 
-        let calib_iter: Vec<f64> = if regime_filtered.len() >= min_stratum_n {
-            regime_filtered
-        } else {
-            let all_filtered: Vec<f64> = manifold
-                .all_calibration_scores
+            let geq_count = calib_iter
                 .iter()
-                .filter(|(item_id, _)| exclude_trade_id != Some(*item_id))
-                .map(|(_, a)| *a)
-                .collect();
-            if all_filtered.len() >= regime_filtered.len() {
-                all_filtered
-            } else {
-                regime_filtered
-            }
-        };
-
-        let geq_count = calib_iter
-            .iter()
-            .filter(|&&alpha_i| alpha_i >= candidate_nonconformity_alpha)
-            .count();
-        let base_p = (1.0 + geq_count as f64) / (1.0 + calib_iter.len() as f64);
-        if geq_count == 0 && calib_iter.len() >= 12 {
+                .filter(|&&alpha_i| alpha_i >= candidate_nonconformity_alpha)
+                .count();
+            let m_len = calib_iter.len();
+            let base_p = (1.0 + geq_count as f64) / (1.0 + m_len as f64);
             let max_calib_alpha = calib_iter
                 .iter()
                 .copied()
                 .fold(0.0_f64, f64::max)
                 .max(1e-6);
-            if candidate_nonconformity_alpha > max_calib_alpha {
+            let finite_concentration_slack = 1.0 + 0.65 / (m_len.max(1) as f64).sqrt();
+            let beyond_envelope =
+                candidate_nonconformity_alpha > max_calib_alpha * finite_concentration_slack;
+            let p_val = if geq_count == 0 && m_len >= 12 && beyond_envelope {
                 (base_p * (max_calib_alpha / candidate_nonconformity_alpha)).clamp(0.001, base_p)
             } else {
                 base_p
-            }
+            };
+            (p_val, beyond_envelope)
         } else {
-            base_p
-        }
-    } else {
-        1.0
-    };
+            (1.0, false)
+        };
 
     let conformal_kelly_scalar = (p_mondrian / 0.25).clamp(0.35, 1.0);
     let unified_stage0_kelly_multiplier =
         (kelly_epistemic_multiplier * conformal_kelly_scalar).clamp(0.10, 1.0);
 
-    let is_mondrian_conformal_veto = calibrated_n >= 12 && p_mondrian < alpha_floor;
+    let is_mondrian_conformal_veto =
+        calibrated_n >= 12 && p_mondrian < alpha_floor && exceeds_finite_loo_envelope;
     let is_trap_veto = conformal_margin < 0.0;
     let vetoed = is_epistemic_ood_veto || is_trap_veto || is_mondrian_conformal_veto;
 

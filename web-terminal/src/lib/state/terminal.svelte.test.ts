@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import rustWireFixture from './__fixtures__/phase30_rust_wire_contract.json';
 import autopsyWireFixture from './__fixtures__/phase32_autopsy_wire_contract.json';
 import phase34ShadowWireFixture from './__fixtures__/phase34_shadow_bandit_wire_contract.json';
+import phase35EigenConvexityWireFixture from './__fixtures__/phase35_portfolio_eigen_convexity_wire_contract.json';
 import {
   TerminalStore,
   formatSubPennyPrice,
@@ -2960,6 +2961,108 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
         evoState.mirror_descent_kl_divergence!,
         6
       );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('hydrates Phase 35 Portfolio Eigen-Covariance AR/N_eff, Contextual NIG Simplex Meta-Allocator, Smart Options Convexity Router, and 0DTE Theta-Burn Stall Guard (#27)', async () => {
+    const store = new TerminalStore(false);
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (
+        url.includes('/api/v1/scanner/watchlist') ||
+        url.includes('/api/v1/scanner/institutional-watchlist') ||
+        url.includes('/api/v1/scanner/sunday-watchlist')
+      ) {
+        return new Response(JSON.stringify(phase35EigenConvexityWireFixture.watchlist_response), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return new Response('{}', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    try {
+      await store.fetchInstitutionalWatchlist();
+      expect(store.institutionalWatchlist).not.toBeNull();
+      const wl = store.institutionalWatchlist!;
+
+      // Book-level Eigen-Covariance & Contextual NIG Simplex assertions
+      expect(Number.isFinite(wl.absorption_ratio)).toBe(true);
+      expect(wl.absorption_ratio!).toBeGreaterThan(0);
+      expect(wl.absorption_ratio!).toBeLessThanOrEqual(1.0);
+      expect(Number.isFinite(wl.effective_independent_bets_neff)).toBe(true);
+      expect(wl.effective_independent_bets_neff!).toBeGreaterThanOrEqual(1.0);
+      expect(Number.isFinite(wl.eigen_kelly_multiplier)).toBe(true);
+      expect(wl.eigen_kelly_multiplier!).toBeGreaterThanOrEqual(0.25);
+      expect(wl.eigen_kelly_multiplier!).toBeLessThanOrEqual(1.0);
+
+      expect(wl.contextual_nig_allocations).toBeDefined();
+      expect(wl.contextual_nig_allocations!.length).toBe(6);
+      const sumPi = wl.contextual_nig_allocations!.reduce((acc, row) => acc + row.capital_weight_pi, 0);
+      expect(sumPi).toBeCloseTo(1.0, 5);
+      for (const alloc of wl.contextual_nig_allocations!) {
+        expect(alloc.capital_weight_pi).toBeGreaterThanOrEqual(0.0999);
+        expect(alloc.capital_weight_pi).toBeLessThanOrEqual(0.4201);
+        expect(Number.isFinite(alloc.posterior_t_sharpe)).toBe(true);
+      }
+
+      // Row-level Conformal + Eigen + Contextual + Convexity wire assertions
+      expect(wl.watchlist.length).toBe(24);
+      for (const r of wl.watchlist) {
+        expect(['SINGLE_LONG_CONVEX', 'DEFINED_RISK_VERTICAL_BAG']).toContain(r.recommended_option_structure);
+        expect(Number.isFinite(r.gamma_theta_efficiency)).toBe(true);
+        expect(r.gamma_theta_efficiency!).toBeGreaterThanOrEqual(0);
+        expect(Number.isFinite(r.theta_burn_hazard)).toBe(true);
+        expect(r.theta_burn_hazard!).toBeGreaterThanOrEqual(0);
+        expect(r.theta_burn_hazard!).toBeLessThanOrEqual(1.0);
+        expect(Number.isFinite(r.conformal_kelly_scalar)).toBe(true);
+        expect(r.conformal_kelly_scalar!).toBeGreaterThanOrEqual(0.35);
+        expect(r.conformal_kelly_scalar!).toBeLessThanOrEqual(1.0);
+        expect(Number.isFinite(r.eigen_kelly_multiplier)).toBe(true);
+        expect(Number.isFinite(r.contextual_brain_weight_pi)).toBe(true);
+      }
+
+      // Orthogonal vs Crowded Eigen-Risk & Regime Contextual Shift & 0DTE Theta Stall audit proofs
+      const orth = phase35EigenConvexityWireFixture.eigen_orthogonal_report;
+      const crowd = phase35EigenConvexityWireFixture.eigen_crowded_report;
+      expect(orth.absorption_ratio).toBeLessThan(0.55);
+      expect(orth.effective_independent_bets_neff).toBeGreaterThan(2.5);
+      expect(orth.vetoed).toBe(false);
+      expect(crowd.absorption_ratio).toBeGreaterThan(0.78);
+      expect(crowd.vetoed).toBe(true);
+      expect(crowd.veto_reason).toBe('PORTFOLIO_VETOED_EIGEN_CORRELATION_CROWDING');
+
+      const negScalp = phase35EigenConvexityWireFixture.nig_neg_gamma_allocations.find(
+        (a) => a.slot_id === 'SCALP_0DTE'
+      )!;
+      const negSwing4 = phase35EigenConvexityWireFixture.nig_neg_gamma_allocations.find(
+        (a) => a.slot_id === 'BRAIN-04'
+      )!;
+      const posScalp = phase35EigenConvexityWireFixture.nig_pos_gamma_allocations.find(
+        (a) => a.slot_id === 'SCALP_0DTE'
+      )!;
+      const posSwing4 = phase35EigenConvexityWireFixture.nig_pos_gamma_allocations.find(
+        (a) => a.slot_id === 'BRAIN-04'
+      )!;
+      expect(negScalp.capital_weight_pi).toBeGreaterThan(negSwing4.capital_weight_pi);
+      expect(posSwing4.capital_weight_pi).toBeGreaterThan(posScalp.capital_weight_pi);
+
+      expect(phase35EigenConvexityWireFixture.convexity_low_iv_trend.recommended_option_structure).toBe(
+        'SINGLE_LONG_CONVEX'
+      );
+      expect(phase35EigenConvexityWireFixture.convexity_high_iv_pin.recommended_option_structure).toBe(
+        'DEFINED_RISK_VERTICAL_BAG'
+      );
+
+      const guarded = phase35EigenConvexityWireFixture.zero_dte_stall_guarded;
+      const unguarded = phase35EigenConvexityWireFixture.zero_dte_stall_unguarded;
+      expect(guarded.exited_via_theta_stall).toBe(true);
+      expect(guarded.exit_bar_index).toBe(4);
+      expect(guarded.realized_option_r - unguarded.realized_option_r).toBeGreaterThan(0.35);
     } finally {
       globalThis.fetch = originalFetch;
     }

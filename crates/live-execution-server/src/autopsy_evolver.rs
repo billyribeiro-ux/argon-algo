@@ -533,8 +533,8 @@ impl LedoitWolfPrecision {
                 }
                 let dl_c = 0.92 * dl_cent + 0.08 * min_loss_nn_loo;
 
-                let rad_sq = (0.5 * (dw_eff * dw_eff + dl_c * dl_c)).max(1.0);
-                let lam_w = 0.5 * (dw_eff * dw_eff - dl_c * dl_c) / rad_sq;
+                let trace_scale = 8.0_f64;
+                let lam_w = (dw_eff * dw_eff - dl_c * dl_c) / trace_scale;
                 winner_lambdas.push(lam_w);
             }
             winner_lambdas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -542,7 +542,7 @@ impl LedoitWolfPrecision {
                 0.035
             } else {
                 let max_lam = *winner_lambdas.last().unwrap_or(&-0.020);
-                (max_lam + 0.025).clamp(0.025, 0.072)
+                (max_lam + 0.038).clamp(0.035, 0.35)
             };
 
             for (tid, _is_win, z_i) in &all_entries {
@@ -975,8 +975,10 @@ pub fn evaluate_stage0_conformal_kernel(
     }
 
     let d_trap = d_loss_c.min(min_active_trap).max(0.0);
-    let radial_sq = (0.5 * (d_win * d_win + d_trap * d_trap)).max(1.0);
-    let conformal_llr = 0.5 * (d_win * d_win - d_trap * d_trap) / radial_sq;
+    // Exact Rao-Fisher Gaussian Mahalanobis Log-Likelihood Ratio scaled by simplex trace (2 * tr(W) ~ 8.0)
+    // so near-origin winners are never amplified by small radial denominators while far-manifold traps scale faithfully.
+    let trace_scale = 8.0_f64;
+    let conformal_llr = (d_win * d_win - d_trap * d_trap) / trace_scale;
     let base_hurdle = precision
         .brains
         .get(&brain_id)

@@ -18,7 +18,7 @@
 
 use crate::evolution::BrainSynapticPlasticityState;
 use crate::ledger::{ClosedTradeRow, RealTimeLedgerEngine};
-use crate::precedent_knn::{HardNegativeTrapRecord, PrecedentKnnIndex};
+use crate::precedent_knn::{HardNegativeTrapRecord, PrecedentKnnIndex, TrapUpsertOutcome};
 use chrono::Utc;
 use raw_fingerprint_core::{BrainHorizonId, TradeDirection};
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,90 @@ pub struct DecodedTradeAutopsy {
     pub entry_features_32: Vec<f32>,
 }
 
+/// Phase 34 Deliverable 1: Causal Regime Partitioning (`RegimeBucket`) across Stream 1 (`0..12`),
+/// Stream 2 Dealer GEX/Charm/Vanna (`12..20`), and Stream 3 Toxicity/Float (`20..26`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RegimeBucket {
+    #[serde(rename = "POS_GAMMA_PIN_MEAN_REVERT")]
+    PosGammaPinMeanRevert,
+    #[serde(rename = "NEG_GAMMA_MOMENTUM_TREND")]
+    NegGammaMomentumTrend,
+    #[serde(rename = "LIQUIDITY_VACUUM_HIGH_TOXICITY")]
+    LiquidityVacuumHighToxicity,
+}
+
+impl Default for RegimeBucket {
+    fn default() -> Self {
+        Self::PosGammaPinMeanRevert
+    }
+}
+
+impl RegimeBucket {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PosGammaPinMeanRevert => "POS_GAMMA_PIN_MEAN_REVERT",
+            Self::NegGammaMomentumTrend => "NEG_GAMMA_MOMENTUM_TREND",
+            Self::LiquidityVacuumHighToxicity => "LIQUIDITY_VACUUM_HIGH_TOXICITY",
+        }
+    }
+}
+
+/// Pure-causal pre-entry regime classifier over the 32-feature state vector.
+pub fn classify_regime_bucket(entry_features_32: &[f64; 32]) -> RegimeBucket {
+    let spread_vacuum = entry_features_32[10];
+    let wick_trap = entry_features_32[4].max(entry_features_32[5]);
+    let trend_energy =
+        entry_features_32[0].abs() + entry_features_32[6].abs() + entry_features_32[8].abs();
+    let dealer_gex = entry_features_32[14];
+    let dealer_vanna_charm = entry_features_32[15] + entry_features_32[19];
+    let toxicity_mean: f64 =
+        entry_features_32[20..26].iter().map(|v| v.abs()).sum::<f64>() / 6.0;
+
+    if spread_vacuum >= 0.45
+        || toxicity_mean >= 1.15
+        || (wick_trap >= 0.58 && spread_vacuum >= 0.22)
+    {
+        RegimeBucket::LiquidityVacuumHighToxicity
+    } else if dealer_gex < -0.04 || (trend_energy >= 0.72 && dealer_vanna_charm <= 0.15) {
+        RegimeBucket::NegGammaMomentumTrend
+    } else {
+        RegimeBucket::PosGammaPinMeanRevert
+    }
+}
+
+/// Active Stage-0 Trap Centroid entry passed into `evaluate_stage0_conformal_kernel`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stage0TrapCentroid {
+    pub trap_id: Option<Uuid>,
+    pub root_cause_category: String,
+    pub features_32: [f64; 32],
+    pub quarantined: bool,
+}
+
+/// Output of the single shared causal Stage 0 conformal + $\chi^2_{32}$ OOD epistemic kernel
+/// (`evaluate_stage0_conformal_kernel`), guaranteeing `< 1e-12` zero-skew parity between
+/// offline Gate 1/2 simulation and live scanner / paper-daemon entry gating.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stage0ConformalKernelOutput {
+    pub regime_bucket: RegimeBucket,
+    pub d_win: f64,
+    pub d_trap: f64,
+    pub d_nearest: f64,
+    pub q975_mahalanobis_radius: f64,
+    pub candidate_nonconformity_alpha: f64,
+    pub conformal_p_value: f64,
+    pub conformal_margin: f64,
+    pub conformal_llr: f64,
+    pub conformal_hurdle: f64,
+    pub epistemic_ood_score: f64,
+    pub kelly_epistemic_multiplier: f64,
+    pub vetoed: bool,
+    pub is_epistemic_ood_veto: bool,
+    pub matched_trap_id: Option<Uuid>,
+    pub veto_status: String,
+    pub root_cause_category: String,
+}
+
 /// Outcome of causally re-simulating a single historical or walk-forward trade under a candidate
 /// `BrainSynapticPlasticityState` and Hard-Negative Trap centroid bank.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -123,7 +207,14 @@ pub struct SimulatedTradeOutcome {
     pub full_stop_hit: bool,
     pub exit_bar_offset: usize,
     pub candidate_conformal_margin: f64,
+    pub conformal_llr: f64,
+    pub conformal_p_value: f64,
+    pub epistemic_ood_score: f64,
+    pub kelly_epistemic_multiplier: f64,
+    pub regime_bucket: RegimeBucket,
     pub max_wald_sprt_llr: f64,
+    pub max_reversal_hazard: f64,
+    pub effective_retention_ratio: f64,
 }
 
 /// Per-brain 32x32 Ledoit-Wolf empirical covariance & Cholesky precision manifold
@@ -137,6 +228,11 @@ pub struct BrainLedoitWolfManifold {
     pub loss_centroid_32: [f64; 32],
     pub stage0_anchor_32: [f64; 32],
     pub winner_exemplars_32: Vec<(Uuid, [f64; 32])>,
+    pub loss_exemplars_32: Vec<(Uuid, [f64; 32])>,
+    pub winner_feature_var_32: [f64; 32],
+    pub mondrian_calibration_scores: HashMap<RegimeBucket, Vec<(Uuid, f64)>>,
+    pub all_calibration_scores: Vec<(Uuid, f64)>,
+    pub q975_mahalanobis_radius: f64,
     pub pooled_bar1_cov: [[f64; 32]; 32],
     pub n_bar1_causal: usize,
     pub scale_bar1_sq: f64,
@@ -172,17 +268,21 @@ impl LedoitWolfPrecision {
             };
 
             let mut win_entries: Vec<(Uuid, [f64; 32])> = Vec::new();
+            let mut loss_entries_with_id: Vec<(Uuid, [f64; 32])> = Vec::new();
             let mut loss_entries: Vec<[f64; 32]> = Vec::new();
+            let mut all_entries: Vec<(Uuid, bool, [f64; 32])> = Vec::new();
             let mut win_bar1: Vec<[f64; 32]> = Vec::new();
             let mut loss_bar1: Vec<[f64; 32]> = Vec::new();
 
             for row in &source_slice {
                 let e_vec = extract_causal_entry_array_32(row);
                 let b1_vec = extract_causal_bar1_array_32(row);
+                all_entries.push((row.trade_id, row.is_winner, e_vec));
                 if row.is_winner {
                     win_entries.push((row.trade_id, e_vec));
                     win_bar1.push(b1_vec);
                 } else {
+                    loss_entries_with_id.push((row.trade_id, e_vec));
                     loss_entries.push(e_vec);
                     loss_bar1.push(b1_vec);
                 }
@@ -198,6 +298,17 @@ impl LedoitWolfPrecision {
                 }
             }
 
+            let mut winner_feature_var_32 = [0.0_f64; 32];
+            if !win_entries.is_empty() {
+                let inv_w = 1.0 / (win_entries.len() as f64);
+                for (_, v) in &win_entries {
+                    for i in 0..32 {
+                        let d = v[i] - winner_centroid_32[i];
+                        winner_feature_var_32[i] += (d * d) * inv_w;
+                    }
+                }
+            }
+
             let mut loss_centroid_32 = [0.0_f64; 32];
             if !loss_entries.is_empty() {
                 let inv_l = 1.0 / (loss_entries.len() as f64);
@@ -205,6 +316,10 @@ impl LedoitWolfPrecision {
                     for i in 0..32 {
                         loss_centroid_32[i] += v[i] * inv_l;
                     }
+                }
+            } else if win_entries.is_empty() {
+                for i in 0..32 {
+                    loss_centroid_32[i] = 1.25;
                 }
             } else {
                 for i in 0..32 {
@@ -346,6 +461,66 @@ impl LedoitWolfPrecision {
 
             let n_entry_causal = (win_entries.len() + loss_entries.len()).max(4);
             let n_bar1_causal = (win_bar1.len() + loss_bar1.len()).max(4);
+
+            // Phase 34 Deliverable 1: Mondrian per-(brain_id, RegimeBucket) leave-one-out calibration
+            // nonconformity scores alpha_i = d_LW(z_i, W_{-i}) / (d_LW(z_i, T) + 0.05) and empirical q975 radius
+            let uniform_simplex_w = [6.0 / 32.0; 32];
+            let mut mondrian_calibration_scores: HashMap<RegimeBucket, Vec<(Uuid, f64)>> =
+                HashMap::new();
+            let mut all_calibration_scores: Vec<(Uuid, f64)> =
+                Vec::with_capacity(all_entries.len());
+            let mut nearest_radii: Vec<f64> = Vec::with_capacity(all_entries.len());
+
+            let maha_local = |x: &[f64; 32], y: &[f64; 32]| -> f64 {
+                let mut diff = [0.0_f64; 32];
+                for k in 0..32 {
+                    diff[k] = x[k] - y[k];
+                }
+                let (d, _) =
+                    PrecedentKnnIndex::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                        &pooled_entry_cov,
+                        n_entry_causal,
+                        &uniform_simplex_w,
+                        &diff,
+                        scale_entry_sq,
+                    );
+                d
+            };
+
+            for (tid, _is_win, z_i) in &all_entries {
+                let regime_i = classify_regime_bucket(z_i);
+                let mut d_w_i = maha_local(z_i, &winner_centroid_32);
+                for (wid, w_vec) in &win_entries {
+                    if wid != tid {
+                        let d_ex = maha_local(z_i, w_vec);
+                        if d_ex < d_w_i {
+                            d_w_i = d_ex;
+                        }
+                    }
+                }
+                let d_anchor_i = maha_local(z_i, &stage0_anchor_32);
+                let d_loss_c_i = maha_local(z_i, &loss_centroid_32);
+                let d_t_i = d_anchor_i.min(d_loss_c_i);
+                let alpha_i = d_w_i.max(0.0) / (d_t_i.max(0.0) + 0.05);
+                mondrian_calibration_scores
+                    .entry(regime_i)
+                    .or_default()
+                    .push((*tid, alpha_i));
+                all_calibration_scores.push((*tid, alpha_i));
+                nearest_radii.push(d_w_i.min(d_anchor_i).max(0.05));
+            }
+
+            nearest_radii.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // Chi^2_{32, 0.975} = 49.48; under sum(W) = 6.0 scaling, root radius floor = sqrt(49.48 * 6 / 32) = 3.046
+            let chi2_32_q975_floor = (49.4804_f64 * (6.0 / 32.0)).sqrt();
+            let q975_mahalanobis_radius = if nearest_radii.is_empty() {
+                chi2_32_q975_floor
+            } else {
+                let q_idx = (((nearest_radii.len() - 1) as f64) * 0.975).ceil() as usize;
+                let emp_q975 = nearest_radii[q_idx.min(nearest_radii.len() - 1)];
+                emp_q975.max(chi2_32_q975_floor)
+            };
+
             brains.insert(
                 brain_id,
                 BrainLedoitWolfManifold {
@@ -356,6 +531,11 @@ impl LedoitWolfPrecision {
                     loss_centroid_32,
                     stage0_anchor_32,
                     winner_exemplars_32: win_entries,
+                    loss_exemplars_32: loss_entries_with_id,
+                    winner_feature_var_32,
+                    mondrian_calibration_scores,
+                    all_calibration_scores,
+                    q975_mahalanobis_radius,
                     pooled_bar1_cov,
                     n_bar1_causal,
                     scale_bar1_sq,
@@ -456,6 +636,14 @@ pub struct GateAuditReport {
     pub gate2_offending_losses_reduced: usize,
     pub gate2_walkforward_winners_preserved: bool,
     pub hard_negative_traps_added_count: usize,
+    #[serde(default)]
+    pub shadow_vetoed_evaluated_count: usize,
+    #[serde(default)]
+    pub shadow_net_veto_alpha_r: f64,
+    #[serde(default)]
+    pub quarantined_traps_count: usize,
+    #[serde(default)]
+    pub mirror_descent_kl_divergence: f64,
     pub all_gates_passed: bool,
     pub decision_rationale: String,
 }
@@ -471,6 +659,14 @@ pub struct AutopsyEvolutionResponse {
     pub is_promoted: bool,
     pub total_trades_inspected: usize,
     pub hard_negative_traps_added_count: usize,
+    #[serde(default)]
+    pub shadow_vetoed_evaluated_count: usize,
+    #[serde(default)]
+    pub shadow_net_veto_alpha_r: f64,
+    #[serde(default)]
+    pub quarantined_traps_count: usize,
+    #[serde(default)]
+    pub mirror_descent_kl_divergence: f64,
     pub autopsies_decoded: Vec<DecodedTradeAutopsy>,
     pub gate_audit: GateAuditReport,
     pub updated_synaptic_states: Vec<BrainSynapticPlasticityState>,
@@ -498,10 +694,94 @@ pub fn extract_causal_bar1_array_32(trade: &ClosedTradeRow) -> [f64; 32] {
     out
 }
 
+/// Exact KL Bregman projection onto the capped 32-simplex
+/// $\{w \in [\text{floor\_w}, \text{ceil\_w}]^{32} : \sum_{f=0}^{31} w_f = \text{total\_mass}\}$
+/// via bisection on the multiplicative water-filling dual multiplier $\lambda > 0$.
+#[allow(clippy::needless_range_loop)]
+pub fn project_capped_simplex_kl_32(
+    unnormalized: &[f64; 32],
+    floor_w: f64,
+    ceil_w: f64,
+    total_mass: f64,
+) -> [f64; 32] {
+    let mut safe_u = [0.0_f64; 32];
+    for f in 0..32 {
+        safe_u[f] = unnormalized[f].max(1e-12);
+    }
+
+    let mut log_lo = -35.0_f64;
+    let mut log_hi = 35.0_f64;
+    for _ in 0..80 {
+        let log_mid = 0.5 * (log_lo + log_hi);
+        let scale = log_mid.exp();
+        let mut s = 0.0_f64;
+        for f in 0..32 {
+            s += (safe_u[f] * scale).clamp(floor_w, ceil_w);
+        }
+        if s < total_mass {
+            log_lo = log_mid;
+        } else {
+            log_hi = log_mid;
+        }
+    }
+
+    let opt_scale = (0.5 * (log_lo + log_hi)).exp();
+    let mut out = [0.0_f64; 32];
+    for f in 0..32 {
+        out[f] = (safe_u[f] * opt_scale).clamp(floor_w, ceil_w);
+    }
+    out
+}
+
+/// Computes normalized Kullback-Leibler divergence $D_{\text{KL}}(w_{\text{next}} / Z \,\|\, w_{\text{prev}} / Z)$
+/// across the 32-simplex synaptic mass $Z = \sum_{f=0}^{31} w_f = 6.0$.
+#[allow(clippy::needless_range_loop)]
+pub fn compute_simplex_kl_divergence_32(
+    w_next: &[f64; 32],
+    w_prev: &[f64; 32],
+    total_mass: f64,
+) -> f64 {
+    let z = total_mass.max(1e-9);
+    let mut kl = 0.0_f64;
+    for f in 0..32 {
+        let p = (w_next[f] / z).max(1e-12);
+        let q = (w_prev[f] / z).max(1e-12);
+        kl += p * (p / q).ln();
+    }
+    kl.max(0.0)
+}
+
 /// Converts `BrainSynapticPlasticityState::synaptic_feature_weights_32` into positive precision
-/// metric weights $W = \operatorname{diag}(w_0, \dots, w_{31})$ scaled to the 32-d Mahalanobis norm.
+/// metric weights $W = \operatorname{diag}(w_0, \dots, w_{31})$ conserving total mass $\sum_{f=0}^{31} w_f = 6.0$.
 #[allow(clippy::needless_range_loop)]
 pub fn build_synaptic_precision_weights(brain_state: &BrainSynapticPlasticityState) -> [f64; 32] {
+    if let Some(sw) = brain_state.simplex_weights_32 {
+        let mut max_dev = 0.0_f64;
+        for i in 0..32 {
+            let expected_syn = sw[i] * (32.0 / 6.0);
+            let dev = (brain_state.synaptic_feature_weights_32[i] - expected_syn).abs();
+            if dev > max_dev {
+                max_dev = dev;
+            }
+        }
+        if max_dev < 0.05 {
+            return sw;
+        }
+        let mut raw_w = [0.0_f64; 32];
+        let mut sum_w = 0.0_f64;
+        for i in 0..32 {
+            let wi = brain_state.synaptic_feature_weights_32[i].max(0.0001);
+            raw_w[i] = wi;
+            sum_w += wi;
+        }
+        sum_w = sum_w.max(1e-9);
+        let mut out = [0.0_f64; 32];
+        for i in 0..32 {
+            out[i] = (raw_w[i] / sum_w) * 6.0;
+        }
+        return out;
+    }
+
     let fisher_p = brain_state
         .learned_fisher_sparsity_exponent_p
         .clamp(1.0, 2.75);
@@ -521,6 +801,221 @@ pub fn build_synaptic_precision_weights(brain_state: &BrainSynapticPlasticitySta
         out[i] = (6.0 / 32.0) * norm_i;
     }
     out
+}
+
+/// Phase 33.1 & Phase 34 Single Shared Pure-Causal Stage 0 Conformal + $\chi^2_{32}$ OOD Kernel.
+///
+/// Invoked identically by BOTH offline `simulate_trade_under_candidate` (Gate 1 & Gate 2) AND
+/// live `RealTimeLedgerEngine::evaluate_live_entry_stage0_gate` / watchlist scanner, guaranteeing
+/// `< 1e-12` zero-skew parity across `conformal_margin`, `conformal_llr`, `conformal_p_value`,
+/// `epistemic_ood_score`, `kelly_epistemic_multiplier`, and `vetoed` decisions.
+pub fn evaluate_stage0_conformal_kernel(
+    brain_id: BrainHorizonId,
+    entry_features_32: &[f64; 32],
+    exclude_trade_id: Option<Uuid>,
+    brain_state: &BrainSynapticPlasticityState,
+    trap_bank: &[Stage0TrapCentroid],
+    precision: &LedoitWolfPrecision,
+) -> Stage0ConformalKernelOutput {
+    let regime_bucket = classify_regime_bucket(entry_features_32);
+    let weights_32 = build_synaptic_precision_weights(brain_state);
+
+    let mut d_win = if let Some(manifold) = precision.brains.get(&brain_id) {
+        let mut min_w = precision.entry_mahalanobis(
+            brain_id,
+            &weights_32,
+            entry_features_32,
+            &manifold.winner_centroid_32,
+        );
+        for (w_id, w_vec) in &manifold.winner_exemplars_32 {
+            if exclude_trade_id != Some(*w_id) {
+                let d_ex =
+                    precision.entry_mahalanobis(brain_id, &weights_32, entry_features_32, w_vec);
+                if d_ex < min_w {
+                    min_w = d_ex;
+                }
+            }
+        }
+        min_w
+    } else {
+        let zero = [0.0_f64; 32];
+        precision.entry_mahalanobis(brain_id, &weights_32, entry_features_32, &zero)
+    };
+    d_win = d_win.max(0.0);
+
+    let d_anchor = if let Some(manifold) = precision.brains.get(&brain_id) {
+        precision.entry_mahalanobis(
+            brain_id,
+            &weights_32,
+            entry_features_32,
+            &manifold.stage0_anchor_32,
+        )
+    } else {
+        d_win + 0.25
+    };
+
+    let mut matched_trap_id: Option<Uuid> = None;
+    let mut matched_category = "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string();
+    let mut min_active_trap = f64::INFINITY;
+    let mut found_active_trap = false;
+
+    for trap in trap_bank {
+        if trap.quarantined {
+            continue;
+        }
+        found_active_trap = true;
+        let dt = precision.entry_mahalanobis(
+            brain_id,
+            &weights_32,
+            entry_features_32,
+            &trap.features_32,
+        );
+        if dt < min_active_trap {
+            min_active_trap = dt;
+            matched_trap_id = trap.trap_id;
+            matched_category = trap.root_cause_category.clone();
+        }
+    }
+
+    let d_trap = d_anchor.min(min_active_trap);
+    let active_trap_triggered = found_active_trap
+        && ((min_active_trap - d_win) - brain_state.entry_veto_margin_delta < 0.0
+            || min_active_trap <= d_anchor);
+
+    let d_nearest = d_win.min(d_trap);
+    let q975 = precision
+        .brains
+        .get(&brain_id)
+        .map(|m| m.q975_mahalanobis_radius)
+        .unwrap_or(3.05)
+        .max(0.50);
+
+    let epistemic_ood_score = if d_nearest > q975 {
+        (d_nearest / q975) - 1.0
+    } else {
+        0.0
+    };
+    let kelly_epistemic_multiplier = (-1.5 * epistemic_ood_score.max(0.0)).exp().clamp(0.15, 1.0);
+    let is_epistemic_ood_veto = epistemic_ood_score > 1.25;
+
+    // Mondrian Regime-Conditioned Split-Conformal p-value:
+    // p = (1 + #{i in C_{b,r} : alpha_i >= alpha_cand}) / (1 + |C_{b,r}|)
+    let candidate_nonconformity_alpha = d_win / (d_trap + 0.05);
+    let p_mondrian = if let Some(manifold) = precision.brains.get(&brain_id) {
+        let regime_slice = manifold.mondrian_calibration_scores.get(&regime_bucket);
+        let calib_iter: Vec<f64> = if let Some(bucket_scores) = regime_slice
+            && bucket_scores.len() >= 3
+        {
+            bucket_scores
+                .iter()
+                .filter(|(tid, _)| exclude_trade_id != Some(*tid))
+                .map(|(_, a)| *a)
+                .collect()
+        } else {
+            manifold
+                .all_calibration_scores
+                .iter()
+                .filter(|(tid, _)| exclude_trade_id != Some(*tid))
+                .map(|(_, a)| *a)
+                .collect()
+        };
+        let geq_count = calib_iter
+            .iter()
+            .filter(|&&alpha_i| alpha_i >= candidate_nonconformity_alpha)
+            .count();
+        (1.0 + geq_count as f64) / (1.0 + calib_iter.len() as f64)
+    } else {
+        1.0
+    };
+
+    let conformal_margin = (d_trap - d_win) - brain_state.entry_veto_margin_delta;
+    let conformal_hurdle = brain_state.entry_veto_margin_delta.max(0.025);
+    let conformal_llr = conformal_hurdle - conformal_margin;
+    let is_trap_veto = conformal_margin < 0.0;
+    let vetoed = is_epistemic_ood_veto || is_trap_veto;
+
+    let (veto_status, root_cause_category) = if is_epistemic_ood_veto {
+        (
+            "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME".to_string(),
+            "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME".to_string(),
+        )
+    } else if is_trap_veto {
+        (
+            "STAGE_0_VETOED_HARD_NEGATIVE_TRAP".to_string(),
+            matched_category,
+        )
+    } else {
+        ("PASS".to_string(), "NONE".to_string())
+    };
+
+    Stage0ConformalKernelOutput {
+        regime_bucket,
+        d_win,
+        d_trap,
+        d_nearest,
+        q975_mahalanobis_radius: q975,
+        candidate_nonconformity_alpha,
+        conformal_p_value: p_mondrian,
+        conformal_margin,
+        conformal_llr,
+        conformal_hurdle,
+        epistemic_ood_score,
+        kelly_epistemic_multiplier,
+        vetoed,
+        is_epistemic_ood_veto,
+        matched_trap_id: if is_trap_veto && active_trap_triggered {
+            matched_trap_id
+        } else {
+            None
+        },
+        veto_status,
+        root_cause_category,
+    }
+}
+
+/// Phase 34 Deliverable 4: Pure-Causal Bar-`k` Reversal Hazard Score $h_{k-1} \in [0, 1]$ and
+/// Hazard-Conditioned Dynamic Stage 3 Continuation Retention Floor $\rho_{\text{eff}}(k) \in [0.50, 0.88]$.
+///
+/// Uses strictly causal observations up to bar `k - 1` (`prev_bar` OHLC rejection wick + `prev_bar_features_32`
+/// post-entry Mahalanobis win/loss separation):
+/// $$h_{k-1} = \operatorname{sigmoid}\big(1.25 \cdot (d_{\text{bar\_win}} - d_{\text{bar\_loss}}) + 1.50 \cdot \text{wick\_exhaustion}_{k-1}\big)$$
+/// $$\rho_{\text{eff}}(k) = \operatorname{clamp}\big(\rho_{\text{base}} + 0.14 \cdot (h_{k-1} - 0.50),\; 0.50,\; 0.88\big)$$
+pub fn compute_causal_reversal_hazard_retention(
+    brain_id: BrainHorizonId,
+    dir: f64,
+    prev_open: f64,
+    prev_high: f64,
+    prev_low: f64,
+    prev_close: f64,
+    prev_bar_features_32: Option<&[f64; 32]>,
+    brain_state: &BrainSynapticPlasticityState,
+    precision: &LedoitWolfPrecision,
+) -> (f64, f64) {
+    let prev_hl = (prev_high - prev_low).max(1e-6);
+    let wick_exhaustion_prev = if dir > 0.0 {
+        ((prev_high - prev_open.max(prev_close)).max(0.0) / prev_hl).clamp(0.0, 1.0)
+    } else {
+        ((prev_open.min(prev_close) - prev_low).max(0.0) / prev_hl).clamp(0.0, 1.0)
+    };
+
+    let maha_delta = if let (Some(fk_prev), Some(manifold)) =
+        (prev_bar_features_32, precision.brains.get(&brain_id))
+    {
+        let weights_32 = build_synaptic_precision_weights(brain_state);
+        let d_bar_win =
+            precision.bar1_mahalanobis(brain_id, &weights_32, fk_prev, &manifold.bar1_win_centroid_32);
+        let d_bar_loss =
+            precision.bar1_mahalanobis(brain_id, &weights_32, fk_prev, &manifold.bar1_loss_centroid_32);
+        (d_bar_win - d_bar_loss).clamp(-4.0, 4.0)
+    } else {
+        0.0
+    };
+
+    let logit_h = 1.25 * maha_delta + 1.50 * wick_exhaustion_prev;
+    let h_prev = 1.0 / (1.0 + (-logit_h).exp());
+    let rho_base = brain_state.learned_giveback_retention_ratio;
+    let rho_eff = (rho_base + 0.14 * (h_prev - 0.50)).clamp(0.50, 0.88);
+    (h_prev, rho_eff)
 }
 
 /// Helper to compute peak post-entry MFE in R units from trade execution levels and `replay_bars`.
@@ -890,85 +1385,59 @@ fn decode_trade_failure_internal(
 /// Deterministic Single-Trade Causal Re-Simulator (`simulate_trade_under_candidate`).
 ///
 /// Evaluates `trade` causally under `brain_state` and `trap_centroids_32` with ZERO outcome lookahead:
-/// 1. **Stage 0 Entry Gate (Strictly Causal — Entry Tensor Only)**:
-///    Computes precision- and synaptic-weight-adjusted Mahalanobis distance (`d_win`, `d_trap`) via
-///    `LedoitWolfPrecision`, yielding `candidate_conformal_margin = (d_trap - d_win) - brain_state.entry_veto_margin_delta`.
-///    If `candidate_conformal_margin < 0.0`, the trade is VETOED at Stage 0 (`realized_r = 0.0`, `vetoed = true`)
-///    regardless of whether `trade` was historically a winner or a loser.
-/// 2. **Stage 1–3 Bar-by-Bar Path Replay (`trade.replay_bars()`)**:
-///    - **Stage 1 (`Bar 1..3`)**: Sequential Wald SPRT log-likelihood ratio from real bar adverse excursion,
-///      candle orderflow body delta, and post-entry Mahalanobis shift vs `brain_state.wald_sprt_thresholds`.
-///      If triggered at bar `k`, exits at **that exact bar's real close price** (`(bar_k_close - ep) * dir / initial_risk`).
-///    - **Stage 3 (`Ratchet / Giveback Guard`)**: Tracks causal `running_peak_r` strictly up to bar `k - 1` ONLY
-///      (zero lookahead to same-bar or future `peak_mfe`). Once `running_peak_r >= 1.0`, enforces
-///      `ratchet_stop_r = running_peak_r * brain_state.learned_giveback_retention_ratio`; if bar `k`'s low (Long)
-///      or high (Short) breaches the real ratchet stop price, settles at `ratchet_stop_price`.
+/// 1. **Stage 0 Entry Gate (Single Shared Kernel `evaluate_stage0_conformal_kernel`)**:
+///    Computes precision- and synaptic-weight-adjusted Mahalanobis distance (`d_win`, `d_trap`),
+///    Mondrian regime-conditioned split-conformal `p_value`, and $\chi^2_{32}$ OOD epistemic shield.
+/// 2. **Stage 1–3 Bar-by-Bar Path Replay (`trade.replay_bars()`) with Gap-Slippage Realism & Hazard Stopping**:
+///    - **Adverse Gap-Through Fill Clamping**: Long ratchet/stop fills at `level.min(bar_open)`;
+///      Short ratchet/stop fills at `level.max(bar_open)` (booking true `realized_r <= -1.0` on adverse open gaps).
+///    - **Stage 1 (`Bar 1..3`)**: Sequential Wald SPRT log-likelihood ratio exiting at exact `bar_k` close price.
+///    - **Stage 3 (`Hazard-Conditioned Optimal Stopping`)**: Tracks causal `running_peak_r` strictly up to bar `k - 1`
+///      ONLY and applies $\rho_{\text{eff}}(k) = \operatorname{clamp}(\rho_{\text{base}} + 0.14(h_{k-1} - 0.50), 0.50, 0.88)$.
 pub fn simulate_trade_under_candidate(
     trade: &ClosedTradeRow,
     brain_state: &BrainSynapticPlasticityState,
     trap_centroids_32: &[[f64; 32]],
     precision_diag_or_chol: &LedoitWolfPrecision,
 ) -> SimulatedTradeOutcome {
+    let trap_bank: Vec<Stage0TrapCentroid> = trap_centroids_32
+        .iter()
+        .map(|c| Stage0TrapCentroid {
+            trap_id: None,
+            root_cause_category: "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string(),
+            features_32: *c,
+            quarantined: false,
+        })
+        .collect();
+    simulate_trade_under_candidate_with_trap_bank(
+        trade,
+        brain_state,
+        &trap_bank,
+        precision_diag_or_chol,
+    )
+}
+
+/// Evaluates `trade` causally using structured `Stage0TrapCentroid` records (preserving `quarantined` status
+/// and exact `trap_id` attribution) via the single shared `evaluate_stage0_conformal_kernel`.
+pub fn simulate_trade_under_candidate_with_trap_bank(
+    trade: &ClosedTradeRow,
+    brain_state: &BrainSynapticPlasticityState,
+    trap_bank: &[Stage0TrapCentroid],
+    precision_diag_or_chol: &LedoitWolfPrecision,
+) -> SimulatedTradeOutcome {
     let entry_vec_32 = extract_causal_entry_array_32(trade);
     let weights_32 = build_synaptic_precision_weights(brain_state);
 
-    // --- STAGE 0: Strictly Causal Pre-Entry Mahalanobis Conformal Margin ---
-    let mut d_win = if let Some(manifold) = precision_diag_or_chol.brains.get(&trade.brain_id) {
-        let mut min_w = precision_diag_or_chol.entry_mahalanobis(
-            trade.brain_id,
-            &weights_32,
-            &entry_vec_32,
-            &manifold.winner_centroid_32,
-        );
-        for (w_id, w_vec) in &manifold.winner_exemplars_32 {
-            if *w_id != trade.trade_id {
-                let d_ex = precision_diag_or_chol.entry_mahalanobis(
-                    trade.brain_id,
-                    &weights_32,
-                    &entry_vec_32,
-                    w_vec,
-                );
-                if d_ex < min_w {
-                    min_w = d_ex;
-                }
-            }
-        }
-        min_w
-    } else {
-        let zero = [0.0_f64; 32];
-        precision_diag_or_chol.entry_mahalanobis(trade.brain_id, &weights_32, &entry_vec_32, &zero)
-    };
-    d_win = d_win.max(0.0);
-
-    let d_trap = if trap_centroids_32.is_empty() {
-        if let Some(manifold) = precision_diag_or_chol.brains.get(&trade.brain_id) {
-            precision_diag_or_chol.entry_mahalanobis(
-                trade.brain_id,
-                &weights_32,
-                &entry_vec_32,
-                &manifold.stage0_anchor_32,
-            )
-        } else {
-            d_win + 0.25
-        }
-    } else {
-        let mut min_t = f64::INFINITY;
-        for trap_c in trap_centroids_32 {
-            let dt = precision_diag_or_chol.entry_mahalanobis(
-                trade.brain_id,
-                &weights_32,
-                &entry_vec_32,
-                trap_c,
-            );
-            if dt < min_t {
-                min_t = dt;
-            }
-        }
-        min_t
-    };
-
-    let candidate_conformal_margin = (d_trap - d_win) - brain_state.entry_veto_margin_delta;
-    if candidate_conformal_margin < 0.0 {
+    // --- STAGE 0: Single Shared Pure-Causal Conformal + OOD Kernel ---
+    let s0 = evaluate_stage0_conformal_kernel(
+        trade.brain_id,
+        &entry_vec_32,
+        Some(trade.trade_id),
+        brain_state,
+        trap_bank,
+        precision_diag_or_chol,
+    );
+    if s0.vetoed {
         return SimulatedTradeOutcome {
             trade_id: trade.trade_id,
             realized_r: 0.0,
@@ -978,8 +1447,15 @@ pub fn simulate_trade_under_candidate(
             ratchet_exited_stage3: false,
             full_stop_hit: false,
             exit_bar_offset: 0,
-            candidate_conformal_margin,
+            candidate_conformal_margin: s0.conformal_margin,
+            conformal_llr: s0.conformal_llr,
+            conformal_p_value: s0.conformal_p_value,
+            epistemic_ood_score: s0.epistemic_ood_score,
+            kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+            regime_bucket: s0.regime_bucket,
             max_wald_sprt_llr: 0.0,
+            max_reversal_hazard: 0.0,
+            effective_retention_ratio: brain_state.learned_giveback_retention_ratio,
         };
     }
 
@@ -1006,14 +1482,23 @@ pub fn simulate_trade_under_candidate(
             ratchet_exited_stage3: false,
             full_stop_hit: trade.realized_r_multiple <= -0.90,
             exit_bar_offset: 0,
-            candidate_conformal_margin,
+            candidate_conformal_margin: s0.conformal_margin,
+            conformal_llr: s0.conformal_llr,
+            conformal_p_value: s0.conformal_p_value,
+            epistemic_ood_score: s0.epistemic_ood_score,
+            kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+            regime_bucket: s0.regime_bucket,
             max_wald_sprt_llr: 0.0,
+            max_reversal_hazard: 0.0,
+            effective_retention_ratio: brain_state.learned_giveback_retention_ratio,
         };
     }
 
     let mut running_peak_r = 0.0_f64;
     let mut wald_llr = 0.0_f64;
     let mut max_wald_sprt_llr = 0.0_f64;
+    let mut max_reversal_hazard = 0.0_f64;
+    let mut last_rho_eff = brain_state.learned_giveback_retention_ratio;
 
     for (idx, bar) in replay_bars.iter().enumerate() {
         let bar_idx = idx + 1;
@@ -1034,9 +1519,36 @@ pub fn simulate_trade_under_candidate(
         };
         let close_r = ((bar_close - ep) * dir) / initial_risk;
 
-        // Stage 3 Ratchet / Giveback Guard: strictly causal `running_peak_r` from bars 1..=bar_idx-1 ONLY
-        if running_peak_r >= 1.0 {
-            let ratchet_stop_r = running_peak_r * brain_state.learned_giveback_retention_ratio;
+        // Stage 3 Hazard-Conditioned Dynamic Continuation Floor:
+        // Strictly causal `running_peak_r` and `prev_bar` (`idx - 1`) from bars 1..=bar_idx-1 ONLY!
+        if running_peak_r >= 1.0 && idx >= 1 {
+            let prev_bar = &replay_bars[idx - 1];
+            let prev_feat_opt: Option<[f64; 32]> =
+                RealTimeLedgerEngine::extract_causal_post_entry_bar_k_features_from_row(trade, idx)
+                    .map(|fk| {
+                        let mut arr = [0.0_f64; 32];
+                        for (i, &v) in fk.iter().take(32).enumerate() {
+                            arr[i] = v as f64;
+                        }
+                        arr
+                    });
+            let (h_prev, rho_eff) = compute_causal_reversal_hazard_retention(
+                trade.brain_id,
+                dir,
+                prev_bar.open.to_f64(),
+                prev_bar.high.to_f64(),
+                prev_bar.low.to_f64(),
+                prev_bar.close.to_f64(),
+                prev_feat_opt.as_ref(),
+                brain_state,
+                precision_diag_or_chol,
+            );
+            if h_prev > max_reversal_hazard {
+                max_reversal_hazard = h_prev;
+            }
+            last_rho_eff = rho_eff;
+
+            let ratchet_stop_r = running_peak_r * rho_eff;
             let ratchet_stop_price = ep + dir * ratchet_stop_r * initial_risk;
             let breached_ratchet = if dir > 0.0 {
                 bar_low <= ratchet_stop_price
@@ -1044,26 +1556,44 @@ pub fn simulate_trade_under_candidate(
                 bar_high >= ratchet_stop_price
             };
             if breached_ratchet {
-                let settled_r = ((ratchet_stop_price - ep) * dir) / initial_risk;
+                let ratchet_fill_price = if dir > 0.0 {
+                    ratchet_stop_price.min(bar_open)
+                } else {
+                    ratchet_stop_price.max(bar_open)
+                };
+                let settled_r = ((ratchet_fill_price - ep) * dir) / initial_risk;
                 return SimulatedTradeOutcome {
                     trade_id: trade.trade_id,
                     realized_r: settled_r,
-                    exit_price: ratchet_stop_price,
+                    exit_price: ratchet_fill_price,
                     vetoed: false,
                     scratched_stage1: false,
                     ratchet_exited_stage3: true,
-                    full_stop_hit: false,
+                    full_stop_hit: settled_r <= -0.90,
                     exit_bar_offset: bar_idx,
-                    candidate_conformal_margin,
+                    candidate_conformal_margin: s0.conformal_margin,
+                    conformal_llr: s0.conformal_llr,
+                    conformal_p_value: s0.conformal_p_value,
+                    epistemic_ood_score: s0.epistemic_ood_score,
+                    kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+                    regime_bucket: s0.regime_bucket,
                     max_wald_sprt_llr,
+                    max_reversal_hazard,
+                    effective_retention_ratio: last_rho_eff,
                 };
             }
         }
 
-        // Structural Stop Check on bar k (with causal T1 50%-tranche breakeven protection if prior bars already hit >= +0.80R)
+        // Structural Stop Check on bar k with Adverse Gap-Open Fill Clamping
         if adverse_r <= -1.0 {
             if running_peak_r >= 0.80 {
-                let banked_t1_r = 0.5 * running_peak_r;
+                let runner_be_fill = if dir > 0.0 {
+                    ep.min(bar_open)
+                } else {
+                    ep.max(bar_open)
+                };
+                let runner_r = ((runner_be_fill - ep) * dir) / initial_risk;
+                let banked_t1_r = 0.5 * running_peak_r + 0.5 * runner_r;
                 let t1_exit_price = ep + dir * banked_t1_r * initial_risk;
                 return SimulatedTradeOutcome {
                     trade_id: trade.trade_id,
@@ -1072,24 +1602,44 @@ pub fn simulate_trade_under_candidate(
                     vetoed: false,
                     scratched_stage1: false,
                     ratchet_exited_stage3: true,
-                    full_stop_hit: false,
+                    full_stop_hit: banked_t1_r <= -0.90,
                     exit_bar_offset: bar_idx,
-                    candidate_conformal_margin,
+                    candidate_conformal_margin: s0.conformal_margin,
+                    conformal_llr: s0.conformal_llr,
+                    conformal_p_value: s0.conformal_p_value,
+                    epistemic_ood_score: s0.epistemic_ood_score,
+                    kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+                    regime_bucket: s0.regime_bucket,
                     max_wald_sprt_llr,
+                    max_reversal_hazard,
+                    effective_retention_ratio: last_rho_eff,
                 };
             }
             let stop_exit_price = ep - dir * initial_risk;
+            let stop_fill_price = if dir > 0.0 {
+                stop_exit_price.min(bar_open)
+            } else {
+                stop_exit_price.max(bar_open)
+            };
+            let stop_realized_r = ((stop_fill_price - ep) * dir) / initial_risk;
             return SimulatedTradeOutcome {
                 trade_id: trade.trade_id,
-                realized_r: -1.0,
-                exit_price: stop_exit_price,
+                realized_r: stop_realized_r,
+                exit_price: stop_fill_price,
                 vetoed: false,
                 scratched_stage1: false,
                 ratchet_exited_stage3: false,
                 full_stop_hit: true,
                 exit_bar_offset: bar_idx,
-                candidate_conformal_margin,
+                candidate_conformal_margin: s0.conformal_margin,
+                conformal_llr: s0.conformal_llr,
+                conformal_p_value: s0.conformal_p_value,
+                epistemic_ood_score: s0.epistemic_ood_score,
+                kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+                regime_bucket: s0.regime_bucket,
                 max_wald_sprt_llr,
+                max_reversal_hazard,
+                effective_retention_ratio: last_rho_eff,
             };
         }
 
@@ -1106,8 +1656,8 @@ pub fn simulate_trade_under_candidate(
                         )
                 {
                     let mut bar_vec = [0.0_f64; 32];
-                    for i in 0..32 {
-                        bar_vec[i] = fk.get(i).copied().unwrap_or(0.0) as f64;
+                    for (i, &v) in fk.iter().take(32).enumerate() {
+                        bar_vec[i] = v as f64;
                     }
                     let d_bw = precision_diag_or_chol.bar1_mahalanobis(
                         trade.brain_id,
@@ -1136,7 +1686,6 @@ pub fn simulate_trade_under_candidate(
             }
             let sprt_hurdle = brain_state.wald_sprt_thresholds[bar_idx - 1];
             if wald_llr >= sprt_hurdle {
-                // Exit at exact bar_k close price (ZERO hardcoded -0.15!)
                 let scratch_r = ((bar_close - ep) * dir) / initial_risk;
                 return SimulatedTradeOutcome {
                     trade_id: trade.trade_id,
@@ -1147,8 +1696,15 @@ pub fn simulate_trade_under_candidate(
                     ratchet_exited_stage3: false,
                     full_stop_hit: scratch_r <= -0.90,
                     exit_bar_offset: bar_idx,
-                    candidate_conformal_margin,
+                    candidate_conformal_margin: s0.conformal_margin,
+                    conformal_llr: s0.conformal_llr,
+                    conformal_p_value: s0.conformal_p_value,
+                    epistemic_ood_score: s0.epistemic_ood_score,
+                    kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+                    regime_bucket: s0.regime_bucket,
                     max_wald_sprt_llr,
+                    max_reversal_hazard,
+                    effective_retention_ratio: last_rho_eff,
                 };
             }
         }
@@ -1171,40 +1727,63 @@ pub fn simulate_trade_under_candidate(
         ratchet_exited_stage3: false,
         full_stop_hit: settled_r <= -0.90,
         exit_bar_offset: replay_bars.len(),
-        candidate_conformal_margin,
+        candidate_conformal_margin: s0.conformal_margin,
+        conformal_llr: s0.conformal_llr,
+        conformal_p_value: s0.conformal_p_value,
+        epistemic_ood_score: s0.epistemic_ood_score,
+        kelly_epistemic_multiplier: s0.kelly_epistemic_multiplier,
+        regime_bucket: s0.regime_bucket,
         max_wald_sprt_llr,
+        max_reversal_hazard,
+        effective_retention_ratio: last_rho_eff,
     }
 }
 
-/// Online Mirror-Descent gate re-adaptation: proposes candidate Gen N+1.
+/// Fisher-Preconditioned Exponentiated Mirror Descent on the 32-Simplex (`propose_candidate_generation`).
 ///
-/// Updates feature weights: `w_f <- w_f * exp(-eta * blame_score_f)` normalized to mean 1.0,
-/// and tightens causal Stage 0 / Stage 1 Wald SPRT / Stage 3 giveback retention parameters.
-#[allow(clippy::needless_range_loop)]
+/// Conserving total synaptic mass $Z = \sum_{f=0}^{31} w_f = 6.0$ with box bounds $w_f \in [0.04, 0.65]$:
+/// $$w_f^{(t+1)} = \operatorname{Proj}_{[0.04, 0.65], \sum=6}\!\left(w_f^{(t)} \cdot \exp\big(\eta \, g_f^{(t)}\big)\right)$$
 pub fn propose_candidate_generation(
     current_states: &[BrainSynapticPlasticityState],
     autopsies: &[DecodedTradeAutopsy],
     candidate_gen_id: u32,
 ) -> Vec<BrainSynapticPlasticityState> {
-    let mut aggregate_blame = [0.0_f64; 32];
+    propose_candidate_generation_with_context(
+        current_states,
+        autopsies,
+        autopsies,
+        None,
+        &HashMap::new(),
+        candidate_gen_id,
+    )
+}
+
+/// Context-aware Fisher-Preconditioned Mirror Descent incorporating causal baseline winner feature
+/// dispersion (`precision`) and counterfactual shadow-regret coordinates (`shadow_regret_penalty_by_brain`).
+#[allow(clippy::needless_range_loop)]
+pub fn propose_candidate_generation_with_context(
+    current_states: &[BrainSynapticPlasticityState],
+    autopsies: &[DecodedTradeAutopsy],
+    threshold_autopsies: &[DecodedTradeAutopsy],
+    precision: Option<&LedoitWolfPrecision>,
+    shadow_regret_penalty_by_brain: &HashMap<BrainHorizonId, [f64; 32]>,
+    candidate_gen_id: u32,
+) -> Vec<BrainSynapticPlasticityState> {
+    let mut global_blame = [0.0_f64; 32];
     for a in autopsies {
         for f in 0..32 {
             if let Some(&b) = a.blame_attribution_32.get(f) {
-                aggregate_blame[f] += b;
+                global_blame[f] += b;
             }
         }
     }
-    let max_blame = aggregate_blame
+    let max_global_blame = global_blame
         .iter()
         .copied()
         .fold(0.0_f64, f64::max)
         .max(0.001);
-    let mut normalized_blame = [0.0_f64; 32];
-    for f in 0..32 {
-        normalized_blame[f] = aggregate_blame[f] / max_blame;
-    }
 
-    let eta = 0.08_f64;
+    let eta = 0.06_f64;
 
     current_states
         .iter()
@@ -1212,23 +1791,91 @@ pub fn propose_candidate_generation(
             let mut cand = st.clone();
             cand.generation_id = candidate_gen_id;
 
-            // 1. Online Mirror-Descent Multiplicative Weights update on 32-feature importance vector
-            let mut new_weights = cand.synaptic_feature_weights_32;
-            for f in 0..32 {
-                new_weights[f] *= (-eta * normalized_blame[f]).exp();
-            }
-            let mean_w = (new_weights.iter().sum::<f64>() / 32.0).max(0.0001);
-            for f in 0..32 {
-                new_weights[f] = ((new_weights[f] / mean_w) * 1000.0).round() / 1000.0;
-            }
-            cand.synaptic_feature_weights_32 = new_weights;
+            // 1. Initialize prior 32-simplex weights w^(t) in [0.04, 0.65], sum == 6.0
+            let raw_prev = build_synaptic_precision_weights(st);
+            let w_prev = project_capped_simplex_kl_32(&raw_prev, 0.04, 0.65, 6.0);
 
-            // 2. Targeted Gate Adaptation based on decoded autopsies for this brain
-            let brain_autopsies: Vec<_> = autopsies
+            // 2. Build Fisher-preconditioned signed gradient g^(t):
+            //    + Mahalanobis separation on decoded losses/givebacks
+            //    - Margin-compression dispersion penalty on causal baseline winners
+            //    - Counterfactual shadow-regret penalty on falsely vetoed setups
+            let brain_autopsies_all: Vec<_> = autopsies
                 .iter()
                 .filter(|a| a.brain_id == cand.brain_id)
                 .collect();
-            for a in &brain_autopsies {
+            let mut loss_sep = [0.0_f64; 32];
+            if !brain_autopsies_all.is_empty() {
+                let mut local_b = [0.0_f64; 32];
+                for a in &brain_autopsies_all {
+                    for f in 0..32 {
+                        local_b[f] += a.blame_attribution_32.get(f).copied().unwrap_or(0.0);
+                    }
+                }
+                let max_lb = local_b.iter().copied().fold(0.0_f64, f64::max).max(0.001);
+                for f in 0..32 {
+                    loss_sep[f] = 0.70 * (local_b[f] / max_lb)
+                        + 0.30 * (global_blame[f] / max_global_blame);
+                }
+            } else {
+                for f in 0..32 {
+                    loss_sep[f] = global_blame[f] / max_global_blame;
+                }
+            }
+
+            let mut win_var_pen = [0.0_f64; 32];
+            if let Some(prec) = precision
+                && let Some(m) = prec.brains.get(&cand.brain_id)
+            {
+                let max_wv = m
+                    .winner_feature_var_32
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, f64::max)
+                    .max(1e-6);
+                for f in 0..32 {
+                    win_var_pen[f] = (m.winner_feature_var_32[f] / max_wv).clamp(0.0, 1.0);
+                }
+            }
+
+            let mut shadow_pen = [0.0_f64; 32];
+            if let Some(sp) = shadow_regret_penalty_by_brain.get(&cand.brain_id) {
+                let max_sp = sp.iter().copied().fold(0.0_f64, f64::max).max(1e-6);
+                for f in 0..32 {
+                    shadow_pen[f] = (sp[f] / max_sp).clamp(0.0, 1.0);
+                }
+            }
+
+            let mut grad = [0.0_f64; 32];
+            let mut grad_mean = 0.0_f64;
+            for f in 0..32 {
+                let fisher_inv_diag = 1.0 / (0.25 + win_var_pen[f]);
+                let raw_gf = fisher_inv_diag
+                    * (0.65 * loss_sep[f] - 0.35 * win_var_pen[f] - 0.45 * shadow_pen[f]);
+                grad[f] = raw_gf;
+                grad_mean += raw_gf / 32.0;
+            }
+
+            let mut unnorm_next = [0.0_f64; 32];
+            for f in 0..32 {
+                let centered_g = (grad[f] - grad_mean).clamp(-2.5, 2.5);
+                unnorm_next[f] = w_prev[f] * (eta * centered_g).exp();
+            }
+
+            let w_next = project_capped_simplex_kl_32(&unnorm_next, 0.04, 0.65, 6.0);
+            let kl_div = compute_simplex_kl_divergence_32(&w_next, &w_prev, 6.0);
+
+            cand.simplex_weights_32 = Some(w_next);
+            cand.mirror_descent_kl_divergence = kl_div;
+            for f in 0..32 {
+                cand.synaptic_feature_weights_32[f] = w_next[f] * (32.0 / 6.0);
+            }
+
+            // 3. Targeted Gate Adaptation based on un-remediated decoded autopsies for this brain
+            let brain_thresh_autopsies: Vec<_> = threshold_autopsies
+                .iter()
+                .filter(|a| a.brain_id == cand.brain_id)
+                .collect();
+            for a in &brain_thresh_autopsies {
                 match a.failure_mode {
                     AutopsyFailureMode::EntryLiquidityVacuumTrap => {
                         cand.entry_veto_margin_delta =
@@ -1293,40 +1940,60 @@ fn summarize_simulated_outcomes(outcomes: &[SimulatedTradeOutcome]) -> (usize, f
     (winners, exp_r, pf)
 }
 
-///Builds per-brain Stage-0 trap centroid banks for `current` champion vs `candidate` generation.
+/// Builds per-brain Stage-0 active `Stage0TrapCentroid` banks for `current` champion vs `candidate` generation,
+/// strictly excluding any `quarantined` traps.
 fn build_trap_centroid_banks(
     ledger: &RealTimeLedgerEngine,
-    precision: &LedoitWolfPrecision,
+    _precision: &LedoitWolfPrecision,
     _baseline_trades: &[ClosedTradeRow],
     decoded_wf_autopsies: &[(&ClosedTradeRow, DecodedTradeAutopsy)],
 ) -> (
-    HashMap<BrainHorizonId, Vec<[f64; 32]>>,
-    HashMap<BrainHorizonId, Vec<[f64; 32]>>,
+    HashMap<BrainHorizonId, Vec<Stage0TrapCentroid>>,
+    HashMap<BrainHorizonId, Vec<Stage0TrapCentroid>>,
 ) {
-    let mut current_bank: HashMap<BrainHorizonId, Vec<[f64; 32]>> = HashMap::new();
-    for (&brain_id, manifold) in &precision.brains {
-        current_bank.insert(brain_id, vec![manifold.stage0_anchor_32]);
-    }
+    let mut current_bank: HashMap<BrainHorizonId, Vec<Stage0TrapCentroid>> = HashMap::new();
+    let all_traps = ledger.precedent_knn().all_hard_negative_traps();
+    let mut quarantined_ids = std::collections::HashSet::new();
 
-    for trap in ledger.precedent_knn().all_hard_negative_traps() {
-        if trap.root_cause_category == "ENTRY_LIQUIDITY_VACUUM_TRAP"
+    for trap in &all_traps {
+        if trap.quarantined {
+            quarantined_ids.insert(trap.loss_trade_id);
+            continue;
+        }
+        if (trap.root_cause_category == "ENTRY_LIQUIDITY_VACUUM_TRAP"
+            || trap.root_cause_category.starts_with("STAGE_0_"))
             && trap.entry_features_32.len() >= 32
         {
             let mut arr = [0.0_f64; 32];
             for (i, &v) in trap.entry_features_32.iter().take(32).enumerate() {
                 arr[i] = v as f64;
             }
-            current_bank.entry(trap.brain_id).or_default().push(arr);
+            current_bank
+                .entry(trap.brain_id)
+                .or_default()
+                .push(Stage0TrapCentroid {
+                    trap_id: Some(trap.loss_trade_id),
+                    root_cause_category: trap.root_cause_category.clone(),
+                    features_32: arr,
+                    quarantined: false,
+                });
         }
     }
 
     let mut candidate_bank = current_bank.clone();
     for (row, dec) in decoded_wf_autopsies {
-        if dec.failure_mode == AutopsyFailureMode::EntryLiquidityVacuumTrap {
+        if dec.failure_mode == AutopsyFailureMode::EntryLiquidityVacuumTrap
+            && !quarantined_ids.contains(&row.trade_id)
+        {
             candidate_bank
                 .entry(row.brain_id)
                 .or_default()
-                .push(extract_causal_entry_array_32(row));
+                .push(Stage0TrapCentroid {
+                    trap_id: Some(row.trade_id),
+                    root_cause_category: "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string(),
+                    features_32: extract_causal_entry_array_32(row),
+                    quarantined: false,
+                });
         }
     }
 
@@ -1334,25 +2001,27 @@ fn build_trap_centroid_banks(
 }
 
 /// Dual-Gate Pareto Verification & Monotonic Closed-Loop Promotion (`verify_and_promote_generation`).
-///
-/// - **Gate 1 (173-Baseline Lock)**: Runs ALL 173 baseline trades through `simulate_trade_under_candidate`
-///   under `current_states` AND `candidate_states`. Passes IFF `candidate_preserved_winners >= current_preserved_winners`
-///   (`116/116` baseline winners intact), `candidate_baseline_exp_r >= current_baseline_exp_r - 1e-6`,
-///   and `candidate_baseline_pf >= current_baseline_pf - 1e-6`.
-/// - **Gate 2 (Walk-Forward Cohort Replay)**: Runs ALL walk-forward trades (winners AND losses/givebacks)
-///   through `simulate_trade_under_candidate` under `current_states` AND `candidate_states`.
-///   Computes `wf_winners_preserved` dynamically and passes IFF `wf_winners_preserved == true`,
-///   `candidate_wf_net_r > current_wf_net_r`, and `candidate_wf_full_stops < current_wf_full_stops`
-///   (when full-stop losses exist in the cohort).
-/// - **Closed-Loop Live Coupling**: When `all_gates_passed`, atomically updates champion
-///   `BrainSynapticPlasticityState`s on `PrecedentKnnIndex` (`generation_id = candidate_gen_id`) AND
-///   registers causal pre-entry 32-feature tensors of decoded `EntryLiquidityVacuumTrap` losses into
-///   the live `PrecedentKnnIndex` Hard-Negative Trap bank.
 pub fn verify_and_promote_generation(
     ledger: &RealTimeLedgerEngine,
     candidate_states: &[BrainSynapticPlasticityState],
     walkforward_trades: &[ClosedTradeRow],
     candidate_gen_id: u32,
+) -> (bool, GateAuditReport) {
+    verify_and_promote_generation_internal(
+        ledger,
+        candidate_states,
+        walkforward_trades,
+        candidate_gen_id,
+        0,
+    )
+}
+
+fn verify_and_promote_generation_internal(
+    ledger: &RealTimeLedgerEngine,
+    candidate_states: &[BrainSynapticPlasticityState],
+    walkforward_trades: &[ClosedTradeRow],
+    candidate_gen_id: u32,
+    newly_quarantined_count: usize,
 ) -> (bool, GateAuditReport) {
     let closed_snap = ledger.closed_trades_snapshot();
     let baseline_count = 173.min(closed_snap.len());
@@ -1401,10 +2070,10 @@ pub fn verify_and_promote_generation(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 
-        current_baseline_outcomes.push(simulate_trade_under_candidate(
+        current_baseline_outcomes.push(simulate_trade_under_candidate_with_trap_bank(
             trade, cur_state, cur_traps, &precision,
         ));
-        candidate_baseline_outcomes.push(simulate_trade_under_candidate(
+        candidate_baseline_outcomes.push(simulate_trade_under_candidate_with_trap_bank(
             trade, cand_state, cand_traps, &precision,
         ));
     }
@@ -1446,11 +2115,11 @@ pub fn verify_and_promote_generation(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 
-        let cur_sim = simulate_trade_under_candidate(wf, cur_state, cur_traps, &precision);
-        let cand_sim = simulate_trade_under_candidate(wf, cand_state, cand_traps, &precision);
+        let cur_sim =
+            simulate_trade_under_candidate_with_trap_bank(wf, cur_state, cur_traps, &precision);
+        let cand_sim =
+            simulate_trade_under_candidate_with_trap_bank(wf, cand_state, cand_traps, &precision);
 
-        // If trade had an un-ratcheted collapse on raw ledger (`realized_r_multiple`), use the worse of
-        // raw settled outcome vs Gen-36 replay when raw trade was already executed live before Gen-37
         let cur_effective_r = if wf.realized_r_multiple < cur_sim.realized_r {
             wf.realized_r_multiple
         } else {
@@ -1468,8 +2137,8 @@ pub fn verify_and_promote_generation(
 
         // Dynamic check: zero profitable non-giveback walk-forward winners may be vetoed or scratched into losses!
         let peak_mfe = compute_trade_peak_mfe_r(wf);
-        let is_non_giveback_wf_winner =
-            wf.realized_r_multiple > 0.0 && !(peak_mfe >= 1.0 && wf.realized_r_multiple < 0.65 * peak_mfe);
+        let is_non_giveback_wf_winner = wf.realized_r_multiple > 0.0
+            && !(peak_mfe >= 1.0 && wf.realized_r_multiple < 0.65 * peak_mfe);
         if is_non_giveback_wf_winner && (cand_sim.vetoed || cand_sim.realized_r <= 0.0) {
             wf_winner_violations += 1;
         }
@@ -1479,6 +2148,8 @@ pub fn verify_and_promote_generation(
 
     let gate2_walkforward_passed = if walkforward_trades.is_empty() {
         wf_winners_preserved
+    } else if newly_quarantined_count > 0 {
+        wf_winners_preserved && candidate_wf_net_r >= current_wf_net_r - 1e-6
     } else if current_wf_full_stops > 0 {
         wf_winners_preserved
             && candidate_wf_net_r > current_wf_net_r
@@ -1496,11 +2167,22 @@ pub fn verify_and_promote_generation(
             .precedent_knn()
             .restore_synaptic_plasticity_states(candidate_states.to_vec());
 
-        // 2. Register causal pre-entry 32-feature tensors of decoded `EntryLiquidityVacuumTrap` losses
-        //    into the live `PrecedentKnnIndex` Hard-Negative Trap bank
+        // 2. Idempotently upsert/reinforce causal pre-entry 32-feature tensors of decoded
+        //    `EntryLiquidityVacuumTrap` losses (excluding quarantined traps!)
+        let quarantined_ids: std::collections::HashSet<Uuid> = ledger
+            .precedent_knn()
+            .all_hard_negative_traps()
+            .into_iter()
+            .filter(|t| t.quarantined)
+            .map(|t| t.loss_trade_id)
+            .collect();
+
         for (wf_row, dec) in &decoded_wf_autopsies {
-            if dec.failure_mode == AutopsyFailureMode::EntryLiquidityVacuumTrap {
-                let entry_f32 = RealTimeLedgerEngine::extract_causal_entry_features_from_row(wf_row);
+            if dec.failure_mode == AutopsyFailureMode::EntryLiquidityVacuumTrap
+                && !quarantined_ids.contains(&wf_row.trade_id)
+            {
+                let entry_f32 =
+                    RealTimeLedgerEngine::extract_causal_entry_features_from_row(wf_row);
                 let bar1_f32 = RealTimeLedgerEngine::extract_causal_bar1_features_from_row(wf_row);
                 let mut culprit_idx = [0usize; 3];
                 let mut culprit_signs = [1.0_f32; 3];
@@ -1524,9 +2206,9 @@ pub fn verify_and_promote_generation(
                     padded
                 };
 
-                ledger
+                let upsert_outcome = ledger
                     .precedent_knn()
-                    .insert_hard_negative_trap(HardNegativeTrapRecord {
+                    .upsert_or_reinforce_hard_negative_trap(HardNegativeTrapRecord {
                         loss_trade_id: wf_row.trade_id,
                         brain_id: wf_row.brain_id,
                         symbol: wf_row.symbol.clone(),
@@ -1542,8 +2224,16 @@ pub fn verify_and_promote_generation(
                         entry_features_32: entry_f32,
                         bar1_r_multiple: wf_row.realized_r_multiple,
                         pre_settlement_bars_features_32: Vec::new(),
+                        observation_count: 1,
+                        true_saves_count: 0,
+                        false_veto_regrets_count: 0,
+                        cumulative_saved_r: 0.0,
+                        cumulative_missed_winner_r: 0.0,
+                        quarantined: false,
                     });
-                hard_negative_traps_added_count += 1;
+                if upsert_outcome == TrapUpsertOutcome::NewlyInserted {
+                    hard_negative_traps_added_count += 1;
+                }
             }
         }
 
@@ -1553,7 +2243,7 @@ pub fn verify_and_promote_generation(
             true,
             vec![
                 format!(
-                    "Gen-{candidate_gen_id} Closed-Loop Precision-Mahalanobis Loss-Autopsy & Bar-Replay Promotion"
+                    "Gen-{candidate_gen_id} Closed-Loop Mondrian Conformal + Shadow Bandit + Simplex Mirror-Descent Promotion"
                 ),
                 format!(
                     "Gate 1 Locked 173-Baseline Replay: {candidate_preserved_winners}/{target_winners} Winners | Exp {:.4}R -> {:.4}R | PF {:.3} -> {:.3}",
@@ -1563,7 +2253,7 @@ pub fn verify_and_promote_generation(
                     candidate_baseline_pf
                 ),
                 format!(
-                    "Gate 2 Walk-Forward Bar Replay: Net R {:.3}R -> {:.3}R | Full Stops {} -> {} | +{} Hard-Negative Traps Indexed",
+                    "Gate 2 Walk-Forward Bar Replay: Net R {:.3}R -> {:.3}R | Full Stops {} -> {} | +{} New Traps",
                     current_wf_net_r,
                     candidate_wf_net_r,
                     current_wf_full_stops,
@@ -1575,9 +2265,21 @@ pub fn verify_and_promote_generation(
         ledger.push_evolution_generation_record(gen_rec);
     }
 
+    let (shadow_eval_cnt, net_shadow_alpha_r, quarantined_cnt) =
+        ledger.shadow_tape_telemetry_summary();
+    let mean_kl_div = if candidate_states.is_empty() {
+        0.0
+    } else {
+        candidate_states
+            .iter()
+            .map(|s| s.mirror_descent_kl_divergence)
+            .sum::<f64>()
+            / (candidate_states.len() as f64)
+    };
+
     let decision_rationale = if all_gates_passed {
         format!(
-            "PROMOTED Gen {candidate_gen_id}: Gate 1 passed ({candidate_preserved_winners}/{target_winners} baseline winners, Exp: {:.4}R -> {:.4}R, PF: {:.3} -> {:.3}) & Gate 2 passed (WF Net R: {:.3}R -> {:.3}R, Full stops: {} -> {}, Traps indexed: +{})",
+            "PROMOTED Gen {candidate_gen_id}: Gate 1 passed ({candidate_preserved_winners}/{target_winners} baseline winners, Exp: {:.4}R -> {:.4}R, PF: {:.3} -> {:.3}) & Gate 2 passed (WF Net R: {:.3}R -> {:.3}R, Full stops: {} -> {}, New traps: +{}, Quarantined: {})",
             current_baseline_exp_r,
             candidate_baseline_exp_r,
             current_baseline_pf,
@@ -1586,7 +2288,8 @@ pub fn verify_and_promote_generation(
             candidate_wf_net_r,
             current_wf_full_stops,
             candidate_wf_full_stops,
-            hard_negative_traps_added_count
+            hard_negative_traps_added_count,
+            quarantined_cnt
         )
     } else if !gate1_baseline_lock_passed {
         format!(
@@ -1608,6 +2311,7 @@ pub fn verify_and_promote_generation(
     };
 
     let round4 = |v: f64| (v * 10_000.0).round() / 10_000.0;
+    let round6 = |v: f64| (v * 1_000_000.0).round() / 1_000_000.0;
     let report = GateAuditReport {
         gate1_baseline_lock_passed,
         gate1_baseline_winners_preserved: candidate_preserved_winners,
@@ -1628,6 +2332,10 @@ pub fn verify_and_promote_generation(
         gate2_offending_losses_reduced: current_wf_full_stops.saturating_sub(candidate_wf_full_stops),
         gate2_walkforward_winners_preserved: wf_winners_preserved,
         hard_negative_traps_added_count,
+        shadow_vetoed_evaluated_count: shadow_eval_cnt,
+        shadow_net_veto_alpha_r: round4(net_shadow_alpha_r),
+        quarantined_traps_count: quarantined_cnt,
+        mirror_descent_kl_divergence: round6(mean_kl_div.max(1e-6)),
         all_gates_passed,
         decision_rationale,
     };
@@ -1635,8 +2343,12 @@ pub fn verify_and_promote_generation(
     (all_gates_passed, report)
 }
 
-/// Orchestrates a complete autonomous closed-loop autopsy & evolution cycle (`POST /api/v1/scanner/evolve-cycle`).
+/// Orchestrates a complete autonomous closed-loop autopsy, shadow-bandit trap quarantine,
+/// and 32-simplex Mirror-Descent evolution cycle (`POST /api/v1/scanner/evolve-cycle`).
 pub fn run_autopsy_evolution_cycle(ledger: &RealTimeLedgerEngine) -> AutopsyEvolutionResponse {
+    // 1. Self-Healing Bayesian Trap Quarantine across shadow counterfactual outcomes
+    let newly_quarantined_count = ledger.precedent_knn().quarantine_underperforming_traps();
+
     let closed_snap = ledger.closed_trades_snapshot();
     let baseline_count = 173.min(closed_snap.len());
     let baseline_trades = &closed_snap[0..baseline_count];
@@ -1654,10 +2366,29 @@ pub fn run_autopsy_evolution_cycle(ledger: &RealTimeLedgerEngine) -> AutopsyEvol
         Vec::new()
     };
 
+    let (current_trap_bank, _) = build_trap_centroid_banks(ledger, &precision, baseline_trades, &[]);
+
     let mut autopsies = Vec::new();
+    let mut threshold_autopsies = Vec::new();
     for t in &walkforward_cohort {
         let st_ref = current_map.get(&t.brain_id);
         if let Some(dec) = decode_trade_failure_with_precision(t, &precision, st_ref) {
+            if let Some(cur_st) = st_ref {
+                let cur_traps = current_trap_bank
+                    .get(&t.brain_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let cur_sim =
+                    simulate_trade_under_candidate_with_trap_bank(t, cur_st, cur_traps, &precision);
+                let already_remediated = cur_sim.vetoed
+                    || cur_sim.scratched_stage1
+                    || cur_sim.ratchet_exited_stage3;
+                if !already_remediated {
+                    threshold_autopsies.push(dec.clone());
+                }
+            } else {
+                threshold_autopsies.push(dec.clone());
+            }
             autopsies.push(dec);
         }
     }
@@ -1670,16 +2401,26 @@ pub fn run_autopsy_evolution_cycle(ledger: &RealTimeLedgerEngine) -> AutopsyEvol
         }
     }
 
+    // Build per-brain counterfactual shadow-regret coordinate penalty from settled false-veto shadow trades
+    let shadow_regret_penalty = ledger.shadow_regret_feature_penalties_by_brain(&precision);
+
     let current_gen_id = current_states.first().map(|s| s.generation_id).unwrap_or(36);
     let candidate_gen_id = current_gen_id + 1;
 
-    let candidate_states =
-        propose_candidate_generation(&current_states, &autopsies, candidate_gen_id);
-    let (is_promoted, gate_audit) = verify_and_promote_generation(
+    let candidate_states = propose_candidate_generation_with_context(
+        &current_states,
+        &autopsies,
+        &threshold_autopsies,
+        Some(&precision),
+        &shadow_regret_penalty,
+        candidate_gen_id,
+    );
+    let (is_promoted, gate_audit) = verify_and_promote_generation_internal(
         ledger,
         &candidate_states,
         &walkforward_cohort,
         candidate_gen_id,
+        newly_quarantined_count,
     );
 
     let active_states = ledger.precedent_knn().ordered_synaptic_plasticity_states();
@@ -1702,6 +2443,10 @@ pub fn run_autopsy_evolution_cycle(ledger: &RealTimeLedgerEngine) -> AutopsyEvol
         is_promoted,
         total_trades_inspected: closed_snap.len(),
         hard_negative_traps_added_count: gate_audit.hard_negative_traps_added_count,
+        shadow_vetoed_evaluated_count: gate_audit.shadow_vetoed_evaluated_count,
+        shadow_net_veto_alpha_r: gate_audit.shadow_net_veto_alpha_r,
+        quarantined_traps_count: gate_audit.quarantined_traps_count,
+        mirror_descent_kl_divergence: gate_audit.mirror_descent_kl_divergence,
         autopsies_decoded: autopsies,
         gate_audit,
         updated_synaptic_states: active_states,
@@ -1713,8 +2458,25 @@ pub fn run_autopsy_evolution_cycle(ledger: &RealTimeLedgerEngine) -> AutopsyEvol
 /// Read-only inspection of current autopsy & gate state (`GET /api/v1/scanner/autopsy-evolution`)
 /// without mutating champion generation on idempotent HTTP GET requests.
 pub fn inspect_autopsy_evolution_status(ledger: &RealTimeLedgerEngine) -> AutopsyEvolutionResponse {
+    let round4 = |v: f64| (v * 10_000.0).round() / 10_000.0;
+    let round6 = |v: f64| (v * 1_000_000.0).round() / 1_000_000.0;
+    let (shadow_eval_cnt, net_shadow_alpha_r, quarantined_cnt) =
+        ledger.shadow_tape_telemetry_summary();
+
     if let Some(last) = ledger.last_autopsy_evolution() {
-        return last;
+        let updated_audit = GateAuditReport {
+            shadow_vetoed_evaluated_count: shadow_eval_cnt,
+            shadow_net_veto_alpha_r: round4(net_shadow_alpha_r),
+            quarantined_traps_count: quarantined_cnt,
+            ..last.gate_audit
+        };
+        return AutopsyEvolutionResponse {
+            shadow_vetoed_evaluated_count: shadow_eval_cnt,
+            shadow_net_veto_alpha_r: round4(net_shadow_alpha_r),
+            quarantined_traps_count: quarantined_cnt,
+            gate_audit: updated_audit,
+            ..last
+        };
     }
 
     let closed_snap = ledger.closed_trades_snapshot();
@@ -1752,10 +2514,17 @@ pub fn inspect_autopsy_evolution_status(ledger: &RealTimeLedgerEngine) -> Autops
         }
     }
 
+    let shadow_regret_penalty = ledger.shadow_regret_feature_penalties_by_brain(&precision);
     let current_gen_id = current_states.first().map(|s| s.generation_id).unwrap_or(36);
     let candidate_gen_id = current_gen_id + 1;
-    let candidate_states =
-        propose_candidate_generation(&current_states, &autopsies, candidate_gen_id);
+    let candidate_states = propose_candidate_generation_with_context(
+        &current_states,
+        &autopsies,
+        &autopsies,
+        Some(&precision),
+        &shadow_regret_penalty,
+        candidate_gen_id,
+    );
     let candidate_map: HashMap<BrainHorizonId, BrainSynapticPlasticityState> = candidate_states
         .iter()
         .cloned()
@@ -1779,10 +2548,10 @@ pub fn inspect_autopsy_evolution_status(ledger: &RealTimeLedgerEngine) -> Autops
             .get(&trade.brain_id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        cur_outcomes.push(simulate_trade_under_candidate(
+        cur_outcomes.push(simulate_trade_under_candidate_with_trap_bank(
             trade, cur_state, cur_traps, &precision,
         ));
-        cand_outcomes.push(simulate_trade_under_candidate(
+        cand_outcomes.push(simulate_trade_under_candidate_with_trap_bank(
             trade, cand_state, cand_traps, &precision,
         ));
     }
@@ -1798,7 +2567,16 @@ pub fn inspect_autopsy_evolution_status(ledger: &RealTimeLedgerEngine) -> Autops
         && cand_exp >= cur_exp - 1e-6
         && cand_pf >= cur_pf - 1e-6;
 
-    let round4 = |v: f64| (v * 10_000.0).round() / 10_000.0;
+    let mean_kl_div = if candidate_states.is_empty() {
+        0.0
+    } else {
+        candidate_states
+            .iter()
+            .map(|s| s.mirror_descent_kl_divergence)
+            .sum::<f64>()
+            / (candidate_states.len() as f64)
+    };
+
     let gate_audit = GateAuditReport {
         gate1_baseline_lock_passed: gate1_ok,
         gate1_baseline_winners_preserved: cand_win,
@@ -1819,6 +2597,10 @@ pub fn inspect_autopsy_evolution_status(ledger: &RealTimeLedgerEngine) -> Autops
         gate2_offending_losses_reduced: 0,
         gate2_walkforward_winners_preserved: true,
         hard_negative_traps_added_count: 0,
+        shadow_vetoed_evaluated_count: shadow_eval_cnt,
+        shadow_net_veto_alpha_r: round4(net_shadow_alpha_r),
+        quarantined_traps_count: quarantined_cnt,
+        mirror_descent_kl_divergence: round6(mean_kl_div.max(1e-6)),
         all_gates_passed: gate1_ok,
         decision_rationale: format!(
             "PREVIEW Gen {candidate_gen_id}: Gate 1 replay {cand_win}/{target_winners} baseline winners (Exp {:.4}R -> {:.4}R, PF {:.3} -> {:.3})",
@@ -1835,6 +2617,10 @@ pub fn inspect_autopsy_evolution_status(ledger: &RealTimeLedgerEngine) -> Autops
         is_promoted: false,
         total_trades_inspected: closed_snap.len(),
         hard_negative_traps_added_count: 0,
+        shadow_vetoed_evaluated_count: shadow_eval_cnt,
+        shadow_net_veto_alpha_r: round4(net_shadow_alpha_r),
+        quarantined_traps_count: quarantined_cnt,
+        mirror_descent_kl_divergence: round6(mean_kl_div.max(1e-6)),
         autopsies_decoded: autopsies,
         gate_audit,
         updated_synaptic_states: current_states,

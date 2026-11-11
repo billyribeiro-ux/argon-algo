@@ -2708,6 +2708,14 @@ pub struct InstitutionalWatchlistRow {
     #[serde(default)]
     pub conformal_margin: f64,
     #[serde(default)]
+    pub regime_bucket: String,
+    #[serde(default)]
+    pub conformal_p_value: f64,
+    #[serde(default)]
+    pub epistemic_ood_score: f64,
+    #[serde(default)]
+    pub kelly_epistemic_multiplier: f64,
+    #[serde(default)]
     pub action_status: String,
     #[serde(default)]
     pub venue_ticket: String,
@@ -3141,11 +3149,21 @@ pub async fn build_institutional_watchlist_at_epoch(
                     conformal_llr,
                     conformal_threshold,
                     conformal_margin,
+                    regime_bucket: stage0.regime_bucket.clone(),
+                    conformal_p_value: (stage0.conformal_p_value * 10_000.0).round() / 10_000.0,
+                    epistemic_ood_score: (stage0.epistemic_ood_score * 10_000.0).round() / 10_000.0,
+                    kelly_epistemic_multiplier: (stage0.kelly_epistemic_multiplier * 10_000.0)
+                        .round()
+                        / 10_000.0,
                     action_status: String::new(),
                     venue_ticket: venue_ticket.to_string(),
                     matched_option_contract: matched_opt,
                     option_structure: opt_struct,
-                    kelly_fraction_pct: kelly_plan.kelly_fraction_pct,
+                    kelly_fraction_pct: ((kelly_plan.kelly_fraction_pct
+                        * stage0.kelly_epistemic_multiplier.clamp(0.15, 1.0))
+                        * 100.0)
+                        .round()
+                        / 100.0,
                     is_actionable,
                     execution_tier: if sym == "SPY"
                         || sym == "QQQ"
@@ -3227,6 +3245,8 @@ pub async fn build_institutional_watchlist_at_epoch(
         if row.action_status.is_empty() {
             row.action_status = if row.is_actionable {
                 "ACTIONABLE_STAGE_READY".to_string()
+            } else if row.epistemic_ood_score > 1.25 {
+                "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME".to_string()
             } else if row.stage0_conformal_status == "VETO" {
                 "STAGE_0_VETOED_HARD_NEGATIVE_TRAP".to_string()
             } else {

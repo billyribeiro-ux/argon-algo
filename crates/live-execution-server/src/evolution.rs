@@ -287,6 +287,12 @@ pub struct BrainSynapticPlasticityState {
     /// Phase 25 Deliverable B: Recovering-Winner Velocity Guard Quantile $q_{v, \text{rec}, b, t}$
     #[serde(default = "default_recovery_velocity_guard_quantile")]
     pub learned_recovery_velocity_guard_quantile: f64,
+    /// Phase 34 Deliverable 3: Fisher-Preconditioned Exponentiated Mirror-Descent 32-Simplex weights $w \in [0.04, 0.65]^{32}, \sum w_f = 6.0$
+    #[serde(default)]
+    pub simplex_weights_32: Option<[f64; 32]>,
+    /// Phase 34 Deliverable 3: KL Divergence $D_{\text{KL}}(w^{(t+1)}/6 \,\|\, w^{(t)}/6)$ from previous generation
+    #[serde(default)]
+    pub mirror_descent_kl_divergence: f64,
     pub top_boosted_warning_features: Vec<SynapticFeatureMutation>,
     pub top_slashed_deceiver_features: Vec<SynapticFeatureMutation>,
 }
@@ -342,6 +348,8 @@ impl BrainSynapticPlasticityState {
             learned_fisher_sparsity_exponent_p: 0.0,
             learned_velocity_absorption_damping_weight: 0.0,
             learned_recovery_velocity_guard_quantile: 0.020,
+            simplex_weights_32: None,
+            mirror_descent_kl_divergence: 0.0,
             top_boosted_warning_features: Vec::new(),
             top_slashed_deceiver_features: Vec::new(),
         }

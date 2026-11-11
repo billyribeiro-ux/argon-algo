@@ -2553,6 +2553,33 @@ pub struct Era1BrainCalibrationProfile {
     pub era1_median_hold_bars: usize,
 }
 
+/// Counterfactual Shadow-Tape trade recorded whenever live Stage 0 vetoes an entry setup due to a
+/// Hard-Negative Trap (`offending_trap_id`), stepped bar-by-bar on incoming real OHLC bars to
+/// de-censor vetoed setups without polluting `positions_opened` or real `closed_ledger` P&L.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowVetoedTrade {
+    pub shadow_id: Uuid,
+    pub offending_trap_id: Option<Uuid>,
+    pub brain_id: BrainHorizonId,
+    pub symbol: String,
+    pub direction: TradeDirection,
+    pub opened_timestamp_ns: i64,
+    pub closed_timestamp_ns: Option<i64>,
+    pub entry_price: SubPennyPrice,
+    pub initial_structural_stop: SubPennyPrice,
+    pub target_1_price: SubPennyPrice,
+    pub target_2_price: SubPennyPrice,
+    pub exit_price: Option<SubPennyPrice>,
+    pub realized_r: Option<f64>,
+    pub running_peak_r: f64,
+    pub bars_held: usize,
+    pub max_hold_bars: usize,
+    pub entry_features_32: [f64; 32],
+    pub prev_bar_record: Option<RawBarRecord>,
+    pub settled: bool,
+    pub outcome_label: String,
+}
+
 /// Thread-safe, sub-millisecond Real-Time Execution Ledger Engine.
 pub struct RealTimeLedgerEngine {
     fingerprint_engine: RawFingerprintEngine,
@@ -2572,6 +2599,8 @@ pub struct RealTimeLedgerEngine {
     enforce_hard_scratch_on_baseline: RwLock<bool>,
     webhook_dispatcher: OutboundWebhookDispatcher,
     last_autopsy_evolution: RwLock<Option<crate::autopsy_evolver::AutopsyEvolutionResponse>>,
+    shadow_open_trades: RwLock<Vec<ShadowVetoedTrade>>,
+    shadow_settled_trades: RwLock<Vec<ShadowVetoedTrade>>,
 }
 
 impl Default for RealTimeLedgerEngine {
@@ -2602,7 +2631,123 @@ impl RealTimeLedgerEngine {
             enforce_hard_scratch_on_baseline: RwLock::new(false),
             webhook_dispatcher: OutboundWebhookDispatcher::new(),
             last_autopsy_evolution: RwLock::new(None),
+            shadow_open_trades: RwLock::new(Vec::with_capacity(128)),
+            shadow_settled_trades: RwLock::new(Vec::with_capacity(512)),
         }
+    }
+
+    pub fn shadow_open_trades_snapshot(&self) -> Vec<ShadowVetoedTrade> {
+        self.shadow_open_trades.read().clone()
+    }
+
+    pub fn shadow_settled_trades_snapshot(&self) -> Vec<ShadowVetoedTrade> {
+        self.shadow_settled_trades.read().clone()
+    }
+
+    /// Returns `(shadow_vetoed_evaluated_count, net_shadow_alpha_r, quarantined_traps_count)`
+    /// computed dynamically from settled counterfactual shadow trades and Bayesian trap outcomes.
+    pub fn shadow_tape_telemetry_summary(&self) -> (usize, f64, usize) {
+        let traps = self.precedent_knn.all_hard_negative_traps();
+        let quarantined_cnt = traps.iter().filter(|t| t.quarantined).count();
+        let trap_eval_cnt: usize = traps
+            .iter()
+            .map(|t| (t.true_saves_count + t.false_veto_regrets_count) as usize)
+            .sum();
+        let trap_alpha_r: f64 = traps.iter().map(|t| t.net_veto_alpha_r()).sum();
+
+        let settled_shadow = self.shadow_settled_trades.read();
+        let unattributed_alpha_r: f64 = settled_shadow
+            .iter()
+            .filter(|s| s.offending_trap_id.is_none())
+            .filter_map(|s| s.realized_r)
+            .map(|r| {
+                if r < 0.0 {
+                    r.abs()
+                } else if r >= 1.0 {
+                    -r
+                } else {
+                    0.0
+                }
+            })
+            .sum();
+        let total_eval = settled_shadow.len().max(trap_eval_cnt);
+        let net_alpha_r = trap_alpha_r + unattributed_alpha_r;
+        (total_eval, net_alpha_r, quarantined_cnt)
+    }
+
+    /// Computes per-brain 32-feature regret penalty vectors from counterfactual shadow-tape
+    /// trades that would have won `>= +1.0R` (`false_veto_regrets`).
+    #[allow(clippy::needless_range_loop)]
+    pub fn shadow_regret_feature_penalties_by_brain(
+        &self,
+        precision: &crate::autopsy_evolver::LedoitWolfPrecision,
+    ) -> std::collections::HashMap<BrainHorizonId, [f64; 32]> {
+        let mut out: std::collections::HashMap<BrainHorizonId, [f64; 32]> =
+            std::collections::HashMap::new();
+        let settled = self.shadow_settled_trades.read();
+        for s in settled.iter() {
+            if let Some(r) = s.realized_r
+                && r >= 1.0
+            {
+                let ref_c = precision
+                    .brains
+                    .get(&s.brain_id)
+                    .map(|m| m.winner_centroid_32)
+                    .unwrap_or([0.0_f64; 32]);
+                let entry = out.entry(s.brain_id).or_insert([0.0_f64; 32]);
+                for f in 0..32 {
+                    entry[f] += (s.entry_features_32[f] - ref_c[f]).abs() * r;
+                }
+            }
+        }
+        out
+    }
+
+    /// Builds the causal `LedoitWolfPrecision` manifold and active non-quarantined `Stage0TrapCentroid`
+    /// slice so live scanner/ledger Stage 0 calls the exact same `evaluate_stage0_conformal_kernel`
+    /// as offline `simulate_trade_under_candidate`.
+    pub fn build_live_stage0_manifold_and_traps(
+        &self,
+        brain_id: BrainHorizonId,
+        causal_before_ts_ns: i64,
+    ) -> (
+        crate::autopsy_evolver::LedoitWolfPrecision,
+        Vec<crate::autopsy_evolver::Stage0TrapCentroid>,
+    ) {
+        let closed_snap = self.closed_ledger.read();
+        let baseline_count = 173.min(closed_snap.len());
+        let precision = crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
+            &closed_snap[0..baseline_count],
+        );
+        drop(closed_snap);
+
+        let trap_bank: Vec<crate::autopsy_evolver::Stage0TrapCentroid> = self
+            .precedent_knn
+            .all_hard_negative_traps()
+            .into_iter()
+            .filter(|t| {
+                !t.quarantined
+                    && t.brain_id == brain_id
+                    && t.closed_timestamp_ns < causal_before_ts_ns
+                    && (t.root_cause_category == "ENTRY_LIQUIDITY_VACUUM_TRAP"
+                        || t.root_cause_category.starts_with("STAGE_0_"))
+                    && t.entry_features_32.len() >= 32
+            })
+            .map(|t| {
+                let mut arr = [0.0_f64; 32];
+                for (i, &v) in t.entry_features_32.iter().take(32).enumerate() {
+                    arr[i] = v as f64;
+                }
+                crate::autopsy_evolver::Stage0TrapCentroid {
+                    trap_id: Some(t.loss_trade_id),
+                    root_cause_category: t.root_cause_category,
+                    features_32: arr,
+                    quarantined: false,
+                }
+            })
+            .collect();
+
+        (precision, trap_bank)
     }
 
     pub fn last_autopsy_evolution(&self) -> Option<crate::autopsy_evolver::AutopsyEvolutionResponse> {
@@ -3979,34 +4124,79 @@ impl RealTimeLedgerEngine {
             &bounded_pre,
             entry_idx,
         );
+        let mut entry_arr_32 = [0.0_f64; 32];
+        for (i, &v) in entry_features_32.iter().take(32).enumerate() {
+            entry_arr_32[i] = v as f64;
+        }
+
         let syn_state = self.precedent_knn.get_synaptic_plasticity_state(sig.brain_id);
-        let tau_veto = (0.855 + syn_state.entry_veto_margin_delta).clamp(0.84, 0.94);
-        let delta_margin = syn_state.entry_veto_margin_delta.clamp(0.005, 0.05);
-        let diag = if record_audit {
-            self.precedent_knn
-                .evaluate_causal_entry_trap_vs_winner_discriminant(
-                    sig.brain_id,
-                    &sig.symbol,
-                    sig.direction,
-                    sig.timestamp_ns,
-                    &sig.latent_embedding_128,
-                    &entry_features_32,
-                    tau_veto,
-                    delta_margin,
-                )
-        } else {
-            self.precedent_knn
-                .evaluate_causal_stage0_conformal_entry_gate(
-                    sig.brain_id,
-                    &sig.symbol,
-                    sig.direction,
-                    sig.timestamp_ns,
-                    &sig.latent_embedding_128,
-                    &entry_features_32,
-                    tau_veto,
-                    delta_margin,
-                )
+        let (precision, trap_bank) =
+            self.build_live_stage0_manifold_and_traps(sig.brain_id, sig.timestamp_ns);
+        let k_out = crate::autopsy_evolver::evaluate_stage0_conformal_kernel(
+            sig.brain_id,
+            &entry_arr_32,
+            None,
+            &syn_state,
+            &trap_bank,
+            &precision,
+        );
+
+        let trap_sim = 1.0 / (1.0 + k_out.d_trap * 0.35);
+        let win_sim = 1.0 / (1.0 + k_out.d_win * 0.35);
+        let mut diag = crate::precedent_knn::EntryTrapVsWinnerDiagnostic {
+            should_veto: k_out.vetoed,
+            matched_trap_id: k_out.matched_trap_id,
+            trap_similarity_score: trap_sim,
+            winner_similarity_score: win_sim,
+            similarity_margin: trap_sim - win_sim,
+            root_cause_category: k_out.root_cause_category.clone(),
+            conformal_entry_llr: k_out.conformal_llr,
+            conformal_entry_hurdle: k_out.conformal_hurdle,
+            conformal_margin: k_out.conformal_margin,
+            conformal_p_value: k_out.conformal_p_value,
+            regime_bucket: k_out.regime_bucket.as_str().to_string(),
+            epistemic_ood_score: k_out.epistemic_ood_score,
+            kelly_epistemic_multiplier: k_out.kelly_epistemic_multiplier,
         };
+
+        // Preserve Era-1 (`Gen <= 36`) historical baseline replay discriminant ONLY when explicitly requested
+        if *self.enforce_hard_scratch_on_baseline.read() && syn_state.generation_id <= 36 && !diag.should_veto {
+            let tau_veto = (0.855 + syn_state.entry_veto_margin_delta).clamp(0.84, 0.94);
+            let delta_margin = syn_state.entry_veto_margin_delta.clamp(0.005, 0.05);
+            let era1_diag = if record_audit {
+                self.precedent_knn
+                    .evaluate_causal_entry_trap_vs_winner_discriminant(
+                        sig.brain_id,
+                        &sig.symbol,
+                        sig.direction,
+                        sig.timestamp_ns,
+                        &sig.latent_embedding_128,
+                        &entry_features_32,
+                        tau_veto,
+                        delta_margin,
+                    )
+            } else {
+                self.precedent_knn
+                    .evaluate_causal_stage0_conformal_entry_gate(
+                        sig.brain_id,
+                        &sig.symbol,
+                        sig.direction,
+                        sig.timestamp_ns,
+                        &sig.latent_embedding_128,
+                        &entry_features_32,
+                        tau_veto,
+                        delta_margin,
+                    )
+            };
+            if era1_diag.should_veto {
+                diag.should_veto = true;
+                diag.matched_trap_id = era1_diag.matched_trap_id;
+                diag.trap_similarity_score = era1_diag.trap_similarity_score;
+                diag.winner_similarity_score = era1_diag.winner_similarity_score;
+                diag.root_cause_category = era1_diag.root_cause_category;
+            }
+        }
+
         if diag.should_veto
             && record_audit
             && let Some(matched_loss_id) = diag.matched_trap_id
@@ -4280,18 +4470,78 @@ impl RealTimeLedgerEngine {
         let syn_state = self.precedent_knn.get_synaptic_plasticity_state(row.brain_id);
         Self::refresh_open_position_sequential_telemetry(&mut row, &syn_state);
 
-        if *self.enforce_hard_scratch_on_baseline.read() || syn_state.generation_id >= 37 {
-            let stage0 = self.evaluate_live_entry_stage0_gate(
-                inference,
+        let enforce_era1_baseline = *self.enforce_hard_scratch_on_baseline.read();
+        let stage0 = self.evaluate_live_entry_stage0_gate(
+            inference,
+            precedents.win_rate_pct,
+            &row.entry_bars,
+            enforce_era1_baseline || syn_state.generation_id >= 37,
+        );
+
+        if stage0.kelly_epistemic_multiplier < 1.0 && !(enforce_era1_baseline && syn_state.generation_id <= 36) {
+            let k_mult = stage0.kelly_epistemic_multiplier.clamp(0.15, 1.0);
+            row.kelly_fraction_pct = ((row.kelly_fraction_pct * k_mult) * 100.0).round() / 100.0;
+            row.risk_budget_usd = ((row.risk_budget_usd * k_mult) * 100.0).round() / 100.0;
+            row.notional_allocated_usd =
+                ((row.notional_allocated_usd * k_mult) * 100.0).round() / 100.0;
+            row.quantity_shares = (row.notional_allocated_usd / entry_f64).max(0.01);
+        }
+
+        if stage0.epistemic_ood_score > 1.25 {
+            row.active_sequential_stage = "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME".to_string();
+            row.sequential_safety_margin_pct = 0.0;
+            return row;
+        }
+
+        if (enforce_era1_baseline || syn_state.generation_id >= 37) && stage0.should_veto {
+            row.active_sequential_stage = "STAGE_0_VETOED_HARD_NEGATIVE_TRAP".to_string();
+            row.sequential_safety_margin_pct = 0.0;
+
+            let entry_features_vec = Self::extract_causal_entry_features_32(
+                &sig.latent_embedding_128,
+                sig.entry_price,
+                sig.structural_stop_price,
+                sig.target_1_price,
+                sig.direction,
+                sig.ai_confidence_pct,
                 precedents.win_rate_pct,
                 &row.entry_bars,
-                true,
+                row.entry_bar_idx,
             );
-            if stage0.should_veto {
-                row.active_sequential_stage = "STAGE_0_VETOED_HARD_NEGATIVE_TRAP".to_string();
-                row.sequential_safety_margin_pct = 0.0;
-                return row;
+            let mut entry_arr_32 = [0.0_f64; 32];
+            for (i, &v) in entry_features_vec.iter().take(32).enumerate() {
+                entry_arr_32[i] = v as f64;
             }
+            let max_hold_bars = match row.brain_id {
+                BrainHorizonId::Brain01PennyAnomaly => 24,
+                BrainHorizonId::Brain02IntradayDayTrade => 28,
+                BrainHorizonId::Brain03ShortTermSwing => 32,
+                BrainHorizonId::Brain04CoreSwing => 38,
+                BrainHorizonId::Brain05LongTermWealth => 44,
+            };
+            self.shadow_open_trades.write().push(ShadowVetoedTrade {
+                shadow_id: Uuid::new_v4(),
+                offending_trap_id: stage0.matched_trap_id,
+                brain_id: row.brain_id,
+                symbol: row.symbol.clone(),
+                direction: row.direction,
+                opened_timestamp_ns: row.opened_timestamp_ns,
+                closed_timestamp_ns: None,
+                entry_price: row.entry_price,
+                initial_structural_stop: row.initial_structural_stop,
+                target_1_price: row.target_1_price,
+                target_2_price: row.target_2_price,
+                exit_price: None,
+                realized_r: None,
+                running_peak_r: 0.0,
+                bars_held: 0,
+                max_hold_bars,
+                entry_features_32: entry_arr_32,
+                prev_bar_record: row.entry_bars.last().copied(),
+                settled: false,
+                outcome_label: "SHADOW_OPEN".to_string(),
+            });
+            return row;
         }
 
         self.positions_opened.write().push(row.clone());
@@ -4355,6 +4605,158 @@ impl RealTimeLedgerEngine {
         self.process_live_bar_internal(symbol, Some(brain_id), recent_bars, internals)
     }
 
+    fn step_shadow_vetoed_trades_on_bar(
+        &self,
+        symbol: &str,
+        brain_filter: Option<BrainHorizonId>,
+        latest: &RawBarRecord,
+    ) {
+        let mut open_shadows = self.shadow_open_trades.write();
+        if open_shadows.is_empty() {
+            return;
+        }
+
+        let closed_snap = self.closed_ledger.read();
+        let baseline_count = 173.min(closed_snap.len());
+        let precision = crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
+            &closed_snap[0..baseline_count],
+        );
+        drop(closed_snap);
+
+        let mut newly_settled = Vec::new();
+        let mut idx = 0;
+
+        while idx < open_shadows.len() {
+            if !open_shadows[idx].symbol.eq_ignore_ascii_case(symbol)
+                || brain_filter.is_some_and(|b| open_shadows[idx].brain_id != b)
+                || latest.timestamp_ns <= open_shadows[idx].opened_timestamp_ns
+            {
+                idx += 1;
+                continue;
+            }
+
+            let sh = &mut open_shadows[idx];
+            sh.bars_held += 1;
+
+            let ep = sh.entry_price.to_f64();
+            let initial_risk = (ep - sh.initial_structural_stop.to_f64()).abs().max(0.0001);
+            let dir = sh.direction.sign();
+            let bar_open = latest.open.to_f64();
+            let bar_high = latest.high.to_f64();
+            let bar_low = latest.low.to_f64();
+            let bar_close = latest.close.to_f64();
+
+            let favorable_r = if dir > 0.0 {
+                (bar_high - ep) / initial_risk
+            } else {
+                (ep - bar_low) / initial_risk
+            };
+            let adverse_r = if dir > 0.0 {
+                (bar_low - ep) / initial_risk
+            } else {
+                (ep - bar_high) / initial_risk
+            };
+
+            let syn_state = self.precedent_knn.get_synaptic_plasticity_state(sh.brain_id);
+
+            let mut settled_outcome: Option<(f64, f64, &str)> = None;
+
+            // 1. Causal Stage 3 Hazard-Conditioned Ratchet Check (from prior bars 1..=k-1 ONLY)
+            if sh.running_peak_r >= 1.0
+                && let Some(ref prev_b) = sh.prev_bar_record
+            {
+                let (_h_prev, rho_eff) =
+                    crate::autopsy_evolver::compute_causal_reversal_hazard_retention(
+                        sh.brain_id,
+                        dir,
+                        prev_b.open.to_f64(),
+                        prev_b.high.to_f64(),
+                        prev_b.low.to_f64(),
+                        prev_b.close.to_f64(),
+                        None,
+                        &syn_state,
+                        &precision,
+                    );
+                let ratchet_stop_price = ep + dir * (sh.running_peak_r * rho_eff) * initial_risk;
+                let breached_ratchet = if dir > 0.0 {
+                    bar_low <= ratchet_stop_price
+                } else {
+                    bar_high >= ratchet_stop_price
+                };
+                if breached_ratchet {
+                    let fill_px = if dir > 0.0 {
+                        ratchet_stop_price.min(bar_open)
+                    } else {
+                        ratchet_stop_price.max(bar_open)
+                    };
+                    let r_val = ((fill_px - ep) * dir) / initial_risk;
+                    settled_outcome = Some((fill_px, r_val, "SHADOW_RATCHET_EXIT"));
+                }
+            }
+
+            // 2. Structural Stop Check with Adverse Gap-Open Clamping
+            if settled_outcome.is_none() && adverse_r <= -1.0 {
+                let stop_exit_price = ep - dir * initial_risk;
+                let stop_fill_price = if dir > 0.0 {
+                    stop_exit_price.min(bar_open)
+                } else {
+                    stop_exit_price.max(bar_open)
+                };
+                let r_val = ((stop_fill_price - ep) * dir) / initial_risk;
+                settled_outcome = Some((stop_fill_price, r_val, "SHADOW_STOPPED_OUT"));
+            }
+
+            // 3. Target 2 Check
+            if settled_outcome.is_none() {
+                let t2_px = sh.target_2_price.to_f64();
+                let hit_t2 = if dir > 0.0 {
+                    bar_high >= t2_px
+                } else {
+                    bar_low <= t2_px
+                };
+                if hit_t2 {
+                    let fill_px = if dir > 0.0 {
+                        t2_px.max(bar_open)
+                    } else {
+                        t2_px.min(bar_open)
+                    };
+                    let r_val = ((fill_px - ep) * dir) / initial_risk;
+                    settled_outcome = Some((fill_px, r_val, "SHADOW_TARGET_HIT"));
+                }
+            }
+
+            // 4. Max-Hold Time-Stop Check
+            if settled_outcome.is_none() && sh.bars_held >= sh.max_hold_bars {
+                let r_val = ((bar_close - ep) * dir) / initial_risk;
+                settled_outcome = Some((bar_close, r_val, "SHADOW_TIME_EXPIRED"));
+            }
+
+            if let Some((fill_px, r_val, label)) = settled_outcome {
+                let mut done = open_shadows.remove(idx);
+                done.closed_timestamp_ns = Some(latest.timestamp_ns);
+                done.exit_price = SubPennyPrice::from_f64(fill_px).ok();
+                done.realized_r = Some(r_val);
+                done.settled = true;
+                done.outcome_label = label.to_string();
+                if let Some(trap_id) = done.offending_trap_id {
+                    self.precedent_knn.record_trap_shadow_outcome(trap_id, r_val);
+                }
+                newly_settled.push(done);
+            } else {
+                if favorable_r > sh.running_peak_r {
+                    sh.running_peak_r = favorable_r;
+                }
+                sh.prev_bar_record = Some(*latest);
+                idx += 1;
+            }
+        }
+        drop(open_shadows);
+
+        if !newly_settled.is_empty() {
+            self.shadow_settled_trades.write().extend(newly_settled);
+        }
+    }
+
     fn process_live_bar_internal(
         &self,
         symbol: &str,
@@ -4367,6 +4769,9 @@ impl RealTimeLedgerEngine {
         }
         let latest = &recent_bars[recent_bars.len() - 1];
         let live_price = latest.close;
+
+        // Step any active Shadow-Tape counterfactual trades on this real incoming bar
+        self.step_shadow_vetoed_trades_on_bar(symbol, brain_filter, latest);
 
         let mut open_list = self.positions_opened.write();
         let mut newly_closed = Vec::new();
@@ -4493,17 +4898,22 @@ impl RealTimeLedgerEngine {
                 TradeDirection::Short => latest.low <= pos.target_2_price,
             };
 
+            let pos_gen_id = self
+                .precedent_knn
+                .get_synaptic_plasticity_state(pos.brain_id)
+                .generation_id;
+
             let stop_hit = match pos.direction {
                 TradeDirection::Long => {
-                    if was_trailing_profit_stop {
-                        latest.close <= stop_at_bar_open
+                    if was_trailing_profit_stop && pos_gen_id <= 36 {
+                        latest.close <= stop_at_bar_open || latest.open <= stop_at_bar_open
                     } else {
                         latest.low <= stop_at_bar_open && !target_hit
                     }
                 }
                 TradeDirection::Short => {
-                    if was_trailing_profit_stop {
-                        latest.close >= stop_at_bar_open
+                    if was_trailing_profit_stop && pos_gen_id <= 36 {
+                        latest.close >= stop_at_bar_open || latest.open >= stop_at_bar_open
                     } else {
                         latest.high >= stop_at_bar_open && !target_hit
                     }
@@ -4713,8 +5123,10 @@ impl RealTimeLedgerEngine {
                     && enforce_live_stage1_3
                 {
                     ai_scratch_exit = true;
-                } else if enforce_live_stage1_3 && bars_since_open >= 2 {
-                    if let Some(ref ratchet_diag) = unified_dec.giveback_ratchet {
+                } else if enforce_live_stage1_3 && bars_since_open >= 1 {
+                    if bars_since_open >= 2
+                        && let Some(ref ratchet_diag) = unified_dec.giveback_ratchet
+                    {
                         let locked_r = ratchet_diag.locked_profit_r.max(0.05);
                         let ratchet_offset_u = ((risk_u as f64) * locked_r).round() as i64;
                         pos.structural_stop_price = match pos.direction {
@@ -4749,8 +5161,32 @@ impl RealTimeLedgerEngine {
                         };
                         let running_peak_r = peak_move_u / (risk_u.max(1) as f64);
                         if running_peak_r >= 1.0 {
-                            let ratchet_r =
-                                running_peak_r * syn_state.learned_giveback_retention_ratio;
+                            let bar_feat_vec = Self::extract_post_entry_bar_features_32(pos, latest);
+                            let mut bar_feat_arr = [0.0_f64; 32];
+                            for (i, &v) in bar_feat_vec.iter().take(32).enumerate() {
+                                bar_feat_arr[i] = v as f64;
+                            }
+                            let closed_snap = self.closed_ledger.read();
+                            let baseline_count = 173.min(closed_snap.len());
+                            let precision =
+                                crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
+                                    &closed_snap[0..baseline_count],
+                                );
+                            drop(closed_snap);
+
+                            let (_h_curr, rho_eff) =
+                                crate::autopsy_evolver::compute_causal_reversal_hazard_retention(
+                                    pos.brain_id,
+                                    pos.direction.sign(),
+                                    latest.open.to_f64(),
+                                    latest.high.to_f64(),
+                                    latest.low.to_f64(),
+                                    latest.close.to_f64(),
+                                    Some(&bar_feat_arr),
+                                    &syn_state,
+                                    &precision,
+                                );
+                            let ratchet_r = running_peak_r * rho_eff;
                             let ratchet_offset_u = ((risk_u as f64) * ratchet_r).round() as i64;
                             pos.structural_stop_price = match pos.direction {
                                 TradeDirection::Long => pos.structural_stop_price.max(
@@ -4808,6 +5244,11 @@ impl RealTimeLedgerEngine {
                     }
                 };
 
+                let gap_clamped_stop_fill = match removed.direction {
+                    TradeDirection::Long => stop_at_bar_open.min(latest.open),
+                    TradeDirection::Short => stop_at_bar_open.max(latest.open),
+                };
+
                 let (badge, runner_exit_price) = if target_hit {
                     (ClosedOutcomeBadge::TargetHit, removed.target_2_price)
                 } else if ai_scratch_exit {
@@ -4819,9 +5260,9 @@ impl RealTimeLedgerEngine {
                     (ClosedOutcomeBadge::AiDynamicExit, removed.live_price)
                 } else if stop_hit {
                     if was_trailing_profit_stop || t1_was_banked || is_profit_locked_stop {
-                        (ClosedOutcomeBadge::TrailingStop, stop_at_bar_open)
+                        (ClosedOutcomeBadge::TrailingStop, gap_clamped_stop_fill)
                     } else {
-                        (ClosedOutcomeBadge::StoppedOut, stop_at_bar_open)
+                        (ClosedOutcomeBadge::StoppedOut, gap_clamped_stop_fill)
                     }
                 } else if t1_was_banked || is_profit_locked_stop {
                     let runner_px = match removed.direction {
@@ -5864,6 +6305,12 @@ impl RealTimeLedgerEngine {
                     entry_features_32,
                     bar1_r_multiple,
                     pre_settlement_bars_features_32,
+                    observation_count: 1,
+                    true_saves_count: 0,
+                    false_veto_regrets_count: 0,
+                    cumulative_saved_r: 0.0,
+                    cumulative_missed_winner_r: 0.0,
+                    quarantined: false,
                 });
         } else {
             let pre_settlement_bars_features_32 = Self::extract_pre_settlement_bar_features_sequence(

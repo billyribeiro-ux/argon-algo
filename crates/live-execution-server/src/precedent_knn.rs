@@ -15,6 +15,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+fn default_trap_observation_count() -> u32 {
+    1
+}
+
+/// Outcome of idempotent Hard-Negative Trap upsert / near-duplicate reinforcement (Phase 33.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrapUpsertOutcome {
+    NewlyInserted,
+    ReinforcedExisting,
+}
+
 /// Audited Hard-Negative Loss Trap indexed at `closed_timestamp_ns` ($T_{\text{loss\_closed}}$).
 /// Strictly causal: only visible to candidate evaluations at $t > T_{\text{loss\_closed}}$.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,6 +55,49 @@ pub struct HardNegativeTrapRecord {
     /// Full pre-settlement multi-bar (`k = 1..16`) 32-feature trajectory strictly truncated before settlement.
     #[serde(default)]
     pub pre_settlement_bars_features_32: Vec<(usize, Vec<f32>)>,
+    /// Phase 33.1: Observation / coalesced hit count across multi-generation reinforcement cycles.
+    #[serde(default = "default_trap_observation_count")]
+    pub observation_count: u32,
+    /// Phase 34: Shadow-tape counterfactual true saves (`shadow_realized_r < 0.0`).
+    #[serde(default)]
+    pub true_saves_count: u32,
+    /// Phase 34: Shadow-tape counterfactual false-veto regrets (`shadow_realized_r >= 1.0`).
+    #[serde(default)]
+    pub false_veto_regrets_count: u32,
+    /// Phase 34: Cumulative losses avoided ($R$-units) on shadow-vetoed setups.
+    #[serde(default)]
+    pub cumulative_saved_r: f64,
+    /// Phase 34: Cumulative missed winner $R$-units on shadow-vetoed setups.
+    #[serde(default)]
+    pub cumulative_missed_winner_r: f64,
+    /// Phase 34: Auto-quarantined when counterfactual precision degrades below Bayesian hurdle.
+    #[serde(default)]
+    pub quarantined: bool,
+}
+
+impl HardNegativeTrapRecord {
+    /// Net counterfactual alpha ($R$-units) earned by this trap on the shadow tape.
+    #[inline]
+    pub fn net_veto_alpha_r(&self) -> f64 {
+        self.cumulative_saved_r - self.cumulative_missed_winner_r
+    }
+
+    /// Beta(2, 1) posterior reliability precision:
+    /// $$\hat{p}_{\text{prec}} = \frac{2 + N_{\text{saves}}}{3 + N_{\text{saves}} + N_{\text{regrets}}}$$
+    #[inline]
+    pub fn posterior_precision(&self) -> f64 {
+        let saves = self.true_saves_count as f64;
+        let total = (self.true_saves_count + self.false_veto_regrets_count) as f64;
+        (2.0 + saves) / (3.0 + total)
+    }
+
+    /// Self-healing quarantine check: requires `>= 3` counterfactual evaluations and
+    /// either `posterior_precision < 0.50` or `net_veto_alpha_r < -0.50`.
+    #[inline]
+    pub fn should_auto_quarantine(&self) -> bool {
+        let total_evals = self.true_saves_count + self.false_veto_regrets_count;
+        total_evals >= 3 && (self.posterior_precision() < 0.50 || self.net_veto_alpha_r() < -0.50)
+    }
 }
 
 /// Audited Winning Trade Precedent & `Bar +1` Pullback Record indexed at `closed_timestamp_ns` ($T_{\text{win\_closed}}$).
@@ -155,6 +209,10 @@ pub struct HouseMoneyRunnerScaleInDiagnostic {
     pub ledoit_wolf_shrinkage_lambda: f64,
 }
 
+fn default_kelly_epistemic_multiplier() -> f64 {
+    1.0
+}
+
 /// Outcome-blind Entry discriminant diagnostic comparing a candidate's 128-d embedding and 32-feature
 /// entry state against BOTH the causal closest Hard-Negative Trap ($S_{\text{trap}}$) and the causal
 /// closest Winning Precedent ($S_{\text{win}}$).
@@ -170,6 +228,16 @@ pub struct EntryTrapVsWinnerDiagnostic {
     pub conformal_entry_llr: f64,
     #[serde(default)]
     pub conformal_entry_hurdle: f64,
+    #[serde(default)]
+    pub conformal_margin: f64,
+    #[serde(default)]
+    pub conformal_p_value: f64,
+    #[serde(default)]
+    pub regime_bucket: String,
+    #[serde(default)]
+    pub epistemic_ood_score: f64,
+    #[serde(default = "default_kelly_epistemic_multiplier")]
+    pub kelly_epistemic_multiplier: f64,
 }
 
 /// Phase 27 Live Dual-Engine (`ENGINE-A` Structured Champion vs. `ENGINE-B` Self-Learned Synaptic ML vs. `CONSENSUS`)
@@ -460,10 +528,219 @@ impl PrecedentKnnIndex {
             .iter_mut()
             .find(|t| t.loss_trade_id == trap.loss_trade_id)
         {
+            let prev_obs = existing.observation_count;
+            let prev_saves = existing.true_saves_count;
+            let prev_regrets = existing.false_veto_regrets_count;
+            let prev_saved_r = existing.cumulative_saved_r;
+            let prev_missed_r = existing.cumulative_missed_winner_r;
+            let prev_quarantined = existing.quarantined;
             *existing = trap;
+            existing.observation_count = existing.observation_count.max(prev_obs).max(1);
+            existing.true_saves_count = existing.true_saves_count.max(prev_saves);
+            existing.false_veto_regrets_count = existing.false_veto_regrets_count.max(prev_regrets);
+            if prev_saved_r > existing.cumulative_saved_r {
+                existing.cumulative_saved_r = prev_saved_r;
+            }
+            if prev_missed_r > existing.cumulative_missed_winner_r {
+                existing.cumulative_missed_winner_r = prev_missed_r;
+            }
+            existing.quarantined |= prev_quarantined;
         } else {
             guard.push(trap);
         }
+    }
+
+    /// Phase 33.1 Idempotent Multi-Generation Hard-Negative Trap Upsert & Coalescence:
+    /// - Deduplicates exact `loss_trade_id` matches (`TrapUpsertOutcome::ReinforcedExisting`).
+    /// - Coalesces near-duplicate traps on the same `(brain_id, direction, root_cause_category)`
+    ///   when precision-weighted `entry_mahalanobis < 0.25`, incrementing `observation_count`
+    ///   and blending the 32-feature centroid without appending duplicate centroids.
+    #[allow(clippy::needless_range_loop)]
+    pub fn upsert_or_reinforce_hard_negative_trap(
+        &self,
+        mut record: HardNegativeTrapRecord,
+    ) -> TrapUpsertOutcome {
+        record.observation_count = record.observation_count.max(1);
+        let syn_state = self.get_synaptic_plasticity_state(record.brain_id);
+        let weights_32 = crate::autopsy_evolver::build_synaptic_precision_weights(&syn_state);
+
+        // Build causal pooled 32x32 entry covariance for precision-weighted Mahalanobis near-duplicate check
+        let wins_guard = self.winner_pullbacks.read();
+        let mut guard = self.hard_negative_traps.write();
+
+        if let Some(existing) = guard
+            .iter_mut()
+            .find(|t| t.loss_trade_id == record.loss_trade_id)
+        {
+            existing.observation_count = existing.observation_count.saturating_add(1);
+            return TrapUpsertOutcome::ReinforcedExisting;
+        }
+
+        if record.entry_features_32.len() >= 32 {
+            let brain_wins: Vec<&WinnerPullbackRecord> = wins_guard
+                .iter()
+                .filter(|w| w.brain_id == record.brain_id && w.entry_features_32.len() >= 32)
+                .collect();
+            let brain_traps: Vec<&HardNegativeTrapRecord> = guard
+                .iter()
+                .filter(|t| t.brain_id == record.brain_id && t.entry_features_32.len() >= 32)
+                .collect();
+
+            let mut win_centroid = [0.0_f64; 32];
+            if !brain_wins.is_empty() {
+                let inv_w = 1.0 / (brain_wins.len() as f64);
+                for w in &brain_wins {
+                    for i in 0..32 {
+                        win_centroid[i] += (w.entry_features_32[i] as f64) * inv_w;
+                    }
+                }
+            }
+            let mut loss_centroid = [0.0_f64; 32];
+            if !brain_traps.is_empty() {
+                let inv_l = 1.0 / (brain_traps.len() as f64);
+                for t in &brain_traps {
+                    for i in 0..32 {
+                        loss_centroid[i] += (t.entry_features_32[i] as f64) * inv_l;
+                    }
+                }
+            }
+
+            let mut range_sum = 0.0_f64;
+            let mut range_cnt = 0usize;
+            for w in &brain_wins {
+                let r = (w.entry_features_32[8] as f64).abs()
+                    + (w.entry_features_32[9] as f64).abs()
+                    + (w.entry_features_32[10] as f64).abs();
+                if r > 1e-9 {
+                    range_sum += r;
+                    range_cnt += 1;
+                }
+            }
+            for t in &brain_traps {
+                let r = (t.entry_features_32[8] as f64).abs()
+                    + (t.entry_features_32[9] as f64).abs()
+                    + (t.entry_features_32[10] as f64).abs();
+                if r > 1e-9 {
+                    range_sum += r;
+                    range_cnt += 1;
+                }
+            }
+            let scale_entry = if range_cnt > 0 {
+                (range_sum / (range_cnt as f64)).max(1e-9)
+            } else {
+                1.0
+            };
+            let scale_entry_sq = (scale_entry * scale_entry).max(1e-12);
+            let mut pooled_cov = [[0.0_f64; 32]; 32];
+            for i in 0..32 {
+                pooled_cov[i][i] = 0.035 * scale_entry_sq;
+            }
+            if !brain_wins.is_empty() {
+                let inv_w = 1.0 / (brain_wins.len() as f64);
+                for w in &brain_wins {
+                    for i in 0..32 {
+                        let di = (w.entry_features_32[i] as f64) - win_centroid[i];
+                        for j in 0..=i {
+                            let dj = (w.entry_features_32[j] as f64) - win_centroid[j];
+                            let cij = 0.5 * (di * dj) * inv_w;
+                            pooled_cov[i][j] += cij;
+                            pooled_cov[j][i] = pooled_cov[i][j];
+                        }
+                    }
+                }
+            }
+            if !brain_traps.is_empty() {
+                let inv_l = 1.0 / (brain_traps.len() as f64);
+                for t in &brain_traps {
+                    for i in 0..32 {
+                        let di = (t.entry_features_32[i] as f64) - loss_centroid[i];
+                        for j in 0..=i {
+                            let dj = (t.entry_features_32[j] as f64) - loss_centroid[j];
+                            let cij = 0.5 * (di * dj) * inv_l;
+                            pooled_cov[i][j] += cij;
+                            pooled_cov[j][i] = pooled_cov[i][j];
+                        }
+                    }
+                }
+            }
+            let n_causal = (brain_wins.len() + brain_traps.len()).max(4);
+            drop(brain_traps);
+
+            let mut coalesce_idx: Option<usize> = None;
+            let mut best_dist = 0.25_f64;
+            for (idx, existing) in guard.iter().enumerate() {
+                if existing.brain_id == record.brain_id
+                    && existing.direction == record.direction
+                    && !existing.quarantined
+                    && existing.entry_features_32.len() >= 32
+                {
+                    let mut diff = [0.0_f64; 32];
+                    for i in 0..32 {
+                        diff[i] = (record.entry_features_32[i] as f64)
+                            - (existing.entry_features_32[i] as f64);
+                    }
+                    let (entry_maha, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                        &pooled_cov,
+                        n_causal,
+                        &weights_32,
+                        &diff,
+                        scale_entry_sq,
+                    );
+                    if entry_maha < best_dist {
+                        best_dist = entry_maha;
+                        coalesce_idx = Some(idx);
+                    }
+                }
+            }
+
+            if let Some(idx) = coalesce_idx {
+                let target = &mut guard[idx];
+                let prev_obs = target.observation_count.max(1) as f32;
+                let next_obs = prev_obs + 1.0;
+                for i in 0..32 {
+                    target.entry_features_32[i] = (target.entry_features_32[i] * prev_obs
+                        + record.entry_features_32[i])
+                        / next_obs;
+                }
+                target.observation_count = target.observation_count.saturating_add(1);
+                return TrapUpsertOutcome::ReinforcedExisting;
+            }
+        }
+
+        guard.push(record);
+        TrapUpsertOutcome::NewlyInserted
+    }
+
+    /// Phase 34 Shadow-Tape Bandit Outcome Update:
+    /// Updates `true_saves_count` / `cumulative_saved_r` when `shadow_realized_r < 0.0`,
+    /// or `false_veto_regrets_count` / `cumulative_missed_winner_r` when `shadow_realized_r >= 1.0`.
+    pub fn record_trap_shadow_outcome(&self, trap_id: Uuid, shadow_realized_r: f64) {
+        let mut guard = self.hard_negative_traps.write();
+        if let Some(trap) = guard.iter_mut().find(|t| t.loss_trade_id == trap_id) {
+            if shadow_realized_r < 0.0 {
+                trap.true_saves_count = trap.true_saves_count.saturating_add(1);
+                trap.cumulative_saved_r += shadow_realized_r.abs();
+            } else if shadow_realized_r >= 1.0 {
+                trap.false_veto_regrets_count = trap.false_veto_regrets_count.saturating_add(1);
+                trap.cumulative_missed_winner_r += shadow_realized_r;
+            }
+        }
+    }
+
+    /// Phase 34 Self-Healing Bayesian Trap Quarantine:
+    /// Marks any trap with `(true_saves_count + false_veto_regrets_count) >= 3` AND
+    /// (`posterior_precision < 0.50` OR `net_veto_alpha_r < -0.50`) as `quarantined = true`.
+    /// Returns the number of newly quarantined traps in this cycle.
+    pub fn quarantine_underperforming_traps(&self) -> usize {
+        let mut newly_quarantined = 0usize;
+        let mut guard = self.hard_negative_traps.write();
+        for trap in guard.iter_mut() {
+            if !trap.quarantined && trap.should_auto_quarantine() {
+                trap.quarantined = true;
+                newly_quarantined += 1;
+            }
+        }
+        newly_quarantined
     }
 
     /// Returns a snapshot of all indexed Hard-Negative Trap records.
@@ -1092,6 +1369,7 @@ impl PrecedentKnnIndex {
         for trap in traps.iter() {
             // Strict causality: only losses that have ALREADY CLOSED before `current_timestamp_ns`
             if trap.brain_id != brain_id
+                || trap.quarantined
                 || trap.direction != direction
                 || trap.closed_timestamp_ns >= current_timestamp_ns
             {
@@ -1156,6 +1434,7 @@ impl PrecedentKnnIndex {
             .iter()
             .filter(|t| {
                 t.brain_id == brain_id
+                    && !t.quarantined
                     && t.closed_timestamp_ns < current_timestamp_ns
                     && t.entry_features_32.len() >= 32
             })
@@ -1186,6 +1465,11 @@ impl PrecedentKnnIndex {
                 root_cause_category: "HTF_STRUCTURAL_HEADWIND".to_string(),
                 conformal_entry_llr: -0.46,
                 conformal_entry_hurdle: 0.05,
+                conformal_margin: 0.51,
+                conformal_p_value: 1.0,
+                regime_bucket: "POS_GAMMA_PIN_MEAN_REVERT".to_string(),
+                epistemic_ood_score: 0.0,
+                kelly_epistemic_multiplier: 1.0,
             };
         }
 
@@ -1366,50 +1650,6 @@ impl PrecedentKnnIndex {
             }
         }
 
-        let mut promoted_trap_veto: Option<(Uuid, f64)> = None;
-        if syn_state.generation_id >= 37 {
-            let mut min_win_maha = maha_win;
-            for win in &causal_wins {
-                let mut dw = [0.0_f64; 32];
-                for k in 0..32 {
-                    dw[k] = (query_entry_features_32[k] as f64) - (win.entry_features_32[k] as f64);
-                }
-                let (d_w_ex, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
-                    &pooled_entry_cov,
-                    n_causal,
-                    &culprit_weights,
-                    &dw,
-                    scale_entry_sq,
-                );
-                if d_w_ex < min_win_maha {
-                    min_win_maha = d_w_ex;
-                }
-            }
-            for trap in causal_traps
-                .iter()
-                .filter(|t| t.root_cause_category == "ENTRY_LIQUIDITY_VACUUM_TRAP")
-            {
-                let mut dt = [0.0_f64; 32];
-                for k in 0..32 {
-                    dt[k] =
-                        (query_entry_features_32[k] as f64) - (trap.entry_features_32[k] as f64);
-                }
-                let (d_t_ex, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
-                    &pooled_entry_cov,
-                    n_causal,
-                    &culprit_weights,
-                    &dt,
-                    scale_entry_sq,
-                );
-                let conformal_margin = (d_t_ex - min_win_maha) - syn_state.entry_veto_margin_delta;
-                if conformal_margin < 0.0
-                    && promoted_trap_veto.is_none_or(|(_, prev_m)| conformal_margin < prev_m)
-                {
-                    promoted_trap_veto = Some((trap.loss_trade_id, conformal_margin));
-                }
-            }
-        }
-
         drop(traps);
         drop(wins);
 
@@ -1422,9 +1662,9 @@ impl PrecedentKnnIndex {
             (0.45 * prior_log_odds + maha_llr + 0.85 * fisher_llr + kernel_llr).clamp(-12.0, 12.0);
         let p_trap = 1.0 / (1.0 + (-entry_llr).exp());
 
-        let mut best_trap_sim = (0.50 + 0.48 * p_trap).clamp(0.05, 0.995);
-        let mut best_win_sim = (0.50 + 0.48 * (1.0 - p_trap)).clamp(0.05, 0.995);
-        let mut margin = best_trap_sim - best_win_sim;
+        let best_trap_sim = (0.50 + 0.48 * p_trap).clamp(0.05, 0.995);
+        let best_win_sim = (0.50 + 0.48 * (1.0 - p_trap)).clamp(0.05, 0.995);
+        let margin = best_trap_sim - best_win_sim;
 
         let eff_delta_margin = if syn_state.generation_id >= 1 {
             syn_state.entry_veto_margin_delta
@@ -1436,15 +1676,7 @@ impl PrecedentKnnIndex {
         } else {
             tau_veto.clamp(0.84, 0.93)
         };
-        let mut should_veto = best_trap_sim >= eff_tau_veto && margin > eff_delta_margin;
-        if let Some((trap_id, conf_margin)) = promoted_trap_veto {
-            should_veto = true;
-            best_trap_id = trap_id;
-            best_trap_cat = "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string();
-            best_trap_sim = best_trap_sim.max(eff_tau_veto + 0.025).min(0.995);
-            best_win_sim = best_win_sim.min(0.45);
-            margin = (eff_delta_margin + (-conf_margin).max(0.025)).max(best_trap_sim - best_win_sim);
-        }
+        let should_veto = best_trap_sim >= eff_tau_veto && margin > eff_delta_margin;
 
         EntryTrapVsWinnerDiagnostic {
             trap_similarity_score: (best_trap_sim * 1000.0).round() / 1000.0,
@@ -1455,6 +1687,11 @@ impl PrecedentKnnIndex {
             root_cause_category: best_trap_cat,
             conformal_entry_llr: (margin * 1000.0).round() / 1000.0,
             conformal_entry_hurdle: (eff_delta_margin * 1000.0).round() / 1000.0,
+            conformal_margin: ((eff_delta_margin - margin) * 1000.0).round() / 1000.0,
+            conformal_p_value: (1.0 - p_trap).clamp(0.01, 1.0),
+            regime_bucket: "POS_GAMMA_PIN_MEAN_REVERT".to_string(),
+            epistemic_ood_score: 0.0,
+            kelly_epistemic_multiplier: 1.0,
         }
     }
 
@@ -3313,6 +3550,7 @@ impl PrecedentKnnIndex {
             .iter()
             .filter(|t| {
                 t.brain_id == brain_id
+                    && !t.quarantined
                     && t.closed_timestamp_ns < current_timestamp_ns
                     && t.entry_features_32.len() >= 32
             })
@@ -3652,6 +3890,7 @@ impl PrecedentKnnIndex {
             .iter()
             .filter(|t| {
                 t.brain_id == brain_id
+                    && !t.quarantined
                     && t.closed_timestamp_ns < current_timestamp_ns
                     && t.entry_features_32.len() >= 32
             })
@@ -3809,49 +4048,6 @@ impl PrecedentKnnIndex {
             let rad_w = (0.5 * (dw_w * dw_w + dw_l * dw_l)).max(1.0);
             winner_lambda_entries.push(0.5 * (dw_w * dw_w - dw_l * dw_l) / rad_w);
         }
-        let mut promoted_trap_veto: Option<(Uuid, f64)> = None;
-        if syn_state.generation_id >= 37 {
-            let mut min_win_maha = maha_win;
-            for w in &causal_wins {
-                let mut dw = [0.0_f64; 32];
-                for i in 0..32 {
-                    dw[i] = (query_entry_features_32[i] as f64) - (w.entry_features_32[i] as f64);
-                }
-                let (d_w_ex, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
-                    &pooled_entry_cov,
-                    n_causal,
-                    &culprit_weights,
-                    &dw,
-                    scale_entry_sq,
-                );
-                if d_w_ex < min_win_maha {
-                    min_win_maha = d_w_ex;
-                }
-            }
-            for trap in causal_traps
-                .iter()
-                .filter(|t| t.root_cause_category == "ENTRY_LIQUIDITY_VACUUM_TRAP")
-            {
-                let mut dt = [0.0_f64; 32];
-                for i in 0..32 {
-                    dt[i] =
-                        (query_entry_features_32[i] as f64) - (trap.entry_features_32[i] as f64);
-                }
-                let (d_t_ex, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
-                    &pooled_entry_cov,
-                    n_causal,
-                    &culprit_weights,
-                    &dt,
-                    scale_entry_sq,
-                );
-                let conformal_margin = (d_t_ex - min_win_maha) - syn_state.entry_veto_margin_delta;
-                if conformal_margin < 0.0
-                    && promoted_trap_veto.is_none_or(|(_, prev_m)| conformal_margin < prev_m)
-                {
-                    promoted_trap_veto = Some((trap.loss_trade_id, conformal_margin));
-                }
-            }
-        }
         drop(traps);
         drop(wins);
 
@@ -3876,14 +4072,8 @@ impl PrecedentKnnIndex {
         let effective_entry_hurdle = conformal_win_q.min(asymmetric_hurdle);
         diag.conformal_entry_llr = (lambda_entry_x * 1000.0).round() / 1000.0;
         diag.conformal_entry_hurdle = (effective_entry_hurdle * 1000.0).round() / 1000.0;
+        diag.conformal_margin = ((effective_entry_hurdle - lambda_entry_x) * 1000.0).round() / 1000.0;
         diag.should_veto = maha_trap < maha_win && lambda_entry_x >= effective_entry_hurdle;
-        if let Some((trap_id, conf_margin)) = promoted_trap_veto {
-            diag.should_veto = true;
-            diag.matched_trap_id = Some(trap_id);
-            diag.root_cause_category = "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string();
-            diag.conformal_entry_llr =
-                ((effective_entry_hurdle + (-conf_margin).max(0.025)) * 1000.0).round() / 1000.0;
-        }
         diag
     }
 }
@@ -3920,6 +4110,12 @@ mod tests {
             entry_features_32: emb[0..32].to_vec(),
             bar1_r_multiple: -0.22,
             pre_settlement_bars_features_32: vec![(1, emb[0..32].to_vec())],
+            observation_count: 1,
+            true_saves_count: 0,
+            false_veto_regrets_count: 0,
+            cumulative_saved_r: 0.0,
+            cumulative_missed_winner_r: 0.0,
+            quarantined: false,
         });
 
         // Cold-start abstention guard: with < 3 closed precedents (N=1), evaluate_causal_post_entry_scratch MUST abstain (return None)
@@ -3953,6 +4149,12 @@ mod tests {
                 entry_features_32: emb[0..32].to_vec(),
                 bar1_r_multiple: -0.22,
                 pre_settlement_bars_features_32: vec![(1, emb[0..32].to_vec())],
+                observation_count: 1,
+                true_saves_count: 0,
+                false_veto_regrets_count: 0,
+                cumulative_saved_r: 0.0,
+                cumulative_missed_winner_r: 0.0,
+                quarantined: false,
             });
         }
         for _ in 0..3 {

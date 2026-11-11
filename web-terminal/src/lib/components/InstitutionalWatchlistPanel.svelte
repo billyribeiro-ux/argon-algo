@@ -346,6 +346,24 @@
         <span class="metric-sub">({paperOverlay?.open_paper_positions ?? 0} OPEN)</span>
       </span>
     </div>
+
+    <div class="telemetry-metric">
+      <span class="metric-label">BOCPD P_CP (GAMMA-FLIP)</span>
+      <span
+        class="metric-value {(watchlist?.bocpd_changepoint_prob ?? 0.05) >= 0.65 ? 'pnl-negative' : 'pnl-positive'}"
+      >
+        {(watchlist?.bocpd_changepoint_prob ?? 0.05).toFixed(3)}
+        <span class="metric-sub">E[r]={((watchlist?.bocpd_expected_run_length ?? 12.0)).toFixed(1)}</span>
+      </span>
+    </div>
+
+    <div class="telemetry-metric">
+      <span class="metric-label">ADAPTIVE MEMORY γ</span>
+      <span class="metric-value">
+        {(watchlist?.adaptive_forgetting_gamma ?? 0.98).toFixed(3)}
+        <span class="metric-sub">NIG DECAY</span>
+      </span>
+    </div>
   </div>
 
   {#if watchlist?.contextual_nig_allocations && watchlist.contextual_nig_allocations.length > 0}
@@ -361,6 +379,27 @@
           <strong>{alloc.slot_id}</strong>
           {(alloc.capital_weight_pi * 100).toFixed(1)}%
           <small>SR {alloc.posterior_t_sharpe.toFixed(2)}</small>
+        </span>
+      {/each}
+    </div>
+  {/if}
+
+  {#if watchlist?.martingale_shield_states && watchlist.martingale_shield_states.length > 0}
+    <div class="martingale-shield-strip" aria-label="Ville Martingale E-Process Alpha Shield">
+      <span class="shield-strip-title">
+        VILLE MARTINGALE ALPHA SHIELD (α=0.05, 1/α=20.0):
+      </span>
+      {#each watchlist.martingale_shield_states as m (m.slot_id)}
+        <span
+          class="shield-chip {m.probation_shadow_only ? 'probation-quarantine' : ''}"
+          title="{m.slot_id} | E-Value={m.martingale_e_value.toFixed(2)} | Kelly={m.martingale_kelly_multiplier.toFixed(2)}x | Stake λ={m.predictable_stake_lambda.toFixed(2)} | Live N={m.live_trades_observed} | Shadow N={m.shadow_recovery_trades_observed}"
+        >
+          <strong>{m.slot_id}</strong>
+          E={m.martingale_e_value.toFixed(2)}
+          <small>×{m.martingale_kelly_multiplier.toFixed(2)}</small>
+          {#if m.probation_shadow_only}
+            <span class="badge badge-probation">PROBATION</span>
+          {/if}
         </span>
       {/each}
     </div>
@@ -805,19 +844,40 @@
                   </span>
                 </div>
               {/if}
+              {#if row.optimal_long_strike}
+                <div class="greeks-meta" title="Exact BSM Surface Greeks: Δ={(row.net_delta ?? 0).toFixed(2)}, Γ={(row.net_gamma ?? 0).toFixed(4)}, Θ={(row.net_theta_per_bar ?? 0).toFixed(5)}/bar, Vanna={(row.net_vanna ?? 0).toFixed(3)}, Charm={(row.net_charm ?? 0).toFixed(4)}">
+                  <span class="strike-pair">K1={row.optimal_long_strike}{row.optimal_short_strike ? ` / K2=${row.optimal_short_strike}` : ''}</span>
+                  <span class="greek-pill">Δ {(row.net_delta ?? 0).toFixed(2)}</span>
+                  <span class="greek-pill">Γ {(row.net_gamma ?? 0).toFixed(3)}</span>
+                  <span class="greek-pill">Vanna {(row.net_vanna ?? 0).toFixed(2)}</span>
+                  <span class="greek-pill">Charm {(row.net_charm ?? 0).toFixed(3)}</span>
+                </div>
+              {/if}
             </td>
-            <td>
+            <td class="execution-cell">
               <span class="badge badge-venue">{row.venue_ticket}</span>
+              {#if row.execution_tactic}
+                <div class="execution-plan-meta" title="Execution: {row.execution_tactic} | Microprice Limit={row.microprice_limit_price ? formatSubPennyPrice(row.microprice_limit_price) : '-'} | Urgency={((row.execution_urgency_score ?? 0) * 100).toFixed(0)}% | Slip={(row.expected_slippage_bps ?? 0).toFixed(1)}bps">
+                  <span class="badge badge-exec-tactic">{row.execution_tactic.replace('IMMEDIATE_', '').replace('_LIMIT', '')}</span>
+                  {#if row.microprice_limit_price}
+                    <span class="microprice-tag">{formatSubPennyPrice(row.microprice_limit_price)}</span>
+                  {/if}
+                  <span class="urgency-tag">{((row.execution_urgency_score ?? 0) * 100).toFixed(0)}% urg</span>
+                </div>
+              {/if}
             </td>
             <td data-numeric="true" class="tabular-num kelly-cell">
               {row.kelly_fraction_pct.toFixed(2)}%
-              {#if (row.kelly_epistemic_multiplier ?? 1.0) < 0.999 || (row.eigen_kelly_multiplier ?? 1.0) < 0.999}
+              {#if (row.kelly_epistemic_multiplier ?? 1.0) < 0.999 || (row.eigen_kelly_multiplier ?? 1.0) < 0.999 || (row.martingale_kelly_multiplier ?? 1.0) < 0.999}
                 <span
                   class="kelly-mult"
-                  title="Stage 0 ×{(row.unified_stage0_kelly_multiplier ?? row.kelly_epistemic_multiplier ?? 1.0).toFixed(2)} | Eigen κ ×{(row.eigen_kelly_multiplier ?? 1.0).toFixed(2)} | Contextual π={((row.contextual_brain_weight_pi ?? 0.167) * 100).toFixed(1)}%"
+                  title="Stage 0 ×{(row.unified_stage0_kelly_multiplier ?? row.kelly_epistemic_multiplier ?? 1.0).toFixed(2)} | Eigen κ ×{(row.eigen_kelly_multiplier ?? 1.0).toFixed(2)} | Martingale ×{(row.martingale_kelly_multiplier ?? 1.0).toFixed(2)} | Contextual π={((row.contextual_brain_weight_pi ?? 0.167) * 100).toFixed(1)}%"
                 >
-                  ×{((row.unified_stage0_kelly_multiplier ?? row.kelly_epistemic_multiplier ?? 1.0) * (row.eigen_kelly_multiplier ?? 1.0)).toFixed(2)}
+                  ×{((row.unified_stage0_kelly_multiplier ?? row.kelly_epistemic_multiplier ?? 1.0) * (row.eigen_kelly_multiplier ?? 1.0) * (row.martingale_kelly_multiplier ?? 1.0)).toFixed(2)}
                 </span>
+              {/if}
+              {#if row.probation_shadow_only}
+                <span class="badge badge-probation-sm" title="Brain under Martingale probation (E_t >= 20.0). Routes strictly to zero-capital Shadow-Tape!">SHADOW ONLY</span>
               {/if}
             </td>
             <td>
@@ -1767,6 +1827,115 @@
     font-family: var(--font-mono, monospace);
     font-size: 0.6rem;
     color: oklch(0.74 0.03 250);
+  }
+
+  .martingale-shield-strip {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    background: oklch(0.14 0.03 280 / 0.8);
+    border: 1px solid oklch(0.3 0.06 280 / 0.45);
+    border-radius: 4px;
+    font-size: 0.66rem;
+    margin-top: 4px;
+  }
+
+  .shield-strip-title {
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: oklch(0.8 0.06 280);
+  }
+
+  .shield-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    background: oklch(0.2 0.03 280 / 0.85);
+    border: 1px solid oklch(0.34 0.06 280 / 0.5);
+    border-radius: 3px;
+    font-family: var(--font-mono, monospace);
+    color: oklch(0.92 0.03 280);
+  }
+
+  .shield-chip small {
+    color: oklch(0.75 0.06 170);
+    font-size: 0.6rem;
+  }
+
+  .shield-chip.probation-quarantine {
+    background: oklch(0.25 0.1 25 / 0.9);
+    border-color: oklch(0.5 0.18 25);
+    color: oklch(0.95 0.08 25);
+  }
+
+  .badge-probation {
+    background: oklch(0.35 0.15 25);
+    color: oklch(0.98 0.05 25);
+    font-size: 0.55rem;
+    padding: 0 3px;
+    border-radius: 2px;
+  }
+
+  .badge-probation-sm {
+    display: block;
+    background: oklch(0.35 0.15 25);
+    color: oklch(0.98 0.05 25);
+    font-size: 0.5rem;
+    padding: 0 2px;
+    border-radius: 2px;
+    margin-top: 2px;
+  }
+
+  .greeks-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 3px;
+    margin-top: 3px;
+    font-family: var(--font-mono, monospace);
+    font-size: 0.58rem;
+  }
+
+  .strike-pair {
+    font-weight: 700;
+    color: oklch(0.85 0.08 85);
+    margin-right: 2px;
+  }
+
+  .greek-pill {
+    padding: 0 3px;
+    background: oklch(0.18 0.02 260 / 0.6);
+    border-radius: 2px;
+    color: oklch(0.78 0.03 250);
+  }
+
+  .execution-plan-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 3px;
+    margin-top: 2px;
+    font-family: var(--font-mono, monospace);
+    font-size: 0.58rem;
+  }
+
+  .badge-exec-tactic {
+    background: oklch(0.22 0.06 200 / 0.85);
+    color: oklch(0.9 0.08 200);
+    border: 1px solid oklch(0.38 0.1 200 / 0.5);
+    font-size: 0.55rem;
+    padding: 0 3px;
+  }
+
+  .microprice-tag {
+    color: oklch(0.88 0.06 140);
+  }
+
+  .urgency-tag {
+    color: oklch(0.72 0.05 60);
   }
 
   :global(.spin-icon) {

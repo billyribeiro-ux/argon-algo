@@ -1,6 +1,6 @@
 {
   "status": "PROMOTED_CHAMPION",
-  "timestamp_iso": "2026-11-11T20:20:03.780263+00:00",
+  "timestamp_iso": "2026-11-11T23:33:20.919019+00:00",
   "current_generation_id": 36,
   "candidate_generation_id": 37,
   "promoted_generation_id": 37,
@@ -13,7 +13,7 @@
   "mirror_descent_kl_divergence": 0.000076,
   "autopsies_decoded": [
     {
-      "trade_id": "8e660577-985c-4361-9368-ef3a4cf75cea",
+      "trade_id": "fe01bce4-f457-452d-956c-dec19a16b6af",
       "symbol": "NVDA",
       "brain_id": "BRAIN-02",
       "realized_r": -1.0,
@@ -71,7 +71,7 @@
       ],
       "mahalanobis_distance_shift": 8.857,
       "collapse_bar_offset": 1,
-      "summary": "Trade 8e660577 on NVDA (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [float_rotation_log] (MFE: +0.03R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 8.857)",
+      "summary": "Trade fe01bce4 on NVDA (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [float_rotation_log] (MFE: +0.03R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 8.857)",
       "entry_features_32": [
         0.5588235,
         0.025,
@@ -108,7 +108,7 @@
       ]
     },
     {
-      "trade_id": "c7479ebe-fe87-41e0-93d7-21cc89b7f548",
+      "trade_id": "fe715c23-93e6-4331-a79c-c07cfe67ae4f",
       "symbol": "AMD",
       "brain_id": "BRAIN-02",
       "realized_r": -1.0,
@@ -166,7 +166,7 @@
       ],
       "mahalanobis_distance_shift": 4.825,
       "collapse_bar_offset": 2,
-      "summary": "Trade c7479ebe on AMD (BRAIN-02) failed via POST_ENTRY_ORDERFLOW_TOXICITY_REVERSAL at Bar +2: top culprit [close_log_ret] (MFE: +0.35R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 4.825)",
+      "summary": "Trade fe715c23 on AMD (BRAIN-02) failed via POST_ENTRY_ORDERFLOW_TOXICITY_REVERSAL at Bar +2: top culprit [close_log_ret] (MFE: +0.35R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 4.825)",
       "entry_features_32": [
         0.8208955,
         0.025,
@@ -203,7 +203,7 @@
       ]
     },
     {
-      "trade_id": "4694c43d-53ff-4e2d-9baa-0ce7654b973f",
+      "trade_id": "7534a872-d509-444d-abf4-1378f21ad828",
       "symbol": "QQQ",
       "brain_id": "BRAIN-02",
       "realized_r": 1.472425,
@@ -261,7 +261,7 @@
       ],
       "mahalanobis_distance_shift": 6.191,
       "collapse_bar_offset": 3,
-      "summary": "Trade 4694c43d on QQQ (BRAIN-02) failed via MFE_STALL_GIVEBACK_EXHAUSTION at Bar +3: top culprit [close_log_ret] (MFE: +2.45R -> Realized: 1.47R, Giveback: 39.9%, LW-Mahalanobis Shift: 6.191)",
+      "summary": "Trade 7534a872 on QQQ (BRAIN-02) failed via MFE_STALL_GIVEBACK_EXHAUSTION at Bar +3: top culprit [close_log_ret] (MFE: +2.45R -> Realized: 1.47R, Giveback: 39.9%, LW-Mahalanobis Shift: 6.191)",
       "entry_features_32": [
         0.84126985,
         0.025,
@@ -302,14 +302,14 @@
     "gate1_baseline_lock_passed": true,
     "gate1_baseline_winners_preserved": 116,
     "gate1_baseline_winners_target": 116,
-    "gate1_current_expectancy_r": 0.2644,
-    "gate1_candidate_expectancy_r": 0.2652,
-    "gate1_current_pf": 1.8405,
-    "gate1_candidate_pf": 1.8452,
-    "current_baseline_exp_r": 0.2644,
-    "candidate_baseline_exp_r": 0.2652,
-    "current_baseline_pf": 1.8405,
-    "candidate_baseline_pf": 1.8452,
+    "gate1_current_expectancy_r": 0.2122,
+    "gate1_candidate_expectancy_r": 0.213,
+    "gate1_current_pf": 1.5789,
+    "gate1_candidate_pf": 1.5823,
+    "current_baseline_exp_r": 0.2122,
+    "candidate_baseline_exp_r": 0.213,
+    "current_baseline_pf": 1.5789,
+    "candidate_baseline_pf": 1.5823,
     "gate2_walkforward_passed": true,
     "gate2_current_walkforward_net_r": 1.1224,
     "gate2_candidate_walkforward_net_r": 2.849,
@@ -323,7 +323,7 @@
     "quarantined_traps_count": 0,
     "mirror_descent_kl_divergence": 0.000076,
     "all_gates_passed": true,
-    "decision_rationale": "PROMOTED Gen 37: Gate 1 passed (116/116 baseline winners, Exp: 0.2644R -> 0.2652R, PF: 1.841 -> 1.845) & Gate 2 passed (WF Net R: 1.122R -> 2.849R, Full stops: 2 -> 0, New traps: +1, Quarantined: 0)"
+    "decision_rationale": "PROMOTED Gen 37: Gate 1 passed (116/116 baseline winners, Exp: 0.2122R -> 0.2130R, PF: 1.579 -> 1.582) & Gate 2 passed (WF Net R: 1.122R -> 2.849R, Full stops: 2 -> 0, New traps: +1, Quarantined: 0)"
   },
   "updated_synaptic_states": [
     {
@@ -641,15 +641,15 @@
         "6d9b0291-466c-42b5-9f10-3001a20f2915": 0.9912,
         "72c628a1-b359-4cc6-9a01-328e920fe9ee": 1.0065,
         "760f0c60-4ab0-4a3d-9a8d-21b5fc78de52": 0.9971,
-        "8e660577-985c-4361-9368-ef3a4cf75cea": 1.0298,
         "9e123dab-246a-42c1-9e06-f5f0e5dd7456": 0.994,
         "a3f24427-7572-4e8f-abd5-c385666dbe16": 0.9955,
         "b5d1ab65-d397-4301-b040-5d1820a1b16b": 0.9908,
         "c657bf95-c630-46d2-8e05-77f55fbe4841": 0.9913,
-        "c7479ebe-fe87-41e0-93d7-21cc89b7f548": 0.9883,
         "df3ee90f-2c41-4037-a8cb-6642df100a05": 0.9953,
         "e69f2515-f284-4f09-84ee-dc0bd5a9a663": 0.987,
         "ec3688f8-debd-4bb5-b2ee-7778b57457d7": 0.9956,
+        "fe01bce4-f457-452d-956c-dec19a16b6af": 1.0298,
+        "fe715c23-93e6-4331-a79c-c07cfe67ae4f": 0.9883,
         "fedbdf31-5e47-4216-b83a-b0a0dc036ff3": 1.0015
       },
       "empirical_bayes_shrinkage_lambda": 0.9104,

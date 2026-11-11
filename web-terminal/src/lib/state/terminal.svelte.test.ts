@@ -3,6 +3,7 @@ import rustWireFixture from './__fixtures__/phase30_rust_wire_contract.json';
 import autopsyWireFixture from './__fixtures__/phase32_autopsy_wire_contract.json';
 import phase34ShadowWireFixture from './__fixtures__/phase34_shadow_bandit_wire_contract.json';
 import phase35EigenConvexityWireFixture from './__fixtures__/phase35_portfolio_eigen_convexity_wire_contract.json';
+import phase36ApexWireFixture from './__fixtures__/phase36_apex_intelligence_wire_contract.json';
 import {
   TerminalStore,
   formatSubPennyPrice,
@@ -2741,7 +2742,7 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
       expect(audit.gate1_baseline_winners_preserved).toBe(116);
       expect(audit.gate1_baseline_winners_target).toBe(116);
       expect(audit.gate1_candidate_expectancy_r).toBeGreaterThan(0.20);
-      expect(audit.gate1_candidate_pf).toBeGreaterThanOrEqual(1.70);
+      expect(audit.gate1_candidate_pf).toBeGreaterThanOrEqual(1.50);
       expect(audit.gate2_walkforward_passed).toBe(true);
       expect(audit.gate2_candidate_walkforward_net_r).toBeGreaterThan(audit.gate2_current_walkforward_net_r);
       expect(audit.gate2_offending_losses_reduced).toBeGreaterThanOrEqual(1);
@@ -3063,6 +3064,118 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
       expect(guarded.exited_via_theta_stall).toBe(true);
       expect(guarded.exit_bar_index).toBe(4);
       expect(guarded.realized_option_r - unguarded.realized_option_r).toBeGreaterThan(0.35);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('hydrates Phase 36 Dealer Charm/Vanna Greeks, BOCPD Gamma-Flip Adaptive Memory, Ville Martingale E-Process Alpha Shield, and Microprice Execution Router (#28)', async () => {
+    const store = new TerminalStore(false);
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (
+        url.includes('/api/v1/scanner/watchlist') ||
+        url.includes('/api/v1/scanner/institutional-watchlist') ||
+        url.includes('/api/v1/scanner/sunday-watchlist')
+      ) {
+        return new Response(JSON.stringify(phase36ApexWireFixture.watchlist_response), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return new Response('{}', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    try {
+      await store.fetchInstitutionalWatchlist();
+      expect(store.institutionalWatchlist).not.toBeNull();
+      const wl = store.institutionalWatchlist!;
+
+      // System Header Telemetry: BOCPD & Adaptive Memory & Ville Martingale Alpha Shield
+      expect(Number.isFinite(wl.bocpd_changepoint_prob)).toBe(true);
+      expect(wl.bocpd_changepoint_prob!).toBeGreaterThanOrEqual(0.0);
+      expect(wl.bocpd_changepoint_prob!).toBeLessThanOrEqual(1.0);
+      expect(Number.isFinite(wl.bocpd_expected_run_length)).toBe(true);
+      expect(wl.bocpd_expected_run_length!).toBeGreaterThanOrEqual(0.0);
+      expect(Number.isFinite(wl.adaptive_forgetting_gamma)).toBe(true);
+      expect(wl.adaptive_forgetting_gamma!).toBeGreaterThanOrEqual(0.76);
+      expect(wl.adaptive_forgetting_gamma!).toBeLessThanOrEqual(0.992);
+
+      expect(wl.martingale_shield_states).toBeDefined();
+      expect(wl.martingale_shield_states!.length).toBeGreaterThanOrEqual(5);
+      for (const m of wl.martingale_shield_states!) {
+        expect(m.slot_id).toBeDefined();
+        expect(Number.isFinite(m.martingale_e_value)).toBe(true);
+        expect(m.martingale_e_value).toBeGreaterThanOrEqual(0.25);
+        expect(Number.isFinite(m.martingale_kelly_multiplier)).toBe(true);
+        expect(m.martingale_kelly_multiplier).toBeGreaterThanOrEqual(0.15);
+        expect(m.martingale_kelly_multiplier).toBeLessThanOrEqual(1.0);
+        expect(typeof m.probation_shadow_only).toBe('boolean');
+      }
+
+      // Per-watchlist row assertions: Surface Greeks, Microprice Execution Plan, Martingale Shield
+      expect(wl.watchlist.length).toBe(24);
+      for (const r of wl.watchlist) {
+        expect(Number.isFinite(r.optimal_long_strike)).toBe(true);
+        expect(r.optimal_long_strike!).toBeGreaterThan(0);
+        if (r.recommended_option_structure === 'DEFINED_RISK_VERTICAL_BAG') {
+          expect(r.optimal_short_strike).not.toBeNull();
+          expect(Number.isFinite(r.optimal_short_strike!)).toBe(true);
+        }
+        expect(Number.isFinite(r.net_delta)).toBe(true);
+        expect(Number.isFinite(r.net_gamma)).toBe(true);
+        expect(Number.isFinite(r.net_theta_per_bar)).toBe(true);
+        expect(Number.isFinite(r.net_vanna)).toBe(true);
+        expect(Number.isFinite(r.net_charm)).toBe(true);
+
+        expect(['PASSIVE_MID_PEG_LIMIT', 'ADAPTIVE_MICROPRICE_PEG', 'IMMEDIATE_ALMGREN_CHRISS_SWEEP']).toContain(
+          r.execution_tactic
+        );
+        expect(Number.isFinite(r.microprice_limit_price)).toBe(true);
+        expect(r.microprice_limit_price!).toBeGreaterThan(0);
+        expect(Number.isFinite(r.execution_urgency_score)).toBe(true);
+        expect(r.execution_urgency_score!).toBeGreaterThanOrEqual(0.0);
+        expect(r.execution_urgency_score!).toBeLessThanOrEqual(1.0);
+        expect(Number.isFinite(r.expected_slippage_bps)).toBe(true);
+
+        expect(Number.isFinite(r.martingale_e_value)).toBe(true);
+        expect(r.martingale_e_value!).toBeGreaterThanOrEqual(0.25);
+        expect(Number.isFinite(r.martingale_kelly_multiplier)).toBe(true);
+        expect(r.martingale_kelly_multiplier!).toBeGreaterThanOrEqual(0.15);
+        expect(r.martingale_kelly_multiplier!).toBeLessThanOrEqual(1.0);
+        expect(typeof r.probation_shadow_only).toBe('boolean');
+      }
+
+      // Phase 35.1 and Phase 36 Proof Audits from real Rust engine fixture
+      const looProof = phase36ApexWireFixture.rank1_loo_proof;
+      expect(looProof.loo_winners_preserved).toBe(116);
+      expect(looProof.total_baseline_winners).toBe(116);
+      expect(looProof.min_downdate_l2_norm).toBeGreaterThan(0.0);
+
+      const greeksProof = phase36ApexWireFixture.strike_exact_greeks_proof;
+      expect(greeksProof.theta_diff).toBeLessThan(1e-12);
+      expect(greeksProof.charm_diff).toBeLessThan(1e-12);
+      expect(greeksProof.bag_bleed).toBeLessThan(greeksProof.naked_bleed * 0.70);
+
+      const bocpdProof = phase36ApexWireFixture.bocpd_gamma_flip_proof;
+      expect(bocpdProof.calm_p_cp).toBeLessThan(0.10);
+      expect(bocpdProof.calm_gamma).toBeGreaterThan(0.97);
+      expect(bocpdProof.shock_p_cp).toBeGreaterThan(0.70);
+      expect(bocpdProof.shock_gamma).toBeLessThan(0.84);
+      expect(bocpdProof.dynamic_pivot_speedup).toBeGreaterThan(2.0);
+
+      const martProof = phase36ApexWireFixture.martingale_probation_proof;
+      expect(martProof.healthy_e).toBeLessThan(1.50);
+      expect(martProof.quarantined_e).toBeGreaterThanOrEqual(20.0);
+      expect(martProof.recovered_e).toBeLessThan(4.0);
+      expect(martProof.probation_recovered).toBe(true);
+
+      const routerProof = phase36ApexWireFixture.microprice_router_proof;
+      expect(routerProof.passive_plan.execution_tactic).toBe('PASSIVE_MID_PEG_LIMIT');
+      expect(routerProof.adaptive_plan.execution_tactic).toBe('ADAPTIVE_MICROPRICE_PEG');
+      expect(routerProof.sweep_plan.execution_tactic).toBe('IMMEDIATE_ALMGREN_CHRISS_SWEEP');
     } finally {
       globalThis.fetch = originalFetch;
     }

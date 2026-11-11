@@ -70,6 +70,8 @@ pub struct BsmLegGreeks {
     pub vomma: f64,
 }
 
+pub type BsmSurfaceLegGreeks = BsmLegGreeks;
+
 /// Solved single-leg $(K_1^*)$ or 2-leg vertical `BAG` $(K_1^*, K_2^*)$ with exact leg-difference Greeks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimalOptionStructurePlan {
@@ -90,6 +92,8 @@ pub struct OptimalOptionStructurePlan {
     pub leg_long: BsmLegGreeks,
     pub leg_short: Option<BsmLegGreeks>,
 }
+
+pub type SolvedOptionStructurePlan = OptimalOptionStructurePlan;
 
 /// Causal inputs for evaluating an option setup's convexity-to-theta efficiency and structure routing.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

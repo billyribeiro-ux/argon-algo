@@ -860,6 +860,16 @@ export interface BrainContextualAllocationRow {
   false_veto_regrets_penalized: number;
 }
 
+export interface BrainMartingaleStateEntry {
+  slot_id: string;
+  martingale_e_value: number;
+  martingale_kelly_multiplier: number;
+  probation_shadow_only: boolean;
+  predictable_stake_lambda: number;
+  live_trades_observed: number;
+  shadow_recovery_trades_observed: number;
+}
+
 export interface InstitutionalWatchlistRow {
   rank: number;
   symbol: string;
@@ -903,6 +913,20 @@ export interface InstitutionalWatchlistRow {
   recommended_option_structure?: string;
   gamma_theta_efficiency?: number;
   theta_burn_hazard?: number;
+  optimal_long_strike?: number;
+  optimal_short_strike?: number | null;
+  net_delta?: number;
+  net_gamma?: number;
+  net_theta_per_bar?: number;
+  net_vanna?: number;
+  net_charm?: number;
+  execution_tactic?: string;
+  microprice_limit_price?: number;
+  execution_urgency_score?: number;
+  expected_slippage_bps?: number;
+  martingale_e_value?: number;
+  martingale_kelly_multiplier?: number;
+  probation_shadow_only?: boolean;
 }
 
 export interface InstitutionalWatchlistResponse {
@@ -918,6 +942,10 @@ export interface InstitutionalWatchlistResponse {
   effective_independent_bets_neff?: number;
   eigen_kelly_multiplier?: number;
   contextual_nig_allocations?: BrainContextualAllocationRow[];
+  bocpd_changepoint_prob?: number;
+  bocpd_expected_run_length?: number;
+  adaptive_forgetting_gamma?: number;
+  martingale_shield_states?: BrainMartingaleStateEntry[];
   timestamp_iso: string;
   eval_epoch_s?: number;
   watchlist: InstitutionalWatchlistRow[];

@@ -8023,4 +8023,573 @@ mod tests {
             rho_with_theta
         );
     }
+
+    #[tokio::test]
+    async fn test_phase35_1_and_36_apex_greeks_bocpd_eprocess_and_microprice_router() {
+        use crate::autopsy_evolver::{
+            compute_rank1_loo_centroid_32, simulate_trade_under_candidate_with_trap_bank,
+            LedoitWolfPrecision, RegimeBucket,
+        };
+        use crate::execution_microstructure::{
+            ExecutionTactic, MicropriceExecutionRouter, MicrostructureQuoteInput,
+        };
+        use crate::martingale_shield::{
+            BrainMartingaleState, VILLE_ALPHA_THRESHOLD, VILLE_RECOVERY_HYSTERESIS_FLOOR,
+        };
+        use crate::options_convexity::{
+            OptionConvexityStructure, OptionsConvexityEngine,
+        };
+        use crate::portfolio_eigen_risk::{MetaAllocatorHorizonSlot, NigPosteriorStats};
+        use crate::regime_bocpd::AdamsMacKayBocpdEngine;
+        use axum::body::Body;
+        use raw_fingerprint_core::TradeDirection;
+        use std::path::Path;
+        use tower::ServiceExt;
+
+        let models_dir = Path::new("../../models");
+        let state = AppState::new(if models_dir.exists() {
+            Some(models_dir)
+        } else {
+            None
+        });
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+        assert!(state.ledger.load_from_disk(ledger_path));
+        state.ledger.set_enforce_hard_scratch_on_baseline(false);
+        for row in &state.ledger.closed_trades_snapshot() {
+            state.ledger.sync_closed_row_to_precedent_knn(row);
+        }
+        state.ledger.recompute_causal_plasticity();
+
+        let app = routes::build_axum_router(state.clone());
+        let closed_snap = state.ledger.closed_trades_snapshot();
+        assert_eq!(closed_snap.len(), 173, "Baseline must contain 173 settled trades");
+        let precision_base = LedoitWolfPrecision::from_settled_trades(&closed_snap);
+
+        // =========================================================================
+        // (a) Exact Rank-1 LOO Centroid Downdate Proof: ||mu_W_loo - mu_W_full||_2 > 0.0 & Gate 1 116/116
+        // =========================================================================
+        let mut loo_winners_preserved = 0usize;
+        let mut total_baseline_winners = 0usize;
+        let mut min_downdate_l2_norm = f64::INFINITY;
+        let mut max_downdate_l2_norm = 0.0_f64;
+
+        for tr in &closed_snap {
+            let syn_st = state
+                .ledger
+                .precedent_knn()
+                .get_synaptic_plasticity_state(tr.brain_id);
+            if tr.is_winner || tr.realized_r_multiple > 0.0 {
+                total_baseline_winners += 1;
+                if let Some(manifold) = precision_base.brains.get(&tr.brain_id) {
+                    let mu_full = manifold.winner_centroid_32;
+                    let mu_loo = compute_rank1_loo_centroid_32(
+                        &mu_full,
+                        &manifold.winner_exemplars_32,
+                        Some(tr.trade_id),
+                    );
+                    let mut sum_sq = 0.0;
+                    for f in 0..32 {
+                        let diff = mu_loo[f] - mu_full[f];
+                        sum_sq += diff * diff;
+                    }
+                    let l2_norm = sum_sq.sqrt();
+                    if manifold.winner_exemplars_32.iter().any(|(id, _)| *id == tr.trade_id)
+                        && manifold.winner_exemplars_32.len() > 1
+                    {
+                        assert!(
+                            l2_norm > 0.0,
+                            "Winner centroid rank-1 downdate L2 norm must be > 0.0, got {}",
+                            l2_norm
+                        );
+                        if l2_norm < min_downdate_l2_norm {
+                            min_downdate_l2_norm = l2_norm;
+                        }
+                        if l2_norm > max_downdate_l2_norm {
+                            max_downdate_l2_norm = l2_norm;
+                        }
+                    }
+                }
+                let sim_loo = simulate_trade_under_candidate_with_trap_bank(
+                    tr,
+                    &syn_st,
+                    &[],
+                    &precision_base,
+                );
+                if !sim_loo.vetoed && sim_loo.realized_r > 0.0 {
+                    loo_winners_preserved += 1;
+                }
+            }
+        }
+        assert_eq!(total_baseline_winners, 116);
+        assert_eq!(
+            loo_winners_preserved, 116,
+            "Gate 1 must preserve all 116 baseline winners under rank-1 LOO centroid downdate!"
+        );
+        assert!(min_downdate_l2_norm > 0.0);
+
+        // =========================================================================
+        // (b) Strike-Exact 2-Leg Surface Greeks (Charm + Vanna) & Strike Solver Proof
+        // =========================================================================
+        let spot = 590.0_f64;
+        let session_frac = 5.0 / 390.0;
+        let solved_high_iv = OptionsConvexityEngine::solve_optimal_option_structure(
+            TradeDirection::Long,
+            spot,
+            588.0,
+            595.0,
+            3.50,
+            0.32,
+            0.82,
+            1.0,
+            session_frac,
+            RegimeBucket::PosGammaPinMeanRevert,
+        );
+        assert_eq!(
+            solved_high_iv.structure,
+            OptionConvexityStructure::DefinedRiskVerticalBag
+        );
+        let s_short = solved_high_iv
+            .leg_short
+            .as_ref()
+            .expect("Vertical bag must have short leg");
+        let theta_diff = (solved_high_iv.net_theta_per_bar
+            - (solved_high_iv.leg_long.theta_per_bar - s_short.theta_per_bar))
+            .abs();
+        let charm_diff = (solved_high_iv.net_charm_per_bar
+            - (solved_high_iv.leg_long.charm_per_bar - s_short.charm_per_bar))
+            .abs();
+        let delta_diff = (solved_high_iv.net_delta
+            - (solved_high_iv.leg_long.delta - s_short.delta))
+            .abs();
+        let gamma_diff = (solved_high_iv.net_gamma
+            - (solved_high_iv.leg_long.gamma - s_short.gamma))
+            .abs();
+        let vanna_diff = (solved_high_iv.net_vanna
+            - (solved_high_iv.leg_long.vanna - s_short.vanna))
+            .abs();
+
+        assert!(
+            theta_diff < 1e-12,
+            "Net Theta must match Leg_Long - Leg_Short difference within 1e-12, got {}",
+            theta_diff
+        );
+        assert!(
+            charm_diff < 1e-12,
+            "Net Charm must match Leg_Long - Leg_Short difference within 1e-12, got {}",
+            charm_diff
+        );
+        assert!(delta_diff < 1e-12);
+        assert!(gamma_diff < 1e-12);
+        assert!(vanna_diff < 1e-12);
+
+        let naked_bleed = solved_high_iv.leg_long.theta_per_bar.abs()
+            + solved_high_iv.leg_long.charm_per_bar.abs() * 3.50;
+        let bag_bleed = solved_high_iv.net_theta_per_bar.abs()
+            + solved_high_iv.net_charm_per_bar.abs() * 3.50;
+        assert!(
+            bag_bleed < naked_bleed * 0.70,
+            "Vertical BAG must reduce bar Theta+Charm bleed by > 30% vs naked ATM call! bag={} vs naked={}",
+            bag_bleed,
+            naked_bleed
+        );
+
+        // =========================================================================
+        // (c) Adams-MacKay BOCPD Gamma-Flip Shift Proof & Dynamic Forgetting NIG Pivot
+        // =========================================================================
+        let mut bocpd = AdamsMacKayBocpdEngine::new(35.0);
+        let mut calm_feat = [0.0_f64; 32];
+        calm_feat[1] = 0.02;
+        calm_feat[8] = 0.01;
+        for i in 12..20 {
+            calm_feat[i] = 0.80; // Positive dealer GEX
+        }
+        for i in 20..26 {
+            calm_feat[i] = 0.10; // Low toxicity
+        }
+        let mut prev_rl = 0.0;
+        let mut calm_tel = bocpd.telemetry();
+        for _ in 0..25 {
+            calm_tel = bocpd.observe_features_32(&calm_feat);
+            assert!(
+                calm_tel.bocpd_expected_run_length >= prev_rl,
+                "Expected run length must grow monotonically during calm regime! prev={}, cur={}",
+                prev_rl,
+                calm_tel.bocpd_expected_run_length
+            );
+            prev_rl = calm_tel.bocpd_expected_run_length;
+        }
+        assert!(
+            calm_tel.bocpd_changepoint_prob < 0.10,
+            "Calm regime p_cp must be < 0.10, got {}",
+            calm_tel.bocpd_changepoint_prob
+        );
+        assert!(
+            calm_tel.adaptive_forgetting_gamma > 0.97,
+            "Calm regime gamma must be > 0.97, got {}",
+            calm_tel.adaptive_forgetting_gamma
+        );
+
+        // Inject 3-bar negative-gamma toxicity shock
+        let mut shock_feat_1 = [0.0_f64; 32];
+        shock_feat_1[1] = -4.0;
+        shock_feat_1[8] = -3.5;
+        for i in 12..20 {
+            shock_feat_1[i] = -2.5; // Negative GEX flip!
+        }
+        for i in 20..26 {
+            shock_feat_1[i] = 0.95; // Toxicity jump!
+        }
+
+        let mut shock_feat_2 = [0.0_f64; 32];
+        shock_feat_2[1] = -4.5;
+        shock_feat_2[8] = -4.0;
+        for i in 12..20 {
+            shock_feat_2[i] = -3.0;
+        }
+        for i in 20..26 {
+            shock_feat_2[i] = 0.98;
+        }
+
+        let mut shock_feat_3 = [0.0_f64; 32];
+        shock_feat_3[1] = -5.0;
+        shock_feat_3[8] = -4.5;
+        for i in 12..20 {
+            shock_feat_3[i] = -3.5;
+        }
+        for i in 20..26 {
+            shock_feat_3[i] = 0.99;
+        }
+
+        bocpd.observe_features_32(&shock_feat_1);
+        bocpd.observe_features_32(&shock_feat_2);
+        let shock_tel = bocpd.observe_features_32(&shock_feat_3);
+        assert!(
+            shock_tel.bocpd_changepoint_prob > 0.70,
+            "Post-shock p_cp must spike > 0.70, got {}",
+            shock_tel.bocpd_changepoint_prob
+        );
+        assert!(
+            shock_tel.adaptive_forgetting_gamma < 0.84,
+            "Post-shock adaptive gamma must drop < 0.84, got {}",
+            shock_tel.adaptive_forgetting_gamma
+        );
+
+        // Prove dynamic gamma NIG capital weights pivot > 2x faster than fixed 0.97
+        let mut nig_dyn_b02 = NigPosteriorStats {
+            mu_n: 0.80,
+            kappa_n: 20.0,
+            alpha_n: 5.0,
+            beta_n: 2.0,
+            ..Default::default()
+        };
+        let mut nig_fix_b02 = nig_dyn_b02.clone();
+        let mut nig_dyn_s0d = NigPosteriorStats {
+            mu_n: 0.10,
+            kappa_n: 20.0,
+            alpha_n: 5.0,
+            beta_n: 2.0,
+            ..Default::default()
+        };
+        let mut nig_fix_s0d = nig_dyn_s0d.clone();
+
+        let initial_diff = nig_dyn_b02.mu_n - nig_dyn_s0d.mu_n;
+
+        // Trade 1 post-shock: B02 takes -1.5R loss, SCALP_0DTE takes +1.8R win
+        nig_dyn_b02.observe_settled_trade_with_gamma(-1.5, 0.40, shock_tel.adaptive_forgetting_gamma);
+        nig_dyn_s0d.observe_settled_trade_with_gamma(1.8, 0.40, shock_tel.adaptive_forgetting_gamma);
+
+        nig_fix_b02.observe_settled_trade_with_gamma(-1.5, 0.40, 0.97);
+        nig_fix_s0d.observe_settled_trade_with_gamma(1.8, 0.40, 0.97);
+
+        let dyn_diff_change = initial_diff - (nig_dyn_b02.mu_n - nig_dyn_s0d.mu_n);
+        let fix_diff_change = initial_diff - (nig_fix_b02.mu_n - nig_fix_s0d.mu_n);
+        let pivot_speedup = dyn_diff_change / fix_diff_change.max(1e-6);
+        assert!(
+            pivot_speedup > 2.0,
+            "Adaptive gamma must pivot NIG weights > 2.0x faster than fixed 0.97! Got speedup: {:.3}x",
+            pivot_speedup
+        );
+
+        // =========================================================================
+        // (d) Ville Martingale E-Process Probation & Self-Recovery Proof
+        // =========================================================================
+        let mut m_state =
+            BrainMartingaleState::new(MetaAllocatorHorizonSlot::Brain02IntradayDayTrade);
+
+        // 1. Healthy winning stream
+        for _ in 0..8 {
+            m_state.observe_trade_r(1.40, false);
+        }
+        assert!(
+            m_state.martingale_e_value < 1.50,
+            "Healthy winning stream must maintain E_t < 1.50, got {}",
+            m_state.martingale_e_value
+        );
+        assert_eq!(m_state.martingale_kelly_multiplier, 1.00);
+        assert!(!m_state.probation_shadow_only);
+        let healthy_e = m_state.martingale_e_value;
+
+        // 2. Regime-break losses: consecutive -1.0R trades until E_t >= 20.0
+        let mut loss_steps = 0usize;
+        while m_state.martingale_e_value < VILLE_ALPHA_THRESHOLD && loss_steps < 35 {
+            m_state.observe_trade_r(-1.0, false);
+            loss_steps += 1;
+        }
+        assert!(
+            m_state.martingale_e_value >= VILLE_ALPHA_THRESHOLD,
+            "E_t must cross 20.0, got {}",
+            m_state.martingale_e_value
+        );
+        assert!(
+            m_state.probation_shadow_only,
+            "Brain must be quarantined into probation_shadow_only = true"
+        );
+        assert!(m_state.martingale_kelly_multiplier <= 0.35);
+        let quarantined_e = m_state.martingale_e_value;
+
+        // 3. Counterfactual shadow winners (+1.8R) recover brain until E_t < 4.0
+        let mut shadow_steps = 0usize;
+        while m_state.martingale_e_value >= VILLE_RECOVERY_HYSTERESIS_FLOOR && shadow_steps < 35 {
+            m_state.observe_trade_r(1.8, true);
+            shadow_steps += 1;
+        }
+        assert!(
+            m_state.martingale_e_value < VILLE_RECOVERY_HYSTERESIS_FLOOR,
+            "Recovered E_t must fall below 4.0, got {}",
+            m_state.martingale_e_value
+        );
+        assert!(
+            !m_state.probation_shadow_only,
+            "Probation must automatically heal back to false"
+        );
+        let recovered_e = m_state.martingale_e_value;
+
+        // =========================================================================
+        // (e) Microprice & Adverse-Selection Execution Router Proof
+        // =========================================================================
+        // 1. Wide-spread calm pin -> PASSIVE_MID_PEG_LIMIT
+        let pin_input = MicrostructureQuoteInput {
+            bid_price: 590.0,
+            ask_price: 590.20,
+            bid_size: 100.0,
+            ask_size: 100.0,
+            orderflow_toxicity_vpin: 0.20,
+            atr_bar: 0.50,
+            structural_risk_per_share: 2.0,
+            direction: TradeDirection::Long,
+            regime_bucket: RegimeBucket::PosGammaPinMeanRevert,
+        };
+        let pin_plan = MicropriceExecutionRouter::route_order(&pin_input);
+        assert_eq!(
+            pin_plan.execution_tactic,
+            ExecutionTactic::PassiveMidPegLimit
+        );
+        assert_eq!(pin_plan.microprice_limit_price, 590.10);
+        assert_eq!(pin_plan.step_up_chase_ms, 0);
+
+        // 2. Moderate imbalance -> ADAPTIVE_MICROPRICE_PEG (P_micro != P_mid)
+        let imb_input = MicrostructureQuoteInput {
+            bid_price: 590.0,
+            ask_price: 590.08,
+            bid_size: 200.0,
+            ask_size: 100.0,
+            orderflow_toxicity_vpin: 0.50,
+            atr_bar: 0.80,
+            structural_risk_per_share: 2.5,
+            direction: TradeDirection::Long,
+            regime_bucket: RegimeBucket::NegGammaMomentumTrend,
+        };
+        let imb_plan = MicropriceExecutionRouter::route_order(&imb_input);
+        assert_eq!(
+            imb_plan.execution_tactic,
+            ExecutionTactic::AdaptiveMicropricePeg
+        );
+        assert!((imb_plan.microprice - imb_plan.mid_price).abs() > 1e-4);
+        assert_eq!(imb_plan.microprice_limit_price, imb_plan.microprice);
+        assert_eq!(imb_plan.step_up_chase_ms, 1500);
+
+        // 3. Heavy ask-depletion breakout -> IMMEDIATE_ALMGREN_CHRISS_SWEEP
+        let sweep_input = MicrostructureQuoteInput {
+            bid_price: 590.0,
+            ask_price: 590.02,
+            bid_size: 2500.0,
+            ask_size: 50.0,
+            orderflow_toxicity_vpin: 0.88,
+            atr_bar: 2.50,
+            structural_risk_per_share: 2.0,
+            direction: TradeDirection::Long,
+            regime_bucket: RegimeBucket::NegGammaMomentumTrend,
+        };
+        let sweep_plan = MicropriceExecutionRouter::route_order(&sweep_input);
+        assert_eq!(
+            sweep_plan.execution_tactic,
+            ExecutionTactic::ImmediateAlmgrenChrissSweep
+        );
+        assert!(sweep_plan.execution_urgency_score >= 0.72);
+        assert!(sweep_plan.microprice_limit_price >= sweep_input.ask_price);
+
+        // =========================================================================
+        // Export real Phase 36 Wire Contract Fixture for Vitest #28 Parity
+        // =========================================================================
+        let wl_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/scanner/watchlist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wl_resp.status(), axum::http::StatusCode::OK);
+        let wl_bytes = axum::body::to_bytes(wl_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let wl_json: serde_json::Value = serde_json::from_slice(&wl_bytes).unwrap();
+        assert!(wl_json.get("bocpd_changepoint_prob").is_some());
+        assert!(wl_json.get("bocpd_expected_run_length").is_some());
+        assert!(wl_json.get("adaptive_forgetting_gamma").is_some());
+        assert!(wl_json.get("martingale_shield_states").is_some());
+
+        let fixture_path = Path::new(
+            "../../web-terminal/src/lib/state/__fixtures__/phase36_apex_intelligence_wire_contract.json",
+        );
+        if let Some(parent) = fixture_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let phase36_fixture = serde_json::json!({
+            "watchlist_response": wl_json,
+            "rank1_loo_proof": {
+                "loo_winners_preserved": loo_winners_preserved,
+                "total_baseline_winners": total_baseline_winners,
+                "min_downdate_l2_norm": min_downdate_l2_norm,
+                "max_downdate_l2_norm": max_downdate_l2_norm
+            },
+            "strike_exact_greeks_proof": {
+                "theta_diff": theta_diff,
+                "charm_diff": charm_diff,
+                "delta_diff": delta_diff,
+                "gamma_diff": gamma_diff,
+                "vanna_diff": vanna_diff,
+                "naked_bleed": naked_bleed,
+                "bag_bleed": bag_bleed,
+                "solved_vertical": solved_high_iv
+            },
+            "bocpd_gamma_flip_proof": {
+                "calm_p_cp": calm_tel.bocpd_changepoint_prob,
+                "calm_gamma": calm_tel.adaptive_forgetting_gamma,
+                "shock_p_cp": shock_tel.bocpd_changepoint_prob,
+                "shock_gamma": shock_tel.adaptive_forgetting_gamma,
+                "dynamic_pivot_speedup": pivot_speedup
+            },
+            "martingale_probation_proof": {
+                "healthy_e": healthy_e,
+                "quarantined_e": quarantined_e,
+                "recovered_e": recovered_e,
+                "probation_recovered": !m_state.probation_shadow_only
+            },
+            "microprice_router_proof": {
+                "passive_plan": pin_plan,
+                "adaptive_plan": imb_plan,
+                "sweep_plan": sweep_plan
+            }
+        });
+        std::fs::write(
+            fixture_path,
+            serde_json::to_string_pretty(&phase36_fixture).unwrap(),
+        )
+        .expect("Write Phase 36 wire fixture");
+
+        println!("\n======================================================================");
+        println!("PHASE 35.1 & PHASE 36 APEX QUANTITATIVE INTELLIGENCE AUDIT");
+        println!("======================================================================");
+        println!(
+            "  [PROOF (a) EXACT RANK-1 LOO CENTROID DOWNDATE & GATE 1 PRESERVATION]:"
+        );
+        println!(
+            "    - Baseline Winners Preserved : {}/{} intact | ||mu_W_loo - mu_W_full||_2 in [{:.6}, {:.6}] > 0.0",
+            loo_winners_preserved, total_baseline_winners, min_downdate_l2_norm, max_downdate_l2_norm
+        );
+        println!(
+            "  [PROOF (b) STRIKE-EXACT 2-LEG SURFACE GREEKS (CHARM + VANNA) & STRIKE SOLVER]:"
+        );
+        println!(
+            "    - Net Theta & Charm Parity   : |Theta_net - (Theta_L - Theta_S)| = {:.2e} < 1e-12 | |Charm_net - (Charm_L - Charm_S)| = {:.2e} < 1e-12",
+            theta_diff, charm_diff
+        );
+        println!(
+            "    - Delta/Gamma/Vanna Parity   : |Delta_diff|={:.2e} | |Gamma_diff|={:.2e} | |Vanna_diff|={:.2e}",
+            delta_diff, gamma_diff, vanna_diff
+        );
+        println!(
+            "    - High-IV Pin Structure      : {} (Long Strike {}, Short Strike {:?}) | Bar Bleed: {:.6} (BAG) vs {:.6} (Naked ATM) -> {:.1}% reduction",
+            solved_high_iv.structure.as_str(),
+            solved_high_iv.optimal_long_strike,
+            solved_high_iv.optimal_short_strike,
+            bag_bleed,
+            naked_bleed,
+            (1.0 - bag_bleed / naked_bleed) * 100.0
+        );
+        println!(
+            "  [PROOF (c) ADAMS-MACKAY BOCPD GAMMA-FLIP SHIFT & DYNAMIC MEMORY PIVOT]:"
+        );
+        println!(
+            "    - 25 Calm Pos-Gamma Bars     : p_cp={:.4} (< 0.10) | gamma_t={:.4} (> 0.97) | expected_rl={:.2} (monotonically growing)",
+            calm_tel.bocpd_changepoint_prob, calm_tel.adaptive_forgetting_gamma, calm_tel.bocpd_expected_run_length
+        );
+        println!(
+            "    - 3-Bar Shock Break          : p_cp={:.4} (> 0.70) | gamma_t={:.4} (< 0.84) | NIG Pivot Speedup: {:.2}x (> 2.0x faster than 0.97)",
+            shock_tel.bocpd_changepoint_prob, shock_tel.adaptive_forgetting_gamma, pivot_speedup
+        );
+        println!(
+            "  [PROOF (d) VILLE MARTINGALE E-PROCESS PROBATION & SELF-RECOVERY]:"
+        );
+        println!(
+            "    - Healthy Stream             : E_t={:.4} (< 1.50) | kappa_martingale={:.2}x | probation=false",
+            healthy_e, 1.00
+        );
+        println!(
+            "    - Loss Break Quarantine      : E_t={:.4} (>= 20.0) | kappa_martingale={:.2}x | probation_shadow_only={}",
+            quarantined_e,
+            BrainMartingaleState::compute_kelly_multiplier(quarantined_e),
+            true
+        );
+        println!(
+            "    - Shadow Winner Recovery     : E_t={:.4} (< 4.0) | kappa_martingale={:.2}x | probation_shadow_only={}",
+            recovered_e,
+            BrainMartingaleState::compute_kelly_multiplier(recovered_e),
+            false
+        );
+        println!(
+            "  [PROOF (e) MICROPRICE & ADVERSE-SELECTION EXECUTION ROUTER]:"
+        );
+        println!(
+            "    - Calm Pin Wide Spread       : {} | limit={:.2} (mid) | chase={}ms | slip={:.1}bps",
+            pin_plan.execution_tactic.as_str(),
+            pin_plan.microprice_limit_price,
+            pin_plan.step_up_chase_ms,
+            pin_plan.expected_slippage_bps
+        );
+        println!(
+            "    - Moderate Queue Imbalance   : {} | limit={:.4} (P_micro != P_mid={:.4}) | chase={}ms | u_exec={:.3}",
+            imb_plan.execution_tactic.as_str(),
+            imb_plan.microprice_limit_price,
+            imb_plan.mid_price,
+            imb_plan.step_up_chase_ms,
+            imb_plan.execution_urgency_score
+        );
+        println!(
+            "    - Breakout Ask-Depletion     : {} | limit={:.4} | u_exec={:.3} (>= 0.72) | slip={:.1}bps\n",
+            sweep_plan.execution_tactic.as_str(),
+            sweep_plan.microprice_limit_price,
+            sweep_plan.execution_urgency_score,
+            sweep_plan.expected_slippage_bps
+        );
+    }
 }

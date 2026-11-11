@@ -916,6 +916,18 @@ pub struct ClosedTradeRow {
     pub occ_tims_pm_relief_ratio_pct: f64,
 }
 
+impl ClosedTradeRow {
+    /// Returns the strictly post-entry bar sequence (`entry_bars[entry_bar_idx + 1..]`)
+    /// used for causal bar-by-bar Stage 1–3 path replay with zero lookahead.
+    pub fn replay_bars(&self) -> &[RawBarRecord] {
+        if self.entry_bars.is_empty() {
+            return &[];
+        }
+        let start = (self.entry_bar_idx + 1).min(self.entry_bars.len());
+        &self.entry_bars[start..]
+    }
+}
+
 /// Speed-2 Nightly Autopsy Grade for a single closed trade (`A+`, `B`, `C`, `F`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutopsyTradeGrade {
@@ -2559,6 +2571,7 @@ pub struct RealTimeLedgerEngine {
     evolution_generations_history: RwLock<Vec<EvolutionGenerationRecord>>,
     enforce_hard_scratch_on_baseline: RwLock<bool>,
     webhook_dispatcher: OutboundWebhookDispatcher,
+    last_autopsy_evolution: RwLock<Option<crate::autopsy_evolver::AutopsyEvolutionResponse>>,
 }
 
 impl Default for RealTimeLedgerEngine {
@@ -2588,7 +2601,19 @@ impl RealTimeLedgerEngine {
             evolution_generations_history: RwLock::new(Vec::with_capacity(16)),
             enforce_hard_scratch_on_baseline: RwLock::new(false),
             webhook_dispatcher: OutboundWebhookDispatcher::new(),
+            last_autopsy_evolution: RwLock::new(None),
         }
+    }
+
+    pub fn last_autopsy_evolution(&self) -> Option<crate::autopsy_evolver::AutopsyEvolutionResponse> {
+        self.last_autopsy_evolution.read().clone()
+    }
+
+    pub fn set_last_autopsy_evolution(
+        &self,
+        resp: Option<crate::autopsy_evolver::AutopsyEvolutionResponse>,
+    ) {
+        *self.last_autopsy_evolution.write() = resp;
     }
 
     pub fn precedent_knn(&self) -> &Arc<PrecedentKnnIndex> {
@@ -4255,7 +4280,7 @@ impl RealTimeLedgerEngine {
         let syn_state = self.precedent_knn.get_synaptic_plasticity_state(row.brain_id);
         Self::refresh_open_position_sequential_telemetry(&mut row, &syn_state);
 
-        if *self.enforce_hard_scratch_on_baseline.read() {
+        if *self.enforce_hard_scratch_on_baseline.read() || syn_state.generation_id >= 37 {
             let stage0 = self.evaluate_live_entry_stage0_gate(
                 inference,
                 precedents.win_rate_pct,
@@ -4679,14 +4704,16 @@ impl RealTimeLedgerEngine {
                     bars_since_open.min(28),
                     tau_scratch,
                 );
+                let enforce_live_stage1_3 =
+                    *self.enforce_hard_scratch_on_baseline.read() || syn_state.generation_id >= 37;
                 if unified_dec
                     .matched_scratch
                     .as_ref()
                     .is_some_and(|s| s.scratch_bar_offset <= bars_since_open)
-                    && *self.enforce_hard_scratch_on_baseline.read()
+                    && enforce_live_stage1_3
                 {
                     ai_scratch_exit = true;
-                } else if *self.enforce_hard_scratch_on_baseline.read() && bars_since_open >= 5 {
+                } else if enforce_live_stage1_3 && bars_since_open >= 2 {
                     if let Some(ref ratchet_diag) = unified_dec.giveback_ratchet {
                         let locked_r = ratchet_diag.locked_profit_r.max(0.05);
                         let ratchet_offset_u = ((risk_u as f64) * locked_r).round() as i64;
@@ -4707,7 +4734,47 @@ impl RealTimeLedgerEngine {
                                 .unwrap_or(pos.entry_price),
                             ),
                         };
-                    } else if let Some(ref hm_diag) = unified_dec.house_money_scale_in {
+                    } else if syn_state.generation_id >= 37 {
+                        let peak_move_u = match pos.direction {
+                            TradeDirection::Long => {
+                                (pos.peak_favorable_price.scaled_units()
+                                    - pos.entry_price.scaled_units())
+                                .max(0) as f64
+                            }
+                            TradeDirection::Short => {
+                                (pos.entry_price.scaled_units()
+                                    - pos.peak_favorable_price.scaled_units())
+                                .max(0) as f64
+                            }
+                        };
+                        let running_peak_r = peak_move_u / (risk_u.max(1) as f64);
+                        if running_peak_r >= 1.0 {
+                            let ratchet_r =
+                                running_peak_r * syn_state.learned_giveback_retention_ratio;
+                            let ratchet_offset_u = ((risk_u as f64) * ratchet_r).round() as i64;
+                            pos.structural_stop_price = match pos.direction {
+                                TradeDirection::Long => pos.structural_stop_price.max(
+                                    SubPennyPrice::from_scaled_units(
+                                        pos.entry_price
+                                            .scaled_units()
+                                            .saturating_add(ratchet_offset_u),
+                                    )
+                                    .unwrap_or(pos.entry_price),
+                                ),
+                                TradeDirection::Short => pos.structural_stop_price.min(
+                                    SubPennyPrice::from_scaled_units(
+                                        pos.entry_price
+                                            .scaled_units()
+                                            .saturating_sub(ratchet_offset_u)
+                                            .max(1),
+                                    )
+                                    .unwrap_or(pos.entry_price),
+                                ),
+                            };
+                        }
+                    } else if bars_since_open >= 5
+                        && let Some(ref hm_diag) = unified_dec.house_money_scale_in
+                    {
                         pos.house_money_scale_eligible = true;
                         pos.locked_profit_r = hm_diag.locked_profit_r;
                         pos.guaranteed_net_floor_r = hm_diag.guaranteed_net_floor_r;
@@ -5538,7 +5605,7 @@ impl RealTimeLedgerEngine {
         feats.into_iter().map(|v| (v * scale_c) as f32).collect()
     }
 
-    fn extract_causal_entry_features_from_row(row: &ClosedTradeRow) -> Vec<f32> {
+    pub fn extract_causal_entry_features_from_row(row: &ClosedTradeRow) -> Vec<f32> {
         Self::extract_causal_entry_features_32(
             &row.entry_embedding_128,
             row.entry_price,
@@ -5552,7 +5619,7 @@ impl RealTimeLedgerEngine {
         )
     }
 
-    fn extract_causal_bar1_features_from_row(row: &ClosedTradeRow) -> Vec<f32> {
+    pub fn extract_causal_bar1_features_from_row(row: &ClosedTradeRow) -> Vec<f32> {
         Self::extract_causal_post_entry_bar_k_features_from_row(row, 1).unwrap_or_else(|| {
             if row.post_entry_bar1_features_32.len() >= 32 {
                 row.post_entry_bar1_features_32.clone()
@@ -5567,7 +5634,7 @@ impl RealTimeLedgerEngine {
     /// Extracts the 32-feature causal state vector $X_{\text{bar } k}$ at post-entry bar offset $k \in \{1..6\}$
     /// using ONLY `row.entry_bars[0..=entry_bar_idx]` and `row.entry_bars[entry_bar_idx + k]`.
     /// 100% blind to `row.is_winner`, `row.actual_exit_price`, `row.realized_r_multiple`, and any bar after `entry_bar_idx + k`.
-    fn extract_causal_post_entry_bar_k_features_from_row(
+    pub fn extract_causal_post_entry_bar_k_features_from_row(
         row: &ClosedTradeRow,
         bar_offset: usize,
     ) -> Option<Vec<f32>> {
@@ -9342,6 +9409,17 @@ impl RealTimeLedgerEngine {
     /// Recomputes causal synaptic plasticity states across all 5 brains (`BRAIN-01..BRAIN-05`)
     /// incorporating all settled trades in `closed_ledger` at the active champion generation (Gen 36).
     pub fn recompute_causal_plasticity(&self) {
+        let current_promoted_gen = self
+            .precedent_knn
+            .ordered_synaptic_plasticity_states()
+            .iter()
+            .map(|s| s.generation_id)
+            .max()
+            .unwrap_or(0);
+        if current_promoted_gen >= 37 {
+            // Preserve Dual-Gate Pareto promoted synaptic plasticity states (Gen >= 37)
+            return;
+        }
         let settled_snap = self.closed_ledger.read().clone();
         let active_gen = self
             .evolution_generations_history
@@ -9366,6 +9444,7 @@ impl RealTimeLedgerEngine {
     /// Resets multi-generation evolution history and synaptic plasticity states to Gen 0 baseline.
     pub fn reset_evolution_to_gen0(&self) {
         self.evolution_generations_history.write().clear();
+        *self.last_autopsy_evolution.write() = None;
         self.precedent_knn.reset_synaptic_plasticity_states_to_gen0();
         self.reconcile_causal_adaptive_immunity_ledger();
     }

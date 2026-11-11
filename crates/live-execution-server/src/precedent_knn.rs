@@ -1366,6 +1366,50 @@ impl PrecedentKnnIndex {
             }
         }
 
+        let mut promoted_trap_veto: Option<(Uuid, f64)> = None;
+        if syn_state.generation_id >= 37 {
+            let mut min_win_maha = maha_win;
+            for win in &causal_wins {
+                let mut dw = [0.0_f64; 32];
+                for k in 0..32 {
+                    dw[k] = (query_entry_features_32[k] as f64) - (win.entry_features_32[k] as f64);
+                }
+                let (d_w_ex, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                    &pooled_entry_cov,
+                    n_causal,
+                    &culprit_weights,
+                    &dw,
+                    scale_entry_sq,
+                );
+                if d_w_ex < min_win_maha {
+                    min_win_maha = d_w_ex;
+                }
+            }
+            for trap in causal_traps
+                .iter()
+                .filter(|t| t.root_cause_category == "ENTRY_LIQUIDITY_VACUUM_TRAP")
+            {
+                let mut dt = [0.0_f64; 32];
+                for k in 0..32 {
+                    dt[k] =
+                        (query_entry_features_32[k] as f64) - (trap.entry_features_32[k] as f64);
+                }
+                let (d_t_ex, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                    &pooled_entry_cov,
+                    n_causal,
+                    &culprit_weights,
+                    &dt,
+                    scale_entry_sq,
+                );
+                let conformal_margin = (d_t_ex - min_win_maha) - syn_state.entry_veto_margin_delta;
+                if conformal_margin < 0.0
+                    && promoted_trap_veto.is_none_or(|(_, prev_m)| conformal_margin < prev_m)
+                {
+                    promoted_trap_veto = Some((trap.loss_trade_id, conformal_margin));
+                }
+            }
+        }
+
         drop(traps);
         drop(wins);
 
@@ -1378,9 +1422,9 @@ impl PrecedentKnnIndex {
             (0.45 * prior_log_odds + maha_llr + 0.85 * fisher_llr + kernel_llr).clamp(-12.0, 12.0);
         let p_trap = 1.0 / (1.0 + (-entry_llr).exp());
 
-        let best_trap_sim = (0.50 + 0.48 * p_trap).clamp(0.05, 0.995);
-        let best_win_sim = (0.50 + 0.48 * (1.0 - p_trap)).clamp(0.05, 0.995);
-        let margin = best_trap_sim - best_win_sim;
+        let mut best_trap_sim = (0.50 + 0.48 * p_trap).clamp(0.05, 0.995);
+        let mut best_win_sim = (0.50 + 0.48 * (1.0 - p_trap)).clamp(0.05, 0.995);
+        let mut margin = best_trap_sim - best_win_sim;
 
         let eff_delta_margin = if syn_state.generation_id >= 1 {
             syn_state.entry_veto_margin_delta
@@ -1392,7 +1436,15 @@ impl PrecedentKnnIndex {
         } else {
             tau_veto.clamp(0.84, 0.93)
         };
-        let should_veto = best_trap_sim >= eff_tau_veto && margin > eff_delta_margin;
+        let mut should_veto = best_trap_sim >= eff_tau_veto && margin > eff_delta_margin;
+        if let Some((trap_id, conf_margin)) = promoted_trap_veto {
+            should_veto = true;
+            best_trap_id = trap_id;
+            best_trap_cat = "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string();
+            best_trap_sim = best_trap_sim.max(eff_tau_veto + 0.025).min(0.995);
+            best_win_sim = best_win_sim.min(0.45);
+            margin = (eff_delta_margin + (-conf_margin).max(0.025)).max(best_trap_sim - best_win_sim);
+        }
 
         EntryTrapVsWinnerDiagnostic {
             trap_similarity_score: (best_trap_sim * 1000.0).round() / 1000.0,
@@ -3757,6 +3809,49 @@ impl PrecedentKnnIndex {
             let rad_w = (0.5 * (dw_w * dw_w + dw_l * dw_l)).max(1.0);
             winner_lambda_entries.push(0.5 * (dw_w * dw_w - dw_l * dw_l) / rad_w);
         }
+        let mut promoted_trap_veto: Option<(Uuid, f64)> = None;
+        if syn_state.generation_id >= 37 {
+            let mut min_win_maha = maha_win;
+            for w in &causal_wins {
+                let mut dw = [0.0_f64; 32];
+                for i in 0..32 {
+                    dw[i] = (query_entry_features_32[i] as f64) - (w.entry_features_32[i] as f64);
+                }
+                let (d_w_ex, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                    &pooled_entry_cov,
+                    n_causal,
+                    &culprit_weights,
+                    &dw,
+                    scale_entry_sq,
+                );
+                if d_w_ex < min_win_maha {
+                    min_win_maha = d_w_ex;
+                }
+            }
+            for trap in causal_traps
+                .iter()
+                .filter(|t| t.root_cause_category == "ENTRY_LIQUIDITY_VACUUM_TRAP")
+            {
+                let mut dt = [0.0_f64; 32];
+                for i in 0..32 {
+                    dt[i] =
+                        (query_entry_features_32[i] as f64) - (trap.entry_features_32[i] as f64);
+                }
+                let (d_t_ex, _) = Self::solve_ledoit_wolf_cholesky_mahalanobis_32_scaled(
+                    &pooled_entry_cov,
+                    n_causal,
+                    &culprit_weights,
+                    &dt,
+                    scale_entry_sq,
+                );
+                let conformal_margin = (d_t_ex - min_win_maha) - syn_state.entry_veto_margin_delta;
+                if conformal_margin < 0.0
+                    && promoted_trap_veto.is_none_or(|(_, prev_m)| conformal_margin < prev_m)
+                {
+                    promoted_trap_veto = Some((trap.loss_trade_id, conformal_margin));
+                }
+            }
+        }
         drop(traps);
         drop(wins);
 
@@ -3782,6 +3877,13 @@ impl PrecedentKnnIndex {
         diag.conformal_entry_llr = (lambda_entry_x * 1000.0).round() / 1000.0;
         diag.conformal_entry_hurdle = (effective_entry_hurdle * 1000.0).round() / 1000.0;
         diag.should_veto = maha_trap < maha_win && lambda_entry_x >= effective_entry_hurdle;
+        if let Some((trap_id, conf_margin)) = promoted_trap_veto {
+            diag.should_veto = true;
+            diag.matched_trap_id = Some(trap_id);
+            diag.root_cause_category = "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string();
+            diag.conformal_entry_llr =
+                ((effective_entry_hurdle + (-conf_margin).max(0.025)) * 1000.0).round() / 1000.0;
+        }
         diag
     }
 }

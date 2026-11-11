@@ -3228,7 +3228,7 @@ pub async fn build_institutional_watchlist_at_epoch(
             row.action_status = if row.is_actionable {
                 "ACTIONABLE_STAGE_READY".to_string()
             } else if row.stage0_conformal_status == "VETO" {
-                "STAGE0_VETOED_TRAP".to_string()
+                "STAGE_0_VETOED_HARD_NEGATIVE_TRAP".to_string()
             } else {
                 "LOW_CONFIDENCE_BELOW_65".to_string()
             };
@@ -3596,6 +3596,65 @@ async fn stage_sunday_orders_handler(
         let t1_sub = SubPennyPrice::from_f64(row.target_1_price).unwrap_or(SubPennyPrice::MIN_VALID);
         let t2_sub = SubPennyPrice::from_f64(row.target_2_price).unwrap_or(SubPennyPrice::MIN_VALID);
 
+        let tf_for_brain = match row.brain_id {
+            BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => {
+                Timeframe::M5
+            }
+            BrainHorizonId::Brain03ShortTermSwing => Timeframe::H1,
+            BrainHorizonId::Brain04CoreSwing | BrainHorizonId::Brain05LongTermWealth => {
+                Timeframe::D1
+            }
+        };
+        let (staged_entry_bars, staged_entry_bar_idx, staged_embedding_128, staged_sparkline) =
+            if let Some(cached_ohlcv) =
+                market_data_bus::YahooSessionManager::try_load_warm_ohlcv_disk_cache(
+                    &row.symbol,
+                    tf_for_brain,
+                    24,
+                    u64::MAX,
+                )
+            {
+                let spread = (row.entry_price * 0.0005).max(0.00001);
+                let unified_bars = YahooFinanceLiveAdapter::map_real_ohlcv_to_unified_bars(
+                    &row.symbol,
+                    tf_for_brain,
+                    &cached_ohlcv,
+                    spread,
+                );
+                let raw_bars: Vec<RawBarRecord> =
+                    unified_bars.iter().map(|b| b.to_raw_bar_record()).collect();
+                let bounded: Vec<RawBarRecord> = if raw_bars.len() > 24 {
+                    raw_bars[raw_bars.len() - 24..].to_vec()
+                } else {
+                    raw_bars
+                };
+                let eb_idx = bounded.len().saturating_sub(1);
+                let (raw_sf, raw_internals, raw_opts) = canonical_settled_walk_forward_streams(
+                    &row.symbol,
+                    &bounded,
+                    raw_fingerprint_core::RawShortFloatSnapshot::default(),
+                    raw_fingerprint_core::RawMarketInternalsSnapshot::default(),
+                    raw_fingerprint_core::RawOptionsSnapshot::default(),
+                );
+                let emb_128 = state
+                    .onnx_engine
+                    .evaluate_live_signal(
+                        &row.symbol,
+                        row.brain_id,
+                        true,
+                        &bounded,
+                        &raw_opts,
+                        &raw_sf,
+                        &raw_internals,
+                    )
+                    .map(|inf| inf.signal.latent_embedding_128)
+                    .unwrap_or_else(|_| vec![0.05_f32; 128]);
+                let spark: Vec<f64> = bounded.iter().map(|b| b.close.to_f64()).collect();
+                (bounded, eb_idx, emb_128, spark)
+            } else {
+                (Vec::new(), 0, vec![0.05_f32; 128], vec![row.entry_price])
+            };
+
         let open_row = OpenPositionRow {
             position_id: pos_id,
             opened_at_iso: now_iso.clone(),
@@ -3651,12 +3710,12 @@ async fn stage_sunday_orders_handler(
                 short_float_squeeze_weight: 0.20,
                 market_internals_macro_weight: 0.15,
             },
-            price_sparkline: vec![row.entry_price],
-            entry_bars: Vec::new(),
-            entry_bar_idx: 0,
+            price_sparkline: staged_sparkline,
+            entry_bars: staged_entry_bars,
+            entry_bar_idx: staged_entry_bar_idx,
             engine_mode: crate::ledger::EngineExecutionMode::StructuredHybridChampion,
             strategy_archetype: crate::ledger::StrategyArchetype::PocVolumeAbsorption,
-            entry_embedding_128: Vec::new(),
+            entry_embedding_128: staged_embedding_128,
             bars_held_count: 0,
             active_sequential_stage: "STAGE_0_PRE_ENTRY".to_string(),
             live_sequential_llr: 0.0,
@@ -3754,7 +3813,7 @@ async fn scanner_evolve_cycle_handler(
 async fn scanner_autopsy_evolution_handler(
     State(state): State<AppState>,
 ) -> Result<Json<crate::autopsy_evolver::AutopsyEvolutionResponse>, (StatusCode, String)> {
-    let res = crate::autopsy_evolver::run_autopsy_evolution_cycle(&state.ledger);
+    let res = crate::autopsy_evolver::inspect_autopsy_evolution_status(&state.ledger);
     Ok(Json(res))
 }
 

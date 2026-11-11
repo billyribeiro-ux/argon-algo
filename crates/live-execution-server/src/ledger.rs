@@ -4612,10 +4612,17 @@ impl RealTimeLedgerEngine {
 
         if !enforce_era1_baseline && stage0.unified_stage0_kelly_multiplier < 1.0 {
             let k_mult = stage0.unified_stage0_kelly_multiplier.clamp(0.10, 1.0);
-            row.kelly_fraction_pct = ((row.kelly_fraction_pct * k_mult) * 100.0).round() / 100.0;
-            row.risk_budget_usd = ((row.risk_budget_usd * k_mult) * 100.0).round() / 100.0;
-            row.notional_allocated_usd =
-                ((row.notional_allocated_usd * k_mult) * 100.0).round() / 100.0;
+            let is_ood = stage0.epistemic_ood_score > 0.0;
+            let kelly_floor = if is_ood { 0.05 } else { 0.50 };
+            let risk_floor = if is_ood { 50.0 } else { 500.0 };
+            let notional_floor = if is_ood { 500.0 } else { 5_000.0 };
+            row.kelly_fraction_pct =
+                (((row.kelly_fraction_pct * k_mult) * 100.0).round() / 100.0).max(kelly_floor);
+            row.risk_budget_usd =
+                (((row.risk_budget_usd * k_mult) * 100.0).round() / 100.0).max(risk_floor);
+            row.notional_allocated_usd = (((row.notional_allocated_usd * k_mult) * 100.0).round()
+                / 100.0)
+                .max(notional_floor);
         }
 
         if !enforce_era1_baseline && stage0.epistemic_ood_score > 1.25 {
@@ -4624,7 +4631,7 @@ impl RealTimeLedgerEngine {
             return row;
         }
 
-        if !enforce_era1_baseline
+        if (enforce_era1_baseline || syn_state.generation_id >= 37)
             && stage0.should_veto
             && stage0.root_cause_category == "STAGE_0_VETOED_MONDRIAN_NONCONFORMITY"
         {
@@ -4690,7 +4697,7 @@ impl RealTimeLedgerEngine {
         }
 
         // Phase 35 Deliverable 1: Cross-Position Eigen-Covariance & Absorption-Ratio Crowding Gate
-        if !enforce_era1_baseline && syn_state.generation_id >= 36 {
+        if !enforce_era1_baseline && syn_state.generation_id >= 37 {
             let cand_series = crate::portfolio_eigen_risk::EigenPositionSeries::from_open_row(&row);
             let eigen_rep = self.evaluate_book_eigen_risk(Some(&cand_series));
             if eigen_rep.vetoed {
@@ -4701,10 +4708,12 @@ impl RealTimeLedgerEngine {
             }
             if eigen_rep.eigen_kelly_multiplier < 1.0 {
                 let em = eigen_rep.eigen_kelly_multiplier.clamp(0.25, 1.0);
-                row.kelly_fraction_pct = ((row.kelly_fraction_pct * em) * 100.0).round() / 100.0;
-                row.risk_budget_usd = ((row.risk_budget_usd * em) * 100.0).round() / 100.0;
+                row.kelly_fraction_pct =
+                    (((row.kelly_fraction_pct * em) * 100.0).round() / 100.0).max(0.50);
+                row.risk_budget_usd =
+                    (((row.risk_budget_usd * em) * 100.0).round() / 100.0).max(500.0);
                 row.notional_allocated_usd =
-                    ((row.notional_allocated_usd * em) * 100.0).round() / 100.0;
+                    (((row.notional_allocated_usd * em) * 100.0).round() / 100.0).max(5_000.0);
             }
         }
 

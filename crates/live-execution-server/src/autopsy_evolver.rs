@@ -519,8 +519,20 @@ impl LedoitWolfPrecision {
                         }
                     }
                 }
-                let dw_eff = 0.55 * d_wc + 0.45 * min_nn_loo;
-                let dl_c = maha_local(w_vec, &loss_centroid_32).max(0.0);
+                let dw_eff = 0.92 * d_wc + 0.08 * min_nn_loo;
+
+                let dl_cent = maha_local(w_vec, &loss_centroid_32).max(0.0);
+                let mut min_loss_nn_loo = dl_cent;
+                for (lid, l_vec) in &loss_entries_with_id {
+                    if lid != wid {
+                        let d_lex = maha_local(w_vec, l_vec);
+                        if d_lex < min_loss_nn_loo {
+                            min_loss_nn_loo = d_lex;
+                        }
+                    }
+                }
+                let dl_c = 0.92 * dl_cent + 0.08 * min_loss_nn_loo;
+
                 let rad_sq = (0.5 * (dw_eff * dw_eff + dl_c * dl_c)).max(1.0);
                 let lam_w = 0.5 * (dw_eff * dw_eff - dl_c * dl_c) / rad_sq;
                 winner_lambdas.push(lam_w);
@@ -530,7 +542,7 @@ impl LedoitWolfPrecision {
                 0.035
             } else {
                 let max_lam = *winner_lambdas.last().unwrap_or(&-0.020);
-                (max_lam + 0.18).clamp(0.025, 0.65)
+                (max_lam + 0.025).clamp(0.025, 0.25)
             };
 
             for (tid, _is_win, z_i) in &all_entries {
@@ -545,8 +557,19 @@ impl LedoitWolfPrecision {
                         }
                     }
                 }
-                let dw_eff_i = (0.55 * d_centroid_i + 0.45 * min_nn_i).max(0.0);
-                let dt_loss_c_i = maha_local(z_i, &loss_centroid_32).max(0.0);
+                let dw_eff_i = (0.92 * d_centroid_i + 0.08 * min_nn_i).max(0.0);
+
+                let dl_cent_i = maha_local(z_i, &loss_centroid_32).max(0.0);
+                let mut min_loss_nn_i = dl_cent_i;
+                for (lid, l_vec) in &loss_entries_with_id {
+                    if lid != tid {
+                        let d_lex = maha_local(z_i, l_vec);
+                        if d_lex < min_loss_nn_i {
+                            min_loss_nn_i = d_lex;
+                        }
+                    }
+                }
+                let dt_loss_c_i = (0.92 * dl_cent_i + 0.08 * min_loss_nn_i).max(0.0);
                 let alpha_i = dw_eff_i / (dt_loss_c_i + 0.05);
                 mondrian_calibration_scores
                     .entry(regime_i)
@@ -899,7 +922,7 @@ pub fn evaluate_stage0_conformal_kernel(
                 min_nn = d_ex;
             }
         }
-        0.55 * d_win_c + 0.45 * min_nn
+        0.92 * d_win_c + 0.08 * min_nn
     } else {
         let zero = [0.0_f64; 32];
         precision.entry_mahalanobis(brain_id, &weights_32, entry_features_32, &zero)
@@ -907,12 +930,23 @@ pub fn evaluate_stage0_conformal_kernel(
     d_win = d_win.max(0.0);
 
     let d_loss_c = if let Some(manifold) = precision.brains.get(&brain_id) {
-        precision.entry_mahalanobis(
+        let dl_cent = precision.entry_mahalanobis(
             brain_id,
             &weights_32,
             entry_features_32,
             &manifold.loss_centroid_32,
-        )
+        );
+        let mut min_loss_nn = dl_cent;
+        for (l_id, l_vec) in &manifold.loss_exemplars_32 {
+            if exclude_trade_id == Some(*l_id) {
+                continue;
+            }
+            let d_lex = precision.entry_mahalanobis(brain_id, &weights_32, entry_features_32, l_vec);
+            if d_lex < min_loss_nn {
+                min_loss_nn = d_lex;
+            }
+        }
+        0.92 * dl_cent + 0.08 * min_loss_nn
     } else {
         d_win + 0.35
     };
@@ -923,7 +957,7 @@ pub fn evaluate_stage0_conformal_kernel(
     let mut found_active_trap = false;
 
     for trap in trap_bank {
-        if trap.quarantined || (exclude_trade_id.is_some() && trap.trap_id == exclude_trade_id) {
+        if trap.quarantined {
             continue;
         }
         found_active_trap = true;
@@ -1019,7 +1053,7 @@ pub fn evaluate_stage0_conformal_kernel(
                 .copied()
                 .fold(0.0_f64, f64::max)
                 .max(1e-6);
-            let finite_concentration_slack = 1.0 + 0.65 / (m_len.max(1) as f64).sqrt();
+            let finite_concentration_slack = 1.0 + 1.05 / (m_len.max(1) as f64).sqrt();
             let beyond_envelope =
                 candidate_nonconformity_alpha > max_calib_alpha * finite_concentration_slack;
             let p_val = if geq_count == 0 && m_len >= 12 && beyond_envelope {

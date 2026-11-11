@@ -3514,17 +3514,18 @@ pub async fn build_institutional_watchlist_at_epoch(
     let net_portfolio_delta_beta_weighted =
         ((net_beta_delta_usd / 1000.0) * 100.0).round() / 100.0;
 
-    // Rank rows: actionable first, then by regime-contextual NIG meta-allocated conviction descending
+    // Rank rows: actionable first, then by consensus_confidence_pct descending (tie-broken by regime-contextual NIG weight)
     rows.sort_by(|a, b| {
         b.is_actionable
             .cmp(&a.is_actionable)
             .then_with(|| {
-                let score_a =
-                    a.consensus_confidence_pct * (0.85 + 0.90 * a.contextual_brain_weight_pi);
-                let score_b =
-                    b.consensus_confidence_pct * (0.85 + 0.90 * b.contextual_brain_weight_pi);
-                score_b
-                    .partial_cmp(&score_a)
+                b.consensus_confidence_pct
+                    .partial_cmp(&a.consensus_confidence_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.contextual_brain_weight_pi
+                    .partial_cmp(&a.contextual_brain_weight_pi)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });

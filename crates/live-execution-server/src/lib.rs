@@ -7669,21 +7669,21 @@ mod tests {
         // (c) Regime-Contextual NIG Capital Meta-Allocator Proof
         // =========================================================================
         let mut nig = ContextualNigMetaAllocator::from_causal_ledger(&closed_snap, &[]);
-        // Feed causal regime-specific outperformance:
-        // - In NegGammaTrendExpansion: Scalp0Dte & Brain02 outperform (+2.4R low MAE), Brain05 lags (-0.6R)
-        // - In PosGammaPinMeanRevert: Brain04 Core Swing outperforms (+2.2R low MAE), Scalp0Dte bleeds (-0.8R) + false_veto_regret
-        for _ in 0..8 {
-            nig.observe(
-                MetaAllocatorHorizonSlot::Scalp0Dte,
-                RegimeBucket::NegGammaMomentumTrend,
-                2.45,
-                0.42,
-            );
+        // Feed causal regime-specific outperformance per Principal Auditor Proof 3(c):
+        // - In NegGammaMomentumTrend: BRAIN-02 outperforms (+2.6R low MAE), SCALP_0DTE & BRAIN-05 lag (-0.75R)
+        // - In PosGammaPinMeanRevert: SCALP_0DTE outperforms (+2.55R low MAE), BRAIN-02 bleeds (-0.80R) + false_veto_regret
+        for _ in 0..9 {
             nig.observe(
                 MetaAllocatorHorizonSlot::Brain02IntradayDayTrade,
                 RegimeBucket::NegGammaMomentumTrend,
-                2.10,
-                0.45,
+                2.60,
+                0.38,
+            );
+            nig.observe(
+                MetaAllocatorHorizonSlot::Scalp0Dte,
+                RegimeBucket::NegGammaMomentumTrend,
+                -0.75,
+                0.95,
             );
             nig.observe(
                 MetaAllocatorHorizonSlot::Brain05LongTermWealth,
@@ -7693,20 +7693,20 @@ mod tests {
             );
 
             nig.observe(
-                MetaAllocatorHorizonSlot::Brain04CoreSwing,
+                MetaAllocatorHorizonSlot::Scalp0Dte,
                 RegimeBucket::PosGammaPinMeanRevert,
-                2.25,
-                0.40,
+                2.55,
+                0.38,
             );
             nig.observe(
-                MetaAllocatorHorizonSlot::Scalp0Dte,
+                MetaAllocatorHorizonSlot::Brain02IntradayDayTrade,
                 RegimeBucket::PosGammaPinMeanRevert,
                 -0.80,
                 0.95,
             );
         }
         nig.penalize_regret(
-            MetaAllocatorHorizonSlot::Scalp0Dte,
+            MetaAllocatorHorizonSlot::Brain02IntradayDayTrade,
             RegimeBucket::PosGammaPinMeanRevert,
             1.85,
         );
@@ -7727,6 +7727,11 @@ mod tests {
             );
         }
 
+        let b02_w_neg = alloc_neg_gamma
+            .iter()
+            .find(|r| r.slot_id == "BRAIN-02")
+            .unwrap()
+            .capital_weight_pi;
         let scalp_w_neg = alloc_neg_gamma
             .iter()
             .find(|r| r.slot_id == "SCALP_0DTE")
@@ -7737,23 +7742,18 @@ mod tests {
             .find(|r| r.slot_id == "SCALP_0DTE")
             .unwrap()
             .capital_weight_pi;
-        let b04_w_pos = alloc_pos_gamma
+        let b02_w_pos = alloc_pos_gamma
             .iter()
-            .find(|r| r.slot_id == "BRAIN-04")
-            .unwrap()
-            .capital_weight_pi;
-        let b04_w_neg = alloc_neg_gamma
-            .iter()
-            .find(|r| r.slot_id == "BRAIN-04")
+            .find(|r| r.slot_id == "BRAIN-02")
             .unwrap()
             .capital_weight_pi;
         assert!(
-            scalp_w_neg > scalp_w_pos + 0.08,
-            "SCALP_0DTE weight must shift higher in NegGammaTrendExpansion ({scalp_w_neg:.4}) vs PosGammaPinMeanRevert ({scalp_w_pos:.4})"
+            b02_w_neg > scalp_w_neg + 0.08 && b02_w_neg > b02_w_pos + 0.08,
+            "BRAIN-02 weight must shift higher in NegGammaMomentumTrend ({b02_w_neg:.4}) vs SCALP_0DTE ({scalp_w_neg:.4}) and PosGamma ({b02_w_pos:.4})"
         );
         assert!(
-            b04_w_pos > b04_w_neg + 0.05,
-            "BRAIN-04 weight must shift higher in PosGammaPinMeanRevert ({b04_w_pos:.4}) vs NegGammaTrendExpansion ({b04_w_neg:.4})"
+            scalp_w_pos > b02_w_pos + 0.08 && scalp_w_pos > scalp_w_neg + 0.08,
+            "SCALP_0DTE weight must shift higher in PosGammaPinMeanRevert ({scalp_w_pos:.4}) vs BRAIN-02 ({b02_w_pos:.4}) and NegGamma ({scalp_w_neg:.4})"
         );
 
         // =========================================================================
@@ -7956,12 +7956,12 @@ mod tests {
             "  [PROOF (c) REGIME-CONTEXTUAL NIG CROSS-BRAIN CAPITAL META-ALLOCATOR]:"
         );
         println!(
-            "    - NegGammaTrendExpansion: Sum={:.6} | SCALP_0DTE pi={:.4} | BRAIN-04 pi={:.4}",
-            sum_neg, scalp_w_neg, b04_w_neg
+            "    - NegGammaMomentumTrend : Sum={:.6} | BRAIN-02 pi={:.4} | SCALP_0DTE pi={:.4}",
+            sum_neg, b02_w_neg, scalp_w_neg
         );
         println!(
-            "    - PosGammaPinMeanRevert : Sum={:.6} | SCALP_0DTE pi={:.4} | BRAIN-04 pi={:.4}",
-            sum_pos, scalp_w_pos, b04_w_pos
+            "    - PosGammaPinMeanRevert : Sum={:.6} | SCALP_0DTE pi={:.4} | BRAIN-02 pi={:.4}",
+            sum_pos, scalp_w_pos, b02_w_pos
         );
         println!(
             "  [PROOF (d) CAUSAL OPTIONS CONVEXITY ROUTER & 0DTE THETA-BLEED HAZARD]:"

@@ -3036,20 +3036,20 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
       expect(crowd.vetoed).toBe(true);
       expect(crowd.veto_reason).toBe('PORTFOLIO_VETOED_EIGEN_CORRELATION_CROWDING');
 
+      const negB02 = phase35EigenConvexityWireFixture.nig_neg_gamma_allocations.find(
+        (a) => a.slot_id === 'BRAIN-02'
+      )!;
       const negScalp = phase35EigenConvexityWireFixture.nig_neg_gamma_allocations.find(
         (a) => a.slot_id === 'SCALP_0DTE'
-      )!;
-      const negSwing4 = phase35EigenConvexityWireFixture.nig_neg_gamma_allocations.find(
-        (a) => a.slot_id === 'BRAIN-04'
       )!;
       const posScalp = phase35EigenConvexityWireFixture.nig_pos_gamma_allocations.find(
         (a) => a.slot_id === 'SCALP_0DTE'
       )!;
-      const posSwing4 = phase35EigenConvexityWireFixture.nig_pos_gamma_allocations.find(
-        (a) => a.slot_id === 'BRAIN-04'
+      const posB02 = phase35EigenConvexityWireFixture.nig_pos_gamma_allocations.find(
+        (a) => a.slot_id === 'BRAIN-02'
       )!;
-      expect(negScalp.capital_weight_pi).toBeGreaterThan(negSwing4.capital_weight_pi);
-      expect(posSwing4.capital_weight_pi).toBeGreaterThan(posScalp.capital_weight_pi);
+      expect(negB02.capital_weight_pi).toBeGreaterThan(negScalp.capital_weight_pi);
+      expect(posScalp.capital_weight_pi).toBeGreaterThan(posB02.capital_weight_pi);
 
       expect(phase35EigenConvexityWireFixture.convexity_low_iv_trend.recommended_option_structure).toBe(
         'SINGLE_LONG_CONVEX'

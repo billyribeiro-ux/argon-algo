@@ -6693,6 +6693,21 @@ mod tests {
             evo_idempotent.hard_negative_traps_added_count, 0,
             "Repeated evolution cycle without new losses must add 0 duplicate traps!"
         );
+        assert_eq!(
+            evo_first.gate_audit.gate1_baseline_winners_preserved,
+            evo_first.gate_audit.gate1_baseline_winners_target,
+            "Gate 1 must preserve 100% of baseline winners ({}/{})",
+            evo_first.gate_audit.gate1_baseline_winners_preserved,
+            evo_first.gate_audit.gate1_baseline_winners_target
+        );
+        println!(
+            "    - Multi-Gen evolve_cycle Idempotency: Pass 1 TrapsAdded=+{} (Gen {}) | Pass 2 Duplicate TrapsAdded=+{} | Gate 1 Baseline Winners={}/{}",
+            evo_first.hard_negative_traps_added_count,
+            evo_first.candidate_generation_id,
+            evo_idempotent.hard_negative_traps_added_count,
+            evo_first.gate_audit.gate1_baseline_winners_preserved,
+            evo_first.gate_audit.gate1_baseline_winners_target
+        );
 
         // Now insert two distinct Stage-0 traps on BRAIN-04 (`MSFT` Overfit Trap vs `AAPL` Productive Trap) at Gen 37:
         let b04_template = snap_initial

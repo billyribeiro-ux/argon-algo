@@ -2714,12 +2714,21 @@ impl RealTimeLedgerEngine {
         crate::autopsy_evolver::LedoitWolfPrecision,
         Vec<crate::autopsy_evolver::Stage0TrapCentroid>,
     ) {
-        let closed_snap = self.closed_ledger.read();
-        let baseline_count = 173.min(closed_snap.len());
-        let precision = crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
-            &closed_snap[0..baseline_count],
-        );
-        drop(closed_snap);
+        let gen_id = self
+            .precedent_knn
+            .get_synaptic_plasticity_state(brain_id)
+            .generation_id;
+        let precision = if gen_id == 0 {
+            crate::autopsy_evolver::LedoitWolfPrecision {
+                brains: std::collections::HashMap::new(),
+            }
+        } else {
+            let closed_snap = self.closed_ledger.read();
+            let baseline_count = 173.min(closed_snap.len());
+            crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
+                &closed_snap[0..baseline_count],
+            )
+        };
 
         let trap_bank: Vec<crate::autopsy_evolver::Stage0TrapCentroid> = self
             .precedent_knn
@@ -3268,6 +3277,10 @@ impl RealTimeLedgerEngine {
         self.era1_symbol_median_stops.write().clear();
         self.vetoed_repeat_traps.write().clear();
         self.staged_broker_tickets.write().clear();
+        self.evolution_generations_history.write().clear();
+        *self.last_autopsy_evolution.write() = None;
+        self.shadow_open_trades.write().clear();
+        self.shadow_settled_trades.write().clear();
         self.webhook_dispatcher.clear_outbox();
         *self.running_net_profit_usd.write() = 0.0;
     }
@@ -4605,12 +4618,22 @@ impl RealTimeLedgerEngine {
             return;
         }
 
-        let closed_snap = self.closed_ledger.read();
-        let baseline_count = 173.min(closed_snap.len());
-        let precision = crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
-            &closed_snap[0..baseline_count],
-        );
-        drop(closed_snap);
+        let sample_brain = brain_filter.unwrap_or(open_shadows[0].brain_id);
+        let gen_id = self
+            .precedent_knn
+            .get_synaptic_plasticity_state(sample_brain)
+            .generation_id;
+        let precision = if gen_id == 0 {
+            crate::autopsy_evolver::LedoitWolfPrecision {
+                brains: std::collections::HashMap::new(),
+            }
+        } else {
+            let closed_snap = self.closed_ledger.read();
+            let baseline_count = 173.min(closed_snap.len());
+            crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
+                &closed_snap[0..baseline_count],
+            )
+        };
 
         let mut newly_settled = Vec::new();
         let mut idx = 0;
@@ -5163,20 +5186,35 @@ impl RealTimeLedgerEngine {
                         };
                         let running_peak_r = peak_move_u / (risk_u.max(1) as f64);
                         if running_peak_r >= 1.0 {
-                            let bar_feat_vec = Self::extract_post_entry_bar_features_32(pos, latest);
-                            let mut bar_feat_arr = [0.0_f64; 32];
-                            for (i, &v) in bar_feat_vec.iter().take(32).enumerate() {
-                                bar_feat_arr[i] = v as f64;
-                            }
-                            let closed_snap = self.closed_ledger.read();
-                            let baseline_count = 173.min(closed_snap.len());
-                            let precision =
-                                crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
-                                    &closed_snap[0..baseline_count],
-                                );
-                            drop(closed_snap);
-
-                            let (_h_curr, rho_eff) =
+                            let (_h_curr, rho_eff) = if syn_state.generation_id == 0 {
+                                let empty_prec = crate::autopsy_evolver::LedoitWolfPrecision {
+                                    brains: std::collections::HashMap::new(),
+                                };
+                                crate::autopsy_evolver::compute_causal_reversal_hazard_retention(
+                                    pos.brain_id,
+                                    pos.direction.sign(),
+                                    latest.open.to_f64(),
+                                    latest.high.to_f64(),
+                                    latest.low.to_f64(),
+                                    latest.close.to_f64(),
+                                    None,
+                                    &syn_state,
+                                    &empty_prec,
+                                )
+                            } else {
+                                let bar_feat_vec =
+                                    Self::extract_post_entry_bar_features_32(pos, latest);
+                                let mut bar_feat_arr = [0.0_f64; 32];
+                                for (i, &v) in bar_feat_vec.iter().take(32).enumerate() {
+                                    bar_feat_arr[i] = v as f64;
+                                }
+                                let closed_snap = self.closed_ledger.read();
+                                let baseline_count = 173.min(closed_snap.len());
+                                let precision =
+                                    crate::autopsy_evolver::LedoitWolfPrecision::from_settled_trades(
+                                        &closed_snap[0..baseline_count],
+                                    );
+                                drop(closed_snap);
                                 crate::autopsy_evolver::compute_causal_reversal_hazard_retention(
                                     pos.brain_id,
                                     pos.direction.sign(),
@@ -5187,7 +5225,8 @@ impl RealTimeLedgerEngine {
                                     Some(&bar_feat_arr),
                                     &syn_state,
                                     &precision,
-                                );
+                                )
+                            };
                             let ratchet_r = running_peak_r * rho_eff;
                             let ratchet_offset_u = ((risk_u as f64) * ratchet_r).round() as i64;
                             pos.structural_stop_price = match pos.direction {

@@ -859,6 +859,8 @@ impl AppState {
         self.precedent_knn.clear_all_hard_negative_traps();
         self.precedent_knn.clear_all_winner_pullbacks();
         self.precedent_knn.clear_all_mid_trade_trajectories();
+        self.precedent_knn.clear_all_runner_giveback_trajectories();
+        self.precedent_knn.reset_synaptic_plasticity_states_to_gen0();
         self.precedent_knn
             .replace_all_records(PrecedentKnnIndex::new_preseeded().all_records());
 

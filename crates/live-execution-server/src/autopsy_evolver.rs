@@ -1430,7 +1430,7 @@ pub fn verify_and_promote_generation(
     let mut candidate_wf_net_r = 0.0_f64;
     let mut current_wf_full_stops = 0usize;
     let mut candidate_wf_full_stops = 0usize;
-    let mut wf_winners_preserved = true;
+    let mut wf_winner_violations = 0usize;
 
     for wf in walkforward_trades {
         let fallback_cur = BrainSynapticPlasticityState::new_gen0(wf.brain_id);
@@ -1471,9 +1471,11 @@ pub fn verify_and_promote_generation(
         let is_non_giveback_wf_winner =
             wf.realized_r_multiple > 0.0 && !(peak_mfe >= 1.0 && wf.realized_r_multiple < 0.65 * peak_mfe);
         if is_non_giveback_wf_winner && (cand_sim.vetoed || cand_sim.realized_r <= 0.0) {
-            wf_winners_preserved = false;
+            wf_winner_violations += 1;
         }
     }
+
+    let wf_winners_preserved = wf_winner_violations == 0;
 
     let gate2_walkforward_passed = if walkforward_trades.is_empty() {
         wf_winners_preserved

@@ -1065,6 +1065,7 @@ export interface DecodedTradeAutopsy {
   failure_mode: AutopsyFailureMode;
   failure_mode_label: string;
   blame_attribution_32: number[];
+  entry_features_32?: number[];
   top_culprit_feature_indices: number[];
   top_culprit_names: string[];
   mahalanobis_distance_shift: number;
@@ -1080,11 +1081,18 @@ export interface GateAuditReport {
   gate1_candidate_expectancy_r: number;
   gate1_current_pf: number;
   gate1_candidate_pf: number;
+  current_baseline_exp_r: number;
+  candidate_baseline_exp_r: number;
+  current_baseline_pf: number;
+  candidate_baseline_pf: number;
   gate2_walkforward_passed: boolean;
   gate2_current_walkforward_net_r: number;
   gate2_candidate_walkforward_net_r: number;
+  current_wf_net_r: number;
+  candidate_wf_net_r: number;
   gate2_offending_losses_reduced: number;
   gate2_walkforward_winners_preserved: boolean;
+  hard_negative_traps_added_count: number;
   all_gates_passed: boolean;
   decision_rationale: string;
 }
@@ -1097,6 +1105,7 @@ export interface AutopsyEvolutionResponse {
   promoted_generation_id: number | null;
   is_promoted: boolean;
   total_trades_inspected: number;
+  hard_negative_traps_added_count: number;
   autopsies_decoded: DecodedTradeAutopsy[];
   gate_audit: GateAuditReport;
   updated_synaptic_states: any[];

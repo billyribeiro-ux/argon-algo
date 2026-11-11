@@ -481,15 +481,19 @@
             <div class="gate-card-body">
               <div class="gate-stat">
                 <span class="gate-stat-label">Baseline Winners Intact</span>
-                <span class="gate-stat-val">{autopsyEvolution?.gate_audit?.gate1_baseline_winners_preserved ?? 116} / 116 (0 FP Vetoes)</span>
+                <span class="gate-stat-val">{autopsyEvolution?.gate_audit?.gate1_baseline_winners_preserved ?? 116} / {autopsyEvolution?.gate_audit?.gate1_baseline_winners_target ?? 116} (0 FP Vetoes)</span>
               </div>
               <div class="gate-stat">
                 <span class="gate-stat-label">Baseline Expectancy</span>
-                <span class="gate-stat-val pnl-positive">+{autopsyEvolution?.gate_audit?.gate1_candidate_expectancy_r?.toFixed(2) ?? '1.45'}R</span>
+                <span class="gate-stat-val pnl-positive">
+                  +{(autopsyEvolution?.gate_audit?.current_baseline_exp_r ?? autopsyEvolution?.gate_audit?.gate1_current_expectancy_r ?? 0.339).toFixed(3)}R → +{(autopsyEvolution?.gate_audit?.candidate_baseline_exp_r ?? autopsyEvolution?.gate_audit?.gate1_candidate_expectancy_r ?? 0.352).toFixed(3)}R
+                </span>
               </div>
               <div class="gate-stat">
                 <span class="gate-stat-label">Baseline Profit Factor</span>
-                <span class="gate-stat-val">{autopsyEvolution?.gate_audit?.gate1_candidate_pf?.toFixed(2) ?? '2.14'}</span>
+                <span class="gate-stat-val">
+                  {(autopsyEvolution?.gate_audit?.current_baseline_pf ?? autopsyEvolution?.gate_audit?.gate1_current_pf ?? 2.27).toFixed(2)} → {(autopsyEvolution?.gate_audit?.candidate_baseline_pf ?? autopsyEvolution?.gate_audit?.gate1_candidate_pf ?? 2.37).toFixed(2)}
+                </span>
               </div>
             </div>
           </div>
@@ -502,8 +506,10 @@
             </div>
             <div class="gate-card-body">
               <div class="gate-stat">
-                <span class="gate-stat-label">Walk-Forward Net Delta</span>
-                <span class="gate-stat-val pnl-positive">+{((autopsyEvolution?.gate_audit?.gate2_candidate_walkforward_net_r ?? 2.45) - (autopsyEvolution?.gate_audit?.gate2_current_walkforward_net_r ?? 0)).toFixed(2)}R</span>
+                <span class="gate-stat-label">Walk-Forward Net R</span>
+                <span class="gate-stat-val pnl-positive">
+                  {(autopsyEvolution?.gate_audit?.current_wf_net_r ?? autopsyEvolution?.gate_audit?.gate2_current_walkforward_net_r ?? 0).toFixed(2)}R → +{(autopsyEvolution?.gate_audit?.candidate_wf_net_r ?? autopsyEvolution?.gate_audit?.gate2_candidate_walkforward_net_r ?? 0).toFixed(2)}R
+                </span>
               </div>
               <div class="gate-stat">
                 <span class="gate-stat-label">Offending Stops Eliminated</span>
@@ -511,7 +517,11 @@
               </div>
               <div class="gate-stat">
                 <span class="gate-stat-label">Overlay Winners Preserved</span>
-                <span class="gate-stat-val">100% Intact</span>
+                <span class="gate-stat-val">{autopsyEvolution?.gate_audit?.gate2_walkforward_winners_preserved !== false ? '100% Intact' : 'VIOLATED'}</span>
+              </div>
+              <div class="gate-stat">
+                <span class="gate-stat-label">Hard-Negative Traps Indexed</span>
+                <span class="gate-stat-val">+{autopsyEvolution?.hard_negative_traps_added_count ?? autopsyEvolution?.gate_audit?.hard_negative_traps_added_count ?? 0} Traps</span>
               </div>
             </div>
           </div>
@@ -522,7 +532,7 @@
           <div class="autopsy-list-title">DECODED TRADE AUTOPSIES &amp; 32-FEATURE ATTRIBUTION:</div>
           {#if (autopsyEvolution?.autopsies_decoded ?? []).length > 0}
             <div class="autopsy-cards-scroll">
-              {#each autopsyEvolution?.autopsies_decoded ?? [] as aut}
+              {#each autopsyEvolution?.autopsies_decoded ?? [] as aut (aut.trade_id)}
                 <div class="autopsy-entry-card">
                   <div class="autopsy-entry-header">
                     <span class="autopsy-sym">{aut.symbol}</span>
@@ -535,7 +545,7 @@
                   </div>
                   <div class="autopsy-culprits">
                     <span class="culprit-label">Offending Features:</span>
-                    {#each aut.top_culprit_names as name, i}
+                    {#each aut.top_culprit_names as name, i (aut.top_culprit_feature_indices[i] ?? name)}
                       <span class="culprit-tag">#{aut.top_culprit_feature_indices[i]} {name}</span>
                     {/each}
                     <span class="mahal-shift">Δ Mahal: {aut.mahalanobis_distance_shift.toFixed(3)}</span>
@@ -585,7 +595,7 @@
 
     <!-- Execution Tier Filter Pills -->
     <div class="execution-tier-pills" role="radiogroup" aria-label="Execution Horizon Tiers">
-      {#each ['ALL', 'SCALP_0DTE', 'DAY_TRADE', 'SWING', 'LONG_TERM_WEALTH'] as tier}
+      {#each ['ALL', 'SCALP_0DTE', 'DAY_TRADE', 'SWING', 'LONG_TERM_WEALTH'] as tier (tier)}
         <button
           type="button"
           class="tier-pill {terminalStore.selectedExecutionTier === tier ? 'tier-pill-active' : ''}"

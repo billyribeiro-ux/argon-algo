@@ -2773,6 +2773,27 @@ pub struct InstitutionalWatchlistRow {
     pub is_actionable: bool,
     #[serde(default = "default_execution_tier")]
     pub execution_tier: String,
+    // Phase 37: Sovereign Quantitative Intelligence Telemetry
+    #[serde(default)]
+    pub hawkes_branching_ratio: f64,
+    #[serde(default)]
+    pub hawkes_absorption_toxicity: f64,
+    #[serde(default)]
+    pub hawkes_regime_state: String,
+    #[serde(default)]
+    pub zero_gamma_flip_price: f64,
+    #[serde(default)]
+    pub nearest_gamma_wall_price: f64,
+    #[serde(default)]
+    pub dealer_pin_resistance: f64,
+    #[serde(default)]
+    pub warped_target_1_price: f64,
+    #[serde(default)]
+    pub wasserstein_ambiguity_eps: f64,
+    #[serde(default)]
+    pub dro_optimal_kelly_pct: f64,
+    #[serde(default)]
+    pub marginal_cvar95_r: f64,
 }
 
 /// Phase 29, 30 & 35: Institutional Watchlist Response returned by `GET /api/v1/scanner/watchlist`
@@ -2831,6 +2852,26 @@ pub struct SundayAlphaProtocolExportRow {
     pub matched_cboe_contract: String,
     pub stage0_conformal_verdict: String,
     pub mahalanobis_llr: f64,
+    #[serde(default)]
+    pub hawkes_branching_ratio: f64,
+    #[serde(default)]
+    pub hawkes_absorption_toxicity: f64,
+    #[serde(default)]
+    pub hawkes_regime_state: String,
+    #[serde(default)]
+    pub zero_gamma_flip_price: f64,
+    #[serde(default)]
+    pub nearest_gamma_wall_price: f64,
+    #[serde(default)]
+    pub dealer_pin_resistance: f64,
+    #[serde(default)]
+    pub warped_target_1_price: f64,
+    #[serde(default)]
+    pub wasserstein_ambiguity_eps: f64,
+    #[serde(default)]
+    pub dro_optimal_kelly_pct: f64,
+    #[serde(default)]
+    pub marginal_cvar95_r: f64,
 }
 
 /// Phase 29 & 30: Sunday Alpha Protocol Response returned by `GET /api/v1/scanner/sunday-protocol`
@@ -3374,10 +3415,69 @@ pub async fn build_institutional_watchlist_at_epoch(
                     },
                 );
 
+                let bounded_pre: Vec<raw_fingerprint_core::RawBarRecord> = if window_bars.len() > 24 {
+                    window_bars[window_bars.len() - 24..].to_vec()
+                } else {
+                    window_bars.to_vec()
+                };
+                let entry_idx = bounded_pre.len().saturating_sub(1);
+                let f32_vec = crate::ledger::RealTimeLedgerEngine::extract_causal_entry_features_32(
+                    &inference.signal.latent_embedding_128,
+                    inference.signal.entry_price,
+                    inference.signal.structural_stop_price,
+                    inference.signal.target_1_price,
+                    inference.signal.direction,
+                    inference.signal.ai_confidence_pct,
+                    precedents.win_rate_pct,
+                    &bounded_pre,
+                    entry_idx,
+                );
+                let mut feat_arr = [0.0_f64; 32];
+                for (i, &v) in f32_vec.iter().take(32).enumerate() {
+                    feat_arr[i] = v as f64;
+                }
+
+                // Phase 37 Pillar 2: Spatial Dealer Gamma Field & Pinning
+                let gamma_field = crate::dealer_gamma_field::SpatialDealerGammaField::compute_spatial_field(
+                    entry_p,
+                    atr_bar,
+                    &feat_arr,
+                    inference.signal.direction,
+                );
+                let warped_target_res = gamma_field.warp_target_and_short_strike(
+                    inference.signal.direction,
+                    t1_p,
+                    atr_bar,
+                );
+
+                // Phase 37 Pillar 1: Multivariate Hawkes Self-Exciting Absorption
+                let mut hwk_engine = crate::hawkes_microstructure::HawkesMicrostructureEngine::new();
+                if let Some(last_b) = window_bars.last() {
+                    let prev_b = if window_bars.len() >= 2 {
+                        Some(&window_bars[window_bars.len() - 2])
+                    } else {
+                        None
+                    };
+                    hwk_engine.observe_bar(last_b, atr_bar, prev_b);
+                }
+                let hwk_telem = hwk_engine.telemetry();
+                let hwk_veto = if let Some(last_b) = window_bars.last() {
+                    hwk_engine.check_veto_with_last(inference.signal.direction, last_b)
+                } else {
+                    false
+                };
+                let effective_stage0_status = if hwk_veto {
+                    "HAWKES_ICEBERG_ABSORPTION_VETO".to_string()
+                } else {
+                    stage0_status
+                };
+
                 let final_actionable =
-                    is_actionable && !eigen_cand.vetoed && !m_state.probation_shadow_only;
+                    is_actionable && !eigen_cand.vetoed && !m_state.probation_shadow_only && !hwk_veto;
                 let init_action_status = if m_state.probation_shadow_only {
                     "PROBATION_SHADOW_ONLY_MARTINGALE_QUARANTINE".to_string()
+                } else if hwk_veto {
+                    "STAGE0_VETOED_HAWKES_ICEBERG_ABSORPTION".to_string()
                 } else if eigen_cand.vetoed {
                     "PORTFOLIO_VETOED_EIGEN_CORRELATION_CROWDING".to_string()
                 } else {
@@ -3401,6 +3501,35 @@ pub async fn build_institutional_watchlist_at_epoch(
                     .round()
                     / 100.0;
 
+                // Phase 37 Pillar 3: 1-Wasserstein DRO Kelly-CVaR Optimization
+                let brain_returns: Vec<f64> = state
+                    .ledger
+                    .closed_trades_snapshot()
+                    .iter()
+                    .filter(|t| t.brain_id == brain_id)
+                    .map(|t| t.realized_r_multiple)
+                    .collect();
+                let returns_sample = if brain_returns.len() >= 5 {
+                    brain_returns
+                } else {
+                    vec![1.5, -1.0, 0.8, -0.5, 2.0, -1.0, 1.2, -0.8]
+                };
+                let dro_input = crate::dro_kelly_allocator::DroKellyInput {
+                    p_cp_eff: bocpd_tel.bocpd_changepoint_prob,
+                    epistemic_ood_score: stage0.epistemic_ood_score,
+                    p_mondrian: stage0.conformal_p_value,
+                    martingale_mixture_m: m_state.martingale_e_value.max(1.0),
+                    eigen_kappa: eigen_cand.eigen_kelly_multiplier,
+                    open_book_heat_pct: base_heat_fraction,
+                    floor_kelly_fraction: 0.005,
+                    max_kelly_fraction: (combined_kelly_pct / 100.0).clamp(0.01, 0.45),
+                };
+                let dro_sol = crate::dro_kelly_allocator::DistributionallyRobustKellyAllocator::solve_dro_allocation(
+                    &returns_sample,
+                    &[],
+                    &dro_input,
+                );
+
                 row_close_series.push(close_vec);
                 row_veto_categories.push(stage0.root_cause_category.clone());
 
@@ -3421,7 +3550,7 @@ pub async fn build_institutional_watchlist_at_epoch(
                     target_1_price: t1_p,
                     target_2_price: t2_p,
                     expected_r_multiple: inference.signal.expected_r_multiple,
-                    stage0_conformal_status: stage0_status,
+                    stage0_conformal_status: effective_stage0_status,
                     mahalanobis_win_distance: dual_eval.mahalanobis_win_distance,
                     mahalanobis_loss_distance: dual_eval.mahalanobis_loss_distance,
                     conformal_llr,
@@ -3486,6 +3615,16 @@ pub async fn build_institutional_watchlist_at_epoch(
                     kelly_fraction_pct: combined_kelly_pct,
                     is_actionable: final_actionable,
                     execution_tier,
+                    hawkes_branching_ratio: (hwk_telem.hawkes_branching_ratio * 10_000.0).round() / 10_000.0,
+                    hawkes_absorption_toxicity: (hwk_telem.hawkes_absorption_toxicity * 10_000.0).round() / 10_000.0,
+                    hawkes_regime_state: hwk_telem.hawkes_orderflow_regime.as_str().to_string(),
+                    zero_gamma_flip_price: (gamma_field.zero_gamma_flip_price * 100.0).round() / 100.0,
+                    nearest_gamma_wall_price: (if inference.signal.direction == raw_fingerprint_core::TradeDirection::Long { gamma_field.overhead_call_wall } else { gamma_field.underfoot_put_wall } * 100.0).round() / 100.0,
+                    dealer_pin_resistance: (gamma_field.active_pin_resistance * 10_000.0).round() / 10_000.0,
+                    warped_target_1_price: (warped_target_res.effective_target_1_price * 100.0).round() / 100.0,
+                    wasserstein_ambiguity_eps: (dro_sol.ambiguity_radius_eps * 10_000.0).round() / 10_000.0,
+                    dro_optimal_kelly_pct: (dro_sol.optimal_kelly_pct * 100.0).round() / 100.0,
+                    marginal_cvar95_r: (dro_sol.marginal_cvar95_r * 10_000.0).round() / 10_000.0,
                 });
             }
         }
@@ -3743,6 +3882,16 @@ pub fn build_sunday_alpha_protocol_response(
             matched_cboe_contract: row.matched_option_contract.clone(),
             stage0_conformal_verdict: row.stage0_conformal_status.clone(),
             mahalanobis_llr: ((maha_llr * 1000.0).round() / 1000.0),
+            hawkes_branching_ratio: row.hawkes_branching_ratio,
+            hawkes_absorption_toxicity: row.hawkes_absorption_toxicity,
+            hawkes_regime_state: row.hawkes_regime_state.clone(),
+            zero_gamma_flip_price: row.zero_gamma_flip_price,
+            nearest_gamma_wall_price: row.nearest_gamma_wall_price,
+            dealer_pin_resistance: row.dealer_pin_resistance,
+            warped_target_1_price: row.warped_target_1_price,
+            wasserstein_ambiguity_eps: row.wasserstein_ambiguity_eps,
+            dro_optimal_kelly_pct: row.dro_optimal_kelly_pct,
+            marginal_cvar95_r: row.marginal_cvar95_r,
         });
 
         csv_lines.push(format!(

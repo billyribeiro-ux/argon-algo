@@ -3786,7 +3786,7 @@ impl RealTimeLedgerEngine {
                 "structure": pos.option_structure,
                 "secType": "OPT",
                 "exchange": "IBUSOPT",
-                "action": if action == "BUY_TO_OPEN" { "BUY" } else { "SELL" },
+                "action": if is_open_order { "BUY" } else { "SELL" },
                 "orderType": "PEG MID",
                 "routingInstruction": "IBKR_IBUSOPT_PEGGED_TO_MIDPOINT_0005",
                 "midpointOffsetUsd": 0.005,

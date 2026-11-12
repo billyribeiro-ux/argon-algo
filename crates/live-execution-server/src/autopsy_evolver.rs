@@ -222,6 +222,30 @@ pub struct SimulatedTradeOutcome {
     pub effective_retention_ratio: f64,
 }
 
+/// Phase 37 Pillar 4: Exact Telescoping Stage Outcome & Marginal Attribution.
+///
+/// Decomposes the causal path into 4 distinct nested intervention stages:
+/// - $R^{(0)}$: Raw path (stops & target exit only, no S0 veto, no S1 SPRT, no S3 ratchet)
+/// - $R^{(1)}$: Stage 0 Pre-Entry Gate only (S0 veto -> 0.0, else $R^{(0)}$)
+/// - $R^{(2)}$: Stage 0 + Stage 1 SPRT (S0 veto -> 0.0, else S1 SPRT early scratch or stop/raw)
+/// - $R^{(3)}$: Full Pipeline (Stage 0 + Stage 1 + Stage 3 Dynamic Ratchet)
+///
+/// Guaranteed Exact Telescoping Identity:
+/// $$\Delta R_{S0} + \Delta R_{S1} + \Delta R_{S3} \equiv (R^{(1)} - R^{(0)}) + (R^{(2)} - R^{(1)}) + (R^{(3)} - R^{(2)}) = R^{(3)} - R^{(0)}$$
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelescopingStageOutcome {
+    pub trade_id: Uuid,
+    pub r0_raw: f64,
+    pub r1_stage0: f64,
+    pub r2_stage1: f64,
+    pub r3_stage3: f64,
+    pub delta_r_stage0: f64,
+    pub delta_r_stage1: f64,
+    pub delta_r_stage3: f64,
+    pub total_alpha_lift: f64,
+    pub premature_shakeout: bool,
+}
+
 /// Per-brain 32x32 Ledoit-Wolf empirical covariance & Cholesky precision manifold
 /// built causally from settled precedent trades.
 #[derive(Debug, Clone)]
@@ -747,6 +771,16 @@ pub struct GateAuditReport {
     pub quarantined_traps_count: usize,
     #[serde(default)]
     pub mirror_descent_kl_divergence: f64,
+    #[serde(default)]
+    pub stage0_marginal_alpha_r: f64,
+    #[serde(default)]
+    pub stage1_marginal_alpha_r: f64,
+    #[serde(default)]
+    pub stage3_marginal_alpha_r: f64,
+    #[serde(default)]
+    pub total_pipeline_alpha_lift: f64,
+    #[serde(default)]
+    pub premature_shakeout_count: usize,
     pub all_gates_passed: bool,
     pub decision_rationale: String,
 }
@@ -770,6 +804,16 @@ pub struct AutopsyEvolutionResponse {
     pub quarantined_traps_count: usize,
     #[serde(default)]
     pub mirror_descent_kl_divergence: f64,
+    #[serde(default)]
+    pub stage0_marginal_alpha_r: f64,
+    #[serde(default)]
+    pub stage1_marginal_alpha_r: f64,
+    #[serde(default)]
+    pub stage3_marginal_alpha_r: f64,
+    #[serde(default)]
+    pub total_pipeline_alpha_lift: f64,
+    #[serde(default)]
+    pub premature_shakeout_count: usize,
     pub autopsies_decoded: Vec<DecodedTradeAutopsy>,
     pub gate_audit: GateAuditReport,
     pub updated_synaptic_states: Vec<BrainSynapticPlasticityState>,
@@ -2040,6 +2084,186 @@ pub fn simulate_trade_under_candidate_with_trap_bank(
     }
 }
 
+/// Phase 37: Re-simulates `trade` across the 4 nested stages to produce an exact telescoping attribution.
+pub fn simulate_trade_telescoping_stages(
+    trade: &ClosedTradeRow,
+    brain_state: &BrainSynapticPlasticityState,
+    trap_bank: &[Stage0TrapCentroid],
+    precision_diag_or_chol: &LedoitWolfPrecision,
+) -> TelescopingStageOutcome {
+    let entry_vec_32 = extract_causal_entry_array_32(trade);
+    let weights_32 = build_synaptic_precision_weights(brain_state);
+
+    let replay_bars = trade.replay_bars();
+    let initial_risk = (trade.entry_price.to_f64() - trade.initial_structural_stop.to_f64())
+        .abs()
+        .max(0.0001);
+    let dir = trade.direction.sign();
+    let ep = if !trade.entry_bars.is_empty() {
+        let idx = trade.entry_bar_idx.min(trade.entry_bars.len() - 1);
+        trade.entry_bars[idx].close.to_f64()
+    } else {
+        trade.entry_price.to_f64()
+    };
+
+    // --- 1. R(0): Raw execution path ---
+    let mut r0_raw = trade.realized_r_multiple;
+    if !replay_bars.is_empty() {
+        let mut hit_stop = false;
+        for bar in replay_bars.iter() {
+            let bar_high = bar.high.to_f64();
+            let bar_low = bar.low.to_f64();
+            let bar_open = bar.open.to_f64();
+            let adverse_r = if dir > 0.0 {
+                (bar_low - ep) / initial_risk
+            } else {
+                (ep - bar_high) / initial_risk
+            };
+            if adverse_r <= -1.0 {
+                let stop_exit_price = ep - dir * initial_risk;
+                let stop_fill_price = if dir > 0.0 {
+                    stop_exit_price.min(bar_open)
+                } else {
+                    stop_exit_price.max(bar_open)
+                };
+                r0_raw = ((stop_fill_price - ep) * dir) / initial_risk;
+                hit_stop = true;
+                break;
+            }
+        }
+        if !hit_stop {
+            let final_exit_price = trade.actual_exit_price.to_f64();
+            let price_r = ((final_exit_price - trade.entry_price.to_f64()) * dir) / initial_risk;
+            r0_raw = if trade.realized_r_multiple.abs() > 1e-9 {
+                trade.realized_r_multiple
+            } else {
+                price_r
+            };
+        }
+    }
+
+    // --- 2. R(1): Stage 0 Conformal Gate Only ---
+    let s0 = evaluate_stage0_conformal_kernel(
+        trade.brain_id,
+        &entry_vec_32,
+        brain_state,
+        trap_bank,
+        precision_diag_or_chol,
+        Some(trade.trade_id),
+    );
+    let r1_stage0 = if s0.vetoed { 0.0 } else { r0_raw };
+
+    // --- 3. R(2): Stage 0 + Stage 1 SPRT Scratch Only ---
+    let r2_stage1 = if s0.vetoed {
+        0.0
+    } else if replay_bars.is_empty() {
+        r0_raw
+    } else {
+        let mut r2_res = r0_raw;
+        let mut wald_llr = 0.0_f64;
+        for (idx, bar) in replay_bars.iter().enumerate() {
+            let bar_idx = idx + 1;
+            let bar_high = bar.high.to_f64();
+            let bar_low = bar.low.to_f64();
+            let bar_open = bar.open.to_f64();
+            let bar_close = bar.close.to_f64();
+
+            let adverse_r = if dir > 0.0 {
+                (bar_low - ep) / initial_risk
+            } else {
+                (ep - bar_high) / initial_risk
+            };
+            if adverse_r <= -1.0 {
+                let stop_exit_price = ep - dir * initial_risk;
+                let stop_fill_price = if dir > 0.0 {
+                    stop_exit_price.min(bar_open)
+                } else {
+                    stop_exit_price.max(bar_open)
+                };
+                r2_res = ((stop_fill_price - ep) * dir) / initial_risk;
+                break;
+            }
+
+            if bar_idx <= 3 {
+                let hl_range = (bar_high - bar_low).max(0.0001);
+                let signed_body_delta = ((bar_close - bar_open) * dir) / hl_range;
+                let close_r = ((bar_close - ep) * dir) / initial_risk;
+
+                let step_llr = if close_r < -0.25 && signed_body_delta < -0.15 {
+                    let mut maha_shift = 0.0_f64;
+                    if let Some(manifold) = precision_diag_or_chol.brains.get(&trade.brain_id)
+                        && let Some(fk) =
+                            RealTimeLedgerEngine::extract_causal_post_entry_bar_k_features_from_row(
+                                trade, bar_idx,
+                            )
+                    {
+                        let mut bar_vec = [0.0_f64; 32];
+                        for (i, &v) in fk.iter().take(32).enumerate() {
+                            bar_vec[i] = v as f64;
+                        }
+                        let d_bw = precision_diag_or_chol.bar1_mahalanobis(
+                            trade.brain_id,
+                            &weights_32,
+                            &bar_vec,
+                            &manifold.bar1_win_centroid_32,
+                        );
+                        let d_bl = precision_diag_or_chol.bar1_mahalanobis(
+                            trade.brain_id,
+                            &weights_32,
+                            &bar_vec,
+                            &manifold.bar1_loss_centroid_32,
+                        );
+                        maha_shift = ((d_bw - d_bl) * 0.05).clamp(0.0, 0.06);
+                    }
+                    (-close_r - 0.20) * 0.85 + (-signed_body_delta) * 0.45 + maha_shift
+                } else if close_r > 0.10 {
+                    -0.35
+                } else {
+                    0.0
+                };
+
+                wald_llr = (wald_llr + step_llr).max(0.0);
+                let sprt_hurdle = brain_state.wald_sprt_thresholds[bar_idx - 1];
+                if wald_llr >= sprt_hurdle {
+                    let scratch_r = ((bar_close - ep) * dir) / initial_risk;
+                    r2_res = scratch_r;
+                    break;
+                }
+            }
+        }
+        r2_res
+    };
+
+    // --- 4. R(3): Full Pipeline Outcome ---
+    let full_sim = simulate_trade_under_candidate_with_trap_bank(
+        trade,
+        brain_state,
+        trap_bank,
+        precision_diag_or_chol,
+    );
+    let r3_stage3 = full_sim.realized_r;
+
+    // Exact telescoping identity
+    let delta_r_stage0 = r1_stage0 - r0_raw;
+    let delta_r_stage1 = r2_stage1 - r1_stage0;
+    let delta_r_stage3 = r3_stage3 - r2_stage1;
+    let total_alpha_lift = r3_stage3 - r0_raw;
+    let premature_shakeout = delta_r_stage1 < -0.50;
+
+    TelescopingStageOutcome {
+        trade_id: trade.trade_id,
+        r0_raw,
+        r1_stage0,
+        r2_stage1,
+        r3_stage3,
+        delta_r_stage0,
+        delta_r_stage1,
+        delta_r_stage3,
+        total_alpha_lift,
+        premature_shakeout,
+    }
+}
+
 /// Fisher-Preconditioned Exponentiated Mirror Descent on the 32-Simplex (`propose_candidate_generation`).
 ///
 /// Conserving total synaptic mass $Z = \sum_{f=0}^{31} w_f = 6.0$ with box bounds $w_f \in [0.04, 0.65]$:
@@ -2184,10 +2408,19 @@ pub fn propose_candidate_generation_with_context(
                                 / 1000.0;
                     }
                     AutopsyFailureMode::PostEntryOrderflowToxicityReversal => {
-                        for k in 0..3 {
-                            cand.wald_sprt_thresholds[k] =
-                                ((cand.wald_sprt_thresholds[k] - 0.10).max(1.34) * 1000.0).round()
-                                    / 1000.0;
+                        if a.peak_mfe_r >= 1.0 {
+                            // Phase 37 Shakeout Self-Healing: relax threshold upward to avoid premature exit on runners
+                            for k in 0..3 {
+                                cand.wald_sprt_thresholds[k] =
+                                    ((cand.wald_sprt_thresholds[k] + 0.12).min(3.50) * 1000.0).round()
+                                        / 1000.0;
+                            }
+                        } else {
+                            for k in 0..3 {
+                                cand.wald_sprt_thresholds[k] =
+                                    ((cand.wald_sprt_thresholds[k] - 0.10).max(1.34) * 1000.0).round()
+                                        / 1000.0;
+                            }
                         }
                     }
                     AutopsyFailureMode::MfeStallGivebackExhaustion => {
@@ -2624,6 +2857,28 @@ fn verify_and_promote_generation_internal(
 
     let round4 = |v: f64| (v * 10_000.0).round() / 10_000.0;
     let round6 = |v: f64| (v * 1_000_000.0).round() / 1_000_000.0;
+
+    let mut sum_delta_s0 = 0.0_f64;
+    let mut sum_delta_s1 = 0.0_f64;
+    let mut sum_delta_s3 = 0.0_f64;
+    let mut premature_shakeout_cnt = 0usize;
+
+    for trade in baseline_trades {
+        let fallback_cur = BrainSynapticPlasticityState::new_gen0(trade.brain_id);
+        let cand_state = candidate_map.get(&trade.brain_id).unwrap_or(&fallback_cur);
+        let cand_traps = candidate_trap_bank
+            .get(&trade.brain_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let tele = simulate_trade_telescoping_stages(trade, cand_state, cand_traps, &precision);
+        sum_delta_s0 += tele.delta_r_stage0;
+        sum_delta_s1 += tele.delta_r_stage1;
+        sum_delta_s3 += tele.delta_r_stage3;
+        if tele.premature_shakeout {
+            premature_shakeout_cnt += 1;
+        }
+    }
+
     let report = GateAuditReport {
         gate1_baseline_lock_passed,
         gate1_baseline_winners_preserved: candidate_preserved_winners,
@@ -2648,6 +2903,11 @@ fn verify_and_promote_generation_internal(
         shadow_net_veto_alpha_r: round4(net_shadow_alpha_r),
         quarantined_traps_count: quarantined_cnt,
         mirror_descent_kl_divergence: round6(mean_kl_div.max(1e-6)),
+        stage0_marginal_alpha_r: round4(sum_delta_s0),
+        stage1_marginal_alpha_r: round4(sum_delta_s1),
+        stage3_marginal_alpha_r: round4(sum_delta_s3),
+        total_pipeline_alpha_lift: round4(sum_delta_s0 + sum_delta_s1 + sum_delta_s3),
+        premature_shakeout_count: premature_shakeout_cnt,
         all_gates_passed,
         decision_rationale,
     };
@@ -2759,6 +3019,11 @@ pub fn run_autopsy_evolution_cycle(ledger: &RealTimeLedgerEngine) -> AutopsyEvol
         shadow_net_veto_alpha_r: gate_audit.shadow_net_veto_alpha_r,
         quarantined_traps_count: gate_audit.quarantined_traps_count,
         mirror_descent_kl_divergence: gate_audit.mirror_descent_kl_divergence,
+        stage0_marginal_alpha_r: gate_audit.stage0_marginal_alpha_r,
+        stage1_marginal_alpha_r: gate_audit.stage1_marginal_alpha_r,
+        stage3_marginal_alpha_r: gate_audit.stage3_marginal_alpha_r,
+        total_pipeline_alpha_lift: gate_audit.total_pipeline_alpha_lift,
+        premature_shakeout_count: gate_audit.premature_shakeout_count,
         autopsies_decoded: autopsies,
         gate_audit,
         updated_synaptic_states: active_states,
@@ -2889,6 +3154,27 @@ pub fn inspect_autopsy_evolution_status(ledger: &RealTimeLedgerEngine) -> Autops
             / (candidate_states.len() as f64)
     };
 
+    let mut sum_delta_s0 = 0.0_f64;
+    let mut sum_delta_s1 = 0.0_f64;
+    let mut sum_delta_s3 = 0.0_f64;
+    let mut premature_shakeout_cnt = 0usize;
+
+    for trade in baseline_trades {
+        let fallback_cur = BrainSynapticPlasticityState::new_gen0(trade.brain_id);
+        let cand_state = candidate_map.get(&trade.brain_id).unwrap_or(&fallback_cur);
+        let cand_traps = candidate_trap_bank
+            .get(&trade.brain_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let tele = simulate_trade_telescoping_stages(trade, cand_state, cand_traps, &precision);
+        sum_delta_s0 += tele.delta_r_stage0;
+        sum_delta_s1 += tele.delta_r_stage1;
+        sum_delta_s3 += tele.delta_r_stage3;
+        if tele.premature_shakeout {
+            premature_shakeout_cnt += 1;
+        }
+    }
+
     let gate_audit = GateAuditReport {
         gate1_baseline_lock_passed: gate1_ok,
         gate1_baseline_winners_preserved: cand_win,
@@ -2913,6 +3199,11 @@ pub fn inspect_autopsy_evolution_status(ledger: &RealTimeLedgerEngine) -> Autops
         shadow_net_veto_alpha_r: round4(net_shadow_alpha_r),
         quarantined_traps_count: quarantined_cnt,
         mirror_descent_kl_divergence: round6(mean_kl_div.max(1e-6)),
+        stage0_marginal_alpha_r: round4(sum_delta_s0),
+        stage1_marginal_alpha_r: round4(sum_delta_s1),
+        stage3_marginal_alpha_r: round4(sum_delta_s3),
+        total_pipeline_alpha_lift: round4(sum_delta_s0 + sum_delta_s1 + sum_delta_s3),
+        premature_shakeout_count: premature_shakeout_cnt,
         all_gates_passed: gate1_ok,
         decision_rationale: format!(
             "PREVIEW Gen {candidate_gen_id}: Gate 1 replay {cand_win}/{target_winners} baseline winners (Exp {:.4}R -> {:.4}R, PF {:.3} -> {:.3})",
@@ -2933,6 +3224,11 @@ pub fn inspect_autopsy_evolution_status(ledger: &RealTimeLedgerEngine) -> Autops
         shadow_net_veto_alpha_r: round4(net_shadow_alpha_r),
         quarantined_traps_count: quarantined_cnt,
         mirror_descent_kl_divergence: round6(mean_kl_div.max(1e-6)),
+        stage0_marginal_alpha_r: gate_audit.stage0_marginal_alpha_r,
+        stage1_marginal_alpha_r: gate_audit.stage1_marginal_alpha_r,
+        stage3_marginal_alpha_r: gate_audit.stage3_marginal_alpha_r,
+        total_pipeline_alpha_lift: gate_audit.total_pipeline_alpha_lift,
+        premature_shakeout_count: gate_audit.premature_shakeout_count,
         autopsies_decoded: autopsies,
         gate_audit,
         updated_synaptic_states: current_states,

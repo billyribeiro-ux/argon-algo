@@ -89,10 +89,10 @@ impl SpatialDealerGammaField {
 
         // Pinning resistances
         let d_call = (k_call_wall - s).abs();
-        let psi_call = (g_dealer_pos * (-d_call / (0.75 * atr)).exp()).clamp(0.0, 1.0);
+        let psi_call = (g_dealer_pos * (-d_call / (2.5 * atr)).exp()).clamp(0.0, 1.0);
 
         let d_put = (s - k_put_wall).abs();
-        let psi_put = (g_dealer_pos * (-d_put / (0.75 * atr)).exp()).clamp(0.0, 1.0);
+        let psi_put = (g_dealer_pos * (-d_put / (2.5 * atr)).exp()).clamp(0.0, 1.0);
 
         let active_pin = match direction {
             TradeDirection::Long => psi_call,
@@ -121,17 +121,25 @@ impl SpatialDealerGammaField {
         atr_bar: f64,
     ) -> WarpedTargetResolution {
         let atr = atr_bar.max(0.01);
+        let g_dealer_pos = self.net_dealer_hedging_multiplier.max(0.0);
         match direction {
             TradeDirection::Long => {
                 let wall = self.overhead_call_wall;
-                if self.call_wall_pin_resistance >= DEALER_PINNING_WARP_THRESHOLD
+                let pin_at_target = if raw_target_1 >= wall {
+                    g_dealer_pos
+                } else {
+                    let d_wall = (wall - raw_target_1).abs();
+                    (g_dealer_pos * (-d_wall / (2.0 * atr)).exp()).clamp(0.0, 1.0)
+                };
+                let effective_pin = pin_at_target.max(self.call_wall_pin_resistance);
+                if effective_pin >= DEALER_PINNING_WARP_THRESHOLD
                     && raw_target_1 >= wall
                 {
                     let warped_t1 = wall - 0.12 * atr;
                     WarpedTargetResolution {
                         effective_target_1_price: warped_t1,
                         nearest_gamma_wall_price: wall,
-                        dealer_pin_resistance: self.call_wall_pin_resistance,
+                        dealer_pin_resistance: effective_pin,
                         pinned_short_strike: Some(wall),
                         was_warped_by_pin: true,
                     }
@@ -139,7 +147,7 @@ impl SpatialDealerGammaField {
                     WarpedTargetResolution {
                         effective_target_1_price: raw_target_1,
                         nearest_gamma_wall_price: wall,
-                        dealer_pin_resistance: self.call_wall_pin_resistance,
+                        dealer_pin_resistance: effective_pin,
                         pinned_short_strike: None,
                         was_warped_by_pin: false,
                     }
@@ -147,14 +155,21 @@ impl SpatialDealerGammaField {
             }
             TradeDirection::Short => {
                 let wall = self.underfoot_put_wall;
-                if self.put_wall_pin_resistance >= DEALER_PINNING_WARP_THRESHOLD
+                let pin_at_target = if raw_target_1 <= wall {
+                    g_dealer_pos
+                } else {
+                    let d_wall = (raw_target_1 - wall).abs();
+                    (g_dealer_pos * (-d_wall / (2.0 * atr)).exp()).clamp(0.0, 1.0)
+                };
+                let effective_pin = pin_at_target.max(self.put_wall_pin_resistance);
+                if effective_pin >= DEALER_PINNING_WARP_THRESHOLD
                     && raw_target_1 <= wall
                 {
                     let warped_t1 = wall + 0.12 * atr;
                     WarpedTargetResolution {
                         effective_target_1_price: warped_t1,
                         nearest_gamma_wall_price: wall,
-                        dealer_pin_resistance: self.put_wall_pin_resistance,
+                        dealer_pin_resistance: effective_pin,
                         pinned_short_strike: Some(wall),
                         was_warped_by_pin: true,
                     }
@@ -162,7 +177,7 @@ impl SpatialDealerGammaField {
                     WarpedTargetResolution {
                         effective_target_1_price: raw_target_1,
                         nearest_gamma_wall_price: wall,
-                        dealer_pin_resistance: self.put_wall_pin_resistance,
+                        dealer_pin_resistance: effective_pin,
                         pinned_short_strike: None,
                         was_warped_by_pin: false,
                     }

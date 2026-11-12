@@ -186,15 +186,19 @@ impl DistributionallyRobustKellyAllocator {
 
         let f_unconstrained = 0.5 * (a + b);
 
-        // CVaR tail-heat constraint
+        // CVaR tail-heat constraint:
+        // Marginal portfolio tail heat of position fraction f with typical stop risk factor (0.15):
         let cvar95 = Self::compute_cvar95_from_returns(r_slice);
-        let remaining_heat_cap = (MAX_PORTFOLIO_CVAR_CAP - input.open_book_heat_pct.max(0.0)).max(0.005);
-        let f_cvar_max = remaining_heat_cap / cvar95.max(0.50);
+        let tail_risk_scale = 0.15_f64;
+        let marginal_tail_heat_per_f = (cvar95 * tail_risk_scale).max(0.05);
+        let remaining_heat_cap =
+            (MAX_PORTFOLIO_CVAR_CAP - input.open_book_heat_pct.max(0.0)).max(0.002);
+        let f_cvar_max = remaining_heat_cap / marginal_tail_heat_per_f;
 
         let was_capped = f_unconstrained > f_cvar_max;
         let f_optimal = f_unconstrained.min(f_cvar_max).clamp(f_min, max_safe_domain);
         let kelly_pct = ((f_optimal * 100.0) * 100.0).round() / 100.0;
-        let tail_heat = input.open_book_heat_pct + f_optimal * cvar95;
+        let tail_heat = input.open_book_heat_pct + f_optimal * marginal_tail_heat_per_f;
 
         DroKellyAllocationResult {
             optimal_dro_fraction: f_optimal,

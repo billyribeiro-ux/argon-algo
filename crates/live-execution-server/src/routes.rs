@@ -130,6 +130,8 @@ pub fn canonical_settled_walk_forward_streams(
             vold_up_down_ratio,
             vix_spot: 17.2,
             vix_front_month: 18.317999999999998,
+            vix9d_spot: None,
+            vix3m_spot: None,
             sector_relative_flow: eff_flow,
         }
     };
@@ -454,6 +456,8 @@ fn canonical_settled_open_position_streams(
         vold_up_down_ratio: 2.448933349014833,
         vix_spot: 17.2,
         vix_front_month: 18.317999999999998,
+        vix9d_spot: None,
+        vix3m_spot: None,
         sector_relative_flow: sector_flow,
     };
     let make_opt = |call_vol: u64,
@@ -3312,6 +3316,7 @@ pub async fn build_institutional_watchlist_at_epoch(
                 let bar_session_frac = match tf {
                     Timeframe::Tick => 0.1 / 390.0,
                     Timeframe::M1 => 1.0 / 390.0,
+                    Timeframe::M2 => 2.0 / 390.0,
                     Timeframe::M3 => 3.0 / 390.0,
                     Timeframe::M5 => 5.0 / 390.0,
                     Timeframe::M15 => 15.0 / 390.0,
@@ -4431,6 +4436,7 @@ fn parse_timeframe_str(tf: Option<&str>) -> Timeframe {
         "1M" if tf == Some("1M") => Timeframe::Mo1,
         "1MO" | "MO1" => Timeframe::Mo1,
         "1m" | "1MIN" | "M1" => Timeframe::M1,
+        "2M" | "2MIN" | "M2" => Timeframe::M2,
         "3M" | "3MIN" | "M3" => Timeframe::M3,
         "5M" | "5MIN" | "M5" => Timeframe::M5,
         "15M" | "15MIN" | "M15" => Timeframe::M15,

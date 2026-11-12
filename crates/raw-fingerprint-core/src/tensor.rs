@@ -110,6 +110,20 @@ impl RawFingerprintEngine {
         short_float: &RawShortFloatSnapshot,
         internals: &RawMarketInternalsSnapshot,
     ) -> Result<NormalizedFingerprintTensor, FingerprintError> {
+        self.build_sequence_tensor_for_brain(None, bars, options, short_float, internals)
+    }
+
+    /// Brain-horizon-aware sequence tensor builder that selects front VIX term structure
+    /// `ln(^VIX9D_t / ^VIX_t)` for intraday/0DTE (`Brain01`/`Brain02`) and `ln(^VIX_t / ^VIX3M_t)`
+    /// for swing/wealth (`Brain03`..`Brain05`), falling back safely if an index bar is missing.
+    pub fn build_sequence_tensor_for_brain(
+        &self,
+        brain_id: Option<BrainHorizonId>,
+        bars: &[RawBarRecord],
+        options: &RawOptionsSnapshot,
+        short_float: &RawShortFloatSnapshot,
+        internals: &RawMarketInternalsSnapshot,
+    ) -> Result<NormalizedFingerprintTensor, FingerprintError> {
         let seq_len = bars.len();
         if seq_len < 2 {
             return Err(FingerprintError::InsufficientBars(seq_len));
@@ -192,9 +206,26 @@ impl RawFingerprintEngine {
         let s4_nasdaq_tick = ((internals.nasdaq_tick as f64) / 1500.0).clamp(-1.5, 1.5) as f32;
         let s4_add_breadth = ((internals.add_breadth as f64) / 2500.0).clamp(-1.5, 1.5) as f32;
         let s4_vold_log = internals.vold_up_down_ratio.max(0.01).ln().clamp(-3.0, 3.0) as f32;
-        let s4_vix_term = (internals.vix_spot.max(1.0) / internals.vix_front_month.max(1.0))
-            .ln()
-            .clamp(-1.0, 1.0) as f32;
+        let vix_spot = internals.vix_spot.max(1.0);
+        let vix_front = internals.vix_front_month.max(1.0);
+        let s4_vix_term = match brain_id {
+            Some(
+                BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade,
+            ) => match internals.vix9d_spot {
+                Some(v9) if v9 > 1.0 => (v9 / vix_spot).ln(),
+                _ => (vix_spot / vix_front).ln(),
+            },
+            Some(
+                BrainHorizonId::Brain03ShortTermSwing
+                | BrainHorizonId::Brain04CoreSwing
+                | BrainHorizonId::Brain05LongTermWealth,
+            ) => match internals.vix3m_spot {
+                Some(v3m) if v3m > 1.0 => (vix_spot / v3m).ln(),
+                _ => (vix_spot / vix_front).ln(),
+            },
+            None => (vix_spot / vix_front).ln(),
+        }
+        .clamp(-1.0, 1.0) as f32;
         let s4_sector_flow = internals.sector_relative_flow.clamp(-1.0, 1.0) as f32;
 
         let mut stream1_energy = 0.0_f32;
@@ -421,7 +452,13 @@ impl RawFingerprintEngine {
         internals: &RawMarketInternalsSnapshot,
         precedents: Option<&EmpiricalPrecedentDistribution>,
     ) -> Result<AutonomousSignalBlueprint, FingerprintError> {
-        let tensor = self.build_sequence_tensor(bars, options, short_float, internals)?;
+        let tensor = self.build_sequence_tensor_for_brain(
+            Some(brain_id),
+            bars,
+            options,
+            short_float,
+            internals,
+        )?;
         let seq_len = bars.len();
         let latest = &bars[seq_len - 1];
         let entry_price = latest.close;
@@ -1110,5 +1147,78 @@ mod tests {
         assert!(signal.entry_price >= SubPennyPrice::MIN_VALID);
         assert!(signal.structural_stop_price >= SubPennyPrice::MIN_VALID);
         assert_eq!(signal.latent_embedding_128.len(), TRACE_EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn test_feature_30_uses_real_vix9d_for_intraday_and_vix3m_for_swing() {
+        let engine = RawFingerprintEngine::new();
+        let bars = vec![
+            RawBarRecord {
+                timestamp_ns: 1_761_768_000_000_000_000,
+                open: SubPennyPrice::from_str("$100.00").unwrap(),
+                high: SubPennyPrice::from_str("$101.00").unwrap(),
+                low: SubPennyPrice::from_str("$99.50").unwrap(),
+                close: SubPennyPrice::from_str("$100.50").unwrap(),
+                volume: 1_000_000,
+                vwap: SubPennyPrice::from_str("$100.25").unwrap(),
+                dollar_turnover: 100_250_000.0,
+                trade_count: 1500,
+                bid_ask_spread: SubPennyPrice::from_str("$0.01").unwrap(),
+                time_delta_ms: 60_000,
+            },
+            RawBarRecord {
+                timestamp_ns: 1_761_768_060_000_000_000,
+                open: SubPennyPrice::from_str("$100.50").unwrap(),
+                high: SubPennyPrice::from_str("$102.00").unwrap(),
+                low: SubPennyPrice::from_str("$100.40").unwrap(),
+                close: SubPennyPrice::from_str("$101.80").unwrap(),
+                volume: 1_250_000,
+                vwap: SubPennyPrice::from_str("$101.20").unwrap(),
+                dollar_turnover: 126_500_000.0,
+                trade_count: 1800,
+                bid_ask_spread: SubPennyPrice::from_str("$0.01").unwrap(),
+                time_delta_ms: 60_000,
+            },
+        ];
+        let internals = RawMarketInternalsSnapshot {
+            timestamp_ns: 1_761_768_060_000_000_000,
+            nyse_tick: 420,
+            nasdaq_tick: 510,
+            add_breadth: 900,
+            vold_up_down_ratio: 1.85,
+            vix_spot: 18.0,
+            vix_front_month: 20.5,
+            vix9d_spot: Some(15.2),
+            vix3m_spot: Some(21.6),
+            sector_relative_flow: 0.45,
+        };
+        let opts = RawOptionsSnapshot::default();
+        let sf = RawShortFloatSnapshot::default();
+
+        let t_day = engine
+            .build_sequence_tensor_for_brain(
+                Some(BrainHorizonId::Brain02IntradayDayTrade),
+                &bars,
+                &opts,
+                &sf,
+                &internals,
+            )
+            .expect("intraday tensor");
+        let t_swing = engine
+            .build_sequence_tensor_for_brain(
+                Some(BrainHorizonId::Brain04CoreSwing),
+                &bars,
+                &opts,
+                &sf,
+                &internals,
+            )
+            .expect("swing tensor");
+
+        let last_off = FINGERPRINT_FEATURE_DIM; // row 1
+        let f30_day = t_day.flat_tensor[last_off + 30] as f64;
+        let f30_swing = t_swing.flat_tensor[last_off + 30] as f64;
+        assert!((f30_day - (15.2_f64 / 18.0).ln()).abs() < 1e-5);
+        assert!((f30_swing - (18.0_f64 / 21.6).ln()).abs() < 1e-5);
+        assert_ne!(f30_day, f30_swing);
     }
 }

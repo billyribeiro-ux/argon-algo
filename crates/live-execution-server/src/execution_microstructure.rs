@@ -142,5 +142,152 @@ impl MicropriceExecutionRouter {
             expected_slippage_r,
         }
     }
+
+    /// Conservative historical/OHLCV routing without live L1 quote depth:
+    /// bypasses synthetic queue-depth guessing (`q_bid`/`q_ask`) and applies explicit
+    /// tier-based conservative half-spread + market-impact slippage (`5 / 12 / 35 bps`).
+    pub fn route_ohlcv_conservative(
+        symbol: &str,
+        mid_price: f64,
+        structural_risk_per_share: f64,
+        atr_bar: f64,
+        direction: TradeDirection,
+        is_penny: bool,
+    ) -> MicropriceExecutionPlan {
+        let mid = mid_price.max(1e-4);
+        let one_way_bps = explicit_one_way_slippage_bps(symbol, mid, is_penny);
+        let slip_dollars = mid * (one_way_bps / 10_000.0);
+        let limit_px = match direction {
+            TradeDirection::Long => mid + slip_dollars,
+            TradeDirection::Short => (mid - slip_dollars).max(0.0001),
+        };
+        let spread_to_atr_ratio = ((2.0 * slip_dollars) / atr_bar.max(1e-4)).clamp(0.0, 2.0);
+        let expected_slippage_r = slip_dollars / structural_risk_per_share.abs().max(1e-4);
+
+        MicropriceExecutionPlan {
+            execution_tactic: ExecutionTactic::AdaptiveMicropricePeg,
+            mid_price: mid,
+            microprice: mid,
+            microprice_limit_price: limit_px,
+            microprice_alpha_skew: 0.0,
+            spread_to_atr_ratio,
+            execution_urgency_score: 0.50,
+            step_up_chase_ms: 0,
+            expected_slippage_bps: one_way_bps,
+            expected_slippage_r,
+        }
+    }
+}
+
+pub const LIQUID_MEGA_CAP_SYMBOLS: &[&str] = &[
+    "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN", "GOOGL", "AMD",
+    "AVGO", "NFLX",
+];
+
+pub const PENNY_BRAIN01_SYMBOLS: &[&str] = &[
+    "SOFI", "MARA", "RIOT", "CLSK", "IONQ", "RGTI", "BBAI", "SOUN", "UPST", "AFRM", "PLUG",
+    "LCID", "RIVN", "OPEN", "CLOV", "KULR", "AMC", "GME",
+];
+
+/// Returns explicit one-way adverse half-spread + market-impact slippage in basis points:
+/// - `5.0 bps` for liquid index / mega-caps
+/// - `35.0 bps` for sub-$5 / low-float / `BRAIN-01` names
+/// - `12.0 bps` for mid/high-beta equities
+#[inline]
+pub fn explicit_one_way_slippage_bps(symbol: &str, price: f64, is_penny_flag: bool) -> f64 {
+    let clean = symbol.trim().to_uppercase();
+    if is_penny_flag || price < 5.0 || PENNY_BRAIN01_SYMBOLS.contains(&clean.as_str()) {
+        35.0
+    } else if LIQUID_MEGA_CAP_SYMBOLS.contains(&clean.as_str()) {
+        5.0
+    } else {
+        12.0
+    }
+}
+
+/// Conservative round-trip option bid-ask spread per share per leg (`$0.03–$0.08`).
+#[inline]
+pub fn estimate_option_spread_per_leg(
+    symbol: &str,
+    spot_price: f64,
+    is_vertical_combo: bool,
+) -> f64 {
+    let clean = symbol.trim().to_uppercase();
+    let base = if matches!(clean.as_str(), "SPY" | "QQQ" | "IWM" | "DIA") {
+        0.035
+    } else if LIQUID_MEGA_CAP_SYMBOLS.contains(&clean.as_str()) {
+        0.045
+    } else if spot_price < 10.0 || PENNY_BRAIN01_SYMBOLS.contains(&clean.as_str()) {
+        0.075
+    } else {
+        0.060
+    };
+    if is_vertical_combo {
+        (base + 0.015).clamp(0.03, 0.08)
+    } else {
+        base.clamp(0.03, 0.08)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RoundTripCostEstimate {
+    pub one_way_equity_slippage_bps: f64,
+    pub expected_t1_payoff_per_unit: f64,
+    pub round_trip_friction_per_unit: f64,
+    pub t1_to_cost_ratio: f64,
+    pub tradable: bool,
+}
+
+/// Evaluates honest round-trip friction (spread + slippage + commissions/SEC-FINRA fees)
+/// and checks Stage 0 Check 3 (**Tradability & Cost Gate**: expected T1 payoff >= 2.5x RT cost).
+pub fn evaluate_tradability_and_cost_gate(
+    symbol: &str,
+    entry_price: f64,
+    target_1_price: f64,
+    is_option_routed: bool,
+    is_vertical_combo: bool,
+    option_entry_premium: f64,
+    option_target_premium: f64,
+    contract_delta: f64,
+    is_penny_flag: bool,
+) -> RoundTripCostEstimate {
+    let entry = entry_price.max(1e-4);
+    let one_way_bps = explicit_one_way_slippage_bps(symbol, entry, is_penny_flag);
+    let underlying_t1_move = (target_1_price - entry).abs();
+
+    if is_option_routed {
+        let legs = if is_vertical_combo { 2.0 } else { 1.0 };
+        let opt_spread_per_leg = estimate_option_spread_per_leg(symbol, entry, is_vertical_combo);
+        let comm_per_share_equiv_rt = legs * 2.0 * 0.0065; // $0.65/contract/leg = $0.0065/share per leg side
+        // Entry/exit adverse fill includes option bid-ask spread across legs + commissions + underlying impact
+        let rt_friction = legs * opt_spread_per_leg
+            + comm_per_share_equiv_rt
+            + (contract_delta.abs().clamp(0.15, 1.0) * entry * (one_way_bps / 10_000.0) * 0.5);
+        let exp_opt_payoff = if option_target_premium > option_entry_premium && option_entry_premium > 0.01 {
+            (option_target_premium - option_entry_premium)
+                .max(underlying_t1_move * contract_delta.abs().clamp(0.20, 0.90))
+        } else {
+            underlying_t1_move * contract_delta.abs().clamp(0.25, 0.90)
+        };
+        let ratio = exp_opt_payoff / rt_friction.max(1e-4);
+        RoundTripCostEstimate {
+            one_way_equity_slippage_bps: one_way_bps,
+            expected_t1_payoff_per_unit: exp_opt_payoff,
+            round_trip_friction_per_unit: rt_friction,
+            t1_to_cost_ratio: ratio,
+            tradable: ratio >= 2.5,
+        }
+    } else {
+        // Equity shares: 2 * explicit slippage (entry + exit) + SEC/FINRA regulatory fee (~0.003%)
+        let rt_friction = entry * ((2.0 * one_way_bps / 10_000.0) + 0.00003);
+        let ratio = underlying_t1_move / rt_friction.max(1e-4);
+        RoundTripCostEstimate {
+            one_way_equity_slippage_bps: one_way_bps,
+            expected_t1_payoff_per_unit: underlying_t1_move,
+            round_trip_friction_per_unit: rt_friction,
+            t1_to_cost_ratio: ratio,
+            tradable: ratio >= 2.5,
+        }
+    }
 }
 

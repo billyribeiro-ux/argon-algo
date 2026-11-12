@@ -30,6 +30,27 @@ use crate::types::{
 
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+/// Fixed causal macro breadth ETF basket used for Stream 4 breadth features (`26..29`).
+pub const MACRO_BREADTH_ETFS: &[&str] = &["SPY", "QQQ", "IWM", "RSP", "SMH", "XLF", "HYG"];
+
+/// Fixed CBOE VIX term-structure index symbols used for Feature `#30` (`^VIX9D`, `^VIX`, `^VIX3M`).
+pub const VIX_TERM_SYMBOLS: &[&str] = &["^VIX9D", "^VIX", "^VIX3M"];
+
+#[inline]
+pub fn encode_yahoo_url_symbol(symbol: &str) -> String {
+    symbol.trim().to_uppercase().replace('^', "%5E")
+}
+
+#[inline]
+pub fn sanitize_cache_symbol(symbol: &str) -> String {
+    symbol
+        .trim()
+        .to_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.' || *c == '_')
+        .collect()
+}
+
 /// Curated real-world Yahoo Finance constituent metadata for universe scanning.
 #[derive(Debug, Clone, Copy)]
 pub struct RealUniverseTickerMeta {
@@ -43,179 +64,73 @@ pub struct RealUniverseTickerMeta {
 /// Real curated multi-index universe covering `NASDAQ_100`, `SP_500`, `RUSSELL_2000`, `DOW_30`,
 /// and active low-priced / penny movers (`OTC_PENNY`).
 pub const REAL_YAHOO_CORE_UNIVERSE: &[RealUniverseTickerMeta] = &[
-    // NASDAQ 100 Leaders
-    RealUniverseTickerMeta {
-        symbol: "NVDA",
-        exchange_index: "NASDAQ_100",
-        sector_etf: "SMH",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "TSLA",
-        exchange_index: "NASDAQ_100",
-        sector_etf: "XLY",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "AMD",
-        exchange_index: "NASDAQ_100",
-        sector_etf: "SMH",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "AAPL",
-        exchange_index: "NASDAQ_100",
-        sector_etf: "XLK",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "MSFT",
-        exchange_index: "NASDAQ_100",
-        sector_etf: "IGV",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "META",
-        exchange_index: "NASDAQ_100",
-        sector_etf: "XLK",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "AVGO",
-        exchange_index: "NASDAQ_100",
-        sector_etf: "SMH",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "MSTR",
-        exchange_index: "NASDAQ_100",
-        sector_etf: "IGV",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "SMCI",
-        exchange_index: "NASDAQ_100",
-        sector_etf: "SMH",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "QQQ",
-        exchange_index: "NASDAQ_100",
-        sector_etf: "QQQ",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    // S&P 500 Leaders
-    RealUniverseTickerMeta {
-        symbol: "PLTR",
-        exchange_index: "SP_500",
-        sector_etf: "IGV",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "COIN",
-        exchange_index: "SP_500",
-        sector_etf: "XLF",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "SPY",
-        exchange_index: "SP_500",
-        sector_etf: "SPY",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    // DOW 30 Leaders
-    RealUniverseTickerMeta {
-        symbol: "GS",
-        exchange_index: "DOW_30",
-        sector_etf: "XLF",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    // RUSSELL 2000 High-Beta & Short-Float Movers
-    RealUniverseTickerMeta {
-        symbol: "SOFI",
-        exchange_index: "RUSSELL_2000",
-        sector_etf: "XLF",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "IONQ",
-        exchange_index: "RUSSELL_2000",
-        sector_etf: "SMH",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "UPST",
-        exchange_index: "RUSSELL_2000",
-        sector_etf: "XLF",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    RealUniverseTickerMeta {
-        symbol: "MARA",
-        exchange_index: "RUSSELL_2000",
-        sector_etf: "XLF",
-        is_optionable: true,
-        is_otc_penny: false,
-    },
-    // Low-Priced / Penny / Micro-Cap Anomaly Movers ($0.0001 - $5.00 tier)
-    RealUniverseTickerMeta {
-        symbol: "PLUG",
-        exchange_index: "OTC_PENNY",
-        sector_etf: "XLI",
-        is_optionable: true,
-        is_otc_penny: true,
-    },
-    RealUniverseTickerMeta {
-        symbol: "KULR",
-        exchange_index: "OTC_PENNY",
-        sector_etf: "XLI",
-        is_optionable: true,
-        is_otc_penny: true,
-    },
-    RealUniverseTickerMeta {
-        symbol: "OPEN",
-        exchange_index: "OTC_PENNY",
-        sector_etf: "XLF",
-        is_optionable: true,
-        is_otc_penny: true,
-    },
-    RealUniverseTickerMeta {
-        symbol: "CLOV",
-        exchange_index: "OTC_PENNY",
-        sector_etf: "XBI",
-        is_optionable: true,
-        is_otc_penny: true,
-    },
-    RealUniverseTickerMeta {
-        symbol: "BBAI",
-        exchange_index: "RUSSELL_2000",
-        sector_etf: "IGV",
-        is_optionable: true,
-        is_otc_penny: true,
-    },
-    RealUniverseTickerMeta {
-        symbol: "SOUN",
-        exchange_index: "RUSSELL_2000",
-        sector_etf: "IGV",
-        is_optionable: true,
-        is_otc_penny: true,
-    },
+    // Bucket 1: 0DTE / Index & Mega-Cap Liquid (14 tickers)
+    RealUniverseTickerMeta { symbol: "SPY", exchange_index: "SP_500", sector_etf: "SPY", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "QQQ", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "IWM", exchange_index: "RUSSELL_2000", sector_etf: "IWM", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "DIA", exchange_index: "DOW_30", sector_etf: "SPY", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "AAPL", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "MSFT", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "NVDA", exchange_index: "NASDAQ_100", sector_etf: "SMH", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "TSLA", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "META", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "AMZN", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "GOOGL", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "AMD", exchange_index: "NASDAQ_100", sector_etf: "SMH", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "AVGO", exchange_index: "NASDAQ_100", sector_etf: "SMH", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "NFLX", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+
+    // Bucket 2: High-Beta Day-Trade Movers (14 tickers)
+    RealUniverseTickerMeta { symbol: "PLTR", exchange_index: "SP_500", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "COIN", exchange_index: "SP_500", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "MSTR", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "SMCI", exchange_index: "NASDAQ_100", sector_etf: "SMH", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "ARM", exchange_index: "NASDAQ_100", sector_etf: "SMH", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "HOOD", exchange_index: "RUSSELL_2000", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "UBER", exchange_index: "SP_500", sector_etf: "SPY", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "SHOP", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "SNOW", exchange_index: "SP_500", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "CRWD", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "PANW", exchange_index: "NASDAQ_100", sector_etf: "QQQ", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "DKNG", exchange_index: "RUSSELL_2000", sector_etf: "RSP", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "ROKU", exchange_index: "RUSSELL_2000", sector_etf: "IWM", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "SQ", exchange_index: "SP_500", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+
+    // Bucket 3: Cyclicals / Defensives / Choppy Control Group (14 tickers, Anti-Survivorship Bias)
+    RealUniverseTickerMeta { symbol: "JPM", exchange_index: "DOW_30", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "GS", exchange_index: "DOW_30", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "BAC", exchange_index: "SP_500", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "XOM", exchange_index: "SP_500", sector_etf: "RSP", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "CVX", exchange_index: "DOW_30", sector_etf: "RSP", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "BA", exchange_index: "DOW_30", sector_etf: "RSP", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "DIS", exchange_index: "DOW_30", sector_etf: "RSP", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "INTC", exchange_index: "NASDAQ_100", sector_etf: "SMH", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "PFE", exchange_index: "SP_500", sector_etf: "RSP", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "NKE", exchange_index: "DOW_30", sector_etf: "RSP", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "PYPL", exchange_index: "NASDAQ_100", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "F", exchange_index: "SP_500", sector_etf: "RSP", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "GM", exchange_index: "SP_500", sector_etf: "RSP", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "T", exchange_index: "SP_500", sector_etf: "RSP", is_optionable: true, is_otc_penny: false },
+
+    // Bucket 4: Small-Cap / Low-Float / Sub-$5 Penny Volatility (BRAIN-01, 18 tickers)
+    RealUniverseTickerMeta { symbol: "SOFI", exchange_index: "RUSSELL_2000", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "MARA", exchange_index: "RUSSELL_2000", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "RIOT", exchange_index: "RUSSELL_2000", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "CLSK", exchange_index: "RUSSELL_2000", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "IONQ", exchange_index: "RUSSELL_2000", sector_etf: "SMH", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "RGTI", exchange_index: "RUSSELL_2000", sector_etf: "SMH", is_optionable: true, is_otc_penny: true },
+    RealUniverseTickerMeta { symbol: "BBAI", exchange_index: "RUSSELL_2000", sector_etf: "QQQ", is_optionable: true, is_otc_penny: true },
+    RealUniverseTickerMeta { symbol: "SOUN", exchange_index: "RUSSELL_2000", sector_etf: "QQQ", is_optionable: true, is_otc_penny: true },
+    RealUniverseTickerMeta { symbol: "UPST", exchange_index: "RUSSELL_2000", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "AFRM", exchange_index: "RUSSELL_2000", sector_etf: "XLF", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "PLUG", exchange_index: "OTC_PENNY", sector_etf: "IWM", is_optionable: true, is_otc_penny: true },
+    RealUniverseTickerMeta { symbol: "LCID", exchange_index: "OTC_PENNY", sector_etf: "IWM", is_optionable: true, is_otc_penny: true },
+    RealUniverseTickerMeta { symbol: "RIVN", exchange_index: "RUSSELL_2000", sector_etf: "IWM", is_optionable: true, is_otc_penny: false },
+    RealUniverseTickerMeta { symbol: "OPEN", exchange_index: "OTC_PENNY", sector_etf: "XLF", is_optionable: true, is_otc_penny: true },
+    RealUniverseTickerMeta { symbol: "CLOV", exchange_index: "OTC_PENNY", sector_etf: "IWM", is_optionable: true, is_otc_penny: true },
+    RealUniverseTickerMeta { symbol: "KULR", exchange_index: "OTC_PENNY", sector_etf: "IWM", is_optionable: true, is_otc_penny: true },
+    RealUniverseTickerMeta { symbol: "AMC", exchange_index: "RUSSELL_2000", sector_etf: "IWM", is_optionable: true, is_otc_penny: true },
+    RealUniverseTickerMeta { symbol: "GME", exchange_index: "RUSSELL_2000", sector_etf: "IWM", is_optionable: true, is_otc_penny: false },
 ];
 
 pub fn lookup_real_universe_meta(symbol: &str) -> RealUniverseTickerMeta {
@@ -563,7 +478,7 @@ impl YahooSessionManager {
         timeframe: Timeframe,
         fetched_bars: &[RealExchangeOhlcvBar],
     ) -> Vec<RealExchangeOhlcvBar> {
-        let clean_sym = symbol.trim().to_uppercase();
+        let clean_sym = sanitize_cache_symbol(symbol);
         let tf_str = timeframe.as_str();
         let filename = format!("{clean_sym}_{tf_str}.json");
 
@@ -637,7 +552,7 @@ impl YahooSessionManager {
         min_bars: usize,
         max_age_secs: u64,
     ) -> Option<Vec<RealExchangeOhlcvBar>> {
-        let clean_sym = symbol.trim().to_uppercase();
+        let clean_sym = sanitize_cache_symbol(symbol);
         let tf_str = timeframe.as_str();
         let filename = format!("{clean_sym}_{tf_str}.json");
         let primary_dir = std::path::PathBuf::from("data/ohlcv_cache");
@@ -674,7 +589,8 @@ impl YahooSessionManager {
 
         let min_cached_bars = match timeframe {
             Timeframe::W1 | Timeframe::Mo1 => 100,
-            _ => 250.max(target_len.min(2000)),
+            Timeframe::M1 | Timeframe::M3 => 180.max(target_len.min(1200)),
+            _ => 250.max(target_len.min(1800)),
         };
         if let Some(cached) =
             Self::try_load_warm_ohlcv_disk_cache(&clean_sym, timeframe, min_cached_bars, 3600)
@@ -705,13 +621,19 @@ impl YahooSessionManager {
 
         // Ensure Yahoo crumb is initialized so v8/finance/chart `range=60d` succeeds on first call
         if self.crumb.read().is_none() {
-            let _ = self.fetch_yahoo_history_ssr_ohlcv(&clean_sym).await;
+            let crumb_seed = if clean_sym.starts_with('^') {
+                "SPY"
+            } else {
+                &clean_sym
+            };
+            let _ = self.fetch_yahoo_history_ssr_ohlcv(crumb_seed).await;
         }
 
         // For intraday timeframes (`1m`, `3m`, `5m`, `15m`, `1h`, `4h`):
         // Use deep `60d` window for `5m`/`15m` (~4,680 real intraday bars) and `730d` for `1h`.
         let (yf_interval, primary_range, fallback_range) = match timeframe {
             Timeframe::Tick | Timeframe::M1 | Timeframe::M3 => ("1m", "7d", "5d"),
+            Timeframe::M2 => ("2m", "60d", "1mo"),
             Timeframe::M5 => ("5m", "60d", "1mo"),
             Timeframe::M15 => ("15m", "60d", "1mo"),
             Timeframe::H1 | Timeframe::H4 => ("1h", "730d", "3mo"),
@@ -937,7 +859,8 @@ impl YahooSessionManager {
         &self,
         symbol: &str,
     ) -> Result<Vec<RealExchangeOhlcvBar>, DataBusError> {
-        let url = format!("https://finance.yahoo.com/quote/{symbol}/history/");
+        let encoded_sym = encode_yahoo_url_symbol(symbol);
+        let url = format!("https://finance.yahoo.com/quote/{encoded_sym}/history/");
         let resp = self
             .client
             .get(&url)
@@ -1029,14 +952,15 @@ impl YahooSessionManager {
         interval: &str,
         range: &str,
     ) -> Result<Vec<RealExchangeOhlcvBar>, DataBusError> {
+        let encoded_sym = encode_yahoo_url_symbol(symbol);
         let crumb_opt = self.crumb.read().clone();
         let url = if let Some(crumb) = crumb_opt {
             format!(
-                "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={range}&includePrePost=false&crumb={crumb}"
+                "https://query2.finance.yahoo.com/v8/finance/chart/{encoded_sym}?interval={interval}&range={range}&includePrePost=false&crumb={crumb}"
             )
         } else {
             format!(
-                "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={range}&includePrePost=false"
+                "https://query1.finance.yahoo.com/v8/finance/chart/{encoded_sym}?interval={interval}&range={range}&includePrePost=false"
             )
         };
 
@@ -1524,7 +1448,8 @@ impl YahooSessionManager {
 
         // Strategy 2: Guaranteed 200 OK fetch via https://finance.yahoo.com/quote/{symbol}
         // which embeds the exact upstream query1.finance.yahoo.com JSON responses in <script data-url="...">
-        let url = format!("https://finance.yahoo.com/quote/{clean_sym}/");
+        let encoded_sym = encode_yahoo_url_symbol(&clean_sym);
+        let url = format!("https://finance.yahoo.com/quote/{encoded_sym}/");
         let resp = self
             .client
             .get(&url)
@@ -1576,8 +1501,9 @@ impl YahooSessionManager {
         interval: &str,
         range: &str,
     ) -> Result<RealYahooSymbolData, DataBusError> {
+        let encoded_sym = encode_yahoo_url_symbol(symbol);
         let url = format!(
-            "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={range}&includePrePost=true"
+            "https://query1.finance.yahoo.com/v8/finance/chart/{encoded_sym}?interval={interval}&range={range}&includePrePost=true"
         );
         let mut req = self.client.get(&url);
         if let Some(cookie) = self.cookie_header.read().clone() {
@@ -2382,7 +2308,8 @@ impl YahooFinanceLiveAdapter {
         for (idx, (sym, tf, limit)) in requests.iter().cloned().enumerate() {
             let min_cached = match tf {
                 Timeframe::W1 | Timeframe::Mo1 => 100,
-                _ => 250.max(limit.min(2000)),
+                Timeframe::M1 | Timeframe::M3 => 180.max(limit.min(1200)),
+                _ => 250.max(limit.min(1800)),
             };
             if YahooSessionManager::try_load_warm_ohlcv_disk_cache(&sym, tf, min_cached, 3600)
                 .is_some()
@@ -2637,69 +2564,456 @@ impl MarketDataAdapter for YahooFinanceLiveAdapter {
             ));
         }
 
-        if self.session.symbol_cache.read().is_empty() {
-            let _ = self.session.fetch_symbol_data("SPY").await;
+        let mut reqs: Vec<(String, Timeframe, usize)> =
+            Vec::with_capacity(MACRO_BREADTH_ETFS.len() + VIX_TERM_SYMBOLS.len());
+        for sym in MACRO_BREADTH_ETFS {
+            reqs.push(((*sym).to_string(), Timeframe::M5, 160));
+        }
+        for sym in VIX_TERM_SYMBOLS {
+            reqs.push(((*sym).to_string(), Timeframe::M5, 160));
+        }
+        self.prefetch_ohlcv_series_parallel(&reqs).await;
+
+        let mut breadth_bars: HashMap<String, Vec<RealExchangeOhlcvBar>> =
+            HashMap::with_capacity(MACRO_BREADTH_ETFS.len());
+        let mut latest_ts_sec = 0_i64;
+        for sym in MACRO_BREADTH_ETFS {
+            let bars = self
+                .session
+                .fetch_real_timeframe_ohlcv_bars(sym, Timeframe::M5, 160)
+                .await
+                .unwrap_or_default();
+            if let Some(last) = bars.last() {
+                latest_ts_sec = latest_ts_sec.max(last.timestamp_sec);
+            }
+            breadth_bars.insert((*sym).to_string(), bars);
         }
 
-        let vix_spot = self.session.latest_vix();
-        let vix_front_month = (vix_spot * 1.065).max(12.0);
+        let mut vix9d_bars = self
+            .session
+            .fetch_real_timeframe_ohlcv_bars("^VIX9D", Timeframe::M5, 160)
+            .await
+            .unwrap_or_default();
+        if vix9d_bars.is_empty() {
+            vix9d_bars = self
+                .session
+                .fetch_real_timeframe_ohlcv_bars("^VIX9D", Timeframe::D1, 60)
+                .await
+                .unwrap_or_default();
+        }
 
-        let cache_guard = self.session.symbol_cache.read();
-        let mut advancing = 0i32;
-        let mut declining = 0i32;
-        let mut up_vol = 0.0_f64;
-        let mut down_vol = 0.0_f64;
-        let mut sector_accum: HashMap<String, (f64, usize)> = HashMap::new();
-        let mut latest_ts_ns = 1_761_768_000_000_000_000_i64;
+        let mut vix_bars = self
+            .session
+            .fetch_real_timeframe_ohlcv_bars("^VIX", Timeframe::M5, 160)
+            .await
+            .unwrap_or_default();
+        if vix_bars.is_empty() {
+            vix_bars = self
+                .session
+                .fetch_real_timeframe_ohlcv_bars("^VIX", Timeframe::D1, 60)
+                .await
+                .unwrap_or_default();
+        }
 
-        for entry in cache_guard.values() {
-            let d = &entry.data;
-            if let Some(&last_s) = d.spark_timestamps_sec.last() {
-                latest_ts_ns = latest_ts_ns.max(last_s * 1_000_000_000);
-            }
-            let ret = (d.regular_market_price - d.previous_close.max(0.0001))
-                / d.previous_close.max(0.0001);
-            if ret >= 0.0 {
-                advancing += 1;
-                up_vol += d.regular_market_volume as f64;
+        let mut vix3m_bars = self
+            .session
+            .fetch_real_timeframe_ohlcv_bars("^VIX3M", Timeframe::M5, 160)
+            .await
+            .unwrap_or_default();
+        if vix3m_bars.is_empty() {
+            vix3m_bars = self
+                .session
+                .fetch_real_timeframe_ohlcv_bars("^VIX3M", Timeframe::D1, 60)
+                .await
+                .unwrap_or_default();
+        }
+
+        if latest_ts_sec <= 0 {
+            latest_ts_sec = vix_bars
+                .last()
+                .map(|b| b.timestamp_sec)
+                .unwrap_or(1_761_768_000);
+        }
+
+        Ok(compute_causal_internals_at_timestamp(
+            latest_ts_sec,
+            &breadth_bars,
+            &vix9d_bars,
+            &vix_bars,
+            &vix3m_bars,
+        ))
+    }
+}
+
+/// Strictly causal (`timestamp_sec <= target_ts_sec`) binary-search bar lookup (`O(log N)`).
+#[inline]
+pub fn lookup_bar_le_timestamp(
+    bars: &[RealExchangeOhlcvBar],
+    target_ts_sec: i64,
+) -> Option<(usize, &RealExchangeOhlcvBar)> {
+    let idx = bars.partition_point(|b| b.timestamp_sec <= target_ts_sec);
+    if idx == 0 {
+        None
+    } else {
+        let i = idx - 1;
+        Some((i, &bars[i]))
+    }
+}
+
+#[inline]
+fn est_trading_day_key(ts_sec: i64) -> i64 {
+    (ts_sec - 5 * 3_600).div_euclid(86_400)
+}
+
+/// Computes causal Stream 4 internals (`26..31`) at `target_ts_sec` strictly from
+/// `MACRO_BREADTH_ETFS` (`SPY`, `QQQ`, `IWM`, `RSP`, `SMH`, `XLF`, `HYG`) and
+/// `VIX_TERM_SYMBOLS` (`^VIX9D`, `^VIX`, `^VIX3M`) using only bars `<= target_ts_sec`.
+pub fn compute_causal_internals_at_timestamp(
+    target_ts_sec: i64,
+    breadth_bars: &HashMap<String, Vec<RealExchangeOhlcvBar>>,
+    vix9d_bars: &[RealExchangeOhlcvBar],
+    vix_bars: &[RealExchangeOhlcvBar],
+    vix3m_bars: &[RealExchangeOhlcvBar],
+) -> UnifiedMarketInternals {
+    let mut etf_bar_rets: HashMap<&'static str, f64> = HashMap::with_capacity(MACRO_BREADTH_ETFS.len());
+    let mut etf_sess_rets: HashMap<&'static str, f64> = HashMap::with_capacity(MACRO_BREADTH_ETFS.len());
+    let mut up_vol = 0.0_f64;
+    let mut down_vol = 0.0_f64;
+    let mut advancing = 0_i32;
+    let mut declining = 0_i32;
+
+    for &sym in MACRO_BREADTH_ETFS {
+        let Some(series) = breadth_bars.get(sym) else {
+            continue;
+        };
+        let Some((idx_t, bar_t)) = lookup_bar_le_timestamp(series, target_ts_sec) else {
+            continue;
+        };
+        // Skip stale symbols separated by > 4 trading days
+        if target_ts_sec - bar_t.timestamp_sec > 4 * 86_400 {
+            continue;
+        }
+        let day_key = est_trading_day_key(bar_t.timestamp_sec);
+        let mut sess_start = idx_t;
+        while sess_start > 0 && est_trading_day_key(series[sess_start - 1].timestamp_sec) == day_key {
+            sess_start -= 1;
+        }
+        let prev_close = if sess_start > 0 {
+            series[sess_start - 1].close
+        } else {
+            series[sess_start].open
+        }
+        .max(1e-4);
+
+        let bar_ref = if idx_t > sess_start {
+            series[idx_t - 1].close.max(1e-4)
+        } else {
+            bar_t.open.max(1e-4)
+        };
+        let bar_ret = (bar_t.close - bar_ref) / bar_ref;
+        let sess_ret = (bar_t.close - prev_close) / prev_close;
+
+        etf_bar_rets.insert(sym, bar_ret);
+        etf_sess_rets.insert(sym, sess_ret);
+        if sess_ret >= 0.0 {
+            advancing += 1;
+        } else {
+            declining += 1;
+        }
+
+        // Accumulate causal upside vs downside dollar volume within current session <= t
+        for j in sess_start..=idx_t {
+            let bj = &series[j];
+            let ref_px = if j > sess_start {
+                series[j - 1].close
             } else {
-                declining += 1;
-                down_vol += d.regular_market_volume as f64;
+                bj.open
+            };
+            let dvol = (bj.volume.max(1) as f64) * bj.close.max(0.01);
+            if bj.close >= ref_px {
+                up_vol += dvol;
+            } else {
+                down_vol += dvol;
             }
-            let meta = lookup_real_universe_meta(&d.symbol);
-            let slot = sector_accum
-                .entry(meta.sector_etf.to_string())
-                .or_insert((0.0, 0));
-            slot.0 += (ret * 20.0).clamp(-1.0, 1.0);
-            slot.1 += 1;
         }
+    }
 
-        let total_tracked = (advancing + declining).max(1) as f64;
-        let net_adv_ratio = ((advancing - declining) as f64) / total_tracked;
-        let nyse_tick = ((net_adv_ratio * 950.0).round() as i32).clamp(-1400, 1400);
-        let nasdaq_tick = ((net_adv_ratio * 1120.0).round() as i32).clamp(-1500, 1500);
-        let add = ((net_adv_ratio * 2100.0).round() as i32).clamp(-2400, 2400);
-        let vold = (up_vol.max(1.0) / down_vol.max(1.0)).clamp(0.15, 9.50);
-
-        let mut sector_flows = HashMap::new();
-        for (etf, (sum_flow, cnt)) in sector_accum {
-            sector_flows.insert(etf, (sum_flow / (cnt.max(1) as f64)).clamp(-1.0, 1.0));
+    let nyse_weights = [
+        ("SPY", 0.30_f64),
+        ("RSP", 0.25),
+        ("IWM", 0.20),
+        ("XLF", 0.15),
+        ("HYG", 0.10),
+    ];
+    let mut nyse_imp = 0.0_f64;
+    let mut nyse_w_sum = 0.0_f64;
+    for (s, w) in nyse_weights {
+        if let Some(&r) = etf_bar_rets.get(s) {
+            nyse_imp += w * (r / 0.0020).tanh();
+            nyse_w_sum += w;
         }
-        for default_etf in ["SMH", "IGV", "XLK", "XLF", "XLY", "XLI", "XBI", "SPY"] {
-            sector_flows
-                .entry(default_etf.to_string())
-                .or_insert((net_adv_ratio * 0.65).clamp(-1.0, 1.0));
-        }
+    }
+    let nyse_tick = if nyse_w_sum > 0.0 {
+        (((nyse_imp / nyse_w_sum) * 1150.0).round() as i32).clamp(-1400, 1400)
+    } else {
+        0
+    };
 
-        Ok(UnifiedMarketInternals {
-            timestamp_ns: latest_ts_ns,
-            nyse_tick,
-            nasdaq_tick,
-            add,
-            vold,
-            vix_spot,
-            vix_front_month,
-            sector_flows,
-        })
+    let nasdaq_weights = [("QQQ", 0.45_f64), ("SMH", 0.35), ("SPY", 0.20)];
+    let mut nq_imp = 0.0_f64;
+    let mut nq_w_sum = 0.0_f64;
+    for (s, w) in nasdaq_weights {
+        if let Some(&r) = etf_bar_rets.get(s) {
+            nq_imp += w * (r / 0.0024).tanh();
+            nq_w_sum += w;
+        }
+    }
+    let nasdaq_tick = if nq_w_sum > 0.0 {
+        (((nq_imp / nq_w_sum) * 1250.0).round() as i32).clamp(-1500, 1500)
+    } else {
+        0
+    };
+
+    let n_etfs = etf_sess_rets.len();
+    let add = if n_etfs > 0 {
+        let discrete_ratio = ((advancing - declining) as f64) / (n_etfs as f64);
+        let cont_breadth = etf_sess_rets
+            .values()
+            .map(|r| (*r / 0.0065).tanh())
+            .sum::<f64>()
+            / (n_etfs as f64);
+        (((0.50 * discrete_ratio + 0.50 * cont_breadth) * 2100.0).round() as i32)
+            .clamp(-2400, 2400)
+    } else {
+        0
+    };
+
+    let vold = (up_vol.max(1.0) / down_vol.max(1.0)).clamp(0.15, 9.50);
+
+    let mut sector_flows = HashMap::with_capacity(14);
+    for &sym in MACRO_BREADTH_ETFS {
+        let sr = etf_sess_rets.get(sym).copied().unwrap_or(0.0);
+        let br = etf_bar_rets.get(sym).copied().unwrap_or(0.0);
+        let flow = (0.65 * (sr / 0.015) + 0.35 * (br / 0.0025)).clamp(-1.0, 1.0);
+        sector_flows.insert(sym.to_string(), flow);
+    }
+    let qqq_f = *sector_flows.get("QQQ").unwrap_or(&0.0);
+    let smh_f = *sector_flows.get("SMH").unwrap_or(&qqq_f);
+    let iwm_f = *sector_flows.get("IWM").unwrap_or(&0.0);
+    let rsp_f = *sector_flows.get("RSP").unwrap_or(&0.0);
+    let hyg_f = *sector_flows.get("HYG").unwrap_or(&0.0);
+    sector_flows.insert("XLK".to_string(), (0.6 * qqq_f + 0.4 * smh_f).clamp(-1.0, 1.0));
+    sector_flows.insert("IGV".to_string(), (0.7 * qqq_f + 0.3 * smh_f).clamp(-1.0, 1.0));
+    sector_flows.insert("XLY".to_string(), (0.5 * qqq_f + 0.5 * rsp_f).clamp(-1.0, 1.0));
+    sector_flows.insert("XLI".to_string(), (0.5 * iwm_f + 0.5 * rsp_f).clamp(-1.0, 1.0));
+    sector_flows.insert("XBI".to_string(), (0.7 * iwm_f + 0.3 * hyg_f).clamp(-1.0, 1.0));
+
+    let vix_opt = lookup_bar_le_timestamp(vix_bars, target_ts_sec)
+        .filter(|(_, b)| (target_ts_sec - b.timestamp_sec) <= 4 * 86_400 && b.close > 2.0)
+        .map(|(_, b)| b.close);
+    let vix9d_spot = lookup_bar_le_timestamp(vix9d_bars, target_ts_sec)
+        .filter(|(_, b)| (target_ts_sec - b.timestamp_sec) <= 4 * 86_400 && b.close > 2.0)
+        .map(|(_, b)| b.close);
+    let vix3m_spot = lookup_bar_le_timestamp(vix3m_bars, target_ts_sec)
+        .filter(|(_, b)| (target_ts_sec - b.timestamp_sec) <= 4 * 86_400 && b.close > 2.0)
+        .map(|(_, b)| b.close);
+
+    let vix_spot = vix_opt.unwrap_or(17.2);
+    // Use real ^VIX3M when present, falling back safely to spot VIX if omitted (never ^VIX * 1.065)
+    let vix_front_month = vix3m_spot.unwrap_or(vix_spot);
+
+    UnifiedMarketInternals {
+        timestamp_ns: target_ts_sec * 1_000_000_000,
+        nyse_tick,
+        nasdaq_tick,
+        add,
+        vold,
+        vix_spot,
+        vix_front_month,
+        vix9d_spot,
+        vix3m_spot,
+        sector_flows,
+    }
+}
+
+/// Builds strictly causal `TickerSnapshot`s at `target_ts_sec` across `REAL_YAHOO_CORE_UNIVERSE`
+/// using ONLY bars `<= target_ts_sec` so `TwoStageMarketFunnel` ranks candidates without lookahead.
+pub fn build_causal_universe_snapshots_at_timestamp(
+    target_ts_sec: i64,
+    symbol_bars: &HashMap<String, Vec<RealExchangeOhlcvBar>>,
+    daily_bars: &HashMap<String, Vec<RealExchangeOhlcvBar>>,
+) -> Vec<TickerSnapshot> {
+    let mut snapshots = Vec::with_capacity(REAL_YAHOO_CORE_UNIVERSE.len());
+    for meta in REAL_YAHOO_CORE_UNIVERSE {
+        let Some(bars) = symbol_bars.get(meta.symbol) else {
+            continue;
+        };
+        let Some((idx_t, bar_t)) = lookup_bar_le_timestamp(bars, target_ts_sec) else {
+            continue;
+        };
+        // Only include tickers active in the current trading day
+        if est_trading_day_key(bar_t.timestamp_sec) != est_trading_day_key(target_ts_sec) {
+            continue;
+        }
+        let day_key = est_trading_day_key(bar_t.timestamp_sec);
+        let mut sess_start = idx_t;
+        while sess_start > 0 && est_trading_day_key(bars[sess_start - 1].timestamp_sec) == day_key {
+            sess_start -= 1;
+        }
+        let day_open_f = bars[sess_start].open.max(1e-4);
+        let prev_close_f = if sess_start > 0 {
+            bars[sess_start - 1].close.max(1e-4)
+        } else {
+            day_open_f
+        };
+        let mut day_high_f = bar_t.high;
+        let mut day_low_f = bar_t.low;
+        let mut day_vol: u64 = 0;
+        let mut dollar_turn = 0.0_f64;
+        let mut pv_sum = 0.0_f64;
+        for b in &bars[sess_start..=idx_t] {
+            day_high_f = day_high_f.max(b.high);
+            day_low_f = day_low_f.min(b.low);
+            let v = b.volume.max(1);
+            day_vol = day_vol.saturating_add(v);
+            let hlc3 = (b.high + b.low + b.close) / 3.0;
+            dollar_turn += hlc3 * (v as f64);
+            pv_sum += hlc3 * (v as f64);
+        }
+        let vwap_f = if day_vol > 0 {
+            (pv_sum / (day_vol as f64)).max(1e-4)
+        } else {
+            bar_t.close
+        };
+
+        // Causal trailing 20-day average daily volume strictly from completed prior daily bars
+        let avg_daily_volume_20d = daily_bars
+            .get(meta.symbol)
+            .map(|dbars| {
+                let end_idx = dbars.partition_point(|d| est_trading_day_key(d.timestamp_sec) < day_key);
+                let start_idx = end_idx.saturating_sub(20);
+                let slice = &dbars[start_idx..end_idx];
+                if slice.is_empty() {
+                    day_vol.max(250_000)
+                } else {
+                    let sum: u64 = slice.iter().map(|d| d.volume).sum();
+                    (sum / (slice.len() as u64)).max(50_000)
+                }
+            })
+            .unwrap_or_else(|| day_vol.max(250_000));
+
+        // Conservative half-spread model for historical OHLCV without L1 depth
+        let bps = if bar_t.close < 5.0 || meta.is_otc_penny {
+            0.0035
+        } else if matches!(
+            meta.symbol,
+            "SPY" | "QQQ" | "IWM" | "DIA" | "AAPL" | "MSFT" | "NVDA" | "TSLA" | "META" | "AMZN" | "GOOGL" | "AMD" | "AVGO" | "NFLX"
+        ) {
+            0.0005
+        } else {
+            0.0012
+        };
+
+        let to_sp = |v: f64| SubPennyPrice::from_f64(v.max(0.0001)).unwrap_or(SubPennyPrice::MIN_VALID);
+        let spread_px = to_sp((bar_t.close * bps).max(0.01));
+
+        snapshots.push(TickerSnapshot {
+            symbol: meta.symbol.to_string(),
+            exchange_index: meta.exchange_index.to_string(),
+            sector_etf: meta.sector_etf.to_string(),
+            timestamp_ns: target_ts_sec * 1_000_000_000,
+            last_price: to_sp(bar_t.close),
+            day_open: to_sp(day_open_f),
+            day_high: to_sp(day_high_f),
+            day_low: to_sp(day_low_f),
+            prev_close: to_sp(prev_close_f),
+            vwap: to_sp(vwap_f),
+            bid_ask_spread: spread_px,
+            day_volume: day_vol,
+            avg_daily_volume_20d,
+            day_dollar_turnover: dollar_turn,
+            public_float_shares: 100_000_000,
+            shares_outstanding: 120_000_000,
+            short_interest_shares: 5_000_000,
+            days_to_cover: 2.0,
+            intraday_short_volume_ratio: 0.45,
+            cost_to_borrow_pct: 1.5,
+            is_optionable: meta.is_optionable,
+            is_otc_penny: meta.is_otc_penny,
+        });
+    }
+    snapshots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expanded_universe_and_causal_vix_term_internals() {
+        assert!(REAL_YAHOO_CORE_UNIVERSE.len() >= 60);
+        assert_eq!(Timeframe::M2.as_str(), "2m");
+        assert_eq!(Timeframe::M2.nominal_duration_ms(), 120_000);
+
+        let t0 = 1_761_744_000_i64;
+        let t1 = t0 + 300;
+        let t2 = t0 + 600; // future bar beyond query time
+
+        let mut breadth = HashMap::new();
+        for &sym in MACRO_BREADTH_ETFS {
+            breadth.insert(
+                sym.to_string(),
+                vec![
+                    RealExchangeOhlcvBar {
+                        timestamp_sec: t0,
+                        open: 100.0,
+                        high: 100.4,
+                        low: 99.8,
+                        close: 100.2,
+                        volume: 1_000_000,
+                    },
+                    RealExchangeOhlcvBar {
+                        timestamp_sec: t1,
+                        open: 100.2,
+                        high: 100.9,
+                        low: 100.1,
+                        close: 100.8,
+                        volume: 1_400_000,
+                    },
+                    RealExchangeOhlcvBar {
+                        timestamp_sec: t2,
+                        open: 100.8,
+                        high: 101.0,
+                        low: 80.0,
+                        close: 80.5, // severe future crash that MUST NOT leak to t1
+                        volume: 50_000_000,
+                    },
+                ],
+            );
+        }
+        let vix9d = vec![
+            RealExchangeOhlcvBar { timestamp_sec: t0, open: 14.0, high: 14.2, low: 13.8, close: 13.9, volume: 0 },
+            RealExchangeOhlcvBar { timestamp_sec: t1, open: 13.9, high: 14.0, low: 13.5, close: 13.6, volume: 0 },
+            RealExchangeOhlcvBar { timestamp_sec: t2, open: 35.0, high: 40.0, low: 35.0, close: 39.0, volume: 0 },
+        ];
+        let vix = vec![
+            RealExchangeOhlcvBar { timestamp_sec: t0, open: 16.0, high: 16.1, low: 15.8, close: 15.9, volume: 0 },
+            RealExchangeOhlcvBar { timestamp_sec: t1, open: 15.9, high: 16.0, low: 15.6, close: 15.7, volume: 0 },
+            RealExchangeOhlcvBar { timestamp_sec: t2, open: 30.0, high: 34.0, low: 29.0, close: 33.0, volume: 0 },
+        ];
+        let vix3m = vec![
+            RealExchangeOhlcvBar { timestamp_sec: t0, open: 18.2, high: 18.3, low: 18.0, close: 18.1, volume: 0 },
+            RealExchangeOhlcvBar { timestamp_sec: t1, open: 18.1, high: 18.2, low: 17.9, close: 18.0, volume: 0 },
+            RealExchangeOhlcvBar { timestamp_sec: t2, open: 26.0, high: 28.0, low: 25.0, close: 27.0, volume: 0 },
+        ];
+
+        let snap_t1 = compute_causal_internals_at_timestamp(t1, &breadth, &vix9d, &vix, &vix3m);
+        assert!(snap_t1.nyse_tick > 0);
+        assert!(snap_t1.add > 0);
+        assert!((snap_t1.vix_spot - 15.7).abs() < 1e-9);
+        assert_eq!(snap_t1.vix9d_spot, Some(13.6));
+        assert_eq!(snap_t1.vix3m_spot, Some(18.0));
+        // Must NOT be vix * 1.065 proxy!
+        assert!((snap_t1.vix_front_month - 18.0).abs() < 1e-9);
     }
 }

@@ -183,6 +183,8 @@ pub unsafe extern "C" fn argon_build_fingerprint_tensor_cabi(
         vold_up_down_ratio: c_int.vold_up_down_ratio,
         vix_spot: c_int.vix_spot,
         vix_front_month: c_int.vix_front_month,
+        vix9d_spot: None,
+        vix3m_spot: None,
         sector_relative_flow: c_int.sector_relative_flow,
     };
 
@@ -333,6 +335,8 @@ pub unsafe extern "C" fn argon_evaluate_autonomous_signal_cabi(
         vold_up_down_ratio: c_int.vold_up_down_ratio,
         vix_spot: c_int.vix_spot,
         vix_front_month: c_int.vix_front_month,
+        vix9d_spot: None,
+        vix3m_spot: None,
         sector_relative_flow: c_int.sector_relative_flow,
     };
 
@@ -435,6 +439,8 @@ pub unsafe extern "C" fn argon_evaluate_live_trace_health_cabi(
         vold_up_down_ratio: c_int.vold_up_down_ratio,
         vix_spot: c_int.vix_spot,
         vix_front_month: c_int.vix_front_month,
+        vix9d_spot: None,
+        vix3m_spot: None,
         sector_relative_flow: c_int.sector_relative_flow,
     };
 
@@ -585,6 +591,8 @@ pub mod pyo3_bridge {
                 vold_up_down_ratio: vold_ratio,
                 vix_spot,
                 vix_front_month: vix_front,
+                vix9d_spot: None,
+                vix3m_spot: None,
                 sector_relative_flow: sector_flow,
             };
 

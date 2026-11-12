@@ -16,6 +16,8 @@ pub enum Timeframe {
     Tick,
     #[serde(rename = "1m")]
     M1,
+    #[serde(rename = "2m")]
+    M2,
     #[serde(rename = "3m")]
     M3,
     #[serde(rename = "5m")]
@@ -40,6 +42,7 @@ impl Timeframe {
         match self {
             Self::Tick => "Tick",
             Self::M1 => "1m",
+            Self::M2 => "2m",
             Self::M3 => "3m",
             Self::M5 => "5m",
             Self::M15 => "15m",
@@ -56,6 +59,7 @@ impl Timeframe {
         match self {
             Self::Tick => 100,
             Self::M1 => 60_000,
+            Self::M2 => 120_000,
             Self::M3 => 180_000,
             Self::M5 => 300_000,
             Self::M15 => 900_000,
@@ -271,6 +275,10 @@ pub struct UnifiedMarketInternals {
     pub vold: f64,
     pub vix_spot: f64,
     pub vix_front_month: f64,
+    #[serde(default)]
+    pub vix9d_spot: Option<f64>,
+    #[serde(default)]
+    pub vix3m_spot: Option<f64>,
     pub sector_flows: HashMap<String, f64>,
 }
 
@@ -286,6 +294,8 @@ impl UnifiedMarketInternals {
             vold_up_down_ratio: self.vold,
             vix_spot: self.vix_spot,
             vix_front_month: self.vix_front_month,
+            vix9d_spot: self.vix9d_spot,
+            vix3m_spot: self.vix3m_spot,
             sector_relative_flow: sector_flow,
         }
     }

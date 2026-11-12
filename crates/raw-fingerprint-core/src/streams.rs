@@ -263,6 +263,12 @@ pub struct RawMarketInternalsSnapshot {
     pub vix_spot: f64,
     /// Front-month VIX futures level.
     pub vix_front_month: f64,
+    /// 9-day short-dated VIX index (`^VIX9D`) for 0DTE/Intraday term structure.
+    #[serde(default)]
+    pub vix9d_spot: Option<f64>,
+    /// 3-month medium-term VIX index (`^VIX3M`) for Swing term structure.
+    #[serde(default)]
+    pub vix3m_spot: Option<f64>,
     /// Target ticker's sector ETF relative net flow (`-1.0` to `+1.0`).
     pub sector_relative_flow: f64,
 }
@@ -277,6 +283,8 @@ impl Default for RawMarketInternalsSnapshot {
             vold_up_down_ratio: 1.0,
             vix_spot: 15.0,
             vix_front_month: 16.0,
+            vix9d_spot: None,
+            vix3m_spot: None,
             sector_relative_flow: 0.0,
         }
     }

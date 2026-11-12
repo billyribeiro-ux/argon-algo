@@ -21,6 +21,8 @@ pub use types::{
     UnifiedOptionChain, UnifiedOptionContract, UnifiedTick,
 };
 pub use yahoo::{
-    FinraShortVolumeRecord, REAL_YAHOO_CORE_UNIVERSE, RealExchangeOhlcvBar, RealUniverseTickerMeta,
-    RealYahooSymbolData, YahooFinanceLiveAdapter, YahooSessionManager,
+    FinraShortVolumeRecord, MACRO_BREADTH_ETFS, REAL_YAHOO_CORE_UNIVERSE, RealExchangeOhlcvBar,
+    RealUniverseTickerMeta, RealYahooSymbolData, VIX_TERM_SYMBOLS, YahooFinanceLiveAdapter,
+    YahooSessionManager, build_causal_universe_snapshots_at_timestamp,
+    compute_causal_internals_at_timestamp, lookup_bar_le_timestamp,
 };

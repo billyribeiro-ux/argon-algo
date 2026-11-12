@@ -529,6 +529,8 @@ impl MarketDataAdapter for HistoricalReplayAdapter {
             vold: 2.85,
             vix_spot: 14.35,
             vix_front_month: 15.90,
+            vix9d_spot: Some(13.60),
+            vix3m_spot: Some(16.85),
             sector_flows,
         })
     }

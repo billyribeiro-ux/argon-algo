@@ -4158,7 +4158,13 @@ async fn stage_sunday_orders_handler(
         };
 
         state.ledger.push_paper_staged_position(open_row);
-        let _ = state.ledger.stage_broker_ticket_for_position(pos_id, Some(venue), Some("BUY_TO_OPEN"));
+        let open_action = match row.direction {
+            raw_fingerprint_core::TradeDirection::Long => "BUY_TO_OPEN",
+            raw_fingerprint_core::TradeDirection::Short => "SELL_TO_OPEN",
+        };
+        let _ = state
+            .ledger
+            .stage_broker_ticket_for_position(pos_id, Some(venue), Some(open_action));
 
         receipts.push(StagedOrderReceipt {
             client_order_id,

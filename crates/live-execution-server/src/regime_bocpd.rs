@@ -110,6 +110,8 @@ pub struct AdamsMacKayBocpdEngine {
     beta: Vec<f64>,
     prev_gex_signature: Option<f64>,
     prev_toxicity_signature: Option<f64>,
+    #[serde(default)]
+    last_timestamp_ns: Option<i64>,
     step_count: usize,
     last_telemetry: BocpdStepTelemetry,
 }
@@ -149,6 +151,7 @@ impl AdamsMacKayBocpdEngine {
             beta: vec![beta0; len],
             prev_gex_signature: None,
             prev_toxicity_signature: None,
+            last_timestamp_ns: None,
             step_count: 0,
             last_telemetry: BocpdStepTelemetry {
                 step_count: 0,
@@ -162,6 +165,27 @@ impl AdamsMacKayBocpdEngine {
 
     pub fn telemetry(&self) -> BocpdStepTelemetry {
         self.last_telemetry
+    }
+
+    pub fn last_timestamp_ns(&self) -> Option<i64> {
+        self.last_timestamp_ns
+    }
+
+    /// Timestamp-deduplicated BOCPD update: if `timestamp_ns` was already observed (`<= last_timestamp_ns`),
+    /// returns the current telemetry without double-stepping run lengths.
+    pub fn observe_surprise_at_timestamp(
+        &mut self,
+        timestamp_ns: i64,
+        x_t: f64,
+    ) -> BocpdStepTelemetry {
+        if self
+            .last_timestamp_ns
+            .is_some_and(|prev_ts| timestamp_ns <= prev_ts)
+        {
+            return self.last_telemetry;
+        }
+        self.last_timestamp_ns = Some(timestamp_ns);
+        self.observe_surprise(x_t)
     }
 
     pub fn run_length_posterior(&self) -> &[f64] {

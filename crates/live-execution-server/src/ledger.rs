@@ -2640,6 +2640,9 @@ pub struct RealTimeLedgerEngine {
     shadow_settled_trades: RwLock<Vec<ShadowVetoedTrade>>,
     martingale_shield: RwLock<crate::martingale_shield::VilleMartingaleAlphaShield>,
     bocpd_engine: RwLock<crate::regime_bocpd::AdamsMacKayBocpdEngine>,
+    last_spy_macro_timestamp_ns: RwLock<Option<i64>>,
+    symbol_bocpd_engines:
+        RwLock<std::collections::HashMap<String, crate::regime_bocpd::AdamsMacKayBocpdEngine>>,
     contextual_nig_allocator: RwLock<crate::portfolio_eigen_risk::ContextualNigMetaAllocator>,
 }
 
@@ -2679,6 +2682,8 @@ impl RealTimeLedgerEngine {
                 crate::martingale_shield::VilleMartingaleAlphaShield::new(),
             ),
             bocpd_engine: RwLock::new(crate::regime_bocpd::AdamsMacKayBocpdEngine::default()),
+            last_spy_macro_timestamp_ns: RwLock::new(None),
+            symbol_bocpd_engines: RwLock::new(std::collections::HashMap::with_capacity(128)),
             contextual_nig_allocator: RwLock::new(
                 crate::portfolio_eigen_risk::ContextualNigMetaAllocator::new(),
             ),
@@ -2687,6 +2692,34 @@ impl RealTimeLedgerEngine {
 
     pub fn bocpd_telemetry_snapshot(&self) -> crate::regime_bocpd::BocpdStepTelemetry {
         self.bocpd_engine.read().telemetry()
+    }
+
+    pub fn symbol_bocpd_telemetry_snapshot(
+        &self,
+        symbol: &str,
+    ) -> Option<crate::regime_bocpd::BocpdStepTelemetry> {
+        self.symbol_bocpd_engines
+            .read()
+            .get(&symbol.trim().to_uppercase())
+            .map(|e| e.telemetry())
+    }
+
+    /// Computes causal fused changepoint probability $p_{\text{cp, eff}} = \operatorname{clamp}(1 - (1 - p_{\text{cp, macro}})(1 - 0.55 p_{\text{cp, symbol}}), 0, 1)$.
+    pub fn compute_effective_bocpd_changepoint_prob(&self, symbol: &str) -> f64 {
+        let p_cp_macro = self
+            .bocpd_engine
+            .read()
+            .telemetry()
+            .bocpd_changepoint_prob
+            .clamp(0.0, 1.0);
+        let p_cp_symbol = self
+            .symbol_bocpd_engines
+            .read()
+            .get(&symbol.trim().to_uppercase())
+            .map(|e| e.telemetry().bocpd_changepoint_prob)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        (1.0 - (1.0 - p_cp_macro) * (1.0 - 0.55 * p_cp_symbol)).clamp(0.0, 1.0)
     }
 
     pub fn contextual_nig_allocator_snapshot(
@@ -3575,7 +3608,13 @@ impl RealTimeLedgerEngine {
         {
             "SCRATCH_EXIT"
         } else if pos.current_r_multiple >= 0.85 {
-            "SELL_TO_CLOSE"
+            if pos.direction == TradeDirection::Short {
+                "BUY_TO_CLOSE"
+            } else {
+                "SELL_TO_CLOSE"
+            }
+        } else if pos.direction == TradeDirection::Short {
+            "SELL_TO_OPEN"
         } else {
             "BUY_TO_OPEN"
         };
@@ -3584,7 +3623,7 @@ impl RealTimeLedgerEngine {
         let eq_side = match (pos.direction, action.as_str()) {
             (TradeDirection::Long, "BUY_TO_OPEN") => "BUY",
             (TradeDirection::Long, _) => "SELL",
-            (TradeDirection::Short, "BUY_TO_OPEN") => "SSHORT",
+            (TradeDirection::Short, "BUY_TO_OPEN" | "SELL_TO_OPEN") => "SSHORT",
             (TradeDirection::Short, _) => "BUY",
         };
         let exit_side = if eq_side == "BUY" { "SELL" } else { "BUY" };
@@ -3650,22 +3689,36 @@ impl RealTimeLedgerEngine {
                 sess_frac,
                 regime_bucket,
             );
+        let is_open_order =
+            matches!(action.as_str(), "BUY_TO_OPEN" | "SELL_TO_OPEN") || action.ends_with("_TO_OPEN");
+        let ref_px = if is_open_order { entry_f64 } else { live_f64 };
+        let order_direction = if is_open_order {
+            pos.direction
+        } else {
+            match pos.direction {
+                TradeDirection::Long => TradeDirection::Short,
+                TradeDirection::Short => TradeDirection::Long,
+            }
+        };
         let (q_bid, q_ask, vpin_tox, bid_px, ask_px) =
             if let Some(last_bar) = pos.entry_bars.last() {
-                let half_sp = (last_bar.bid_ask_spread.to_f64() * 0.5)
-                    .max(entry_f64 * 0.0002)
-                    .max(0.0001);
+                let raw_sp = last_bar.bid_ask_spread.to_f64();
+                let half_sp = if raw_sp > 0.0 {
+                    (raw_sp * 0.5).max(0.0001)
+                } else {
+                    (ref_px * 0.0002).max(0.0001)
+                };
                 let vol = (last_bar.volume as f64).max(100.0);
                 let close_loc = ((last_bar.close.to_f64() - last_bar.low.to_f64())
                     / (last_bar.high.to_f64() - last_bar.low.to_f64()).max(1e-4))
                 .clamp(0.05, 0.95);
                 let qb = (vol * close_loc * 0.01).max(10.0);
                 let qa = (vol * (1.0 - close_loc) * 0.01).max(10.0);
-                let vpin = ((close_loc - 0.5).abs() * 1.8).clamp(0.15, 0.95);
-                (qb, qa, vpin, entry_f64 - half_sp, entry_f64 + half_sp)
+                let vpin = ((close_loc - 0.5).abs() * 1.95).clamp(0.15, 0.96);
+                (qb, qa, vpin, ref_px - half_sp, ref_px + half_sp)
             } else {
-                let half_sp = (entry_f64 * 0.0003).max(0.0001);
-                (150.0, 120.0, 0.45, entry_f64 - half_sp, entry_f64 + half_sp)
+                let half_sp = (ref_px * 0.0003).max(0.0001);
+                (150.0, 120.0, 0.45, ref_px - half_sp, ref_px + half_sp)
             };
         let micro_plan = crate::execution_microstructure::MicropriceExecutionRouter::route_order(
             &crate::execution_microstructure::MicrostructureQuoteInput {
@@ -3676,15 +3729,17 @@ impl RealTimeLedgerEngine {
                 orderflow_toxicity_vpin: vpin_tox,
                 atr_bar,
                 structural_risk_per_share: (entry_f64 - stop_f64).abs().max(0.01),
-                direction: pos.direction,
+                direction: order_direction,
                 regime_bucket,
             },
         );
-        let limit_px = if action == "BUY_TO_OPEN" {
-            SubPennyPrice::from_f64(micro_plan.microprice_limit_price).unwrap_or(pos.entry_price)
+        let fallback_px = if is_open_order {
+            pos.entry_price
         } else {
-            SubPennyPrice::from_f64(live_f64).unwrap_or(pos.live_price)
+            pos.live_price
         };
+        let limit_px =
+            SubPennyPrice::from_f64(micro_plan.microprice_limit_price).unwrap_or(fallback_px);
         let qty_int = pos.quantity_shares.round().max(1.0) as u64;
 
         let syn_state = self.precedent_knn.get_synaptic_plasticity_state(pos.brain_id);
@@ -5308,7 +5363,7 @@ impl RealTimeLedgerEngine {
         let latest = &recent_bars[recent_bars.len() - 1];
         let live_price = latest.close;
 
-        // Phase 36 / 36.1 Pillar 2: Step resident Adams-MacKay BOCPD engine on incoming causal bar surprise
+        // Phase 36.2: Two-Tier Stream-Isolated BOCPD (Macro Systemic Index vs Per-Symbol Idiosyncratic)
         {
             let bar_surprise_x = if recent_bars.len() >= 2 {
                 let prev = &recent_bars[recent_bars.len() - 2];
@@ -5332,7 +5387,43 @@ impl RealTimeLedgerEngine {
                 let cl = latest.close.to_f64();
                 ((cl - op) / (hi - lo).max(op * 0.002)).clamp(-8.0, 8.0)
             };
-            self.bocpd_engine.write().observe_surprise(bar_surprise_x);
+            let sym_upper = symbol.trim().to_uppercase();
+            let bar_ts = latest.timestamp_ns;
+
+            // 1. Per-symbol isolated Normal-Gamma run-length filter (bounded LRU <= 128 symbols, timestamp-deduplicated)
+            {
+                let mut sym_map = self.symbol_bocpd_engines.write();
+                if !sym_map.contains_key(&sym_upper) && sym_map.len() >= 128 {
+                    if let Some(oldest_key) = sym_map
+                        .iter()
+                        .min_by_key(|(_, eng)| eng.last_timestamp_ns().unwrap_or(i64::MIN))
+                        .map(|(k, _)| k.clone())
+                    {
+                        sym_map.remove(&oldest_key);
+                    }
+                }
+                sym_map
+                    .entry(sym_upper.clone())
+                    .or_default()
+                    .observe_surprise_at_timestamp(bar_ts, bar_surprise_x);
+            }
+
+            // 2. Macro Systemic Regime Engine: updated ONLY by "SPY" primary, or "QQQ"/"IWM" fallback if "SPY" stale > 60s
+            let should_step_macro = if sym_upper == "SPY" {
+                *self.last_spy_macro_timestamp_ns.write() = Some(bar_ts);
+                true
+            } else if matches!(sym_upper.as_str(), "QQQ" | "IWM") {
+                self.last_spy_macro_timestamp_ns
+                    .read()
+                    .is_none_or(|spy_ts| bar_ts.saturating_sub(spy_ts) > 60_000_000_000)
+            } else {
+                false
+            };
+            if should_step_macro {
+                self.bocpd_engine
+                    .write()
+                    .observe_surprise_at_timestamp(bar_ts, bar_surprise_x);
+            }
         }
 
         // Step any active Shadow-Tape counterfactual trades on this real incoming bar
@@ -6175,11 +6266,20 @@ impl RealTimeLedgerEngine {
             let risk_pct = ((ep - row.initial_structural_stop.to_f64()).abs() / ep * 100.0)
                 .max(0.10);
             let mae_r = (row.mae_pct / risk_pct).max(0.35);
-            let bocpd_p_cp = self
+            let p_cp_macro = self
                 .bocpd_engine
                 .read()
                 .telemetry()
-                .bocpd_changepoint_prob;
+                .bocpd_changepoint_prob
+                .clamp(0.0, 1.0);
+            let p_cp_symbol = self
+                .symbol_bocpd_engines
+                .read()
+                .get(&row.symbol.trim().to_uppercase())
+                .map(|e| e.telemetry().bocpd_changepoint_prob)
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let p_cp_eff = (1.0 - (1.0 - p_cp_macro) * (1.0 - 0.55 * p_cp_symbol)).clamp(0.0, 1.0);
             self.contextual_nig_allocator
                 .write()
                 .observe_settled_trade_adaptive(
@@ -6187,7 +6287,7 @@ impl RealTimeLedgerEngine {
                     regime,
                     row.realized_r_multiple,
                     mae_r,
-                    bocpd_p_cp,
+                    p_cp_eff,
                 );
             self.martingale_shield
                 .write()

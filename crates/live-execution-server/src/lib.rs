@@ -9001,7 +9001,11 @@ mod tests {
         );
 
         // Step live bar to close the real position and verify live BOCPD + Contextual NIG settlement hook!
-        let bocpd_steps_before = state.ledger.bocpd_telemetry_snapshot().step_count;
+        let bocpd_steps_before = state
+            .ledger
+            .symbol_bocpd_telemetry_snapshot("NVDA")
+            .map(|t| t.step_count)
+            .unwrap_or(0);
         t_cursor_ns += 300_000_000_000;
         let mut live_close_bars = nvda_pre_bars.clone();
         live_close_bars.push(make_bar(
@@ -9022,10 +9026,14 @@ mod tests {
             !closed_live_row.is_empty(),
             "Real position must settle on target hit"
         );
-        let bocpd_steps_after = state.ledger.bocpd_telemetry_snapshot().step_count;
+        let bocpd_steps_after = state
+            .ledger
+            .symbol_bocpd_telemetry_snapshot("NVDA")
+            .map(|t| t.step_count)
+            .unwrap_or(0);
         assert!(
             bocpd_steps_after > bocpd_steps_before,
-            "Live bar ingestion in ledger.rs must advance AdamsMacKayBocpdEngine step_count!"
+            "Live bar ingestion in ledger.rs must advance per-symbol AdamsMacKayBocpdEngine step_count!"
         );
 
         // =========================================================================

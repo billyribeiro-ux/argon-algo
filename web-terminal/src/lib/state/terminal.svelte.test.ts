@@ -4,6 +4,7 @@ import autopsyWireFixture from './__fixtures__/phase32_autopsy_wire_contract.jso
 import phase34ShadowWireFixture from './__fixtures__/phase34_shadow_bandit_wire_contract.json';
 import phase35EigenConvexityWireFixture from './__fixtures__/phase35_portfolio_eigen_convexity_wire_contract.json';
 import phase36ApexWireFixture from './__fixtures__/phase36_apex_intelligence_wire_contract.json';
+import phase37SovereignWireFixture from './__fixtures__/phase37_sovereign_intelligence_wire_contract.json';
 import {
   TerminalStore,
   formatSubPennyPrice,
@@ -3176,6 +3177,88 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
       expect(routerProof.passive_plan.execution_tactic).toBe('PASSIVE_MID_PEG_LIMIT');
       expect(routerProof.adaptive_plan.execution_tactic).toBe('ADAPTIVE_MICROPRICE_PEG');
       expect(routerProof.sweep_plan.execution_tactic).toBe('IMMEDIATE_ALMGREN_CHRISS_SWEEP');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('hydrates Phase 37 Sovereign Hawkes Absorption, Dealer Gamma Wall Pinning, 1-Wasserstein DRO Kelly-CVaR, and Telescoping Multi-Stage Credit (#29)', async () => {
+    const store = new TerminalStore(false);
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (
+        url.includes('/api/v1/scanner/watchlist') ||
+        url.includes('/api/v1/scanner/institutional-watchlist') ||
+        url.includes('/api/v1/scanner/sunday-watchlist')
+      ) {
+        return new Response(JSON.stringify(phase37SovereignWireFixture.watchlist_response), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return new Response('{}', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    try {
+      await store.fetchInstitutionalWatchlist();
+      expect(store.institutionalWatchlist).not.toBeNull();
+      const rows = store.institutionalWatchlist!.watchlist;
+      expect(rows.length).toBeGreaterThan(0);
+
+      // Verify all 10 Phase 37 fields on hydrated rows
+      for (const r of rows) {
+        expect(Number.isFinite(r.hawkes_branching_ratio)).toBe(true);
+        expect(r.hawkes_branching_ratio!).toBeGreaterThanOrEqual(0.0);
+        expect(Number.isFinite(r.hawkes_absorption_toxicity)).toBe(true);
+        expect(r.hawkes_absorption_toxicity!).toBeGreaterThanOrEqual(0.0);
+        expect(r.hawkes_absorption_toxicity!).toBeLessThanOrEqual(1.0);
+        expect(typeof r.hawkes_regime_state).toBe('string');
+        expect(Number.isFinite(r.zero_gamma_flip_price)).toBe(true);
+        expect(Number.isFinite(r.nearest_gamma_wall_price)).toBe(true);
+        expect(Number.isFinite(r.dealer_pin_resistance)).toBe(true);
+        expect(Number.isFinite(r.warped_target_1_price)).toBe(true);
+        expect(Number.isFinite(r.wasserstein_ambiguity_eps)).toBe(true);
+        expect(r.wasserstein_ambiguity_eps!).toBeGreaterThan(0.0);
+        expect(Number.isFinite(r.dro_optimal_kelly_pct)).toBe(true);
+        expect(Number.isFinite(r.marginal_cvar95_r)).toBe(true);
+      }
+
+      // Proof Audits from real Rust engine telemetry
+      const bocpdProof = phase37SovereignWireFixture.bocpd_isolation_proof;
+      expect(bocpdProof.macro_p_cp).toBeLessThan(0.25);
+      expect(bocpdProof.xyz_p_cp).toBeGreaterThan(0.40);
+      expect(bocpdProof.fused_p_cp).toBeGreaterThanOrEqual(bocpdProof.macro_p_cp);
+      expect(bocpdProof.symmetric_buy_to_open_parity).toBe(true);
+      expect(bocpdProof.symmetric_sell_to_open_parity).toBe(true);
+
+      const hawkesProof = phase37SovereignWireFixture.hawkes_microstructure_proof;
+      expect(hawkesProof.branching_ratio).toBeGreaterThan(0.60);
+      expect(hawkesProof.absorption_toxicity).toBeGreaterThan(0.68);
+      expect(hawkesProof.long_iceberg_vetoed).toBe(true);
+      expect(hawkesProof.short_iceberg_vetoed).toBe(false);
+      expect(hawkesProof.climax_ratchet_floor).toBeGreaterThanOrEqual(0.85);
+
+      const gammaProof = phase37SovereignWireFixture.dealer_gamma_field_proof;
+      expect(gammaProof.zero_gamma_flip).toBeLessThan(gammaProof.spot);
+      expect(gammaProof.call_wall).toBeGreaterThan(gammaProof.spot);
+      expect(gammaProof.warped_t1).toBeLessThan(gammaProof.call_wall);
+      expect(gammaProof.pinned_short_strike).toBe(gammaProof.call_wall);
+      expect(gammaProof.unwarped_t1).toBe(gammaProof.raw_t1_safe);
+
+      const droProof = phase37SovereignWireFixture.wasserstein_dro_proof;
+      expect(droProof.calm_eps).toBeLessThan(droProof.elevated_eps);
+      expect(droProof.elevated_eps).toBeLessThan(droProof.stress_eps);
+      expect(droProof.calm_f_dro).toBeGreaterThan(droProof.elevated_f_dro);
+      expect(droProof.elevated_f_dro).toBeGreaterThan(droProof.stress_f_dro);
+      expect(droProof.cvar_capped).toBe(true);
+      expect(droProof.cvar_tail_heat_pct).toBeLessThanOrEqual(0.0651);
+
+      const shapleyProof = phase37SovereignWireFixture.telescoping_shapley_proof;
+      expect(shapleyProof.baseline_trades_verified).toBe(173);
+      expect(shapleyProof.max_telescoping_error).toBe(0.0);
+      expect(shapleyProof.total_alpha_lift).toBeGreaterThan(0.0);
     } finally {
       globalThis.fetch = originalFetch;
     }

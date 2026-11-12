@@ -1,6 +1,6 @@
 {
   "status": "PROMOTED_CHAMPION",
-  "timestamp_iso": "2026-11-12T01:36:31.543653+00:00",
+  "timestamp_iso": "2026-11-12T17:09:27.922655+00:00",
   "current_generation_id": 36,
   "candidate_generation_id": 37,
   "promoted_generation_id": 37,
@@ -11,9 +11,14 @@
   "shadow_net_veto_alpha_r": 0.0,
   "quarantined_traps_count": 0,
   "mirror_descent_kl_divergence": 0.000076,
+  "stage0_marginal_alpha_r": 3.5972,
+  "stage1_marginal_alpha_r": 0.6313,
+  "stage3_marginal_alpha_r": 4.6639,
+  "total_pipeline_alpha_lift": 8.8924,
+  "premature_shakeout_count": 0,
   "autopsies_decoded": [
     {
-      "trade_id": "bf6cc548-9aac-4499-ba79-fa479c901aa6",
+      "trade_id": "9f911969-d987-46f0-bdbc-afced65ba9d7",
       "symbol": "NVDA",
       "brain_id": "BRAIN-02",
       "realized_r": -1.0,
@@ -71,7 +76,7 @@
       ],
       "mahalanobis_distance_shift": 8.857,
       "collapse_bar_offset": 1,
-      "summary": "Trade bf6cc548 on NVDA (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [float_rotation_log] (MFE: +0.03R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 8.857)",
+      "summary": "Trade 9f911969 on NVDA (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [float_rotation_log] (MFE: +0.03R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 8.857)",
       "entry_features_32": [
         0.5588235,
         0.025,
@@ -108,7 +113,7 @@
       ]
     },
     {
-      "trade_id": "c777cfb4-286c-4326-82ad-9437e70a6a38",
+      "trade_id": "81486347-966e-420e-ac04-1f7220980a3d",
       "symbol": "AMD",
       "brain_id": "BRAIN-02",
       "realized_r": -1.0,
@@ -166,7 +171,7 @@
       ],
       "mahalanobis_distance_shift": 4.825,
       "collapse_bar_offset": 2,
-      "summary": "Trade c777cfb4 on AMD (BRAIN-02) failed via POST_ENTRY_ORDERFLOW_TOXICITY_REVERSAL at Bar +2: top culprit [close_log_ret] (MFE: +0.35R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 4.825)",
+      "summary": "Trade 81486347 on AMD (BRAIN-02) failed via POST_ENTRY_ORDERFLOW_TOXICITY_REVERSAL at Bar +2: top culprit [close_log_ret] (MFE: +0.35R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 4.825)",
       "entry_features_32": [
         0.8208955,
         0.025,
@@ -203,7 +208,7 @@
       ]
     },
     {
-      "trade_id": "34afab9f-6952-43cb-bf37-92ac5356c200",
+      "trade_id": "80cfdfd7-d32a-4ffc-b7c7-ec728d0c2aab",
       "symbol": "QQQ",
       "brain_id": "BRAIN-02",
       "realized_r": 1.472425,
@@ -261,7 +266,7 @@
       ],
       "mahalanobis_distance_shift": 6.191,
       "collapse_bar_offset": 3,
-      "summary": "Trade 34afab9f on QQQ (BRAIN-02) failed via MFE_STALL_GIVEBACK_EXHAUSTION at Bar +3: top culprit [close_log_ret] (MFE: +2.45R -> Realized: 1.47R, Giveback: 39.9%, LW-Mahalanobis Shift: 6.191)",
+      "summary": "Trade 80cfdfd7 on QQQ (BRAIN-02) failed via MFE_STALL_GIVEBACK_EXHAUSTION at Bar +3: top culprit [close_log_ret] (MFE: +2.45R -> Realized: 1.47R, Giveback: 39.9%, LW-Mahalanobis Shift: 6.191)",
       "entry_features_32": [
         0.84126985,
         0.025,
@@ -322,6 +327,11 @@
     "shadow_net_veto_alpha_r": 0.0,
     "quarantined_traps_count": 0,
     "mirror_descent_kl_divergence": 0.000076,
+    "stage0_marginal_alpha_r": 3.5972,
+    "stage1_marginal_alpha_r": 0.6313,
+    "stage3_marginal_alpha_r": 4.6639,
+    "total_pipeline_alpha_lift": 8.8924,
+    "premature_shakeout_count": 0,
     "all_gates_passed": true,
     "decision_rationale": "PROMOTED Gen 37: Gate 1 passed (116/116 baseline winners, Exp: 0.2122R -> 0.2130R, PF: 1.579 -> 1.582) & Gate 2 passed (WF Net R: 1.122R -> 2.849R, Full stops: 2 -> 0, New traps: +1, Quarantined: 0)"
   },
@@ -641,12 +651,12 @@
         "6d9b0291-466c-42b5-9f10-3001a20f2915": 0.9912,
         "72c628a1-b359-4cc6-9a01-328e920fe9ee": 1.0065,
         "760f0c60-4ab0-4a3d-9a8d-21b5fc78de52": 0.9971,
+        "81486347-966e-420e-ac04-1f7220980a3d": 0.9883,
         "9e123dab-246a-42c1-9e06-f5f0e5dd7456": 0.994,
+        "9f911969-d987-46f0-bdbc-afced65ba9d7": 1.0298,
         "a3f24427-7572-4e8f-abd5-c385666dbe16": 0.9955,
         "b5d1ab65-d397-4301-b040-5d1820a1b16b": 0.9908,
-        "bf6cc548-9aac-4499-ba79-fa479c901aa6": 1.0298,
         "c657bf95-c630-46d2-8e05-77f55fbe4841": 0.9913,
-        "c777cfb4-286c-4326-82ad-9437e70a6a38": 0.9883,
         "df3ee90f-2c41-4037-a8cb-6642df100a05": 0.9953,
         "e69f2515-f284-4f09-84ee-dc0bd5a9a663": 0.987,
         "ec3688f8-debd-4bb5-b2ee-7778b57457d7": 0.9956,

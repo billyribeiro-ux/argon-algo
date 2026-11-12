@@ -927,6 +927,17 @@ export interface InstitutionalWatchlistRow {
   martingale_e_value?: number;
   martingale_kelly_multiplier?: number;
   probation_shadow_only?: boolean;
+  // Phase 37 Sovereign Quantitative Intelligence Telemetry
+  hawkes_branching_ratio?: number;
+  hawkes_absorption_toxicity?: number;
+  hawkes_regime_state?: string;
+  zero_gamma_flip_price?: number;
+  nearest_gamma_wall_price?: number;
+  dealer_pin_resistance?: number;
+  warped_target_1_price?: number;
+  wasserstein_ambiguity_eps?: number;
+  dro_optimal_kelly_pct?: number;
+  marginal_cvar95_r?: number;
 }
 
 export interface InstitutionalWatchlistResponse {
@@ -972,6 +983,17 @@ export interface SundayAlphaProtocolExportRow {
   matched_option_contract: string;
   kelly_fraction_pct: number;
   action_status: string;
+  // Phase 37 Sovereign Quantitative Intelligence Telemetry
+  hawkes_branching_ratio?: number;
+  hawkes_absorption_toxicity?: number;
+  hawkes_regime_state?: string;
+  zero_gamma_flip_price?: number;
+  nearest_gamma_wall_price?: number;
+  dealer_pin_resistance?: number;
+  warped_target_1_price?: number;
+  wasserstein_ambiguity_eps?: number;
+  dro_optimal_kelly_pct?: number;
+  marginal_cvar95_r?: number;
 }
 
 export interface SundayAlphaProtocolResponse {

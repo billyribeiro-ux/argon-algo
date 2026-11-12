@@ -3466,12 +3466,6 @@ pub async fn build_institutional_watchlist_at_epoch(
                 } else {
                     false
                 };
-                let effective_stage0_status = if hwk_veto {
-                    "HAWKES_ICEBERG_ABSORPTION_VETO".to_string()
-                } else {
-                    stage0_status
-                };
-
                 let final_actionable =
                     is_actionable && !eigen_cand.vetoed && !m_state.probation_shadow_only && !hwk_veto;
                 let init_action_status = if m_state.probation_shadow_only {
@@ -3492,11 +3486,12 @@ pub async fn build_institutional_watchlist_at_epoch(
                     BrainHorizonId::Brain05LongTermWealth => "IBKR_VOL_AUCTION_ACCUM",
                 };
 
-                let combined_kelly_pct = ((kelly_plan.kelly_fraction_pct
+                let combined_kelly_pct = (((kelly_plan.kelly_fraction_pct
                     * stage0.unified_stage0_kelly_multiplier.clamp(0.10, 1.0)
                     * eigen_cand.eigen_kelly_multiplier.clamp(0.25, 1.0)
                     * m_state.martingale_kelly_multiplier.clamp(0.15, 1.0)
                     * nig_kelly_mult.clamp(0.75, 1.35))
+                    .min(2.75))
                     * 100.0)
                     .round()
                     / 100.0;
@@ -3550,7 +3545,7 @@ pub async fn build_institutional_watchlist_at_epoch(
                     target_1_price: t1_p,
                     target_2_price: t2_p,
                     expected_r_multiple: inference.signal.expected_r_multiple,
-                    stage0_conformal_status: effective_stage0_status,
+                    stage0_conformal_status: stage0_status,
                     mahalanobis_win_distance: dual_eval.mahalanobis_win_distance,
                     mahalanobis_loss_distance: dual_eval.mahalanobis_loss_distance,
                     conformal_llr,

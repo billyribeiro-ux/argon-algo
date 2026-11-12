@@ -1,6 +1,6 @@
 {
   "status": "PROMOTED_CHAMPION",
-  "timestamp_iso": "2026-11-11T23:33:22.668531+00:00",
+  "timestamp_iso": "2026-11-12T01:36:33.356514+00:00",
   "current_generation_id": 38,
   "candidate_generation_id": 39,
   "promoted_generation_id": 39,
@@ -13,7 +13,7 @@
   "mirror_descent_kl_divergence": 0.000137,
   "autopsies_decoded": [
     {
-      "trade_id": "1ea147ed-960d-4de9-b39c-416475bb288a",
+      "trade_id": "5cfcb9d1-cbbd-4fb9-964d-6e7e9081b1cf",
       "symbol": "SPY",
       "brain_id": "BRAIN-02",
       "realized_r": -1.45,
@@ -71,7 +71,7 @@
       ],
       "mahalanobis_distance_shift": 4.734,
       "collapse_bar_offset": 1,
-      "summary": "Trade 1ea147ed on SPY (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [close_log_ret] (MFE: +0.00R -> Realized: -1.45R, Giveback: 0.0%, LW-Mahalanobis Shift: 4.734)",
+      "summary": "Trade 5cfcb9d1 on SPY (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [close_log_ret] (MFE: +0.00R -> Realized: -1.45R, Giveback: 0.0%, LW-Mahalanobis Shift: 4.734)",
       "entry_features_32": [
         0.8153846,
         0.025,
@@ -425,7 +425,7 @@
         1.0085211661968092,
         0.9665272622879192,
         1.0100596639431894,
-        0.96904433610509
+        0.9690443361050902
       ],
       "stream_prior_multipliers": [
         1.024,
@@ -441,13 +441,13 @@
       "entry_veto_margin_delta": 0.021,
       "trap_conviction_weights": {
         "0b6d9498-3edc-4231-b974-762301b8659c": 1.0921,
-        "1ea147ed-960d-4de9-b39c-416475bb288a": 0.9925,
         "1ffa1890-0e4a-40ea-8642-2c8fffad6630": 1.1061,
         "274cfa64-a4da-4a4e-b8c1-583c95203b6b": 1.0375,
         "2c5e547e-a32a-40bf-ba8e-d126823a6bd0": 1.0777,
         "3670baa8-a27c-44fa-a072-2bf8ffed6b7d": 1.0832,
         "532945d3-0361-4934-b1cc-36d8ce985f4f": 1.1148,
         "58e17930-211e-470c-9b93-98f4f2d0d68c": 1.0787,
+        "5cfcb9d1-cbbd-4fb9-964d-6e7e9081b1cf": 0.9925,
         "6d444c75-650d-4200-90e7-8ff5797f832c": 1.1165,
         "6d9b0291-466c-42b5-9f10-3001a20f2915": 1.1308,
         "72c628a1-b359-4cc6-9a01-328e920fe9ee": 1.1148,
@@ -533,9 +533,9 @@
         0.18909771866190173,
         0.18122386167898483,
         0.189386186989348,
-        0.18169581301970436
+        0.1816958130197044
       ],
-      "mirror_descent_kl_divergence": 0.00013335865527925288,
+      "mirror_descent_kl_divergence": 0.0001333586552792595,
       "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {
@@ -1005,7 +1005,7 @@
       "learned_velocity_absorption_damping_weight": 0.4725,
       "learned_recovery_velocity_guard_quantile": 0.02,
       "simplex_weights_32": [
-        0.17057696674840792,
+        0.17057696674840794,
         0.1894227807228868,
         0.18026088614189936,
         0.185642581485736,
@@ -1038,7 +1038,7 @@
         0.19743362414861215,
         0.1866613578869489
       ],
-      "mirror_descent_kl_divergence": 0.0001942130788597423,
+      "mirror_descent_kl_divergence": 0.00019421307885974577,
       "mondrian_conformal_alpha_floor": 0.04,
       "top_boosted_warning_features": [
         {

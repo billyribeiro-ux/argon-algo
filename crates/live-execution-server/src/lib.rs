@@ -8592,4 +8592,606 @@ mod tests {
             sweep_plan.expected_slippage_bps
         );
     }
+
+    #[tokio::test]
+    async fn test_phase36_1_adversarial_ville_supermartingale_bocpd_absorber_and_live_ledger_loop()
+    {
+        use crate::autopsy_evolver::{compute_rank1_loo_centroid_32, LedoitWolfPrecision};
+        use crate::martingale_shield::{
+            BrainMartingaleState, VilleMartingaleAlphaShield, VILLE_ALPHA_THRESHOLD,
+            VILLE_RECOVERY_HYSTERESIS_FLOOR,
+        };
+        use crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot;
+        use crate::regime_bocpd::AdamsMacKayBocpdEngine;
+        use std::path::Path;
+
+        let models_dir = Path::new("../../models");
+        let state = AppState::new(if models_dir.exists() {
+            Some(models_dir)
+        } else {
+            None
+        });
+        let ledger_path = [
+            Path::new("../../data/ledger_state.json"),
+            Path::new("data/ledger_state.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("data/ledger_state.json must exist on disk");
+        assert!(state.ledger.load_from_disk(ledger_path));
+        state.ledger.clear_all_open_positions();
+        state.ledger.set_enforce_hard_scratch_on_baseline(false);
+        for row in &state.ledger.closed_trades_snapshot() {
+            state.ledger.sync_closed_row_to_precedent_knn(row);
+        }
+        state.ledger.recompute_causal_plasticity();
+
+        let closed_snap = state.ledger.closed_trades_snapshot();
+        assert_eq!(closed_snap.len(), 173, "Baseline must contain 173 settled trades");
+
+        // =========================================================================
+        // (a) Asymmetric Runner Supermartingale Proof (40% +2.0R / 60% -1.0R + 173 Baseline Replay + Broken Brain < 15 Trades)
+        // =========================================================================
+        let d_win_2r = BrainMartingaleState::compute_symmetric_shortfall_d(2.0);
+        let d_loss_1r = BrainMartingaleState::compute_symmetric_shortfall_d(-1.0);
+        let expected_d_runner = 0.40 * d_win_2r + 0.60 * d_loss_1r;
+        assert!(
+            expected_d_runner < 0.0,
+            "Asymmetric +2.0R/-1.0R runner (+0.20R expectancy) must have negative drift E[d_k] < 0, got {}",
+            expected_d_runner
+        );
+
+        // Run 500 deterministic/Monte-Carlo cycles of a 40% +2.0R / 60% -1.0R runner
+        let mut runner_false_quarantines = 0usize;
+        let mut min_raw_ville_e = f64::INFINITY;
+        for cycle in 0..500usize {
+            let mut runner_state =
+                BrainMartingaleState::new(MetaAllocatorHorizonSlot::Brain04CoreSwing);
+            // Balanced 5-trade block (2 wins of +2.0R, 3 losses of -1.0R => 40% win rate, +0.20R/trade)
+            // permuted across 500 seeds/rotations over 100 trades per cycle
+            for step in 0..100usize {
+                let slot_in_block = (step + cycle * 3 + (step / 5) * 2) % 5;
+                let r_trade = if slot_in_block < 2 { 2.0 } else { -1.0 };
+                runner_state.observe_trade_r(r_trade, false);
+                if runner_state.raw_ville_e_value < min_raw_ville_e {
+                    min_raw_ville_e = runner_state.raw_ville_e_value;
+                }
+            }
+            if runner_state.probation_shadow_only {
+                runner_false_quarantines += 1;
+            }
+        }
+        assert_eq!(
+            runner_false_quarantines, 0,
+            "Profitable 40% +2.0R / 60% -1.0R runner must have 0/500 false quarantines!"
+        );
+        assert!(
+            min_raw_ville_e < 0.05,
+            "Unreflected raw_ville_e_value must drop freely below 0.05 (zero lower reflection barrier at 0.25!), got {}",
+            min_raw_ville_e
+        );
+
+        // Replay all 173 real baseline trades chronologically per brain through VilleMartingaleAlphaShield
+        let baseline_shield = VilleMartingaleAlphaShield::from_causal_ledger(&closed_snap);
+        let baseline_states = baseline_shield.snapshot_all();
+        let baseline_quarantined_count = baseline_states
+            .iter()
+            .filter(|st| st.probation_shadow_only)
+            .count();
+        assert_eq!(
+            baseline_quarantined_count, 0,
+            "0/5 baseline brains (0/6 slots) may falsely trigger probation across the 173 baseline trades! States: {:?}",
+            baseline_states
+        );
+
+        // True broken brain (-0.65R per trade) must trip probation in < 15 trades
+        let mut broken_brain =
+            BrainMartingaleState::new(MetaAllocatorHorizonSlot::Brain02IntradayDayTrade);
+        let mut broken_trades_to_trip = 0usize;
+        while !broken_brain.probation_shadow_only && broken_trades_to_trip < 25 {
+            broken_brain.observe_trade_r(-0.65, false);
+            broken_trades_to_trip += 1;
+        }
+        assert!(
+            broken_brain.probation_shadow_only
+                && broken_brain.martingale_e_value >= VILLE_ALPHA_THRESHOLD,
+            "Broken -0.65R brain must trip probation_shadow_only=true (M_t >= 20.0), got M_t={}",
+            broken_brain.martingale_e_value
+        );
+        assert!(
+            broken_trades_to_trip < 15,
+            "Broken -0.65R brain must trip probation in < 15 trades, took {} trades",
+            broken_trades_to_trip
+        );
+
+        // =========================================================================
+        // (b) Full `ledger.rs` Closed-Loop Probation -> Shadow-Tape -> Live Recovery Proof
+        // =========================================================================
+        let internals = raw_fingerprint_core::RawMarketInternalsSnapshot::default();
+        let make_bar = |ts_ns: i64, o: f64, h: f64, l: f64, c: f64, vol: f64| {
+            raw_fingerprint_core::RawBarRecord {
+                timestamp_ns: ts_ns,
+                open: SubPennyPrice::from_f64(o).unwrap(),
+                high: SubPennyPrice::from_f64(h).unwrap(),
+                low: SubPennyPrice::from_f64(l).unwrap(),
+                close: SubPennyPrice::from_f64(c).unwrap(),
+                volume: vol as u64,
+                vwap: SubPennyPrice::from_f64((o + h + l + c) * 0.25).unwrap(),
+                dollar_turnover: c * vol,
+                trade_count: 1_250,
+                bid_ask_spread: SubPennyPrice::from_f64((c * 0.0004).max(0.01)).unwrap(),
+                time_delta_ms: 300_000,
+            }
+        };
+
+        let base_template = closed_snap
+            .iter()
+            .find(|t| t.brain_id == BrainHorizonId::Brain02IntradayDayTrade && t.is_winner)
+            .expect("BRAIN-02 winner template exists")
+            .clone();
+
+        let build_inf = |sym: &str,
+                         brain_id: BrainHorizonId,
+                         dir: TradeDirection,
+                         ts_ns: i64,
+                         ep: SubPennyPrice,
+                         sp: SubPennyPrice,
+                         t1: SubPennyPrice,
+                         t2: SubPennyPrice,
+                         conf_pct: f64,
+                         emb_128: Vec<f32>| {
+            let signal = raw_fingerprint_core::AutonomousSignalBlueprint {
+                brain_id,
+                symbol: sym.to_string(),
+                timestamp_ns: ts_ns,
+                direction: dir,
+                ai_confidence_pct: conf_pct,
+                entry_price: ep,
+                structural_stop_price: sp,
+                target_1_price: t1,
+                target_2_price: t2,
+                predicted_hold_duration_ms: 900_000,
+                expected_r_multiple: 2.25,
+                primary_driver: raw_fingerprint_core::PrimaryFingerprintDriver::VolumeAbsorption,
+                stream_weights: raw_fingerprint_core::FourStreamWeights {
+                    chart_tape_physics_weight: 0.35,
+                    options_gamma_vanna_weight: 0.30,
+                    short_float_squeeze_weight: 0.20,
+                    market_internals_macro_weight: 0.15,
+                },
+                latent_embedding_128: emb_128,
+            };
+            let matched_option = crate::onnx_engine::MatchedOptionExecutionPlan {
+                option_structure: "SINGLE_LEG_CALL".to_string(),
+                matched_option_contract: format!("{sym} 2026-11-20 $100.00C"),
+                option_entry_premium: SubPennyPrice::from_f64(3.50).unwrap(),
+                option_live_premium: SubPennyPrice::from_f64(3.50).unwrap(),
+                option_stop_premium: SubPennyPrice::from_f64(1.75).unwrap(),
+                option_target_premium: SubPennyPrice::from_f64(7.80).unwrap(),
+                option_contracts_count: 4,
+                contract_delta: 0.54,
+                contract_gamma: 0.042,
+                contract_vanna: 0.018,
+                contract_theta: -0.12,
+                contract_vega: 0.25,
+                contract_iv: 0.34,
+            };
+            let prec = crate::precedent_knn::PrecedentMatchSummary {
+                matches_count: 16,
+                win_rate_pct: 78.0,
+                mean_realized_r_multiple: 2.05,
+                mean_similarity_pct: 89.5,
+                p50_mfe_pct: 2.2,
+                p80_mfe_pct: 3.4,
+                p85_mae_pct: 0.9,
+                median_hold_duration_ms: 900_000,
+                top_exemplar_symbols: vec![sym.to_string()],
+            };
+            (
+                crate::onnx_engine::LiveBrainInferenceOutput {
+                    signal,
+                    matched_option,
+                    bar_attention_heatmap: vec![0.5; 24],
+                    top_shap_drivers: Vec::new(),
+                    inference_latency_micros: 90,
+                    model_version: "v1.36.1-onnx".to_string(),
+                },
+                prec,
+            )
+        };
+
+        // 1. Drive BRAIN-02 into Martingale Probation via RealTimeLedgerEngine
+        let b02_slot = MetaAllocatorHorizonSlot::Brain02IntradayDayTrade;
+        let mut ledger_m_state = state.ledger.martingale_state_for_slot(b02_slot);
+        while !ledger_m_state.probation_shadow_only {
+            ledger_m_state = state.ledger.observe_martingale_trade(b02_slot, -1.25, false);
+        }
+        assert!(
+            ledger_m_state.probation_shadow_only
+                && ledger_m_state.martingale_e_value >= VILLE_ALPHA_THRESHOLD
+        );
+        let e_at_probation = ledger_m_state.martingale_e_value;
+
+        // 2. Submit a live signal on NVDA for BRAIN-02 while in probation -> must route to shadow_open_trades!
+        let mut t_cursor_ns = 1_800_000_000_000_000_000_i64;
+        let mut nvda_pre_bars = Vec::with_capacity(24);
+        for i in 0..24 {
+            let px = 98.85 + (i as f64) * 0.05;
+            nvda_pre_bars.push(make_bar(
+                t_cursor_ns + (i as i64) * 300_000_000_000,
+                px - 0.04,
+                px + 0.12,
+                px - 0.08,
+                px,
+                65_000.0,
+            ));
+        }
+        t_cursor_ns = nvda_pre_bars.last().unwrap().timestamp_ns;
+        let ep_100 = SubPennyPrice::from_f64(100.00).unwrap();
+        let sp_98 = SubPennyPrice::from_f64(98.00).unwrap(); // 1R = $2.00
+        let t1_103 = SubPennyPrice::from_f64(103.00).unwrap();
+        let t2_104_4 = SubPennyPrice::from_f64(104.40).unwrap(); // +2.20R
+
+        let (nvda_inf_1, nvda_prec_1) = build_inf(
+            "NVDA",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            TradeDirection::Long,
+            t_cursor_ns,
+            ep_100,
+            sp_98,
+            t1_103,
+            t2_104_4,
+            base_template.ai_confidence_pct,
+            base_template.entry_embedding_128.clone(),
+        );
+        let intercepted_row = state.ledger.open_position_with_bars(
+            "NASDAQ",
+            &nvda_inf_1,
+            &nvda_prec_1,
+            100_000.0,
+            nvda_pre_bars.clone(),
+        );
+        assert_eq!(
+            intercepted_row.active_sequential_stage,
+            "PROBATION_SHADOW_ONLY_MARTINGALE_QUARANTINE"
+        );
+        let open_pos_during_probation = state
+            .ledger
+            .query_filtered_snapshot(&HyperFilterQuery::default())
+            .positions_opened
+            .len();
+        let shadow_open_during_probation = state.ledger.shadow_open_trades_snapshot();
+        assert_eq!(
+            open_pos_during_probation, 0,
+            "Probation brain must open 0 live positions!"
+        );
+        assert_eq!(
+            shadow_open_during_probation.len(),
+            1,
+            "Probation brain setup must be diverted into shadow_open_trades!"
+        );
+        assert_eq!(
+            shadow_open_during_probation[0].shadow_reason,
+            "MARTINGALE_PROBATION_SHADOW"
+        );
+        assert_eq!(shadow_open_during_probation[0].offending_trap_id, None);
+        assert_eq!(
+            shadow_open_during_probation[0].probation_brain_slot,
+            Some(b02_slot)
+        );
+
+        // 3. Step real OHLC bars through `ledger.rs` (`process_live_bar_for_symbol`) to settle shadow winners
+        //    until `martingale_shield` automatically lifts `probation_shadow_only -> false`!
+        let mut shadow_heals_settled = 0usize;
+        loop {
+            t_cursor_ns += 300_000_000_000;
+            let mut win_bars = nvda_pre_bars.clone();
+            win_bars.push(make_bar(
+                t_cursor_ns,
+                100.20,
+                104.80, // hits target_2 ($104.40 => +2.20R!)
+                100.00,
+                104.60,
+                85_000.0,
+            ));
+            state
+                .ledger
+                .process_live_bar_for_symbol("NVDA", &win_bars, &internals);
+            shadow_heals_settled += 1;
+            assert_eq!(
+                state.ledger.shadow_open_trades_snapshot().len(),
+                0,
+                "Shadow trade must settle on target bar"
+            );
+
+            let cur_m = state.ledger.martingale_state_for_slot(b02_slot);
+            if !cur_m.probation_shadow_only {
+                break;
+            }
+            assert!(
+                shadow_heals_settled < 20,
+                "Shadow winners must heal probation within 20 trades"
+            );
+
+            // Submit next setup while still in probation; it also routes to shadow_open_trades
+            t_cursor_ns += 300_000_000_000;
+            let (next_inf, next_prec) = build_inf(
+                "NVDA",
+                BrainHorizonId::Brain02IntradayDayTrade,
+                TradeDirection::Long,
+                t_cursor_ns,
+                ep_100,
+                sp_98,
+                t1_103,
+                t2_104_4,
+                base_template.ai_confidence_pct,
+                base_template.entry_embedding_128.clone(),
+            );
+            let r_sub = state.ledger.open_position_with_bars(
+                "NASDAQ",
+                &next_inf,
+                &next_prec,
+                100_000.0,
+                nvda_pre_bars.clone(),
+            );
+            assert_eq!(
+                r_sub.active_sequential_stage,
+                "PROBATION_SHADOW_ONLY_MARTINGALE_QUARANTINE"
+            );
+        }
+
+        let healed_m_state = state.ledger.martingale_state_for_slot(b02_slot);
+        assert!(
+            !healed_m_state.probation_shadow_only
+                && healed_m_state.martingale_e_value < VILLE_RECOVERY_HYSTERESIS_FLOOR,
+            "Probation must automatically lift once shadow winners bring M_t < 4.0! Got {:?}",
+            healed_m_state
+        );
+        assert_eq!(
+            healed_m_state.shadow_recovery_trades_observed,
+            shadow_heals_settled
+        );
+
+        // 4. Submit the next live signal -> prove it now opens a REAL Paper-OMS position (`open_positions == 1`)
+        //    with populated `OptimalOptionStructurePlan` and `MicropriceExecutionPlan` on the staged ticket!
+        t_cursor_ns += 300_000_000_000;
+        let (live_inf, live_prec) = build_inf(
+            "NVDA",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            TradeDirection::Long,
+            t_cursor_ns,
+            ep_100,
+            sp_98,
+            t1_103,
+            t2_104_4,
+            base_template.ai_confidence_pct,
+            base_template.entry_embedding_128.clone(),
+        );
+        let opened_live = state.ledger.open_position_with_bars(
+            "NASDAQ",
+            &live_inf,
+            &live_prec,
+            100_000.0,
+            nvda_pre_bars.clone(),
+        );
+        let open_pos_after_recovery = state
+            .ledger
+            .query_filtered_snapshot(&HyperFilterQuery::default())
+            .positions_opened
+            .len();
+        assert_eq!(
+            open_pos_after_recovery, 1,
+            "Healed brain must open a real Paper-OMS position (`open_positions == 1`)!"
+        );
+
+        let staged_tickets = state.ledger.execution_tickets_snapshot().tickets;
+        let nvda_ticket = staged_tickets
+            .iter()
+            .find(|t| t.position_id == opened_live.position_id)
+            .expect("Staged Paper-OMS ticket must exist for opened live position");
+        assert!(
+            nvda_ticket.optimal_long_strike > 0.0
+                && nvda_ticket.solved_net_delta.abs() > 0.0,
+            "Staged ticket must carry real OptimalOptionStructurePlan strikes & Greeks!"
+        );
+        assert!(
+            nvda_ticket.microprice_limit_price > 0.0
+                && !nvda_ticket.execution_tactic.is_empty(),
+            "Staged ticket must carry real MicropriceExecutionPlan limit price!"
+        );
+
+        // Step live bar to close the real position and verify live BOCPD + Contextual NIG settlement hook!
+        let bocpd_steps_before = state.ledger.bocpd_telemetry_snapshot().step_count;
+        t_cursor_ns += 300_000_000_000;
+        let mut live_close_bars = nvda_pre_bars.clone();
+        live_close_bars.push(make_bar(
+            t_cursor_ns,
+            100.20,
+            104.90,
+            100.10,
+            104.70,
+            90_000.0,
+        ));
+        let closed_live_row = state.ledger.process_live_bar_for_symbol_and_brain(
+            "NVDA",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            &live_close_bars,
+            &internals,
+        );
+        assert!(
+            !closed_live_row.is_empty(),
+            "Real position must settle on target hit"
+        );
+        let bocpd_steps_after = state.ledger.bocpd_telemetry_snapshot().step_count;
+        assert!(
+            bocpd_steps_after > bocpd_steps_before,
+            "Live bar ingestion in ledger.rs must advance AdamsMacKayBocpdEngine step_count!"
+        );
+
+        // =========================================================================
+        // (c) BOCPD `ell = 64` Absorber Conservation Proof (120 Stationary Bars > 64)
+        // =========================================================================
+        let mut bocpd_absorber = AdamsMacKayBocpdEngine::default();
+        let mut kappa_at_64 = 0.0_f64;
+        let mut kappa_at_65 = 0.0_f64;
+        let mut kappa_at_90 = 0.0_f64;
+        let mut kappa_at_120 = 0.0_f64;
+        let mut max_prob_conservation_err = 0.0_f64;
+
+        for step in 1..=120usize {
+            let x_calm = if step % 2 == 0 { 0.04 } else { -0.04 };
+            bocpd_absorber.observe_surprise(x_calm);
+            let sum_probs: f64 = bocpd_absorber.run_length_probs().iter().sum();
+            let err = (sum_probs - 1.0).abs();
+            if err > max_prob_conservation_err {
+                max_prob_conservation_err = err;
+            }
+            match step {
+                64 => kappa_at_64 = bocpd_absorber.kappa_at(64),
+                65 => kappa_at_65 = bocpd_absorber.kappa_at(64),
+                90 => kappa_at_90 = bocpd_absorber.kappa_at(64),
+                120 => kappa_at_120 = bocpd_absorber.kappa_at(64),
+                _ => {}
+            }
+        }
+        assert!(
+            max_prob_conservation_err < 1e-12,
+            "Run-length posterior must sum to 1.0 within 1e-12 across all 120 bars, max_err={:.3e}",
+            max_prob_conservation_err
+        );
+        assert!(
+            kappa_at_65 > kappa_at_64,
+            "kappa[64] must grow smoothly at bar 65 without resetting! kappa_64={} vs kappa_65={}",
+            kappa_at_64,
+            kappa_at_65
+        );
+        assert!(
+            kappa_at_120 > kappa_at_90 && kappa_at_90 > kappa_at_65,
+            "kappa[64] must continue accumulating precision across stationary bars 65..120! k64={:.2}, k65={:.2}, k90={:.2}, k120={:.2}",
+            kappa_at_64,
+            kappa_at_65,
+            kappa_at_90,
+            kappa_at_120
+        );
+
+        // =========================================================================
+        // (d) Exact LOO Brute-Force Identity Proof Across All 173 Baseline Trades
+        // =========================================================================
+        let precision_173 = LedoitWolfPrecision::from_settled_trades(&closed_snap);
+        let mut max_loo_bruteforce_err = 0.0_f64;
+        let mut loo_checked_trades = 0usize;
+
+        for tr in &closed_snap {
+            let manifold = precision_173
+                .brains
+                .get(&tr.brain_id)
+                .expect("Brain manifold exists");
+            let (full_cent, exemplars) = if tr.is_winner {
+                (&manifold.winner_centroid_32, &manifold.winner_exemplars_32)
+            } else {
+                (&manifold.loss_centroid_32, &manifold.loss_exemplars_32)
+            };
+
+            let mu_rank1 =
+                compute_rank1_loo_centroid_32(full_cent, exemplars, Some(tr.trade_id));
+
+            // Brute-force leave-one-out mean recomputation from scratch
+            let remaining: Vec<&[f64; 32]> = exemplars
+                .iter()
+                .filter(|(id, _)| *id != tr.trade_id)
+                .map(|(_, v)| v)
+                .collect();
+            assert_eq!(
+                remaining.len() + 1,
+                exemplars.len(),
+                "Every baseline trade must be present in its brain exemplar bank"
+            );
+            let mut mu_bruteforce = [0.0_f64; 32];
+            let inv_rem = 1.0 / (remaining.len() as f64);
+            for v in &remaining {
+                for f in 0..32 {
+                    mu_bruteforce[f] += v[f] * inv_rem;
+                }
+            }
+
+            for f in 0..32 {
+                let diff = (mu_rank1[f] - mu_bruteforce[f]).abs();
+                if diff > max_loo_bruteforce_err {
+                    max_loo_bruteforce_err = diff;
+                }
+            }
+            loo_checked_trades += 1;
+        }
+        assert_eq!(loo_checked_trades, 173);
+        assert!(
+            max_loo_bruteforce_err < 1e-12,
+            "Rank-1 LOO centroid must match brute-force LOO mean to < 1e-12 across all 173 trades, got {:.3e}",
+            max_loo_bruteforce_err
+        );
+
+        let sum_probs_120: f64 = bocpd_absorber.run_length_probs().iter().sum();
+        println!("\n======================================================================");
+        println!("PHASE 36.1 ADVERSARIAL ZERO-TRUST REMEDIATION AUDIT");
+        println!("======================================================================");
+        println!(
+            "  [PROOF (a) SYMMETRIC-BOUNDED VILLE SUPERMARTINGALE & ASYMMETRIC RUNNER PROTECTION]:"
+        );
+        println!(
+            "    - 40% +2.0R / 60% -1.0R (+0.20R) : E[d_k] = {:.6} < 0.0 | False Quarantines = {}/500 | min(raw_ville_E_t) = {:.6e} (no 0.25 floor!)",
+            expected_d_runner, runner_false_quarantines, min_raw_ville_e
+        );
+        println!(
+            "    - 173-Trade Baseline Replay      : {}/5 Brains Falsely Quarantined (0/6 Slots in Probation)",
+            baseline_quarantined_count
+        );
+        println!(
+            "    - Broken -0.65R Brain Detection  : Tripped probation_shadow_only=true (M_t={:.4} >= 20.0) in {} trades (< 15)",
+            broken_brain.martingale_e_value, broken_trades_to_trip
+        );
+        println!(
+            "  [PROOF (b) CLOSED-LOOP `ledger.rs` PROBATION -> SHADOW-TAPE -> LIVE RECOVERY]:"
+        );
+        println!(
+            "    - Probation Intercept (M_t={:.2}) : stage={} | open_positions={} | shadow_open_trades={} (reason={}, trap_id={:?})",
+            e_at_probation,
+            intercepted_row.active_sequential_stage,
+            open_pos_during_probation,
+            shadow_open_during_probation.len(),
+            shadow_open_during_probation[0].shadow_reason,
+            shadow_open_during_probation[0].offending_trap_id
+        );
+        println!(
+            "    - Live OHLC Shadow Settlement    : {} shadow winners (+2.20R) settled via process_live_bar_for_symbol -> M_t={:.4} (< 4.0) | probation_shadow_only={}",
+            shadow_heals_settled,
+            healed_m_state.martingale_e_value,
+            healed_m_state.probation_shadow_only
+        );
+        println!(
+            "    - Post-Recovery Live Paper-OMS   : open_positions={} | optimal_long_strike=${:.2} | microprice_limit=${:.4} ({}) | BOCPD steps={} -> {}",
+            open_pos_after_recovery,
+            nvda_ticket.optimal_long_strike,
+            nvda_ticket.microprice_limit_price,
+            nvda_ticket.execution_tactic,
+            bocpd_steps_before,
+            bocpd_steps_after
+        );
+        println!(
+            "  [PROOF (c) BOCPD `ell = 64` MOMENT-MATCHED ABSORBER CONSERVATION (120 BARS)]:"
+        );
+        println!(
+            "    - Absorber Precision kappa[64]   : bar64={:.4} -> bar65={:.4} -> bar90={:.4} -> bar120={:.4} (monotonically growing, zero reset!)",
+            kappa_at_64, kappa_at_65, kappa_at_90, kappa_at_120
+        );
+        println!(
+            "    - Run-Length Posterior Mass      : sum_{{ell=0}}^{{64}} P(r_t = ell) = {:.12} (max_err = {:.3e} < 1e-12)",
+            sum_probs_120, max_prob_conservation_err
+        );
+        println!(
+            "  [PROOF (d) EXACT RANK-1 LOO VS BRUTE-FORCE MEAN IDENTITY (173/173 TRADES)]:"
+        );
+        println!(
+            "    - Verified Trades                : {}/173 | max_f |mu_loo_rank1[f] - mu_loo_bruteforce[f]| = {:.3e} < 1e-12\n",
+            loo_checked_trades, max_loo_bruteforce_err
+        );
+    }
 }

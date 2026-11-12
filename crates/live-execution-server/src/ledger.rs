@@ -3652,10 +3652,10 @@ impl RealTimeLedgerEngine {
             );
         let (q_bid, q_ask, vpin_tox, bid_px, ask_px) =
             if let Some(last_bar) = pos.entry_bars.last() {
-                let half_sp = ((last_bar.ask.to_f64() - last_bar.bid.to_f64()) * 0.5)
+                let half_sp = (last_bar.bid_ask_spread.to_f64() * 0.5)
                     .max(entry_f64 * 0.0002)
                     .max(0.0001);
-                let vol = last_bar.volume.max(100.0);
+                let vol = (last_bar.volume as f64).max(100.0);
                 let close_loc = ((last_bar.close.to_f64() - last_bar.low.to_f64())
                     / (last_bar.high.to_f64() - last_bar.low.to_f64()).max(1e-4))
                 .clamp(0.05, 0.95);

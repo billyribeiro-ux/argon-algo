@@ -208,7 +208,144 @@ impl KellyCapitalAllocator {
             quantity_shares,
         }
     }
+
+    /// Unified single-pass post-cost Fractional-Kelly / DRO-CVaR sizer (`0.50%` to `2.50%` equity risk).
+    /// Eliminates stacked multiplicative dampeners (`corr * stage0 * martingale * eigen * nig * dro`)
+    /// and incorporates explicit round-trip slippage, spread, and commission friction up front.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_unified_post_cost_dro_sizing(
+        account_equity_usd: f64,
+        symbol: &str,
+        brain_id: BrainHorizonId,
+        entry_price: SubPennyPrice,
+        stop_price: SubPennyPrice,
+        target_1_price: SubPennyPrice,
+        target_2_price: SubPennyPrice,
+        is_option_routed: bool,
+        option_entry_premium: f64,
+        option_target_premium: f64,
+        contract_delta: f64,
+        ai_confidence_pct: f64,
+        precedent_win_rate_pct: f64,
+        p50_mfe_pct: f64,
+        p85_mae_pct: f64,
+        era1_calibrated_win_rate_pct: f64,
+        era1_calibrated_profit_factor: f64,
+        symbol_era1_median_stop_pct: f64,
+        brain_returns_history: &[f64],
+        epistemic_ood_score: f64,
+        p_mondrian: f64,
+        martingale_e_value: f64,
+        eigen_kappa: f64,
+        bocpd_changepoint_prob: f64,
+        open_book_heat_pct: f64,
+        is_penny_flag: bool,
+    ) -> KellyAllocationPlan {
+        let equity = account_equity_usd.max(50_000.0);
+        let base = Self::compute_allocation_with_symbol_stop(
+            equity,
+            brain_id,
+            entry_price,
+            stop_price,
+            target_1_price,
+            target_2_price,
+            ai_confidence_pct,
+            precedent_win_rate_pct,
+            p50_mfe_pct,
+            p85_mae_pct,
+            era1_calibrated_win_rate_pct,
+            era1_calibrated_profit_factor,
+            symbol_era1_median_stop_pct,
+        );
+
+        let entry_f64 = entry_price.to_f64().max(0.00001);
+        let stop_f64 = stop_price.to_f64().max(0.00001);
+        let cost_est = crate::execution_microstructure::evaluate_tradability_and_cost_gate(
+            symbol,
+            entry_f64,
+            target_1_price.to_f64().max(0.00001),
+            is_option_routed,
+            false,
+            option_entry_premium,
+            option_target_premium,
+            contract_delta,
+            is_penny_flag,
+        );
+        let stop_dist = (entry_f64 - stop_f64)
+            .abs()
+            .max(0.004 * entry_f64)
+            .max(0.00001);
+        let unit_risk = if is_option_routed {
+            stop_dist * contract_delta.abs().clamp(0.25, 0.90)
+                + (cost_est.round_trip_friction_per_unit * 0.5)
+        } else {
+            stop_dist
+                + (entry_f64 * (cost_est.one_way_equity_slippage_bps / 10_000.0))
+        };
+        let net_payoff_b = ((cost_est.expected_t1_payoff_per_unit
+            - cost_est.round_trip_friction_per_unit)
+            .max(0.05 * unit_risk)
+            / unit_risk.max(1e-4))
+        .clamp(0.65, 4.50);
+
+        let post_cost_kelly =
+            (base.win_probability - (1.0 - base.win_probability) / net_payoff_b).clamp(0.01, 0.45);
+        // Translate post-cost Kelly into an institutional risk cap inside [0.50%, 2.50%] before single DRO pass
+        let conviction_scale = ((post_cost_kelly / 0.35) * (net_payoff_b / 1.40).powf(0.25))
+            .clamp(0.20, 1.0);
+        let max_risk_frac = (0.0085 + 0.0165 * conviction_scale).clamp(0.005, 0.025);
+
+        let returns_sample: Vec<f64> = if brain_returns_history.len() >= 6 {
+            brain_returns_history.to_vec()
+        } else {
+            vec![1.5, -1.0, 0.85, -0.60, 1.90, -0.95, 1.25, -0.75]
+        };
+        let dro_sol =
+            crate::dro_kelly_allocator::DistributionallyRobustKellyAllocator::solve_dro_allocation(
+                &returns_sample,
+                &[],
+                &crate::dro_kelly_allocator::DroKellyInput {
+                    p_cp_eff: bocpd_changepoint_prob.clamp(0.0, 0.99),
+                    epistemic_ood_score: epistemic_ood_score.max(0.0),
+                    p_mondrian: p_mondrian.clamp(0.0, 1.0),
+                    martingale_mixture_m: martingale_e_value.max(1.0),
+                    eigen_kappa: eigen_kappa.clamp(0.25, 1.0),
+                    open_book_heat_pct: open_book_heat_pct.clamp(0.0, 0.95),
+                    floor_kelly_fraction: 0.005,
+                    max_kelly_fraction: max_risk_frac,
+                },
+            );
+
+        // Single unified risk allocation strictly within [0.50%, 2.50%]
+        let unified_risk_frac = if dro_sol.optimal_dro_fraction >= 0.005 {
+            dro_sol.optimal_dro_fraction.clamp(0.005, 0.025)
+        } else {
+            max_risk_frac.clamp(0.005, 0.025)
+        };
+        let risk_budget_usd = ((equity * unified_risk_frac) * 100.0).round() / 100.0;
+        let kelly_fraction_pct = ((unified_risk_frac * 100.0) * 100.0).round() / 100.0;
+
+        let effective_stop_pct = (stop_dist / entry_f64)
+            .max(symbol_era1_median_stop_pct.clamp(0.004, 0.22) * 0.92)
+            .clamp(0.004, 0.25);
+        let raw_notional = (risk_budget_usd / effective_stop_pct).clamp(5_000.0, 50_000.0);
+        let quantity_shares = (raw_notional / entry_f64).round().max(1.0);
+        let notional_allocated_usd = ((quantity_shares * entry_f64) * 100.0).round() / 100.0;
+
+        KellyAllocationPlan {
+            win_probability: base.win_probability,
+            payoff_ratio_b: net_payoff_b,
+            raw_kelly_fraction: post_cost_kelly,
+            kelly_fraction_pct,
+            risk_budget_usd,
+            notional_allocated_usd,
+            quantity_shares,
+        }
+    }
 }
+
+pub const BENCHMARK_LEDGER_FIXTURE_PATH: &str = "data/ledger_state.json";
+pub const LIVE_RUNTIME_STATE_PATH: &str = "data/live_runtime_state.json";
 
 /// Immutable final outcome badge assigned when a position transitions to `closed_trade_ledger`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -3700,38 +3837,14 @@ impl RealTimeLedgerEngine {
                 TradeDirection::Short => TradeDirection::Long,
             }
         };
-        let (q_bid, q_ask, vpin_tox, bid_px, ask_px) =
-            if let Some(last_bar) = pos.entry_bars.last() {
-                let raw_sp = last_bar.bid_ask_spread.to_f64();
-                let half_sp = if raw_sp > 0.0 {
-                    (raw_sp * 0.5).max(0.0001)
-                } else {
-                    (ref_px * 0.0002).max(0.0001)
-                };
-                let vol = (last_bar.volume as f64).max(100.0);
-                let close_loc = ((last_bar.close.to_f64() - last_bar.low.to_f64())
-                    / (last_bar.high.to_f64() - last_bar.low.to_f64()).max(1e-4))
-                .clamp(0.05, 0.95);
-                let qb = (vol * close_loc * 0.01).max(10.0);
-                let qa = (vol * (1.0 - close_loc) * 0.01).max(10.0);
-                let vpin = ((close_loc - 0.5).abs() * 1.95).clamp(0.15, 0.96);
-                (qb, qa, vpin, ref_px - half_sp, ref_px + half_sp)
-            } else {
-                let half_sp = (ref_px * 0.0003).max(0.0001);
-                (150.0, 120.0, 0.45, ref_px - half_sp, ref_px + half_sp)
-            };
-        let micro_plan = crate::execution_microstructure::MicropriceExecutionRouter::route_order(
-            &crate::execution_microstructure::MicrostructureQuoteInput {
-                bid_price: bid_px,
-                ask_price: ask_px,
-                bid_size: q_bid,
-                ask_size: q_ask,
-                orderflow_toxicity_vpin: vpin_tox,
-                atr_bar,
-                structural_risk_per_share: (entry_f64 - stop_f64).abs().max(0.01),
-                direction: order_direction,
-                regime_bucket,
-            },
+        let is_penny_tier = ref_px < 5.0 || pos.brain_id == BrainHorizonId::Brain01PennyAnomaly;
+        let micro_plan = crate::execution_microstructure::MicropriceExecutionRouter::route_ohlcv_conservative(
+            &pos.symbol,
+            ref_px,
+            (entry_f64 - stop_f64).abs().max(0.01),
+            atr_bar,
+            order_direction,
+            is_penny_tier,
         );
         let fallback_px = if is_open_order {
             pos.entry_price
@@ -4724,7 +4837,12 @@ impl RealTimeLedgerEngine {
             .get_era1_symbol_median_stop_pct(&sig.symbol, sig.brain_id)
             .unwrap_or(brain_era1_stop_pct);
 
-        let mut kelly_plan = KellyCapitalAllocator::compute_allocation_with_symbol_stop(
+        let is_opt_routed = !opt.matched_option_contract.is_empty()
+            && !opt.option_structure.eq_ignore_ascii_case("EQUITY");
+        let is_penny_tier =
+            entry_f64 < 5.0 || sig.brain_id == BrainHorizonId::Brain01PennyAnomaly;
+
+        let kelly_plan = KellyCapitalAllocator::compute_allocation_with_symbol_stop(
             live_equity,
             sig.brain_id,
             sig.entry_price,
@@ -4739,35 +4857,6 @@ impl RealTimeLedgerEngine {
             era1_pf,
             symbol_era1_median_stop_pct,
         );
-
-        let corr_heat_mult = {
-            let open_snap = self.positions_opened.read();
-            PortfolioHeatRiskEngine::compute_candidate_correlation_multiplier(
-                &open_snap,
-                &sig.symbol,
-                sig.direction,
-                &sig.latent_embedding_128,
-                live_equity,
-            )
-        };
-        if corr_heat_mult < 1.0 {
-            kelly_plan.kelly_fraction_pct = (((kelly_plan.kelly_fraction_pct * corr_heat_mult)
-                .clamp(0.50, 2.75))
-                * 100.0)
-                .round()
-                / 100.0;
-            kelly_plan.risk_budget_usd = (((kelly_plan.risk_budget_usd * corr_heat_mult)
-                .clamp(125.0, 2_750.0))
-                * 100.0)
-                .round()
-                / 100.0;
-            kelly_plan.notional_allocated_usd = ((kelly_plan.notional_allocated_usd
-                * corr_heat_mult)
-                .clamp(5_000.0, 35_000.0)
-                * 100.0)
-                .round()
-                / 100.0;
-        }
 
         let strategy_archetype = classify_strategy_archetype(
             engine_mode,
@@ -4872,27 +4961,13 @@ impl RealTimeLedgerEngine {
         Self::refresh_open_position_sequential_telemetry(&mut row, &syn_state);
 
         let enforce_era1_baseline = *self.enforce_hard_scratch_on_baseline.read();
+        // Consolidated Stage 0 Gate Check 1: Causal Edge & Red-Trade Trap Gate
         let stage0 = self.evaluate_live_entry_stage0_gate(
             inference,
             precedents.win_rate_pct,
             &row.entry_bars,
             enforce_era1_baseline || syn_state.generation_id >= 37,
         );
-
-        if !enforce_era1_baseline && stage0.unified_stage0_kelly_multiplier < 1.0 {
-            let k_mult = stage0.unified_stage0_kelly_multiplier.clamp(0.10, 1.0);
-            let is_ood = stage0.epistemic_ood_score > 0.0;
-            let kelly_floor = if is_ood { 0.05 } else { 0.50 };
-            let risk_floor = if is_ood { 50.0 } else { 500.0 };
-            let notional_floor = if is_ood { 500.0 } else { 5_000.0 };
-            row.kelly_fraction_pct =
-                (((row.kelly_fraction_pct * k_mult) * 100.0).round() / 100.0).max(kelly_floor);
-            row.risk_budget_usd =
-                (((row.risk_budget_usd * k_mult) * 100.0).round() / 100.0).max(risk_floor);
-            row.notional_allocated_usd = (((row.notional_allocated_usd * k_mult) * 100.0).round()
-                / 100.0)
-                .max(notional_floor);
-        }
 
         if !enforce_era1_baseline && stage0.epistemic_ood_score > 1.25 {
             row.active_sequential_stage = "STAGE_0_VETOED_EPISTEMIC_OOD_REGIME".to_string();
@@ -4967,7 +5042,9 @@ impl RealTimeLedgerEngine {
             return row;
         }
 
-        // Phase 36 / 36.1 Pillar 3: Live Ville Martingale Probation Interception -> Shadow-Tape Routing
+        // Consolidated Stage 0 Gate Check 2: Book & Brain Health Gate (Ville Martingale + Eigen-Correlation Crowding)
+        let mut m_e_value = 1.0_f64;
+        let mut eigen_kappa = 1.0_f64;
         if !enforce_era1_baseline {
             let is_0dte_slot = matches!(row.symbol.as_str(), "SPY" | "QQQ" | "IWM")
                 && row.brain_id == BrainHorizonId::Brain02IntradayDayTrade;
@@ -4980,6 +5057,7 @@ impl RealTimeLedgerEngine {
                 )
             };
             let m_state = self.martingale_shield.read().state_for_slot(m_slot);
+            m_e_value = m_state.martingale_e_value.max(1.0);
             if m_state.probation_shadow_only {
                 row.active_sequential_stage =
                     "PROBATION_SHADOW_ONLY_MARTINGALE_QUARANTINE".to_string();
@@ -5038,36 +5116,86 @@ impl RealTimeLedgerEngine {
                 });
                 return row;
             }
-            if m_state.martingale_kelly_multiplier < 1.0 {
-                let km = m_state.martingale_kelly_multiplier.clamp(0.15, 1.0);
-                row.kelly_fraction_pct =
-                    (((row.kelly_fraction_pct * km) * 100.0).round() / 100.0).max(0.25);
-                row.risk_budget_usd =
-                    (((row.risk_budget_usd * km) * 100.0).round() / 100.0).max(250.0);
-                row.notional_allocated_usd =
-                    (((row.notional_allocated_usd * km) * 100.0).round() / 100.0).max(2_500.0);
+
+            if syn_state.generation_id >= 37 {
+                let cand_series =
+                    crate::portfolio_eigen_risk::EigenPositionSeries::from_open_row(&row);
+                let eigen_rep = self.evaluate_book_eigen_risk(Some(&cand_series));
+                eigen_kappa = eigen_rep.eigen_kelly_multiplier.clamp(0.25, 1.0);
+                if eigen_rep.vetoed {
+                    row.active_sequential_stage =
+                        "PORTFOLIO_VETOED_EIGEN_CORRELATION_CROWDING".to_string();
+                    row.sequential_safety_margin_pct = 0.0;
+                    return row;
+                }
             }
         }
 
-        // Phase 35 Deliverable 1: Cross-Position Eigen-Covariance Crowding Gate
-        if !enforce_era1_baseline && syn_state.generation_id >= 37 {
-            let cand_series = crate::portfolio_eigen_risk::EigenPositionSeries::from_open_row(&row);
-            let eigen_rep = self.evaluate_book_eigen_risk(Some(&cand_series));
-            if eigen_rep.vetoed {
-                row.active_sequential_stage =
-                    "PORTFOLIO_VETOED_EIGEN_CORRELATION_CROWDING".to_string();
+        // Consolidated Stage 0 Gate Check 3: Tradability & Cost Gate (Expected T1 Net Payoff >= 2.5x RT Cost)
+        if !enforce_era1_baseline && !row.entry_bars.is_empty() {
+            let cost_check = crate::execution_microstructure::evaluate_tradability_and_cost_gate(
+                &row.symbol,
+                entry_f64,
+                sig.target_1_price.to_f64().max(0.00001),
+                is_opt_routed,
+                false,
+                opt.option_entry_premium.to_f64(),
+                opt.option_target_premium.to_f64(),
+                opt.contract_delta,
+                is_penny_tier,
+            );
+            if !cost_check.tradable {
+                row.active_sequential_stage = "STAGE_0_VETOED_COST_TRADABILITY_EDGE".to_string();
                 row.sequential_safety_margin_pct = 0.0;
                 return row;
             }
-            if eigen_rep.eigen_kelly_multiplier < 1.0 {
-                let em = eigen_rep.eigen_kelly_multiplier.clamp(0.25, 1.0);
-                row.kelly_fraction_pct =
-                    (((row.kelly_fraction_pct * em) * 100.0).round() / 100.0).max(0.50);
-                row.risk_budget_usd =
-                    (((row.risk_budget_usd * em) * 100.0).round() / 100.0).max(500.0);
-                row.notional_allocated_usd =
-                    (((row.notional_allocated_usd * em) * 100.0).round() / 100.0).max(5_000.0);
-            }
+        }
+
+        // Unified single-pass post-cost Fractional-Kelly / DRO-CVaR sizer (`0.50%` to `2.50%` equity risk)
+        if !enforce_era1_baseline {
+            let brain_returns: Vec<f64> = self
+                .closed_ledger
+                .read()
+                .iter()
+                .filter(|t| t.brain_id == row.brain_id)
+                .map(|t| t.realized_r_multiple)
+                .collect();
+            let open_book_heat = {
+                let open_snap = self.positions_opened.read();
+                let open_risk_usd: f64 = open_snap.iter().map(|p| p.risk_budget_usd).sum();
+                (open_risk_usd / live_equity.max(50_000.0)).clamp(0.0, 0.95)
+            };
+            let unified_kelly = KellyCapitalAllocator::compute_unified_post_cost_dro_sizing(
+                live_equity,
+                &row.symbol,
+                row.brain_id,
+                sig.entry_price,
+                sig.structural_stop_price,
+                sig.target_1_price,
+                sig.target_2_price,
+                is_opt_routed,
+                opt.option_entry_premium.to_f64(),
+                opt.option_target_premium.to_f64(),
+                opt.contract_delta,
+                sig.ai_confidence_pct,
+                precedents.win_rate_pct,
+                precedents.p50_mfe_pct,
+                precedents.p85_mae_pct,
+                era1_wr,
+                era1_pf,
+                symbol_era1_median_stop_pct,
+                &brain_returns,
+                stage0.epistemic_ood_score,
+                stage0.conformal_p_value,
+                m_e_value,
+                eigen_kappa,
+                0.08,
+                open_book_heat,
+                is_penny_tier,
+            );
+            row.kelly_fraction_pct = unified_kelly.kelly_fraction_pct;
+            row.risk_budget_usd = unified_kelly.risk_budget_usd;
+            row.notional_allocated_usd = unified_kelly.notional_allocated_usd;
         }
 
         self.positions_opened.write().push(row.clone());
@@ -10703,8 +10831,64 @@ impl RealTimeLedgerEngine {
         self.run_multi_generation_evolution_to_gen16()
     }
 
+    /// Atomic persistence helper for live runtime execution state (`data/live_runtime_state.json`).
+    /// Explicitly refuses to overwrite `ledger_state.json` so the 173-trade benchmark fixture
+    /// remains 100% read-only. Writes to a temporary file, calls `sync_all()`, and atomically renames.
+    pub fn save_runtime_state_atomic(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("ledger_state.json"))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Refusing to overwrite read-only benchmark fixture data/ledger_state.json; use data/live_runtime_state.json",
+            ));
+        }
+        self.save_to_disk(path)
+    }
+
+    /// Loads runtime state from `runtime_path` (`data/live_runtime_state.json`) if it exists and is valid,
+    /// otherwise seeds read-only from `benchmark_path` (`data/ledger_state.json`) without mutating it.
+    pub fn load_runtime_or_seed_benchmark(
+        &self,
+        runtime_path: &std::path::Path,
+        benchmark_path: &std::path::Path,
+    ) -> &'static str {
+        if self.load_from_disk(runtime_path) {
+            "LIVE_RUNTIME_STATE"
+        } else if self.load_from_disk(benchmark_path) {
+            "BENCHMARK_FIXTURE_READ_ONLY"
+        } else {
+            "EMPTY_UNINITIALIZED"
+        }
+    }
+
+    /// Computes a lightweight monotonic mutation digest covering open positions, stop ratchets,
+    /// closed trades, hard-negative traps, and promoted plasticity generations so the daemon loop
+    /// triggers atomic persistence whenever any runtime state changes.
+    pub fn runtime_mutation_digest(&self) -> (usize, usize, i64, usize, u64) {
+        let open_guard = self.positions_opened.read();
+        let open_len = open_guard.len();
+        let stop_ratchet_hash: i64 = open_guard.iter().fold(0_i64, |acc, p| {
+            acc.wrapping_add(p.structural_stop_price.scaled_units())
+                .wrapping_add((p.tranche_count as i64) * 1_000_003)
+                .wrapping_add((p.bars_held_count as i64) * 97)
+        });
+        let closed_len = self.closed_ledger.read().len();
+        let trap_len = self.precedent_knn.all_hard_negative_traps().len();
+        let gen_sum: u64 = self
+            .precedent_knn
+            .ordered_synaptic_plasticity_states()
+            .iter()
+            .map(|s| s.generation_id as u64)
+            .sum();
+        (open_len, closed_len, stop_ratchet_hash, trap_len, gen_sum)
+    }
+
     /// Saves the current `positions_opened`, `closed_ledger`, `era1_calibrations`, `era1_symbol_median_stops`, `vetoed_repeat_traps`, and `webhook_outbox` state to disk as JSON.
     pub fn save_to_disk(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -10725,10 +10909,17 @@ impl RealTimeLedgerEngine {
             webhook_outbox: self.webhook_dispatcher.export_outbox(),
             evolution_generations_history: self.evolution_generations_history.read().clone(),
             synaptic_plasticity_states: self.precedent_knn.ordered_synaptic_plasticity_states(),
+            hard_negative_traps: self.precedent_knn.all_hard_negative_traps(),
+            shadow_open_trades: self.shadow_open_trades.read().clone(),
+            shadow_settled_trades: self.shadow_settled_trades.read().clone(),
         };
         let bytes = serde_json::to_vec_pretty(&payload).map_err(std::io::Error::other)?;
         let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp_path, &bytes)?;
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp_path, path)
     }
 
@@ -10809,6 +11000,16 @@ impl RealTimeLedgerEngine {
         } else {
             self.reconcile_causal_adaptive_immunity_ledger();
         }
+        if !parsed.hard_negative_traps.is_empty() {
+            self.precedent_knn
+                .replace_hard_negative_traps(parsed.hard_negative_traps);
+        }
+        if !parsed.shadow_open_trades.is_empty() {
+            *self.shadow_open_trades.write() = parsed.shadow_open_trades;
+        }
+        if !parsed.shadow_settled_trades.is_empty() {
+            *self.shadow_settled_trades.write() = parsed.shadow_settled_trades;
+        }
         true
     }
 }
@@ -10834,6 +11035,12 @@ pub struct PersistedLedgerState {
     pub evolution_generations_history: Vec<EvolutionGenerationRecord>,
     #[serde(default)]
     pub synaptic_plasticity_states: Vec<BrainSynapticPlasticityState>,
+    #[serde(default)]
+    pub hard_negative_traps: Vec<HardNegativeTrapRecord>,
+    #[serde(default)]
+    pub shadow_open_trades: Vec<ShadowVetoedTrade>,
+    #[serde(default)]
+    pub shadow_settled_trades: Vec<ShadowVetoedTrade>,
 }
 
 #[derive(Debug, Clone)]

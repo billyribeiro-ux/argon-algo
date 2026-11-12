@@ -213,7 +213,7 @@ pub fn estimate_option_spread_per_leg(
     is_vertical_combo: bool,
 ) -> f64 {
     let clean = symbol.trim().to_uppercase();
-    let base = if matches!(clean.as_str(), "SPY" | "QQQ" | "IWM" | "DIA") {
+    let base: f64 = if matches!(clean.as_str(), "SPY" | "QQQ" | "IWM" | "DIA") {
         0.035
     } else if LIQUID_MEGA_CAP_SYMBOLS.contains(&clean.as_str()) {
         0.045
@@ -289,5 +289,51 @@ pub fn evaluate_tradability_and_cost_gate(
             tradable: ratio >= 2.5,
         }
     }
+}
+
+/// Converts Unix epoch seconds into exact US/Eastern (`America/New_York`, EST/EDT DST-aware)
+/// `(NaiveDate, Weekday, hour, minute, second)`.
+pub fn unix_sec_to_ny_et(ts_sec: i64) -> (chrono::NaiveDate, chrono::Weekday, u32, u32, u32) {
+    use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, Timelike};
+    let utc_dt = chrono::DateTime::from_timestamp(ts_sec, 0)
+        .unwrap_or_default()
+        .naive_utc();
+    let year = utc_dt.year();
+    // 2nd Sunday in March: start from March 8..=14
+    let mar1 = NaiveDate::from_ymd_opt(year, 3, 1).unwrap_or_default();
+    let first_sun_mar = 1 + ((7 - mar1.weekday().num_days_from_sunday()) % 7);
+    let second_sun_mar = first_sun_mar + 7;
+    let dst_start_utc = NaiveDate::from_ymd_opt(year, 3, second_sun_mar)
+        .unwrap_or_default()
+        .and_hms_opt(7, 0, 0) // 02:00 EST == 07:00 UTC
+        .unwrap_or_default();
+
+    // 1st Sunday in November: Nov 1..=7
+    let nov1 = NaiveDate::from_ymd_opt(year, 11, 1).unwrap_or_default();
+    let first_sun_nov = 1 + ((7 - nov1.weekday().num_days_from_sunday()) % 7);
+    let dst_end_utc = NaiveDate::from_ymd_opt(year, 11, first_sun_nov)
+        .unwrap_or_default()
+        .and_hms_opt(6, 0, 0) // 02:00 EDT == 06:00 UTC
+        .unwrap_or_default();
+
+    let offset_hours = if utc_dt >= dst_start_utc && utc_dt < dst_end_utc {
+        4_i64
+    } else {
+        5_i64
+    };
+    let et = utc_dt - ChronoDuration::hours(offset_hours);
+    (et.date(), et.weekday(), et.hour(), et.minute(), et.second())
+}
+
+#[inline]
+pub fn ny_et_hhmm(ts_sec: i64) -> (chrono::Weekday, u32) {
+    let (_, wd, h, m, _) = unix_sec_to_ny_et(ts_sec);
+    (wd, h * 100 + m)
+}
+
+#[inline]
+pub fn is_us_regular_market_hours_et(ts_sec: i64) -> bool {
+    let (wd, hhmm) = ny_et_hhmm(ts_sec);
+    !matches!(wd, chrono::Weekday::Sat | chrono::Weekday::Sun) && (930..=1600).contains(&hhmm)
 }
 

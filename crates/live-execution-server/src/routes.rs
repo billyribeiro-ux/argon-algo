@@ -39,16 +39,15 @@ use crate::evolution::MultiGenEvolutionResponse;
 use crate::exporter::{ExportScope, export_to_csv_bytes, export_to_xlsx_bytes};
 use crate::ledger::{
     BrainEvolutionStatus, ClosedTradeRow, EngineExecutionMode, ExecutionTicketsSnapshot,
-    FilteredLedgerSnapshot, HyperFilterQuery, LossRootCauseCategory, OpenPositionRow,
-    RealTimeLedgerEngine, StagedBrokerOrderTicket, StrategyArchetype, VetoedTrapAuditRecord,
+    FilteredLedgerSnapshot, HyperFilterQuery, LIVE_RUNTIME_STATE_PATH, LossRootCauseCategory,
+    OpenPositionRow, RealTimeLedgerEngine, StagedBrokerOrderTicket, StrategyArchetype,
+    VetoedTrapAuditRecord,
 };
 use crate::onnx_engine::{LiveBrainInferenceOutput, OnnxMultiBrainEngine};
 use crate::precedent_knn::{
     HistoricalTraceRecord, PrecedentKnnIndex, PrecedentMatchSummary,
 };
 use crate::webhooks::{WebhookChannelConfig, WebhookDispatchRecord, WebhookStatusResponse};
-
-const LEDGER_DISK_PATH: &str = "data/ledger_state.json";
 
 /// Returns the canonical settled-session 3-stream baseline (`RawShortFloatSnapshot`,
 /// `RawMarketInternalsSnapshot`, `RawOptionsSnapshot`) for historical walk-forward evaluation
@@ -884,8 +883,10 @@ impl AppState {
 
         let _ = self.ledger.run_multi_generation_evolution_to_gen36();
         let _ = self.ledger.run_autopsy_and_tournament(false);
-        if !Path::new("../../Cargo.toml").exists() && !Path::new(LEDGER_DISK_PATH).exists() {
-            let _ = self.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+        if !Path::new("../../Cargo.toml").exists() {
+            let _ = self
+                .ledger
+                .save_runtime_state_atomic(Path::new(LIVE_RUNTIME_STATE_PATH));
         }
 
         let snap = self
@@ -893,6 +894,213 @@ impl AppState {
             .query_filtered_snapshot(&HyperFilterQuery::default());
         self.broadcast_live_snapshot(&snap);
         Ok(snap)
+    }
+
+    /// Unattended Multi-Timeframe Scanner Tick (`1m`, `5m`, `1h`, `1D`) for daemon mode:
+    /// 1. Screens `REAL_YAHOO_CORE_UNIVERSE` dynamically through `TwoStageMarketFunnel`
+    ///    using synchronized `MACRO_BREADTH_ETFS` + real `^VIX9D`/`^VIX`/`^VIX3M`.
+    /// 2. Evaluates consolidated Stage 0 gates & opens qualifying paper positions.
+    /// 3. Steps all currently open & shadow positions and runs red-trade plasticity learning.
+    pub async fn run_unattended_scanner_cycle(
+        &self,
+        now_sec: i64,
+        scan_m1: bool,
+        scan_m5: bool,
+        scan_h1: bool,
+        scan_d1: bool,
+        respect_market_hours: bool,
+    ) -> (usize, usize) {
+        let scanner_enabled = std::env::var("ARGON_ENABLE_AUTONOMOUS_SCANNER")
+            .ok()
+            .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "FALSE"));
+
+        let mut newly_opened_count = 0usize;
+        let mut newly_closed_count = 0usize;
+
+        let internals_u_opt = self.yahoo_adapter.fetch_market_internals().await.ok();
+
+        // 1. Multi-timeframe funnel scan & qualifying paper position entry on closed candle boundaries
+        let in_rth = !respect_market_hours
+            || crate::execution_microstructure::is_us_regular_market_hours_et(now_sec);
+        let (_, et_hhmm) = crate::execution_microstructure::ny_et_hhmm(now_sec);
+
+        if scanner_enabled && in_rth && (scan_m1 || scan_m5 || scan_h1 || scan_d1) {
+            if let Some(internals_u) = internals_u_opt.as_ref() {
+                // Screen the 60+ ticker universe through TwoStageMarketFunnel
+                let core_syms: Vec<String> = market_data_bus::REAL_YAHOO_CORE_UNIVERSE
+                    .iter()
+                    .map(|m| m.symbol.to_string())
+                    .collect();
+                let universe_snaps = self
+                    .yahoo_adapter
+                    .fetch_universe_snapshots(Some(&core_syms))
+                    .await
+                    .unwrap_or_default();
+                let promoted = TwoStageMarketFunnel::execute_funnel(
+                    &universe_snaps,
+                    &UniverseScannerConfig {
+                        min_daily_share_volume: 10_000,
+                        min_daily_dollar_turnover: 10_000.0,
+                        max_stage2_candidates: 12,
+                        ..UniverseScannerConfig::default()
+                    },
+                );
+
+                // Prefetch needed timeframes in parallel
+                let mut tfs_to_scan: Vec<(Timeframe, BrainHorizonId, usize)> = Vec::new();
+                if scan_m1 && (935..=1515).contains(&et_hhmm) {
+                    tfs_to_scan.push((
+                        Timeframe::M1,
+                        BrainHorizonId::Brain02IntradayDayTrade,
+                        48,
+                    ));
+                }
+                if scan_m5 && (935..=1530).contains(&et_hhmm) {
+                    tfs_to_scan.push((
+                        Timeframe::M5,
+                        BrainHorizonId::Brain02IntradayDayTrade,
+                        48,
+                    ));
+                    tfs_to_scan.push((Timeframe::M5, BrainHorizonId::Brain01PennyAnomaly, 48));
+                }
+                if scan_h1 {
+                    tfs_to_scan.push((Timeframe::H1, BrainHorizonId::Brain03ShortTermSwing, 48));
+                }
+                if scan_d1 {
+                    tfs_to_scan.push((Timeframe::D1, BrainHorizonId::Brain04CoreSwing, 48));
+                }
+
+                for cand in promoted.iter().take(12) {
+                    let sym = cand.snapshot.symbol.as_str();
+                    let meta = market_data_bus::yahoo::lookup_real_universe_meta(sym);
+                    let raw_int = internals_u.to_raw_internals_snapshot(meta.sector_etf);
+                    for &(tf, brain_id, lookback) in &tfs_to_scan {
+                        let is_penny_cand =
+                            cand.snapshot.last_price.to_f64() < 5.0 || meta.is_otc_penny;
+                        if (brain_id == BrainHorizonId::Brain01PennyAnomaly) != is_penny_cand
+                            && tf == Timeframe::M5
+                        {
+                            continue;
+                        }
+                        if tf == Timeframe::M1
+                            && !matches!(
+                                sym,
+                                "SPY" | "QQQ" | "NVDA" | "TSLA" | "AAPL" | "AMD" | "META" | "AMZN" | "IWM"
+                            )
+                        {
+                            continue;
+                        }
+                        if self.ledger.has_open_position_for_symbol_and_brain(sym, brain_id) {
+                            continue;
+                        }
+                        let Ok(bars) = self
+                            .yahoo_adapter
+                            .fetch_historical_bars(sym, tf, lookback)
+                            .await
+                        else {
+                            continue;
+                        };
+                        if bars.len() < 16 {
+                            continue;
+                        }
+                        let raw_bars: Vec<RawBarRecord> =
+                            bars.iter().map(|b| b.to_raw_bar_record()).collect();
+                        let raw_sf = cand.snapshot.to_raw_short_float_snapshot();
+                        let raw_opt = raw_fingerprint_core::RawOptionsSnapshot::default();
+                        let precedents = self.precedent_knn.query_precedents(
+                            &vec![0.0; 128],
+                            brain_id,
+                            Some(sym),
+                        );
+                        if let Ok(mut inference) = self.onnx_engine.infer_signal_with_precedents(
+                            sym,
+                            brain_id,
+                            &raw_bars,
+                            &raw_opt,
+                            &raw_sf,
+                            &raw_int,
+                            None,
+                        ) {
+                            let is_weak = inference.signal.ai_confidence_pct < 68.0;
+                            if is_weak {
+                                continue;
+                            }
+                            if !meta.is_optionable
+                                && !matches!(brain_id, BrainHorizonId::Brain02IntradayDayTrade)
+                            {
+                                inference.matched_option.matched_option_contract.clear();
+                                inference.matched_option.option_structure = "EQUITY".to_string();
+                            }
+                            let opened = self.ledger.open_position_with_bars_and_engine(
+                                meta.exchange_index,
+                                &inference,
+                                &precedents,
+                                100_000.0,
+                                raw_bars,
+                                EngineExecutionMode::EngineCBlend,
+                            );
+                            if opened.sequential_safety_margin_pct > 0.0 {
+                                newly_opened_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Step all currently open & shadow positions and trigger continual plasticity on close
+        let open_targets: Vec<(String, BrainHorizonId, i64)> = {
+            let snap = self
+                .ledger
+                .query_filtered_snapshot(&HyperFilterQuery::default());
+            snap.positions_opened
+                .iter()
+                .map(|p| (p.symbol.clone(), p.brain_id, p.opened_timestamp_ns))
+                .collect()
+        };
+        if !open_targets.is_empty()
+            && let Some(internals_u) = internals_u_opt.as_ref()
+        {
+            for (sym, brain_id, opened_ts_ns) in &open_targets {
+                let meta = market_data_bus::yahoo::lookup_real_universe_meta(sym);
+                let raw_internals = internals_u.to_raw_internals_snapshot(meta.sector_etf);
+                let native_tf = native_timeframe_for_brain(*brain_id);
+                if let Ok(bars) = self
+                    .yahoo_adapter
+                    .fetch_historical_bars(sym, native_tf, 24)
+                    .await
+                {
+                    let raw_bars: Vec<RawBarRecord> =
+                        bars.iter().map(|b| b.to_raw_bar_record()).collect();
+                    if raw_bars
+                        .last()
+                        .is_some_and(|b| b.timestamp_ns > *opened_ts_ns)
+                    {
+                        let settled = self.ledger.process_live_bar_for_symbol_and_brain(
+                            sym,
+                            *brain_id,
+                            &raw_bars,
+                            &raw_internals,
+                        );
+                        newly_closed_count += settled.len();
+                        for closed_row in &settled {
+                            let _ = self
+                                .ledger
+                                .on_live_trade_settled_continual_plasticity(closed_row);
+                        }
+                    } else if let Some(latest_bar) = raw_bars.last() {
+                        self.ledger.mark_open_position_to_market(
+                            sym,
+                            Some(*brain_id),
+                            latest_bar,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+
+        (newly_opened_count, newly_closed_count)
     }
 
     /// Executes an on-demand causal Era-1 Calibration + Era-2 Walk-Forward backtest for any arbitrary
@@ -943,8 +1151,10 @@ impl AppState {
 
         let _ = self.ledger.run_multi_generation_evolution_to_gen36();
         let _ = self.ledger.run_autopsy_and_tournament(false);
-        if !Path::new("../../Cargo.toml").exists() && !Path::new(LEDGER_DISK_PATH).exists() {
-            let _ = self.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+        if !Path::new("../../Cargo.toml").exists() {
+            let _ = self
+                .ledger
+                .save_runtime_state_atomic(Path::new(LIVE_RUNTIME_STATE_PATH));
         }
 
         let snap = self
@@ -3372,53 +3582,16 @@ pub async fn build_institutional_watchlist_at_epoch(
 
                 let m_state = state.ledger.martingale_state_for_slot(meta_slot);
 
-                let (bid_px, ask_px, q_bid, q_ask, vpin_tox) = if let Some(last_b) = window_bars.last()
-                {
-                    let b_open = last_b.open.to_f64();
-                    let b_high = last_b.high.to_f64();
-                    let b_low = last_b.low.to_f64();
-                    let b_close = last_b.close.to_f64();
-                    let b_range = (b_high - b_low).max(1e-4);
-                    let clv = ((b_close - b_low) / b_range).clamp(0.0, 1.0);
-                    let eff_sp = last_b
-                        .bid_ask_spread
-                        .to_f64()
-                        .max(entry_p * 0.0004)
-                        .max(0.01);
-                    let q_tot = (last_b.volume as f64).sqrt().clamp(20.0, 5_000.0);
-                    let vpin = (0.55 * ((b_close - b_open).abs() / b_range)
-                        + 0.45 * raw_sf.intraday_short_volume_ratio.clamp(0.0, 1.0))
-                    .clamp(0.05, 0.98);
-                    (
-                        (entry_p - 0.5 * eff_sp).max(0.0001),
-                        entry_p + 0.5 * eff_sp,
-                        q_tot * (0.15 + 0.70 * clv),
-                        q_tot * (0.85 - 0.70 * clv),
-                        vpin,
-                    )
-                } else {
-                    let eff_sp = (entry_p * 0.0005).max(0.01);
-                    (
-                        (entry_p - 0.5 * eff_sp).max(0.0001),
-                        entry_p + 0.5 * eff_sp,
-                        100.0,
-                        100.0,
-                        0.50,
-                    )
-                };
-                let exec_plan = crate::execution_microstructure::MicropriceExecutionRouter::route_order(
-                    &crate::execution_microstructure::MicrostructureQuoteInput {
-                        bid_price: bid_px,
-                        ask_price: ask_px,
-                        bid_size: q_bid,
-                        ask_size: q_ask,
-                        orderflow_toxicity_vpin: vpin_tox,
+                let is_penny_tier = entry_p < 5.0 || brain_id == BrainHorizonId::Brain01PennyAnomaly;
+                let exec_plan =
+                    crate::execution_microstructure::MicropriceExecutionRouter::route_ohlcv_conservative(
+                        sym,
+                        entry_p,
+                        (entry_p - stop_p).abs().max(0.01),
                         atr_bar,
-                        structural_risk_per_share: (entry_p - stop_p).abs().max(0.01),
-                        direction: inference.signal.direction,
-                        regime_bucket: regime_enum,
-                    },
-                );
+                        inference.signal.direction,
+                        is_penny_tier,
+                    );
 
                 let bounded_pre: Vec<raw_fingerprint_core::RawBarRecord> = if window_bars.len() > 24 {
                     window_bars[window_bars.len() - 24..].to_vec()
@@ -3455,7 +3628,7 @@ pub async fn build_institutional_watchlist_at_epoch(
                     atr_bar,
                 );
 
-                // Phase 37 Pillar 1: Multivariate Hawkes Self-Exciting Absorption
+                // Hawkes telemetry (preserved for UI/wire parity; Stage 0 Consolidated Gate has 3 orthogonal checks)
                 let mut hwk_engine = crate::hawkes_microstructure::HawkesMicrostructureEngine::new();
                 if let Some(last_b) = window_bars.last() {
                     let prev_b = if window_bars.len() >= 2 {
@@ -3466,19 +3639,32 @@ pub async fn build_institutional_watchlist_at_epoch(
                     hwk_engine.observe_bar(last_b, atr_bar, prev_b);
                 }
                 let hwk_telem = hwk_engine.telemetry();
-                let hwk_veto = if let Some(last_b) = window_bars.last() {
-                    hwk_engine.check_veto_with_last(inference.signal.direction, last_b)
-                } else {
-                    false
-                };
+
+                // Consolidated 3-Check Stage 0 Gate:
+                // 1) Causal Edge & Red-Trade Trap (stage0 / is_actionable)
+                // 2) Book & Brain Health (Eigen crowding + Ville Martingale probation)
+                // 3) Tradability & Cost Gate (Expected T1 net payoff >= 2.5x RT cost)
+                let is_opt_routed = !matched_opt.is_empty() && !opt_struct.eq_ignore_ascii_case("EQUITY");
+                let cost_gate = crate::execution_microstructure::evaluate_tradability_and_cost_gate(
+                    sym,
+                    entry_p,
+                    t1_p,
+                    is_opt_routed,
+                    opt_struct.contains("VERTICAL") || opt_struct.contains("SPREAD"),
+                    active_opt_meta.option_entry_premium.to_f64(),
+                    active_opt_meta.option_target_premium.to_f64(),
+                    active_opt_meta.contract_delta,
+                    is_penny_tier,
+                );
+
                 let final_actionable =
-                    is_actionable && !eigen_cand.vetoed && !m_state.probation_shadow_only && !hwk_veto;
+                    is_actionable && !eigen_cand.vetoed && !m_state.probation_shadow_only && cost_gate.tradable;
                 let init_action_status = if m_state.probation_shadow_only {
                     "PROBATION_SHADOW_ONLY_MARTINGALE_QUARANTINE".to_string()
-                } else if hwk_veto {
-                    "STAGE0_VETOED_HAWKES_ICEBERG_ABSORPTION".to_string()
                 } else if eigen_cand.vetoed {
                     "PORTFOLIO_VETOED_EIGEN_CORRELATION_CROWDING".to_string()
+                } else if !cost_gate.tradable {
+                    "STAGE_0_VETOED_COST_TRADABILITY_EDGE".to_string()
                 } else {
                     String::new()
                 };
@@ -3491,17 +3677,7 @@ pub async fn build_institutional_watchlist_at_epoch(
                     BrainHorizonId::Brain05LongTermWealth => "IBKR_VOL_AUCTION_ACCUM",
                 };
 
-                let combined_kelly_pct = (((kelly_plan.kelly_fraction_pct
-                    * stage0.unified_stage0_kelly_multiplier.clamp(0.10, 1.0)
-                    * eigen_cand.eigen_kelly_multiplier.clamp(0.25, 1.0)
-                    * m_state.martingale_kelly_multiplier.clamp(0.15, 1.0)
-                    * nig_kelly_mult.clamp(0.75, 1.35))
-                    .min(2.75))
-                    * 100.0)
-                    .round()
-                    / 100.0;
-
-                // Phase 37 Pillar 3: 1-Wasserstein DRO Kelly-CVaR Optimization
+                // Unified single-pass post-cost Fractional-Kelly / DRO-CVaR sizing (`0.50%` to `2.50%` risk)
                 let brain_returns: Vec<f64> = state
                     .ledger
                     .closed_trades_snapshot()
@@ -3514,6 +3690,35 @@ pub async fn build_institutional_watchlist_at_epoch(
                 } else {
                     vec![1.5, -1.0, 0.8, -0.5, 2.0, -1.0, 1.2, -0.8]
                 };
+                let unified_sizing = crate::ledger::KellyCapitalAllocator::compute_unified_post_cost_dro_sizing(
+                    100_000.0,
+                    sym,
+                    brain_id,
+                    SubPennyPrice::from_f64(entry_p).unwrap_or(inference.signal.entry_price),
+                    SubPennyPrice::from_f64(stop_p).unwrap_or(inference.signal.structural_stop_price),
+                    SubPennyPrice::from_f64(t1_p).unwrap_or(inference.signal.target_1_price),
+                    SubPennyPrice::from_f64(t2_p).unwrap_or(inference.signal.target_2_price),
+                    is_opt_routed,
+                    active_opt_meta.option_entry_premium.to_f64(),
+                    active_opt_meta.option_target_premium.to_f64(),
+                    active_opt_meta.contract_delta,
+                    dual_eval.consensus_confidence_pct,
+                    precedents.win_rate_pct,
+                    precedents.p50_mfe_pct,
+                    precedents.p85_mae_pct,
+                    era1_wr,
+                    era1_pf,
+                    symbol_era1_median_stop_pct,
+                    &returns_sample,
+                    stage0.epistemic_ood_score,
+                    stage0.conformal_p_value,
+                    m_state.martingale_e_value.max(1.0),
+                    eigen_cand.eigen_kelly_multiplier,
+                    bocpd_tel.bocpd_changepoint_prob,
+                    base_heat_fraction,
+                    is_penny_tier,
+                );
+                let combined_kelly_pct = unified_sizing.kelly_fraction_pct;
                 let dro_input = crate::dro_kelly_allocator::DroKellyInput {
                     p_cp_eff: bocpd_tel.bocpd_changepoint_prob,
                     epistemic_ood_score: stage0.epistemic_ood_score,
@@ -3522,7 +3727,7 @@ pub async fn build_institutional_watchlist_at_epoch(
                     eigen_kappa: eigen_cand.eigen_kelly_multiplier,
                     open_book_heat_pct: base_heat_fraction,
                     floor_kelly_fraction: 0.005,
-                    max_kelly_fraction: (combined_kelly_pct / 100.0).clamp(0.01, 0.45),
+                    max_kelly_fraction: 0.025,
                 };
                 let dro_sol = crate::dro_kelly_allocator::DistributionallyRobustKellyAllocator::solve_dro_allocation(
                     &returns_sample,
@@ -4804,7 +5009,9 @@ async fn evaluate_symbol_handler(
         raw_bars,
     );
     if !Path::new("../../Cargo.toml").exists() {
-        let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+        let _ = state
+            .ledger
+            .save_runtime_state_atomic(Path::new(LIVE_RUNTIME_STATE_PATH));
     }
     let snap = state
         .ledger
@@ -4850,7 +5057,9 @@ async fn evolution_run_autopsy_handler(
     let _ = state.ledger.run_autonomous_evolution_generation();
     let status = state.ledger.run_autopsy_and_tournament(true);
     if !Path::new("../../Cargo.toml").exists() {
-        let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+        let _ = state
+            .ledger
+            .save_runtime_state_atomic(Path::new(LIVE_RUNTIME_STATE_PATH));
     }
     Json(status)
 }
@@ -4866,7 +5075,9 @@ async fn evolution_run_generation_handler(
 ) -> Json<MultiGenEvolutionResponse> {
     let resp = state.ledger.run_autonomous_evolution_generation();
     if !Path::new("../../Cargo.toml").exists() {
-        let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+        let _ = state
+            .ledger
+            .save_runtime_state_atomic(Path::new(LIVE_RUNTIME_STATE_PATH));
     }
     let snap = state
         .ledger
@@ -4885,7 +5096,9 @@ async fn webhooks_configure_handler(
 ) -> Json<WebhookStatusResponse> {
     state.ledger.webhooks().update_config(cfg);
     if !Path::new("../../Cargo.toml").exists() {
-        let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+        let _ = state
+            .ledger
+            .save_runtime_state_atomic(Path::new(LIVE_RUNTIME_STATE_PATH));
     }
     Json(state.ledger.webhooks().status_snapshot())
 }
@@ -4902,7 +5115,9 @@ async fn webhooks_test_handler(
     let sym = payload.and_then(|Json(req)| req.symbol);
     let record = state.ledger.webhooks().fire_test_alert(sym).await;
     if !Path::new("../../Cargo.toml").exists() {
-        let _ = state.ledger.save_to_disk(Path::new(LEDGER_DISK_PATH));
+        let _ = state
+            .ledger
+            .save_runtime_state_atomic(Path::new(LIVE_RUNTIME_STATE_PATH));
     }
     Json(record)
 }

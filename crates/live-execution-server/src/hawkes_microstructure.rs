@@ -105,9 +105,9 @@ impl HawkesMicrostructureEngine {
             baseline_mu: [0.10, 0.10, 0.08],
             decay_beta: [0.85, 0.85, 0.65],
             alpha_matrix: [
-                [0.35, 0.08, 0.12],
-                [0.08, 0.35, 0.12],
-                [0.15, 0.15, 0.40],
+                [0.35, 0.08, 0.04],
+                [0.08, 0.35, 0.04],
+                [0.08, 0.08, 0.52],
             ],
             xi_state: [0.0, 0.0, 0.0],
             rolling_volume_window: Vec::with_capacity(32),
@@ -188,10 +188,11 @@ impl HawkesMicrostructureEngine {
         let is_down = c <= o || c <= prev_c;
 
         // Standardized jump marks:
-        let j_plus = v_rel * close_loc * (if is_up { 1.35 } else { 0.65 });
-        let j_minus = v_rel * (1.0 - close_loc) * (if is_down { 1.35 } else { 0.65 });
         let atr_safe = atr_bar.max(c * 0.0005).max(1e-4);
         let displacement_ratio = (body / atr_safe).max(0.05);
+        let sweep_eff = displacement_ratio.clamp(0.10, 1.50);
+        let j_plus = v_rel * sweep_eff * close_loc * (if is_up { 1.35 } else { 0.65 });
+        let j_minus = v_rel * sweep_eff * (1.0 - close_loc) * (if is_down { 1.35 } else { 0.65 });
         let j_abs = (v_rel / displacement_ratio.max(0.15)).clamp(0.0, 15.0);
 
         let jumps = [j_plus, j_minus, j_abs];

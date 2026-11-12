@@ -9542,28 +9542,59 @@ mod tests {
 
         // 2. Iceberg Passive Seller Absorption Wall
         let mut hawkes_iceberg = HawkesMicrostructureEngine::new();
+        // Seed baseline volume history
+        for step in 0..10 {
+            let base_bar = RawBarRecord {
+                timestamp_ns: base_ts + (400 + step * 60) * 1_000_000_000,
+                open: SubPennyPrice::from_f64(150.00).unwrap(),
+                high: SubPennyPrice::from_f64(150.15).unwrap(),
+                low: SubPennyPrice::from_f64(149.85).unwrap(),
+                close: SubPennyPrice::from_f64(150.05).unwrap(),
+                volume: 50_000,
+                bid_ask_spread: SubPennyPrice::from_f64(0.02).unwrap(),
+                dollar_turnover: 7_500_000.0,
+                time_delta_ms: 60_000,
+                vwap: SubPennyPrice::from_f64(150.00).unwrap(),
+                trade_count: 500,
+            };
+            hawkes_iceberg.observe_bar(&base_bar, 0.50, None);
+        }
+
         // Feed aggressive buy volume that hits an iceberg wall (long upper wick, close rejected near low)
-        let iceberg_bar = RawBarRecord {
-            timestamp_ns: base_ts + 500_000_000_000,
+        let mut last_iceberg_bar = RawBarRecord {
+            timestamp_ns: base_ts + 500 * 1_000_000_000,
             open: SubPennyPrice::from_f64(150.00).unwrap(),
-            high: SubPennyPrice::from_f64(154.50).unwrap(), // +4.50 upper wick excursion
+            high: SubPennyPrice::from_f64(154.50).unwrap(),
             low: SubPennyPrice::from_f64(149.80).unwrap(),
-            close: SubPennyPrice::from_f64(150.20).unwrap(), // pushed down by passive sellers
-            volume: 850_000,                                // heavy volume absorbed
+            close: SubPennyPrice::from_f64(150.20).unwrap(),
+            volume: 850_000,
             bid_ask_spread: SubPennyPrice::from_f64(0.08).unwrap(),
             dollar_turnover: 120_000_000.0,
             time_delta_ms: 60_000,
             vwap: SubPennyPrice::from_f64(151.00).unwrap(),
             trade_count: 2_000,
         };
-        // Inject multiple absorbed attempts
-        for _ in 0..5 {
+        for step in 0..5 {
+            let iceberg_bar = RawBarRecord {
+                timestamp_ns: base_ts + (500 + step * 60) * 1_000_000_000,
+                open: SubPennyPrice::from_f64(150.00).unwrap(),
+                high: SubPennyPrice::from_f64(154.50).unwrap(), // +4.50 upper wick excursion
+                low: SubPennyPrice::from_f64(149.80).unwrap(),
+                close: SubPennyPrice::from_f64(150.20).unwrap(), // pushed down by passive sellers
+                volume: 850_000,                                // heavy volume absorbed (17x relative)
+                bid_ask_spread: SubPennyPrice::from_f64(0.08).unwrap(),
+                dollar_turnover: 120_000_000.0,
+                time_delta_ms: 60_000,
+                vwap: SubPennyPrice::from_f64(151.00).unwrap(),
+                trade_count: 2_000,
+            };
+            last_iceberg_bar = iceberg_bar;
             hawkes_iceberg.observe_bar(&iceberg_bar, 2.50, None);
         }
         let iceberg_telem = hawkes_iceberg.telemetry();
-        let long_vetoed = hawkes_iceberg.check_veto_with_last(TradeDirection::Long, &iceberg_bar);
+        let long_vetoed = hawkes_iceberg.check_veto_with_last(TradeDirection::Long, &last_iceberg_bar);
         let short_vetoed =
-            hawkes_iceberg.check_veto_with_last(TradeDirection::Short, &iceberg_bar);
+            hawkes_iceberg.check_veto_with_last(TradeDirection::Short, &last_iceberg_bar);
         assert!(
             long_vetoed,
             "Long entry must be vetoed when colliding into passive institutional sell iceberg"

@@ -2320,6 +2320,26 @@ pub struct StagedBrokerOrderTicket {
     pub expected_post_fill_markout_toxicity_bps: f64,
     #[serde(default)]
     pub child_execution_slices: Vec<MicrostructureChildSlice>,
+    #[serde(default)]
+    pub optimal_long_strike: f64,
+    #[serde(default)]
+    pub optimal_short_strike: Option<f64>,
+    #[serde(default)]
+    pub solved_net_delta: f64,
+    #[serde(default)]
+    pub solved_net_gamma: f64,
+    #[serde(default)]
+    pub solved_net_vanna: f64,
+    #[serde(default)]
+    pub solved_net_charm_daily: f64,
+    #[serde(default)]
+    pub solved_net_theta_per_bar: f64,
+    #[serde(default)]
+    pub execution_tactic: String,
+    #[serde(default)]
+    pub microprice_limit_price: f64,
+    #[serde(default)]
+    pub execution_urgency_score: f64,
     pub ibkr_tws_payload_json: String,
     pub schwab_trader_payload_json: String,
     pub alpaca_api_payload_json: String,
@@ -2586,6 +2606,10 @@ pub struct ShadowVetoedTrade {
     #[serde(default)]
     pub entry_bar_idx: usize,
     pub prev_bar_record: Option<RawBarRecord>,
+    #[serde(default)]
+    pub shadow_reason: String,
+    #[serde(default)]
+    pub probation_brain_slot: Option<crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot>,
     pub settled: bool,
     pub outcome_label: String,
 }
@@ -2615,6 +2639,8 @@ pub struct RealTimeLedgerEngine {
     shadow_open_trades: RwLock<Vec<ShadowVetoedTrade>>,
     shadow_settled_trades: RwLock<Vec<ShadowVetoedTrade>>,
     martingale_shield: RwLock<crate::martingale_shield::VilleMartingaleAlphaShield>,
+    bocpd_engine: RwLock<crate::regime_bocpd::AdamsMacKayBocpdEngine>,
+    contextual_nig_allocator: RwLock<crate::portfolio_eigen_risk::ContextualNigMetaAllocator>,
 }
 
 impl Default for RealTimeLedgerEngine {
@@ -2652,7 +2678,21 @@ impl RealTimeLedgerEngine {
             martingale_shield: RwLock::new(
                 crate::martingale_shield::VilleMartingaleAlphaShield::new(),
             ),
+            bocpd_engine: RwLock::new(crate::regime_bocpd::AdamsMacKayBocpdEngine::default()),
+            contextual_nig_allocator: RwLock::new(
+                crate::portfolio_eigen_risk::ContextualNigMetaAllocator::new(),
+            ),
         }
+    }
+
+    pub fn bocpd_telemetry_snapshot(&self) -> crate::regime_bocpd::BocpdStepTelemetry {
+        self.bocpd_engine.read().telemetry()
+    }
+
+    pub fn contextual_nig_allocator_snapshot(
+        &self,
+    ) -> crate::portfolio_eigen_risk::ContextualNigMetaAllocator {
+        self.contextual_nig_allocator.read().clone()
     }
 
     pub fn martingale_shield_snapshot(
@@ -2808,17 +2848,25 @@ impl RealTimeLedgerEngine {
         )
     }
 
-    /// Builds the live Regime-Contextual Normal-Inverse-Gamma (NIG) Cross-Brain Capital Meta-Allocator
-    /// from causal settled trades and counterfactual shadow-tape `false_veto_regrets` (`Phase 35`).
+    /// Returns the resident Regime-Contextual Normal-Inverse-Gamma (NIG) Cross-Brain Capital Meta-Allocator
+    /// stepped online via `AdamsMacKayBocpdEngine` and `observe_settled_trade_adaptive` (`Phase 35` + `Phase 36.1`).
     pub fn build_contextual_nig_meta_allocator(
         &self,
     ) -> crate::portfolio_eigen_risk::ContextualNigMetaAllocator {
+        let current_len = self
+            .closed_ledger_len
+            .load(std::sync::atomic::Ordering::Acquire);
+        let resident = self.contextual_nig_allocator.read().clone();
+        if current_len > 0 && resident.bocpd_telemetry().step_count > 0 {
+            return resident;
+        }
         let closed_snap = self.closed_ledger.read().clone();
         let settled_shadows = self.shadow_settled_trades.read().clone();
         let mut regrets = Vec::new();
         for sh in &settled_shadows {
             if let Some(r) = sh.realized_r
                 && r >= 1.0
+                && sh.offending_trap_id.is_some()
             {
                 let regime =
                     crate::autopsy_evolver::classify_regime_bucket(&sh.entry_features_32);
@@ -2835,10 +2883,13 @@ impl RealTimeLedgerEngine {
                 regrets.push((slot, regime, r));
             }
         }
-        crate::portfolio_eigen_risk::ContextualNigMetaAllocator::from_causal_ledger(
+        let built = crate::portfolio_eigen_risk::ContextualNigMetaAllocator::from_causal_ledger(
             &closed_snap,
             &regrets,
-        )
+        );
+        *self.bocpd_engine.write() = built.bocpd_engine().clone();
+        *self.contextual_nig_allocator.write() = built.clone();
+        built
     }
 
     /// Builds the causal `LedoitWolfPrecision` manifold and active non-quarantined `Stage0TrapCentroid`
@@ -2928,6 +2979,12 @@ impl RealTimeLedgerEngine {
         let len = trades.len();
         *self.martingale_shield.write() =
             crate::martingale_shield::VilleMartingaleAlphaShield::from_causal_ledger(&trades);
+        let built_nig = crate::portfolio_eigen_risk::ContextualNigMetaAllocator::from_causal_ledger(
+            &trades,
+            &[],
+        );
+        *self.bocpd_engine.write() = built_nig.bocpd_engine().clone();
+        *self.contextual_nig_allocator.write() = built_nig;
         *self.closed_ledger.write() = trades;
         self.closed_ledger_len
             .store(len, std::sync::atomic::Ordering::Release);
@@ -3434,6 +3491,9 @@ impl RealTimeLedgerEngine {
         self.shadow_settled_trades.write().clear();
         *self.martingale_shield.write() =
             crate::martingale_shield::VilleMartingaleAlphaShield::new();
+        *self.bocpd_engine.write() = crate::regime_bocpd::AdamsMacKayBocpdEngine::default();
+        *self.contextual_nig_allocator.write() =
+            crate::portfolio_eigen_risk::ContextualNigMetaAllocator::new();
         self.webhook_dispatcher.clear_outbox();
         *self.running_net_profit_usd.write() = 0.0;
     }
@@ -3528,10 +3588,102 @@ impl RealTimeLedgerEngine {
             (TradeDirection::Short, _) => "BUY",
         };
         let exit_side = if eq_side == "BUY" { "SELL" } else { "BUY" };
+        let entry_f64 = pos.entry_price.to_f64().max(0.0001);
+        let live_f64 = pos.live_price.to_f64().max(0.0001);
+        let stop_f64 = pos.structural_stop_price.to_f64().max(0.0001);
+        let t1_f64 = pos.target_1_price.to_f64().max(0.0001);
+        let atr_bar = crate::options_convexity::OptionsConvexityEngine::compute_causal_atr_bar(
+            &pos.entry_bars,
+            entry_f64,
+        );
+        let sess_frac = match pos.brain_id {
+            BrainHorizonId::Brain01PennyAnomaly => 1.0 / 390.0,
+            BrainHorizonId::Brain02IntradayDayTrade => 5.0 / 390.0,
+            BrainHorizonId::Brain03ShortTermSwing => 60.0 / 390.0,
+            BrainHorizonId::Brain04CoreSwing => 1.0,
+            BrainHorizonId::Brain05LongTermWealth => 5.0,
+        };
+        let dte_days = match pos.brain_id {
+            BrainHorizonId::Brain01PennyAnomaly => 2.0,
+            BrainHorizonId::Brain02IntradayDayTrade => {
+                if matches!(pos.symbol.as_str(), "SPY" | "QQQ" | "IWM") {
+                    0.50
+                } else {
+                    5.0
+                }
+            }
+            BrainHorizonId::Brain03ShortTermSwing => 14.0,
+            BrainHorizonId::Brain04CoreSwing => 30.0,
+            BrainHorizonId::Brain05LongTermWealth => 60.0,
+        };
+        let entry_feat_vec = Self::extract_causal_entry_features_32(
+            &pos.entry_embedding_128,
+            pos.entry_price,
+            pos.initial_structural_stop,
+            pos.target_1_price,
+            pos.direction,
+            pos.ai_confidence_pct,
+            pos.precedent_win_rate_pct,
+            &pos.entry_bars,
+            pos.entry_bar_idx,
+        );
+        let mut entry_arr_32 = [0.0_f64; 32];
+        for (i, &v) in entry_feat_vec.iter().take(32).enumerate() {
+            entry_arr_32[i] = v as f64;
+        }
+        let regime_bucket = crate::autopsy_evolver::classify_regime_bucket(&entry_arr_32);
+        let iv_rank = crate::options_convexity::OptionsConvexityEngine::derive_causal_iv_rank(
+            &pos.entry_bars,
+            pos.contract_iv.max(0.15),
+            sess_frac,
+        );
+        let solved_opt =
+            crate::options_convexity::OptionsConvexityEngine::solve_optimal_option_structure(
+                pos.direction,
+                entry_f64,
+                stop_f64,
+                t1_f64,
+                atr_bar,
+                pos.contract_iv.max(0.15),
+                iv_rank,
+                dte_days,
+                sess_frac,
+                regime_bucket,
+            );
+        let (q_bid, q_ask, vpin_tox, bid_px, ask_px) =
+            if let Some(last_bar) = pos.entry_bars.last() {
+                let half_sp = ((last_bar.ask.to_f64() - last_bar.bid.to_f64()) * 0.5)
+                    .max(entry_f64 * 0.0002)
+                    .max(0.0001);
+                let vol = last_bar.volume.max(100.0);
+                let close_loc = ((last_bar.close.to_f64() - last_bar.low.to_f64())
+                    / (last_bar.high.to_f64() - last_bar.low.to_f64()).max(1e-4))
+                .clamp(0.05, 0.95);
+                let qb = (vol * close_loc * 0.01).max(10.0);
+                let qa = (vol * (1.0 - close_loc) * 0.01).max(10.0);
+                let vpin = ((close_loc - 0.5).abs() * 1.8).clamp(0.15, 0.95);
+                (qb, qa, vpin, entry_f64 - half_sp, entry_f64 + half_sp)
+            } else {
+                let half_sp = (entry_f64 * 0.0003).max(0.0001);
+                (150.0, 120.0, 0.45, entry_f64 - half_sp, entry_f64 + half_sp)
+            };
+        let micro_plan = crate::execution_microstructure::MicropriceExecutionRouter::route_order(
+            &crate::execution_microstructure::MicrostructureQuoteInput {
+                bid_price: bid_px,
+                ask_price: ask_px,
+                bid_size: q_bid,
+                ask_size: q_ask,
+                orderflow_toxicity_vpin: vpin_tox,
+                atr_bar,
+                structural_risk_per_share: (entry_f64 - stop_f64).abs().max(0.01),
+                direction: pos.direction,
+                regime_bucket,
+            },
+        );
         let limit_px = if action == "BUY_TO_OPEN" {
-            pos.entry_price
+            SubPennyPrice::from_f64(micro_plan.microprice_limit_price).unwrap_or(pos.entry_price)
         } else {
-            pos.live_price
+            SubPennyPrice::from_f64(live_f64).unwrap_or(pos.live_price)
         };
         let qty_int = pos.quantity_shares.round().max(1.0) as u64;
 
@@ -3748,6 +3900,16 @@ impl RealTimeLedgerEngine {
             sor_venue_weights_4: ac_plan.sor_venue_weights_4,
             expected_post_fill_markout_toxicity_bps: ac_plan.expected_post_fill_markout_toxicity_bps,
             child_execution_slices: ac_plan.child_execution_slices,
+            optimal_long_strike: solved_opt.optimal_long_strike,
+            optimal_short_strike: solved_opt.optimal_short_strike,
+            solved_net_delta: solved_opt.net_delta,
+            solved_net_gamma: solved_opt.net_gamma,
+            solved_net_vanna: solved_opt.net_vanna,
+            solved_net_charm_daily: solved_opt.net_charm_daily,
+            solved_net_theta_per_bar: solved_opt.net_theta_per_bar,
+            execution_tactic: micro_plan.execution_tactic.as_str().to_string(),
+            microprice_limit_price: micro_plan.microprice_limit_price,
+            execution_urgency_score: micro_plan.execution_urgency_score,
             ibkr_tws_payload_json,
             schwab_trader_payload_json,
             alpaca_api_payload_json,
@@ -4432,6 +4594,26 @@ impl RealTimeLedgerEngine {
 
     /// Instantaneously births a new live signal into `POSITIONS OPENED` with its real Yahoo Finance candle slice
     /// and explicit `EngineExecutionMode` (`ENGINE-A`, `ENGINE-B`, or `CONSENSUS_BOTH_ENGINES`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_open_live_or_paper_position(
+        &self,
+        exchange_index: &str,
+        inference: &LiveBrainInferenceOutput,
+        precedents: &PrecedentMatchSummary,
+        notional_allocation_usd: f64,
+        entry_bars: Vec<RawBarRecord>,
+        engine_mode: EngineExecutionMode,
+    ) -> OpenPositionRow {
+        self.open_position_with_bars_and_engine(
+            exchange_index,
+            inference,
+            precedents,
+            notional_allocation_usd,
+            entry_bars,
+            engine_mode,
+        )
+    }
+
     pub fn open_position_with_bars_and_engine(
         &self,
         exchange_index: &str,
@@ -4722,14 +4904,16 @@ impl RealTimeLedgerEngine {
                 causal_bars: row.entry_bars.clone(),
                 entry_bar_idx: row.entry_bar_idx,
                 prev_bar_record: row.entry_bars.last().copied(),
+                shadow_reason: "STAGE_0_HARD_NEGATIVE_TRAP".to_string(),
+                probation_brain_slot: None,
                 settled: false,
                 outcome_label: "SHADOW_OPEN".to_string(),
             });
             return row;
         }
 
-        // Phase 35 Deliverable 1 + Phase 36 Pillar 3: Ville Martingale Probation & Eigen-Risk Gate
-        if !enforce_era1_baseline && syn_state.generation_id >= 37 {
+        // Phase 36 / 36.1 Pillar 3: Live Ville Martingale Probation Interception -> Shadow-Tape Routing
+        if !enforce_era1_baseline {
             let is_0dte_slot = matches!(row.symbol.as_str(), "SPY" | "QQQ" | "IWM")
                 && row.brain_id == BrainHorizonId::Brain02IntradayDayTrade;
             let m_slot = if is_0dte_slot {
@@ -4792,6 +4976,8 @@ impl RealTimeLedgerEngine {
                     causal_bars: row.entry_bars.clone(),
                     entry_bar_idx: row.entry_bar_idx,
                     prev_bar_record: row.entry_bars.last().copied(),
+                    shadow_reason: "MARTINGALE_PROBATION_SHADOW".to_string(),
+                    probation_brain_slot: Some(m_slot),
                     settled: false,
                     outcome_label: "SHADOW_PROBATION_OPEN".to_string(),
                 });
@@ -4806,7 +4992,10 @@ impl RealTimeLedgerEngine {
                 row.notional_allocated_usd =
                     (((row.notional_allocated_usd * km) * 100.0).round() / 100.0).max(2_500.0);
             }
+        }
 
+        // Phase 35 Deliverable 1: Cross-Position Eigen-Covariance Crowding Gate
+        if !enforce_era1_baseline && syn_state.generation_id >= 37 {
             let cand_series = crate::portfolio_eigen_risk::EigenPositionSeries::from_open_row(&row);
             let eigen_rep = self.evaluate_book_eigen_risk(Some(&cand_series));
             if eigen_rep.vetoed {
@@ -5047,18 +5236,43 @@ impl RealTimeLedgerEngine {
                 done.outcome_label = label.to_string();
                 if let Some(trap_id) = done.offending_trap_id {
                     self.precedent_knn.record_trap_shadow_outcome(trap_id, r_val);
-                } else {
-                    let is_0dte_slot = matches!(done.symbol.as_str(), "SPY" | "QQQ" | "IWM")
-                        && done.brain_id == BrainHorizonId::Brain02IntradayDayTrade;
-                    let m_slot = if is_0dte_slot {
-                        crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::Scalp0Dte
-                    } else {
-                        crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::from_brain_and_tier(
-                            done.brain_id,
-                            "STANDARD",
-                        )
-                    };
-                    self.martingale_shield.write().observe_trade(m_slot, r_val, true);
+                    if r_val >= 1.0 {
+                        let regime = crate::autopsy_evolver::classify_regime_bucket(
+                            &done.entry_features_32,
+                        );
+                        let is_0dte = matches!(done.symbol.as_str(), "SPY" | "QQQ" | "IWM")
+                            && done.brain_id == BrainHorizonId::Brain02IntradayDayTrade;
+                        let slot = if is_0dte {
+                            crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::Scalp0Dte
+                        } else {
+                            crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::from_brain_and_tier(
+                                done.brain_id,
+                                "STANDARD",
+                            )
+                        };
+                        self.contextual_nig_allocator
+                            .write()
+                            .penalize_regret(slot, regime, r_val);
+                    }
+                }
+                if done.shadow_reason == "MARTINGALE_PROBATION_SHADOW"
+                    || done.probation_brain_slot.is_some()
+                {
+                    let m_slot = done.probation_brain_slot.unwrap_or_else(|| {
+                        let is_0dte_slot = matches!(done.symbol.as_str(), "SPY" | "QQQ" | "IWM")
+                            && done.brain_id == BrainHorizonId::Brain02IntradayDayTrade;
+                        if is_0dte_slot {
+                            crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::Scalp0Dte
+                        } else {
+                            crate::portfolio_eigen_risk::MetaAllocatorHorizonSlot::from_brain_and_tier(
+                                done.brain_id,
+                                "STANDARD",
+                            )
+                        }
+                    });
+                    self.martingale_shield
+                        .write()
+                        .observe_trade_r(m_slot, r_val, true);
                 }
                 newly_settled.push(done);
             } else {
@@ -5093,6 +5307,33 @@ impl RealTimeLedgerEngine {
         }
         let latest = &recent_bars[recent_bars.len() - 1];
         let live_price = latest.close;
+
+        // Phase 36 / 36.1 Pillar 2: Step resident Adams-MacKay BOCPD engine on incoming causal bar surprise
+        {
+            let bar_surprise_x = if recent_bars.len() >= 2 {
+                let prev = &recent_bars[recent_bars.len() - 2];
+                let c_cur = latest.close.to_f64().max(1e-6);
+                let c_prev = prev.close.to_f64().max(1e-6);
+                let atr_ref = crate::options_convexity::OptionsConvexityEngine::compute_causal_atr_bar(
+                    &recent_bars[..recent_bars.len() - 1],
+                    c_prev,
+                );
+                let norm_ret = (c_cur - c_prev) / atr_ref.max(c_prev * 0.001);
+                let vix_term = if internals.vix_spot > 0.0 {
+                    (internals.vix_spot - 18.0) * 0.08
+                } else {
+                    0.0
+                };
+                (0.75 * norm_ret + 0.25 * vix_term).clamp(-12.0, 12.0)
+            } else {
+                let hi = latest.high.to_f64();
+                let lo = latest.low.to_f64();
+                let op = latest.open.to_f64().max(1e-6);
+                let cl = latest.close.to_f64();
+                ((cl - op) / (hi - lo).max(op * 0.002)).clamp(-8.0, 8.0)
+            };
+            self.bocpd_engine.write().observe_surprise(bar_surprise_x);
+        }
 
         // Step any active Shadow-Tape counterfactual trades on this real incoming bar
         self.step_shadow_vetoed_trades_on_bar(symbol, brain_filter, latest);
@@ -5928,9 +6169,29 @@ impl RealTimeLedgerEngine {
                     "STANDARD",
                 )
             };
+            let entry_vec = crate::autopsy_evolver::extract_causal_entry_array_32(&row);
+            let regime = crate::autopsy_evolver::classify_regime_bucket(&entry_vec);
+            let ep = row.entry_price.to_f64().max(1e-6);
+            let risk_pct = ((ep - row.initial_structural_stop.to_f64()).abs() / ep * 100.0)
+                .max(0.10);
+            let mae_r = (row.mae_pct / risk_pct).max(0.35);
+            let bocpd_p_cp = self
+                .bocpd_engine
+                .read()
+                .telemetry()
+                .bocpd_changepoint_prob;
+            self.contextual_nig_allocator
+                .write()
+                .observe_settled_trade_adaptive(
+                    m_slot,
+                    regime,
+                    row.realized_r_multiple,
+                    mae_r,
+                    bocpd_p_cp,
+                );
             self.martingale_shield
                 .write()
-                .observe_trade(m_slot, row.realized_r_multiple, false);
+                .observe_trade_r(m_slot, row.realized_r_multiple, false);
         }
         self.recompute_causal_plasticity();
 
@@ -10397,6 +10658,12 @@ impl RealTimeLedgerEngine {
             crate::martingale_shield::VilleMartingaleAlphaShield::from_causal_ledger(
                 &parsed.closed_ledger,
             );
+        let built_nig = crate::portfolio_eigen_risk::ContextualNigMetaAllocator::from_causal_ledger(
+            &parsed.closed_ledger,
+            &[],
+        );
+        *self.bocpd_engine.write() = built_nig.bocpd_engine().clone();
+        *self.contextual_nig_allocator.write() = built_nig;
         *self.closed_ledger.write() = parsed.closed_ledger;
         self.closed_ledger_len
             .store(loaded_closed_len, std::sync::atomic::Ordering::Release);

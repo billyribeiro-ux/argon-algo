@@ -2927,6 +2927,24 @@ pub struct StagedOrderReceipt {
     pub allocated_notional_usd: f64,
     pub matched_cboe_contract: String,
     pub almgren_chriss_slices: Vec<f64>,
+    #[serde(default)]
+    pub optimal_long_strike: f64,
+    #[serde(default)]
+    pub optimal_short_strike: Option<f64>,
+    #[serde(default)]
+    pub net_delta: f64,
+    #[serde(default)]
+    pub net_gamma: f64,
+    #[serde(default)]
+    pub net_vanna: f64,
+    #[serde(default)]
+    pub net_charm: f64,
+    #[serde(default)]
+    pub net_theta_per_bar: f64,
+    #[serde(default)]
+    pub execution_tactic: String,
+    #[serde(default)]
+    pub microprice_limit_price: f64,
     pub staged_at_iso: String,
 }
 
@@ -2972,7 +2990,7 @@ pub async fn build_institutional_watchlist_at_epoch(
         .get_synaptic_plasticity_state(BrainHorizonId::Brain02IntradayDayTrade)
         .generation_id;
     let nig_allocator = state.ledger.build_contextual_nig_meta_allocator();
-    let bocpd_tel = nig_allocator.bocpd_telemetry();
+    let bocpd_tel = state.ledger.bocpd_telemetry_snapshot();
     let martingale_shield_states = state.ledger.martingale_shield_snapshot();
     let base_snap = state
         .ledger
@@ -4023,6 +4041,43 @@ async fn stage_sunday_orders_handler(
                 (Vec::new(), 0, vec![0.05_f32; 128], vec![row.entry_price])
             };
 
+        let solved_stage_opt =
+            crate::options_convexity::OptionsConvexityEngine::solve_optimal_option_structure(
+                row.direction,
+                row.entry_price.max(0.05),
+                row.structural_stop_price.max(0.01),
+                row.target_1_price.max(0.01),
+                crate::options_convexity::OptionsConvexityEngine::compute_causal_atr_bar(
+                    &staged_entry_bars,
+                    row.entry_price.max(0.05),
+                ),
+                0.32,
+                0.50,
+                match row.brain_id {
+                    BrainHorizonId::Brain01PennyAnomaly => 2.0,
+                    BrainHorizonId::Brain02IntradayDayTrade => 1.0,
+                    BrainHorizonId::Brain03ShortTermSwing => 14.0,
+                    BrainHorizonId::Brain04CoreSwing => 30.0,
+                    BrainHorizonId::Brain05LongTermWealth => 60.0,
+                },
+                5.0 / 390.0,
+                crate::autopsy_evolver::RegimeBucket::NegGammaMomentumTrend,
+            );
+        let eff_limit_entry = if row.microprice_limit_price > 0.0 {
+            row.microprice_limit_price
+        } else {
+            row.entry_price
+        };
+        let limit_entry_sub =
+            SubPennyPrice::from_f64(eff_limit_entry).unwrap_or(entry_sub);
+        let opt_debit = solved_stage_opt.net_debit.max(0.05);
+        let opt_entry_prem =
+            SubPennyPrice::from_f64(opt_debit).unwrap_or(SubPennyPrice::MIN_VALID);
+        let opt_stop_prem =
+            SubPennyPrice::from_f64((opt_debit * 0.48).max(0.02)).unwrap_or(SubPennyPrice::MIN_VALID);
+        let opt_target_prem =
+            SubPennyPrice::from_f64((opt_debit * 1.95).max(0.10)).unwrap_or(SubPennyPrice::MIN_VALID);
+
         let open_row = OpenPositionRow {
             position_id: pos_id,
             opened_at_iso: now_iso.clone(),
@@ -4033,7 +4088,7 @@ async fn stage_sunday_orders_handler(
             symbol: row.symbol.clone(),
             exchange_index: "NASDAQ".to_string(),
             direction: row.direction,
-            entry_price: entry_sub,
+            entry_price: limit_entry_sub,
             live_price: entry_sub,
             initial_structural_stop: stop_sub,
             structural_stop_price: stop_sub,
@@ -4041,25 +4096,27 @@ async fn stage_sunday_orders_handler(
             target_2_price: t2_sub,
             peak_favorable_price: entry_sub,
             max_adverse_price: entry_sub,
-            quantity_shares: (notional_allocated_usd / row.entry_price.max(0.01)).round().max(1.0),
+            quantity_shares: (notional_allocated_usd / eff_limit_entry.max(0.01)).round().max(1.0),
             kelly_fraction_pct: row.kelly_fraction_pct,
             risk_budget_usd: ((row.kelly_fraction_pct / 100.0) * 2000.0 * 100.0).round() / 100.0,
             notional_allocated_usd,
             tranche_count: 1,
             scale_in_history: Vec::new(),
-            option_structure: row.option_structure.clone(),
+            option_structure: row.recommended_option_structure.clone(),
             matched_option_contract: row.matched_option_contract.clone(),
-            option_entry_premium: SubPennyPrice::from_f64(2.50).unwrap_or(SubPennyPrice::MIN_VALID),
-            option_live_premium: SubPennyPrice::from_f64(2.50).unwrap_or(SubPennyPrice::MIN_VALID),
-            option_stop_premium: SubPennyPrice::from_f64(1.20).unwrap_or(SubPennyPrice::MIN_VALID),
-            option_target_premium: SubPennyPrice::from_f64(5.00).unwrap_or(SubPennyPrice::MIN_VALID),
-            option_contracts_count: 5,
-            contract_delta: match row.direction { raw_fingerprint_core::TradeDirection::Long => 0.55, raw_fingerprint_core::TradeDirection::Short => -0.55 },
-            contract_gamma: 0.045,
-            contract_vanna: 0.022,
-            contract_theta: -0.15,
-            contract_vega: 0.35,
-            contract_iv: 0.38,
+            option_entry_premium: opt_entry_prem,
+            option_live_premium: opt_entry_prem,
+            option_stop_premium: opt_stop_prem,
+            option_target_premium: opt_target_prem,
+            option_contracts_count: ((notional_allocated_usd * 0.20) / (opt_debit * 100.0).max(5.0))
+                .round()
+                .clamp(1.0, 50.0) as u32,
+            contract_delta: row.net_delta,
+            contract_gamma: row.net_gamma,
+            contract_vanna: row.net_vanna,
+            contract_theta: solved_stage_opt.net_theta_daily,
+            contract_vega: solved_stage_opt.net_vega,
+            contract_iv: solved_stage_opt.leg_long.implied_vol,
             unrealized_stock_pnl_usd: 0.0,
             unrealized_stock_pnl_pct: 0.0,
             unrealized_option_pnl_usd: 0.0,
@@ -4094,7 +4151,7 @@ async fn stage_sunday_orders_handler(
             learned_house_money_phi: 0.35,
             locked_profit_r: 0.0,
             guaranteed_net_floor_r: 0.0,
-            next_gamma_wall_strike: 0.0,
+            next_gamma_wall_strike: row.optimal_short_strike.unwrap_or(row.optimal_long_strike),
             next_gamma_wall_contract: String::new(),
             banked_option_gain_usd: 0.0,
             rolled_option_budget_usd: 0.0,
@@ -4110,7 +4167,7 @@ async fn stage_sunday_orders_handler(
             direction: format!("{:?}", row.direction).to_uppercase(),
             execution_safety_mode: safety_mode,
             execution_venue: venue.to_string(),
-            limit_entry_price: row.entry_price,
+            limit_entry_price: eff_limit_entry,
             structural_stop_loss: row.structural_stop_price,
             profit_target_1: row.target_1_price,
             profit_target_2: row.target_2_price,
@@ -4118,6 +4175,15 @@ async fn stage_sunday_orders_handler(
             allocated_notional_usd: notional_allocated_usd,
             matched_cboe_contract: row.matched_option_contract.clone(),
             almgren_chriss_slices,
+            optimal_long_strike: row.optimal_long_strike,
+            optimal_short_strike: row.optimal_short_strike,
+            net_delta: row.net_delta,
+            net_gamma: row.net_gamma,
+            net_vanna: row.net_vanna,
+            net_charm: row.net_charm,
+            net_theta_per_bar: row.net_theta_per_bar,
+            execution_tactic: row.execution_tactic.clone(),
+            microprice_limit_price: eff_limit_entry,
             staged_at_iso: now_iso.clone(),
         });
     }

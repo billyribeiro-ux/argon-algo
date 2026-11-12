@@ -204,7 +204,32 @@ impl AdamsMacKayBocpdEngine {
         self.observe_surprise(x_t)
     }
 
-    /// Exact Adams-MacKay (2007) run-length posterior update on scalar regime surprise $x_t$.
+    pub fn run_length_probs(&self) -> &[f64] {
+        &self.run_length_probs
+    }
+
+    pub fn kappa_at(&self, ell: usize) -> f64 {
+        self.kappa.get(ell).copied().unwrap_or(self.prior_kappa0)
+    }
+
+    #[inline]
+    fn update_normal_gamma_branch(
+        mu_prev: f64,
+        kappa_prev: f64,
+        alpha_prev: f64,
+        beta_prev: f64,
+        x: f64,
+    ) -> (f64, f64, f64, f64) {
+        let k_new = kappa_prev + 1.0;
+        let diff = x - mu_prev;
+        let mu_new = (kappa_prev * mu_prev + x) / k_new;
+        let alpha_new = alpha_prev + 0.5;
+        let beta_new = beta_prev + (kappa_prev * diff * diff) / (2.0 * k_new);
+        (mu_new, k_new, alpha_new, beta_new)
+    }
+
+    /// Exact Adams-MacKay (2007) run-length posterior update on scalar regime surprise $x_t$
+    /// with precision-weighted Normal-Gamma moment matching at the truncation absorber $\ell = 64$.
     #[allow(clippy::needless_range_loop)]
     pub fn observe_surprise(&mut self, x_t: f64) -> BocpdStepTelemetry {
         let x = if x_t.is_finite() {
@@ -228,14 +253,20 @@ impl AdamsMacKayBocpdEngine {
 
         let mut next_probs = vec![0.0_f64; len];
         let mut cp_mass = 0.0_f64;
+        let mut w_63_to_64 = 0.0_f64;
+        let mut w_64_to_64 = 0.0_f64;
+
         for ell in 0..len {
             let weighted = self.run_length_probs[ell] * pred_pdf[ell];
             cp_mass += weighted * h;
             let growth = weighted * (1.0 - h);
-            if ell + 1 < len {
+            if ell + 1 < BOCPD_MAX_RUN_LENGTH {
                 next_probs[ell + 1] += growth;
+            } else if ell + 1 == BOCPD_MAX_RUN_LENGTH {
+                w_63_to_64 = growth;
+                next_probs[BOCPD_MAX_RUN_LENGTH] += growth;
             } else {
-                // Conserve probability mass at truncation boundary ell = 64
+                w_64_to_64 = growth;
                 next_probs[BOCPD_MAX_RUN_LENGTH] += growth;
             }
         }
@@ -246,24 +277,64 @@ impl AdamsMacKayBocpdEngine {
             *p /= evidence;
         }
 
-        // Update Normal-Gamma sufficient statistics shifted along run-length index ell -> ell + 1
+        // Update Normal-Gamma sufficient statistics shifted along interior run-lengths ell = 0..63 -> 1..=63
         let mut next_mu = vec![self.prior_mu0; len];
         let mut next_kappa = vec![self.prior_kappa0; len];
         let mut next_alpha = vec![self.prior_alpha0; len];
         let mut next_beta = vec![self.prior_beta0; len];
 
-        for ell in 0..BOCPD_MAX_RUN_LENGTH {
-            let k_prev = self.kappa[ell];
-            let m_prev = self.mu[ell];
-            let a_prev = self.alpha[ell];
-            let b_prev = self.beta[ell];
+        for ell in 0..(BOCPD_MAX_RUN_LENGTH - 1) {
+            let (m_n, k_n, a_n, b_n) = Self::update_normal_gamma_branch(
+                self.mu[ell],
+                self.kappa[ell],
+                self.alpha[ell],
+                self.beta[ell],
+                x,
+            );
+            next_mu[ell + 1] = m_n;
+            next_kappa[ell + 1] = k_n;
+            next_alpha[ell + 1] = a_n;
+            next_beta[ell + 1] = b_n;
+        }
 
-            let k_new = k_prev + 1.0;
-            let diff = x - m_prev;
-            next_mu[ell + 1] = (k_prev * m_prev + x) / k_new;
-            next_kappa[ell + 1] = k_new;
-            next_alpha[ell + 1] = a_prev + 0.5;
-            next_beta[ell + 1] = b_prev + (k_prev * diff * diff) / (2.0 * k_new);
+        // Moment-match the incoming ell=63->64 and stationary absorber ell=64->64 Normal-Gamma branches
+        let idx_63 = BOCPD_MAX_RUN_LENGTH - 1;
+        let idx_64 = BOCPD_MAX_RUN_LENGTH;
+        let (mu_a, k_a, a_a, b_a) = Self::update_normal_gamma_branch(
+            self.mu[idx_63],
+            self.kappa[idx_63],
+            self.alpha[idx_63],
+            self.beta[idx_63],
+            x,
+        );
+        let (mu_b, k_b, a_b, b_b) = Self::update_normal_gamma_branch(
+            self.mu[idx_64],
+            self.kappa[idx_64],
+            self.alpha[idx_64],
+            self.beta[idx_64],
+            x,
+        );
+        let w_absorber_sum = w_63_to_64 + w_64_to_64;
+        if w_absorber_sum > 1e-30 {
+            let omega_63 = w_63_to_64 / w_absorber_sum;
+            let omega_64 = w_64_to_64 / w_absorber_sum;
+            let k_mix = omega_63 * k_a + omega_64 * k_b;
+            let mu_mix = (omega_63 * k_a * mu_a + omega_64 * k_b * mu_b) / k_mix.max(1e-12);
+            let a_mix = omega_63 * a_a + omega_64 * a_b;
+            let dm_a = mu_a - mu_mix;
+            let dm_b = mu_b - mu_mix;
+            let b_mix = omega_63 * b_a
+                + omega_64 * b_b
+                + 0.5 * (omega_63 * k_a * dm_a * dm_a + omega_64 * k_b * dm_b * dm_b);
+            next_mu[idx_64] = mu_mix;
+            next_kappa[idx_64] = k_mix;
+            next_alpha[idx_64] = a_mix;
+            next_beta[idx_64] = b_mix;
+        } else {
+            next_mu[idx_64] = mu_a;
+            next_kappa[idx_64] = k_a;
+            next_alpha[idx_64] = a_a;
+            next_beta[idx_64] = b_a;
         }
 
         self.run_length_probs = next_probs;

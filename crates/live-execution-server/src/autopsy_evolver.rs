@@ -300,11 +300,15 @@ impl LedoitWolfPrecision {
 
             let mut winner_centroid_32 = [0.0_f64; 32];
             if !win_entries.is_empty() {
-                let inv_w = 1.0 / (win_entries.len() as f64);
+                let mut sum_w = [0.0_f64; 32];
                 for (_, v) in &win_entries {
                     for i in 0..32 {
-                        winner_centroid_32[i] += v[i] * inv_w;
+                        sum_w[i] += v[i];
                     }
+                }
+                let n_w = win_entries.len() as f64;
+                for i in 0..32 {
+                    winner_centroid_32[i] = sum_w[i] / n_w;
                 }
             }
 
@@ -321,11 +325,15 @@ impl LedoitWolfPrecision {
 
             let mut loss_centroid_32 = [0.0_f64; 32];
             if !loss_entries.is_empty() {
-                let inv_l = 1.0 / (loss_entries.len() as f64);
+                let mut sum_l = [0.0_f64; 32];
                 for v in &loss_entries {
                     for i in 0..32 {
-                        loss_centroid_32[i] += v[i] * inv_l;
+                        sum_l[i] += v[i];
                     }
+                }
+                let n_l = loss_entries.len() as f64;
+                for i in 0..32 {
+                    loss_centroid_32[i] = sum_l[i] / n_l;
                 }
             } else if win_entries.is_empty() {
                 for i in 0..32 {

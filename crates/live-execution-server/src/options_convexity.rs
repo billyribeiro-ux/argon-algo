@@ -210,8 +210,15 @@ pub fn compute_bsm_leg_greeks(
     let sess_frac = bar_session_fraction.clamp(1.0 / 390.0, 5.0);
 
     let log_m = (k / s).ln();
-    let sigma = (atm_iv.max(0.05) * (1.0 + skew_beta * log_m + smile_beta * log_m * log_m))
-        .clamp(0.05, 4.00);
+    let base_atm_iv = atm_iv.max(0.05);
+    let raw_sigma = base_atm_iv * (1.0 + skew_beta * log_m + smile_beta * log_m * log_m);
+    let sigma = raw_sigma.clamp(0.05, 4.00);
+    // Sticky-strike skew slope d(sigma)/dS holding K fixed: d/dS ln(K/S) = -1/S
+    let d_sigma_d_spot = if (0.05..=4.00).contains(&raw_sigma) {
+        -(base_atm_iv / s) * (skew_beta + 2.0 * smile_beta * log_m)
+    } else {
+        0.0
+    };
     let sig_sqrt_t = (sigma * sqrt_t).max(1e-8);
 
     let d1 = ((s / k).ln() + (r_rate - div_yield_q + 0.5 * sigma * sigma) * t) / sig_sqrt_t;
@@ -225,34 +232,36 @@ pub fn compute_bsm_leg_greeks(
 
     let df_q = (-div_yield_q * t).exp();
     let df_r = (-r_rate * t).exp();
+    let vega = s * df_q * pdf_d1 * sqrt_t;
 
     let (theoretical_price, delta, theta_annual, d_delta_d_tau) = match right {
         OptionRight::Call => {
             let px = (s * df_q * cdf_d1 - k * df_r * cdf_d2).max(1e-4);
-            let del = df_q * cdf_d1;
+            let del_bsm = df_q * cdf_d1;
+            let del_skew = (del_bsm + vega * d_sigma_d_spot).clamp(1e-4, df_q);
             let th_ann = -(s * df_q * pdf_d1 * sigma) / (2.0 * sqrt_t)
                 - r_rate * k * df_r * cdf_d2
                 + div_yield_q * s * df_q * cdf_d1;
             let dd_dtau = -div_yield_q * df_q * cdf_d1
                 + df_q * pdf_d1 * (2.0 * (r_rate - div_yield_q) * t - d2 * sig_sqrt_t)
                     / (2.0 * t * sig_sqrt_t);
-            (px, del, th_ann, dd_dtau)
+            (px, del_skew, th_ann, dd_dtau)
         }
         OptionRight::Put => {
             let px = (k * df_r * cdf_neg_d2 - s * df_q * cdf_neg_d1).max(1e-4);
-            let del = -df_q * cdf_neg_d1;
+            let del_bsm = -df_q * cdf_neg_d1;
+            let del_skew = (del_bsm + vega * d_sigma_d_spot).clamp(-df_q, -1e-4);
             let th_ann = -(s * df_q * pdf_d1 * sigma) / (2.0 * sqrt_t)
                 + r_rate * k * df_r * cdf_neg_d2
                 - div_yield_q * s * df_q * cdf_neg_d1;
             let dd_dtau = div_yield_q * df_q * cdf_neg_d1
                 + df_q * pdf_d1 * (2.0 * (r_rate - div_yield_q) * t - d2 * sig_sqrt_t)
                     / (2.0 * t * sig_sqrt_t);
-            (px, del, th_ann, dd_dtau)
+            (px, del_skew, th_ann, dd_dtau)
         }
     };
 
     let gamma = (df_q * pdf_d1) / (s * sig_sqrt_t);
-    let vega = s * df_q * pdf_d1 * sqrt_t;
     let theta_daily = theta_annual / 252.0;
     let theta_per_bar = theta_daily * sess_frac;
 
@@ -383,11 +392,17 @@ impl OptionsConvexityEngine {
         let delta_s_t1 = eff_t1 - spot;
         let delta_s_bar = dir * atr_b;
 
-        // Expected causal IV shift: negative (IV crush) in high-IV / PosGamma pin, positive in low-IV NegGamma trend
+        // Expected causal IV shift: negative (IV crush) in high-IV / PosGamma pin, positive in low-IV NegGamma trend or bearish put momentum spikes
         let expected_delta_iv = match regime_bucket {
             RegimeBucket::PosGammaPinMeanRevert => -0.20 * atm_iv * (0.35 + iv_rank.clamp(0.0, 1.0)),
             RegimeBucket::NegGammaMomentumTrend if iv_rank <= 0.55 => {
-                0.12 * atm_iv * (0.65 - iv_rank)
+                let put_spike_boost = if direction == TradeDirection::Short { 1.25 } else { 1.0 };
+                0.12 * atm_iv * (0.65 - iv_rank) * put_spike_boost
+            }
+            RegimeBucket::LiquidityVacuumHighToxicity
+                if direction == TradeDirection::Short && iv_rank <= 0.70 =>
+            {
+                0.15 * atm_iv * (0.80 - iv_rank)
             }
             _ => -0.10 * atm_iv * (iv_rank.clamp(0.0, 1.0) - 0.40),
         };
@@ -427,11 +442,15 @@ impl OptionsConvexityEngine {
                 smile_beta,
             );
 
-            // 1. Single-leg utility U(K_1)
-            let single_num = leg_l.delta * trend_runner_move
-                + 0.5 * leg_l.gamma * trend_runner_move * trend_runner_move
+            // 1. Single-leg utility U(K_1): consistent Taylor horizon payoff + separate per-bar Gamma convexity + signed Vega/Vanna
+            let single_t1_payoff = (leg_l.delta * trend_runner_move
+                + 0.5 * leg_l.gamma * trend_runner_move * trend_runner_move)
+                .max(0.0);
+            let single_bar_convexity = 0.5 * leg_l.gamma * atr_b * atr_b;
+            let single_num = single_t1_payoff
+                + single_bar_convexity
                 + leg_l.vanna * delta_s_bar * expected_delta_iv
-                + leg_l.vega * expected_delta_iv.min(0.0);
+                + leg_l.vega * expected_delta_iv;
             let single_den = leg_l.theoretical_price.max(0.05)
                 + 3.0 * (leg_l.theta_per_bar.abs() + leg_l.charm_per_bar.abs() * atr_b);
             let u_single = single_num / single_den.max(1e-6);
@@ -502,11 +521,15 @@ impl OptionsConvexityEngine {
 
                 let spread_width = (k2 - k1).abs();
                 let max_spread_gain = (spread_width - net_debit).max(0.01);
-                let raw_t1_gain = (net_delta * delta_s_t1 + 0.5 * net_gamma * atr_b * atr_b)
-                    .min(max_spread_gain);
+                // Consistent Taylor step Delta S_{T1} for Target-1 payoff (clamped to spread saturation) + separate 1-bar convexity + signed Vega
+                let raw_t1_gain = (net_delta * delta_s_t1
+                    + 0.5 * net_gamma * delta_s_t1 * delta_s_t1)
+                    .clamp(0.0, max_spread_gain);
+                let bar_gamma_convexity = 0.5 * net_gamma * atr_b * atr_b;
                 let vert_num = raw_t1_gain
+                    + bar_gamma_convexity
                     + net_vanna * delta_s_bar * expected_delta_iv
-                    + net_vega * expected_delta_iv.min(0.0);
+                    + net_vega * expected_delta_iv;
                 let vert_den = net_debit.max(0.05)
                     + 3.0 * (net_theta_per_bar.abs() + net_charm_per_bar.abs() * atr_b);
                 let u_vert = vert_num / vert_den.max(1e-6);

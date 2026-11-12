@@ -547,6 +547,10 @@ impl ContextualNigMetaAllocator {
         self.bocpd_engine.telemetry()
     }
 
+    pub fn bocpd_engine(&self) -> &AdamsMacKayBocpdEngine {
+        &self.bocpd_engine
+    }
+
     pub fn bocpd_engine_mut(&mut self) -> &mut AdamsMacKayBocpdEngine {
         &mut self.bocpd_engine
     }
@@ -587,6 +591,17 @@ impl ContextualNigMetaAllocator {
             alloc.penalize_regret(slot, regime, missed_r);
         }
         alloc
+    }
+
+    pub fn observe_settled_trade_adaptive(
+        &mut self,
+        slot: MetaAllocatorHorizonSlot,
+        regime: RegimeBucket,
+        realized_r: f64,
+        mae_r: f64,
+        bocpd_p_cp: f64,
+    ) {
+        self.observe_adaptive(slot, regime, realized_r, mae_r, bocpd_p_cp);
     }
 
     pub fn observe_adaptive(

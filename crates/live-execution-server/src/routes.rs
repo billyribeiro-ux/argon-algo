@@ -1045,8 +1045,9 @@ impl AppState {
                             if !meta.is_optionable
                                 && !matches!(brain_id, BrainHorizonId::Brain02IntradayDayTrade)
                             {
-                                inference.matched_option.matched_option_contract.clear();
-                                inference.matched_option.option_structure = "EQUITY".to_string();
+                                inference.matched_option.matched_option_contract =
+                                    "SHARES_ONLY".to_string();
+                                inference.matched_option.option_structure = "SHARES_ONLY".to_string();
                             }
                             let opened = self.ledger.open_position_with_bars_and_engine(
                                 meta.exchange_index,
@@ -3661,7 +3662,10 @@ pub async fn build_institutional_watchlist_at_epoch(
                 // 1) Causal Edge & Red-Trade Trap (stage0 / is_actionable)
                 // 2) Book & Brain Health (Eigen crowding + Ville Martingale probation)
                 // 3) Tradability & Cost Gate (Expected T1 net payoff >= 2.5x RT cost)
-                let is_opt_routed = !matched_opt.is_empty() && !opt_struct.eq_ignore_ascii_case("EQUITY");
+                let is_opt_routed = crate::execution_microstructure::is_option_routed_structure(
+                    &matched_opt,
+                    &opt_struct,
+                );
                 let cost_gate = crate::execution_microstructure::evaluate_tradability_and_cost_gate(
                     sym,
                     entry_p,

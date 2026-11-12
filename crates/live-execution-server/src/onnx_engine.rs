@@ -556,7 +556,7 @@ impl OnnxMultiBrainEngine {
         eval_epoch_s: i64,
     ) -> MatchedOptionExecutionPlan {
         let spot = entry_price.to_f64();
-        if !is_optionable || spot < 1.25 {
+        if !is_optionable || spot < 5.0 || brain_id == BrainHorizonId::Brain01PennyAnomaly {
             return MatchedOptionExecutionPlan {
                 option_structure: "SHARES_ONLY".to_string(),
                 matched_option_contract: "SHARES_ONLY".to_string(),

@@ -4837,8 +4837,10 @@ impl RealTimeLedgerEngine {
             .get_era1_symbol_median_stop_pct(&sig.symbol, sig.brain_id)
             .unwrap_or(brain_era1_stop_pct);
 
-        let is_opt_routed = !opt.matched_option_contract.is_empty()
-            && !opt.option_structure.eq_ignore_ascii_case("EQUITY");
+        let is_opt_routed = crate::execution_microstructure::is_option_routed_structure(
+            &opt.matched_option_contract,
+            &opt.option_structure,
+        );
         let is_penny_tier =
             entry_f64 < 5.0 || sig.brain_id == BrainHorizonId::Brain01PennyAnomaly;
 
@@ -10889,7 +10891,11 @@ impl RealTimeLedgerEngine {
     /// Saves the current `positions_opened`, `closed_ledger`, `era1_calibrations`, `era1_symbol_median_stops`, `vetoed_repeat_traps`, and `webhook_outbox` state to disk as JSON.
     pub fn save_to_disk(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
-        if let Some(parent) = path.parent() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
             std::fs::create_dir_all(parent)?;
         }
         let mut serialized_median_stops = BTreeMap::new();
@@ -10914,7 +10920,8 @@ impl RealTimeLedgerEngine {
             shadow_settled_trades: self.shadow_settled_trades.read().clone(),
         };
         let bytes = serde_json::to_vec_pretty(&payload).map_err(std::io::Error::other)?;
-        let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
         {
             let mut f = std::fs::File::create(&tmp_path)?;
             f.write_all(&bytes)?;

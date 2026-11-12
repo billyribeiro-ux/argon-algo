@@ -238,6 +238,18 @@ pub struct RoundTripCostEstimate {
     pub tradable: bool,
 }
 
+/// Returns true only when both contract label and structure specify an actual option contract
+/// rather than cash shares (`SHARES_ONLY`, `EQUITY`, or empty).
+#[inline]
+pub fn is_option_routed_structure(matched_contract: &str, option_structure: &str) -> bool {
+    let mc = matched_contract.trim();
+    let st = option_structure.trim();
+    !mc.is_empty()
+        && !mc.eq_ignore_ascii_case("SHARES_ONLY")
+        && !st.eq_ignore_ascii_case("SHARES_ONLY")
+        && !st.eq_ignore_ascii_case("EQUITY")
+}
+
 /// Evaluates honest round-trip friction (spread + slippage + commissions/SEC-FINRA fees)
 /// and checks Stage 0 Check 3 (**Tradability & Cost Gate**: expected T1 payoff >= 2.5x RT cost).
 pub fn evaluate_tradability_and_cost_gate(
@@ -251,7 +263,7 @@ pub fn evaluate_tradability_and_cost_gate(
     contract_delta: f64,
     is_penny_flag: bool,
 ) -> RoundTripCostEstimate {
-    let entry = entry_price.max(1e-4);
+    let entry = entry_price.max(1e-6);
     let one_way_bps = explicit_one_way_slippage_bps(symbol, entry, is_penny_flag);
     let underlying_t1_move = (target_1_price - entry).abs();
 
@@ -269,7 +281,7 @@ pub fn evaluate_tradability_and_cost_gate(
         } else {
             underlying_t1_move * contract_delta.abs().clamp(0.25, 0.90)
         };
-        let ratio = exp_opt_payoff / rt_friction.max(1e-4);
+        let ratio = exp_opt_payoff / rt_friction.max(1e-9);
         RoundTripCostEstimate {
             one_way_equity_slippage_bps: one_way_bps,
             expected_t1_payoff_per_unit: exp_opt_payoff,
@@ -280,7 +292,7 @@ pub fn evaluate_tradability_and_cost_gate(
     } else {
         // Equity shares: 2 * explicit slippage (entry + exit) + SEC/FINRA regulatory fee (~0.003%)
         let rt_friction = entry * ((2.0 * one_way_bps / 10_000.0) + 0.00003);
-        let ratio = underlying_t1_move / rt_friction.max(1e-4);
+        let ratio = underlying_t1_move / rt_friction.max(1e-9);
         RoundTripCostEstimate {
             one_way_equity_slippage_bps: one_way_bps,
             expected_t1_payoff_per_unit: underlying_t1_move,

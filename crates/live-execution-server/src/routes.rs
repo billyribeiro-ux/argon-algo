@@ -936,12 +936,12 @@ impl AppState {
                     .fetch_universe_snapshots(Some(&core_syms))
                     .await
                     .unwrap_or_default();
-                let promoted = TwoStageMarketFunnel::execute_funnel(
+                let promoted = TwoStageMarketFunnel::new().execute_funnel(
                     &universe_snaps,
                     &UniverseScannerConfig {
                         min_daily_share_volume: 10_000,
                         min_daily_dollar_turnover: 10_000.0,
-                        max_stage2_candidates: 12,
+                        stage2_promotion_limit: 12,
                         ..UniverseScannerConfig::default()
                     },
                 );
@@ -1007,19 +1007,36 @@ impl AppState {
                             bars.iter().map(|b| b.to_raw_bar_record()).collect();
                         let raw_sf = cand.snapshot.to_raw_short_float_snapshot();
                         let raw_opt = raw_fingerprint_core::RawOptionsSnapshot::default();
-                        let precedents = self.precedent_knn.query_precedents(
-                            &vec![0.0; 128],
-                            brain_id,
-                            Some(sym),
-                        );
-                        if let Ok(mut inference) = self.onnx_engine.infer_signal_with_precedents(
+                        let max_bar_ts_ns = raw_bars.last().map(|b| b.timestamp_ns).unwrap_or(i64::MAX);
+                        let Ok(probe) = self.onnx_engine.evaluate_live_signal_with_precedents(
                             sym,
                             brain_id,
+                            meta.is_optionable,
                             &raw_bars,
                             &raw_opt,
                             &raw_sf,
                             &raw_int,
                             None,
+                        ) else {
+                            continue;
+                        };
+                        let precedents = self.precedent_knn.query_causal_precedents(
+                            brain_id,
+                            Some(sym),
+                            max_bar_ts_ns,
+                            &probe.signal.latent_embedding_128,
+                            16,
+                        );
+                        let emp_dist = precedents.to_empirical_distribution();
+                        if let Ok(mut inference) = self.onnx_engine.evaluate_live_signal_with_precedents(
+                            sym,
+                            brain_id,
+                            meta.is_optionable,
+                            &raw_bars,
+                            &raw_opt,
+                            &raw_sf,
+                            &raw_int,
+                            Some(&emp_dist),
                         ) {
                             let is_weak = inference.signal.ai_confidence_pct < 68.0;
                             if is_weak {
@@ -1037,7 +1054,7 @@ impl AppState {
                                 &precedents,
                                 100_000.0,
                                 raw_bars,
-                                EngineExecutionMode::EngineCBlend,
+                                EngineExecutionMode::StructuredHybridChampion,
                             );
                             if opened.sequential_safety_margin_pct > 0.0 {
                                 newly_opened_count += 1;
@@ -3506,7 +3523,7 @@ pub async fn build_institutional_watchlist_at_epoch(
                         brain_id,
                         &execution_tier,
                     );
-                let (pi_weight, post_sharpe, nig_kelly_mult) =
+                let (pi_weight, post_sharpe, _nig_kelly_mult) =
                     nig_allocator.weight_and_sharpe_for_slot(meta_slot, regime_enum);
 
                 let close_vec: Vec<f64> = window_bars.iter().map(|b| b.close.to_f64()).collect();

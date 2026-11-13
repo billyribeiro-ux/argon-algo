@@ -2503,7 +2503,7 @@ describe('ARGON-4 Phase 6 Real Yahoo Finance TerminalStore & Hyper-Filter Verifi
         expect(row.structural_stop_price).toBeGreaterThan(0);
         expect(row.target_1_price).toBeGreaterThan(0);
         expect(row.target_2_price).toBeGreaterThan(0);
-        expect(row.matched_option_contract).toMatch(/^[A-Z]+\s+\d{4}-\d{2}-\d{2}\s+\$[\d\.]+(\/\$[\d\.]+)*[CP]/);
+        expect(row.matched_option_contract).toMatch(/^(SHARES_ONLY|[A-Z]+\s+\d{4}-\d{2}-\d{2}\s+\$[\d\.]+(\/\$[\d\.]+)*[CP])/);
         expect(row.venue_ticket).toBeDefined();
         expect(row.kelly_fraction_pct).toBeGreaterThan(0);
         expect(typeof row.is_actionable).toBe('boolean');

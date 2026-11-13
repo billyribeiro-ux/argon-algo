@@ -912,22 +912,23 @@ impl BrokerExecutionBridge {
         let trimmed = contract_str.trim();
 
         // 1. Try parsing standard OCC symbol: "MSFT  261218C00465000"
-        if trimmed.len() >= 15 && (trimmed.contains('C') || trimmed.contains('P')) {
-            if let Some(pos_cp) = trimmed.find(['C', 'P']) {
-                if pos_cp >= 6 && pos_cp + 1 < trimmed.len() {
-                    let maybe_yymmdd = &trimmed[pos_cp - 6..pos_cp];
-                    let maybe_strike_str = &trimmed[pos_cp + 1..];
-                    if maybe_yymmdd.chars().all(|c| c.is_ascii_digit())
-                        && maybe_strike_str.chars().all(|c| c.is_ascii_digit())
-                    {
-                        let right = &trimmed[pos_cp..=pos_cp];
-                        if let Ok(strike_int) = maybe_strike_str.parse::<u64>() {
-                            let strike = (strike_int as f64) / 1000.0;
-                            let strike_millis = strike_int.min(99_999_999);
-                            let occ = format!("{sym_padded}{maybe_yymmdd}{right}{strike_millis:08}");
-                            return (occ, maybe_yymmdd.to_string(), strike, right.to_string());
-                        }
-                    }
+        if trimmed.len() >= 15
+            && (trimmed.contains('C') || trimmed.contains('P'))
+            && let Some(pos_cp) = trimmed.find(['C', 'P'])
+            && pos_cp >= 6
+            && pos_cp + 1 < trimmed.len()
+        {
+            let maybe_yymmdd = &trimmed[pos_cp - 6..pos_cp];
+            let maybe_strike_str = &trimmed[pos_cp + 1..];
+            if maybe_yymmdd.chars().all(|c| c.is_ascii_digit())
+                && maybe_strike_str.chars().all(|c| c.is_ascii_digit())
+            {
+                let right = &trimmed[pos_cp..=pos_cp];
+                if let Ok(strike_int) = maybe_strike_str.parse::<u64>() {
+                    let strike = (strike_int as f64) / 1000.0;
+                    let strike_millis = strike_int.min(99_999_999);
+                    let occ = format!("{sym_padded}{maybe_yymmdd}{right}{strike_millis:08}");
+                    return (occ, maybe_yymmdd.to_string(), strike, right.to_string());
                 }
             }
         }
@@ -948,8 +949,7 @@ impl BrokerExecutionBridge {
                     parsed_date = Some(format!("{yy}{mm}{dd}"));
                 }
             }
-            if token.starts_with('$') {
-                let stripped = &token[1..];
+            if let Some(stripped) = token.strip_prefix('$') {
                 let right_char = if stripped.ends_with('C') || stripped.ends_with('c') {
                     parsed_right = Some("C".to_string());
                     &stripped[..stripped.len() - 1]
@@ -1102,10 +1102,10 @@ impl BrokerExecutionBridge {
                 let cur_epoch_s = pos
                     .entry_bars
                     .last()
-                    .map(|b| (b.timestamp_ns / 1_000_000_000) as i64)
-                    .unwrap_or((pos.opened_timestamp_ns / 1_000_000_000) as i64);
+                    .map(|b| b.timestamp_ns / 1_000_000_000)
+                    .unwrap_or(pos.opened_timestamp_ns / 1_000_000_000);
                 let diff_days = (exp_epoch_s - cur_epoch_s) as f64 / 86400.0;
-                if diff_days >= 0.5 && diff_days <= 120.0 {
+                if (0.5..=120.0).contains(&diff_days) {
                     diff_days
                 } else {
                     default_dte_days

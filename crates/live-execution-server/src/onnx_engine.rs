@@ -392,6 +392,7 @@ impl OnnxMultiBrainEngine {
     /// - `BRAIN-03`: `expiry_epoch_s >= eval_epoch_s + 14 * 86_400` (+14d..+21d Friday)
     /// - `BRAIN-04`: `expiry_epoch_s >= eval_epoch_s + 30 * 86_400` (+30d..+45d monthly/Friday)
     /// - `BRAIN-05`: `expiry_epoch_s >= eval_epoch_s + 60 * 86_400` (+60d..+90d cycle)
+    ///
     /// Checks if a date is a standard closed US equity options exchange holiday:
     /// - New Year's Day (Jan 1)
     /// - Good Friday (Easter - 2 days)

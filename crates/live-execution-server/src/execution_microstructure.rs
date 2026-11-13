@@ -252,6 +252,7 @@ pub fn is_option_routed_structure(matched_contract: &str, option_structure: &str
 
 /// Evaluates honest round-trip friction (spread + slippage + commissions/SEC-FINRA fees)
 /// and checks Stage 0 Check 3 (**Tradability & Cost Gate**: expected T1 payoff >= 2.5x RT cost).
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_tradability_and_cost_gate(
     symbol: &str,
     entry_price: f64,
@@ -347,5 +348,82 @@ pub fn ny_et_hhmm(ts_sec: i64) -> (chrono::Weekday, u32) {
 pub fn is_us_regular_market_hours_et(ts_sec: i64) -> bool {
     let (wd, hhmm) = ny_et_hhmm(ts_sec);
     !matches!(wd, chrono::Weekday::Sat | chrono::Weekday::Sun) && (930..=1600).contains(&hhmm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tradability_cost_gate_blocks_low_edge_chop_and_allows_clean_moves() {
+        // Tight SPY option scalp: T1 target only moves option ~$0.05 vs ~$0.058 RT spread/comm -> VETO (< 2.5x)
+        let chop_opt = evaluate_tradability_and_cost_gate(
+            "SPY",
+            500.0,
+            500.10,
+            true,
+            false,
+            1.20,
+            1.25,
+            0.50,
+            false,
+        );
+        assert!(
+            !chop_opt.tradable && chop_opt.t1_to_cost_ratio < 2.5,
+            "Expected tight chop option scalp to fail 2.5x cost gate, got ratio {:.2}",
+            chop_opt.t1_to_cost_ratio
+        );
+
+        // Clean trend option move: T1 expected move +$0.85 vs ~$0.058 RT cost -> PASS (>= 2.5x)
+        let trend_opt = evaluate_tradability_and_cost_gate(
+            "SPY",
+            500.0,
+            501.60,
+            true,
+            false,
+            1.20,
+            2.05,
+            0.52,
+            false,
+        );
+        assert!(
+            trend_opt.tradable && trend_opt.t1_to_cost_ratio >= 2.5,
+            "Expected trend option move to pass 2.5x cost gate, got ratio {:.2}",
+            trend_opt.t1_to_cost_ratio
+        );
+
+        // Option structure helper rejects SHARES_ONLY and EQUITY
+        assert!(!is_option_routed_structure("SHARES_ONLY", "SHARES_ONLY"));
+        assert!(!is_option_routed_structure("", "EQUITY"));
+        assert!(is_option_routed_structure("SPY 2026-11-13 $500.00C", "SINGLE_LEG_CALL"));
+    }
+
+    #[test]
+    fn test_dst_aware_ny_et_clock_and_slippage_tiers() {
+        // 2026-11-12 14:35:00 UTC is EST (UTC-5) = 09:35 ET (Thursday)
+        let est_ts = chrono::NaiveDate::from_ymd_opt(2026, 11, 12)
+            .unwrap()
+            .and_hms_opt(14, 35, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let (_, _, h, m, _) = unix_sec_to_ny_et(est_ts);
+        assert_eq!((h, m), (9, 35));
+        assert!(is_us_regular_market_hours_et(est_ts));
+
+        // 2026-07-15 19:50:00 UTC is EDT (UTC-4) = 15:50 ET
+        let edt_ts = chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+            .unwrap()
+            .and_hms_opt(19, 50, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let (_, _, h2, m2, _) = unix_sec_to_ny_et(edt_ts);
+        assert_eq!((h2, m2), (15, 50));
+
+        assert_eq!(explicit_one_way_slippage_bps("SPY", 550.0, false), 5.0);
+        assert_eq!(explicit_one_way_slippage_bps("COIN", 210.0, false), 12.0);
+        assert_eq!(explicit_one_way_slippage_bps("SOUN", 4.5, true), 35.0);
+    }
 }
 

@@ -131,10 +131,9 @@ impl HawkesMicrostructureEngine {
     #[inline]
     fn compute_spectral_branching_ratio(&self) -> f64 {
         let mut row_sums = [0.0_f64; 3];
-        for i in 0..3 {
-            for j in 0..3 {
-                row_sums[i] += self.alpha_matrix[i][j] / self.decay_beta[i].max(0.10);
-            }
+        for (i, sum_slot) in row_sums.iter_mut().enumerate() {
+            let denom = self.decay_beta[i].max(0.10);
+            *sum_slot = self.alpha_matrix[i].iter().map(|a| a / denom).sum();
         }
         let max_row_sum = row_sums.iter().copied().fold(0.0_f64, f64::max);
         let total_xi: f64 = self.xi_state.iter().sum();
@@ -199,13 +198,13 @@ impl HawkesMicrostructureEngine {
 
         // O(1) recursive Markovian decay + cross-excitation
         let mut next_xi = [0.0_f64; 3];
-        for i in 0..3 {
+        for (i, next_slot) in next_xi.iter_mut().enumerate() {
             let decay = (-self.decay_beta[i] * delta_t_bars).exp();
             let mut exc = 0.0_f64;
-            for j in 0..3 {
-                exc += self.alpha_matrix[i][j] * jumps[j];
+            for (j, &jump) in jumps.iter().enumerate() {
+                exc += self.alpha_matrix[i][j] * jump;
             }
-            next_xi[i] = self.xi_state[i] * decay + exc;
+            *next_slot = self.xi_state[i] * decay + exc;
         }
         self.xi_state = next_xi;
         self.step_count += 1;

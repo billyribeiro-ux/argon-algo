@@ -497,7 +497,7 @@ impl NigPosteriorStats {
 
     /// Penalizes posterior mean and dispersion when a hard-negative trap censors a counterfactual winner.
     pub fn penalize_false_veto_regret(&mut self, missed_winner_r: f64) {
-        let r_pos = missed_winner_r.max(0.0).min(6.0);
+        let r_pos = missed_winner_r.clamp(0.0, 6.0);
         if r_pos <= 0.0 {
             return;
         }

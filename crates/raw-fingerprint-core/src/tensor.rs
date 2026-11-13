@@ -463,9 +463,7 @@ impl RawFingerprintEngine {
         let latest = &bars[seq_len - 1];
         let entry_price = latest.close;
 
-        // Inspect recent 10-bar turnover window and horizon-scaled structural absorption pivot window
-        let lookback = seq_len.min(10);
-        let window = &bars[seq_len - lookback..];
+        // Inspect horizon-scaled local raw range envelope
         let pivot_lookback = match brain_id {
             BrainHorizonId::Brain01PennyAnomaly | BrainHorizonId::Brain02IntradayDayTrade => {
                 seq_len.min(5)
@@ -476,18 +474,8 @@ impl RawFingerprintEngine {
         };
         let pivot_window = &bars[seq_len - pivot_lookback..];
 
-        let mut net_signed_turnover = 0.0_f64;
-        let mut total_window_vol = 0.0_f64;
         let mut absorption_low = latest.low;
         let mut absorption_high = latest.high;
-
-        for b in window {
-            let range_u = (b.high.scaled_units() - b.low.scaled_units()).max(1) as f64;
-            let body_u = (b.close.scaled_units() - b.open.scaled_units()) as f64;
-            let body_conv = (body_u / range_u).clamp(-1.0, 1.0);
-            net_signed_turnover += (b.volume as f64) * body_conv;
-            total_window_vol += b.volume as f64;
-        }
         for b in pivot_window {
             if b.low < absorption_low {
                 absorption_low = b.low;
@@ -497,8 +485,7 @@ impl RawFingerprintEngine {
             }
         }
 
-        // Compute mean per-bar log range so multi-scale trend drift is volatility-normalized (Z-score)
-        // across all timeframes (1m penny stocks through 1W institutional mega-caps)
+        // Compute mean per-bar log range for scale-invariant volatility normalization
         let mean_bar_range_log = (bars
             .iter()
             .map(|b| b.high.log_ratio(b.low).abs().max(1e-4))
@@ -506,30 +493,11 @@ impl RawFingerprintEngine {
             / (seq_len as f64))
             .max(1e-4);
 
-        let full_trend_z =
-            latest.close.log_ratio(bars[0].close) / (mean_bar_range_log * (seq_len as f64).sqrt());
-        let half_span = (seq_len - (seq_len / 2)).max(1) as f64;
-        let half_trend_z =
-            latest.close.log_ratio(bars[seq_len / 2].close) / (mean_bar_range_log * half_span.sqrt());
-        let micro_span = (seq_len - seq_len.saturating_sub(4)).max(1) as f64;
-        let micro_trend_z = latest
-            .close
-            .log_ratio(bars[seq_len.saturating_sub(4)].close)
-            / (mean_bar_range_log * micro_span.sqrt());
-
-        let norm_turnover_bias =
-            (net_signed_turnover / total_window_vol.max(1.0)).clamp(-1.0, 1.0);
-        let options_bias = options.ask_fill_aggression_ratio - options.bid_fill_aggression_ratio;
-        let internals_bias = (internals.nyse_tick as f64) / 2500.0;
-
-        let composite_dir_score = full_trend_z * 0.42
-            + half_trend_z * 0.33
-            + micro_trend_z * 0.25
-            + norm_turnover_bias * 0.30
-            + options_bias * 0.08
-            + internals_bias * 0.05;
-
-        let direction = if composite_dir_score >= 0.0 {
+        // Neutral unweighted latent tensor projection sign for legacy C-ABI / telemetry blueprints.
+        // Live & walk-forward action selection `{FLAT, LONG, SHORT}` and continuous trade geometry
+        // are computed directly by `PureAutonomousRlBrain` from the raw 164-d state tensor.
+        let latent_signed_projection: f32 = tensor.latent_embedding_128[0..32].iter().sum();
+        let direction = if latent_signed_projection >= 0.0 {
             TradeDirection::Long
         } else {
             TradeDirection::Short

@@ -64,6 +64,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let rl_brain_count = state.ledger.snapshot_pure_rl_brains().len();
+    info!("PureAutonomousRlBrain ensembles active in live daemon: {rl_brain_count}");
+
     // Spawn unattended multi-timeframe candle-boundary scanner + atomic persistence + WS broadcast loop
     let bg_state = state.clone();
     tokio::spawn(async move {

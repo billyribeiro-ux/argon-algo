@@ -274,7 +274,7 @@ pub fn canonical_settled_walk_forward_streams(
                 4.201607921203093,
                 0.03364173427568938,
                 0.9551163412055806,
-                2.8552357560368564,
+                2.855_235_756_036_856,
                 0.7619498664627116,
                 190.0,
             ),
@@ -924,8 +924,11 @@ impl AppState {
             || crate::execution_microstructure::is_us_regular_market_hours_et(now_sec);
         let (_, et_hhmm) = crate::execution_microstructure::ny_et_hhmm(now_sec);
 
-        if scanner_enabled && in_rth && (scan_m1 || scan_m5 || scan_h1 || scan_d1) {
-            if let Some(internals_u) = internals_u_opt.as_ref() {
+        if scanner_enabled
+            && in_rth
+            && (scan_m1 || scan_m5 || scan_h1 || scan_d1)
+            && let Some(internals_u) = internals_u_opt.as_ref()
+        {
                 // Screen the 60+ ticker universe through TwoStageMarketFunnel
                 let core_syms: Vec<String> = market_data_bus::REAL_YAHOO_CORE_UNIVERSE
                     .iter()
@@ -1038,6 +1041,44 @@ impl AppState {
                             &raw_int,
                             Some(&emp_dist),
                         ) {
+                            // Blend/gate with persisted PureAutonomousRlBrain ensemble if loaded
+                            let rl_brains = self.ledger.snapshot_pure_rl_brains();
+                            let target_label = match (tf, brain_id) {
+                                (Timeframe::M1, _) => "SCALP_0DTE (1m)",
+                                (Timeframe::M5, BrainHorizonId::Brain01PennyAnomaly) => "BRAIN-01 (Penny Day)",
+                                (Timeframe::M5, BrainHorizonId::Brain02IntradayDayTrade) => "SCALP_0DTE (5m)",
+                                (Timeframe::H1, BrainHorizonId::Brain03ShortTermSwing) => "BRAIN-03 (Short Swing)",
+                                _ => "BRAIN-04 (Core Swing)",
+                            };
+                            if let Some(rl_brain) = rl_brains.iter().find(|b| b.horizon_label == target_label) {
+                                let last_px = bars.last().map(|b| b.close.to_f64()).unwrap_or(1.0);
+                                let slip_bps = crate::execution_microstructure::explicit_one_way_slippage_bps(sym, last_px, is_penny_cand) as f32;
+                                let x_raw = crate::pure_rl_brain::build_raw_212_state_vector(
+                                    &probe.signal.latent_embedding_128,
+                                    &[0.0; 32],
+                                    (slip_bps as f64) / 100.0,
+                                    0.5,
+                                    0.0,
+                                    0.0,
+                                    &[0.0; crate::pure_rl_brain::RL_CROSS_SECT_DIM],
+                                    &[0.0; crate::pure_rl_brain::RL_MULTI_SCALE_HTF_DIM],
+                                );
+                                let self_s = crate::pure_rl_brain::SelfAwarenessState {
+                                    one_way_cost_bps: slip_bps,
+                                    session_time_left: 0.5,
+                                    ..Default::default()
+                                };
+                                let rl_out = rl_brain.infer_ensemble_step(
+                                    &x_raw,
+                                    self_s,
+                                    &[],
+                                    &[0.0; crate::pure_rl_brain::WM_DIM],
+                                    meta.is_optionable && !is_penny_cand,
+                                );
+                                if rl_out.action.abs() < 0.05 {
+                                    continue;
+                                }
+                            }
                             let is_weak = inference.signal.ai_confidence_pct < 68.0;
                             if is_weak {
                                 continue;
@@ -1063,7 +1104,6 @@ impl AppState {
                         }
                     }
                 }
-            }
         }
 
         // 2. Step all currently open & shadow positions and trigger continual plasticity on close
@@ -2570,6 +2610,10 @@ pub fn build_axum_router(state: AppState) -> Router {
             get(paper_overlay_handler),
         )
         .route(
+            "/api/v1/rl/brains/status",
+            get(rl_brains_status_handler),
+        )
+        .route(
             "/api/v1/scanner/sunday-protocol/dispatch",
             post(sunday_protocol_dispatch_handler),
         )
@@ -2646,6 +2690,10 @@ pub fn build_axum_router(state: AppState) -> Router {
         .route(
             "/api/v1/execution/execute-roll-combo/{position_id}",
             post(execute_roll_combo_handler),
+        )
+        .route(
+            "/api/v1/proof/run-walkforward",
+            post(run_walkforward_proof_handler),
         )
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -3287,25 +3335,24 @@ pub async fn build_institutional_watchlist_at_epoch(
                 24,
                 u64::MAX,
             )
+            && let Some(last_bar) = cached_ohlcv.last()
         {
-            if let Some(last_bar) = cached_ohlcv.last() {
-                let epoch = last_bar.timestamp_sec as i64;
-                let close = last_bar.close;
-                let should_replace = match canonical_spot_map.get(sym) {
-                    Some(&(cur_epoch, _)) => {
-                        if epoch > cur_epoch {
-                            true
-                        } else if epoch == cur_epoch {
-                            tf == Timeframe::M5 || tf == Timeframe::H1
-                        } else {
-                            false
-                        }
+            let epoch = last_bar.timestamp_sec;
+            let close = last_bar.close;
+            let should_replace = match canonical_spot_map.get(sym) {
+                Some(&(cur_epoch, _)) => {
+                    if epoch > cur_epoch {
+                        true
+                    } else if epoch == cur_epoch {
+                        tf == Timeframe::M5 || tf == Timeframe::H1
+                    } else {
+                        false
                     }
-                    None => true,
-                };
-                if should_replace {
-                    canonical_spot_map.insert(sym.to_string(), (epoch, close));
                 }
+                None => true,
+            };
+            if should_replace {
+                canonical_spot_map.insert(sym.to_string(), (epoch, close));
             }
         }
     }
@@ -5072,6 +5119,36 @@ async fn evolution_status_handler(State(state): State<AppState>) -> Json<BrainEv
     Json(state.ledger.run_autopsy_and_tournament(false))
 }
 
+async fn rl_brains_status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let brains = state.ledger.snapshot_pure_rl_brains();
+    let summaries: Vec<serde_json::Value> = brains
+        .iter()
+        .map(|b| {
+            let best = b
+                .population
+                .iter()
+                .max_by(|x, y| {
+                    x.causal_score
+                        .partial_cmp(&y.causal_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            serde_json::json!({
+                "horizon_label": b.horizon_label,
+                "population_size": b.population.len(),
+                "online_updates_count": b.online_updates_count,
+                "pbt_generations_run": b.pbt_generations_run,
+                "world_model_last_pinball_loss": b.world_model.last_pinball_loss,
+                "champion_sharpe": best.map(|m| m.causal_sharpe).unwrap_or(0.0),
+                "champion_score": best.map(|m| m.causal_score).unwrap_or(0.0),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "pure_rl_brains_loaded": summaries.len(),
+        "brains": summaries,
+    }))
+}
+
 async fn evolution_run_autopsy_handler(
     State(state): State<AppState>,
 ) -> Json<BrainEvolutionStatus> {
@@ -5394,4 +5471,27 @@ fn base64_encode_20(bytes: &[u8; 20]) -> String {
     out.push(TABLE[((n >> 6) & 0x3F) as usize] as char);
     out.push('=');
     out
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RunWalkforwardProofRequest {
+    pub starting_equity_usd: Option<f64>,
+}
+
+async fn run_walkforward_proof_handler(
+    State(state): State<AppState>,
+    payload: Option<Json<RunWalkforwardProofRequest>>,
+) -> Result<Json<crate::proof_harness::WalkforwardProofReport>, (StatusCode, String)> {
+    let starting_equity = payload
+        .and_then(|p| p.starting_equity_usd)
+        .unwrap_or(100_000.0)
+        .max(50_000.0);
+    crate::proof_harness::run_chronological_hard_evidence_proof(
+        Arc::clone(&state.onnx_engine),
+        &state.yahoo_adapter,
+        starting_equity,
+    )
+    .await
+    .map(Json)
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }

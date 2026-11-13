@@ -29,3 +29,6 @@ web-terminal/dist/
 .env.local
 *.pem
 
+# Runtime execution state (182MB+)
+data/live_runtime_state.json
+

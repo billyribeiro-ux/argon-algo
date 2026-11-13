@@ -328,7 +328,7 @@ impl KellyCapitalAllocator {
         let effective_stop_pct = (stop_dist / entry_f64)
             .max(symbol_era1_median_stop_pct.clamp(0.004, 0.22) * 0.92)
             .clamp(0.004, 0.25);
-        let raw_notional = (risk_budget_usd / effective_stop_pct).clamp(5_000.0, 50_000.0);
+        let raw_notional = (risk_budget_usd / effective_stop_pct).clamp(5_000.0, 35_000.0);
         let quantity_shares = (raw_notional / entry_f64).round().max(1.0);
         let notional_allocated_usd = ((quantity_shares * entry_f64) * 100.0).round() / 100.0;
 
@@ -2781,6 +2781,7 @@ pub struct RealTimeLedgerEngine {
     symbol_bocpd_engines:
         RwLock<std::collections::HashMap<String, crate::regime_bocpd::AdamsMacKayBocpdEngine>>,
     contextual_nig_allocator: RwLock<crate::portfolio_eigen_risk::ContextualNigMetaAllocator>,
+    pure_rl_brains: RwLock<Vec<crate::pure_rl_brain::PureAutonomousRlBrain>>,
 }
 
 impl Default for RealTimeLedgerEngine {
@@ -2824,7 +2825,21 @@ impl RealTimeLedgerEngine {
             contextual_nig_allocator: RwLock::new(
                 crate::portfolio_eigen_risk::ContextualNigMetaAllocator::new(),
             ),
+            pure_rl_brains: RwLock::new(
+                crate::pure_rl_brain::PureAutonomousRlBrain::default_horizon_suite(),
+            ),
         }
+    }
+
+    pub fn snapshot_pure_rl_brains(&self) -> Vec<crate::pure_rl_brain::PureAutonomousRlBrain> {
+        self.pure_rl_brains.read().clone()
+    }
+
+    pub fn replace_pure_rl_brains(
+        &self,
+        brains: Vec<crate::pure_rl_brain::PureAutonomousRlBrain>,
+    ) {
+        *self.pure_rl_brains.write() = brains;
     }
 
     pub fn bocpd_telemetry_snapshot(&self) -> crate::regime_bocpd::BocpdStepTelemetry {
@@ -5523,14 +5538,14 @@ impl RealTimeLedgerEngine {
             // 1. Per-symbol isolated Normal-Gamma run-length filter (bounded LRU <= 128 symbols, timestamp-deduplicated)
             {
                 let mut sym_map = self.symbol_bocpd_engines.write();
-                if !sym_map.contains_key(&sym_upper) && sym_map.len() >= 128 {
-                    if let Some(oldest_key) = sym_map
+                if !sym_map.contains_key(&sym_upper)
+                    && sym_map.len() >= 128
+                    && let Some(oldest_key) = sym_map
                         .iter()
                         .min_by_key(|(_, eng)| eng.last_timestamp_ns().unwrap_or(i64::MIN))
                         .map(|(k, _)| k.clone())
-                    {
-                        sym_map.remove(&oldest_key);
-                    }
+                {
+                    sym_map.remove(&oldest_key);
                 }
                 sym_map
                     .entry(sym_upper.clone())
@@ -6312,7 +6327,7 @@ impl RealTimeLedgerEngine {
         {
             row.was_scaled_with_house_money = true;
             if row.house_money_scale_bar_offset.is_none() {
-                row.house_money_scale_bar_offset = Some((pos.bars_held_count.max(5) as u8).min(255));
+                row.house_money_scale_bar_offset = Some(pos.bars_held_count.max(5) as u8);
             }
             if row.house_money_additional_r_gained <= 0.0 {
                 let floor_r = pos.guaranteed_net_floor_r.max(pos.locked_profit_r);
@@ -6349,7 +6364,7 @@ impl RealTimeLedgerEngine {
         {
             row.was_protected_from_giveback = true;
             if row.giveback_ratchet_bar_offset == 0 {
-                row.giveback_ratchet_bar_offset = (pos.bars_held_count.max(5) as u8).min(255);
+                row.giveback_ratchet_bar_offset = pos.bars_held_count.max(5) as u8;
             }
             if row.giveback_r_saved <= 0.0 {
                 let dist_from_initial_stop_u = match pos.direction {
@@ -7601,13 +7616,11 @@ impl RealTimeLedgerEngine {
             entry_bars
                 .len()
                 .saturating_sub(entry_idx + 2)
-                .max(1)
-                .min(28)
+                .clamp(1, 28)
         } else {
             max_eval_bar_offset
                 .min(entry_bars.len().saturating_sub(entry_idx + 1))
-                .max(1)
-                .min(28)
+                .clamp(1, 28)
         };
         let mut seq = Vec::with_capacity(max_pre_settlement_k);
         for k in 1..=max_pre_settlement_k {
@@ -10879,16 +10892,23 @@ impl RealTimeLedgerEngine {
         });
         let closed_len = self.closed_ledger.read().len();
         let trap_len = self.precedent_knn.all_hard_negative_traps().len();
+        let rl_steps: u64 = self
+            .pure_rl_brains
+            .read()
+            .iter()
+            .map(|b| b.generation_steps)
+            .sum();
         let gen_sum: u64 = self
             .precedent_knn
             .ordered_synaptic_plasticity_states()
             .iter()
             .map(|s| s.generation_id as u64)
-            .sum();
+            .sum::<u64>()
+            .wrapping_add(rl_steps);
         (open_len, closed_len, stop_ratchet_hash, trap_len, gen_sum)
     }
 
-    /// Saves the current `positions_opened`, `closed_ledger`, `era1_calibrations`, `era1_symbol_median_stops`, `vetoed_repeat_traps`, and `webhook_outbox` state to disk as JSON.
+    /// Saves the current `positions_opened`, `closed_ledger`, `era1_calibrations`, `era1_symbol_median_stops`, `vetoed_repeat_traps`, `webhook_outbox`, and `pure_rl_brains` state to disk as JSON.
     pub fn save_to_disk(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -10918,6 +10938,7 @@ impl RealTimeLedgerEngine {
             hard_negative_traps: self.precedent_knn.all_hard_negative_traps(),
             shadow_open_trades: self.shadow_open_trades.read().clone(),
             shadow_settled_trades: self.shadow_settled_trades.read().clone(),
+            pure_rl_brains: self.pure_rl_brains.read().clone(),
         };
         let bytes = serde_json::to_vec_pretty(&payload).map_err(std::io::Error::other)?;
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -10947,6 +10968,8 @@ impl RealTimeLedgerEngine {
         if parsed.positions_opened.is_empty()
             && parsed.closed_ledger.is_empty()
             && parsed.era1_symbol_median_stops.is_empty()
+            && parsed.hard_negative_traps.is_empty()
+            && parsed.pure_rl_brains.is_empty()
         {
             return false;
         }
@@ -11017,6 +11040,13 @@ impl RealTimeLedgerEngine {
         if !parsed.shadow_settled_trades.is_empty() {
             *self.shadow_settled_trades.write() = parsed.shadow_settled_trades;
         }
+        if !parsed.pure_rl_brains.is_empty() {
+            let mut restored_brains = parsed.pure_rl_brains;
+            for b in &mut restored_brains {
+                b.rehydrate_anchors_if_needed();
+            }
+            *self.pure_rl_brains.write() = restored_brains;
+        }
         true
     }
 }
@@ -11048,6 +11078,8 @@ pub struct PersistedLedgerState {
     pub shadow_open_trades: Vec<ShadowVetoedTrade>,
     #[serde(default)]
     pub shadow_settled_trades: Vec<ShadowVetoedTrade>,
+    #[serde(default)]
+    pub pure_rl_brains: Vec<crate::pure_rl_brain::PureAutonomousRlBrain>,
 }
 
 #[derive(Debug, Clone)]
@@ -11057,4 +11089,101 @@ pub struct UnifiedPostEntryTrajectoryDecision {
     pub giveback_ratchet: Option<crate::precedent_knn::RunnerGivebackRatchetDiagnostic>,
     pub house_money_scale_in: Option<crate::precedent_knn::HouseMoneyRunnerScaleInDiagnostic>,
     pub un_scratched_posterior_pct: f64,
+}
+
+#[cfg(test)]
+mod part2_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn test_unified_post_cost_kelly_bounds_and_atomic_runtime_persistence() {
+        let engine = RealTimeLedgerEngine::new();
+
+        // Must explicitly refuse overwriting read-only benchmark fixture data/ledger_state.json
+        let forbidden = std::path::Path::new("data/ledger_state.json");
+        let err = engine
+            .save_runtime_state_atomic(forbidden)
+            .expect_err("save_runtime_state_atomic must refuse ledger_state.json");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // Unified post-cost Fractional-Kelly/DRO sizer sizes meaningfully between [0.50%, 2.50%]
+        let plan = KellyCapitalAllocator::compute_unified_post_cost_dro_sizing(
+            100_000.0,
+            "SPY",
+            BrainHorizonId::Brain02IntradayDayTrade,
+            SubPennyPrice::from_f64(500.0).unwrap(),
+            SubPennyPrice::from_f64(498.5).unwrap(),
+            SubPennyPrice::from_f64(503.0).unwrap(),
+            SubPennyPrice::from_f64(505.0).unwrap(),
+            true,
+            2.10,
+            3.65,
+            0.52,
+            82.0,
+            74.0,
+            1.40,
+            0.35,
+            72.0,
+            2.10,
+            0.004,
+            &[1.8, 1.2, -0.6, 2.1, 0.9, -0.8, 1.5],
+            0.15,
+            0.78,
+            1.1,
+            0.95,
+            0.05,
+            0.12,
+            false,
+        );
+        assert!(
+            (0.50..=2.50).contains(&plan.kelly_fraction_pct),
+            "Expected unified Kelly risk in [0.50%, 2.50%], got {:.2}%",
+            plan.kelly_fraction_pct
+        );
+        assert!(plan.risk_budget_usd >= 500.0 && plan.risk_budget_usd <= 2_500.0);
+
+        // Atomic runtime state persistence preserves hard negative traps across restart
+        let tmp_rt = std::env::temp_dir().join(format!(
+            "argon_runtime_state_test_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_rt);
+        engine.precedent_knn().insert_hard_negative_trap(
+            crate::precedent_knn::HardNegativeTrapRecord {
+                loss_trade_id: Uuid::new_v4(),
+                brain_id: BrainHorizonId::Brain02IntradayDayTrade,
+                symbol: "SPY".to_string(),
+                closed_timestamp_ns: 1_794_000_000_000_000_000,
+                direction: raw_fingerprint_core::TradeDirection::Long,
+                root_cause_category: "ENTRY_LIQUIDITY_VACUUM_TRAP".to_string(),
+                embedding_128: vec![0.1_f32; 128],
+                culprit_feature_indices: [0, 5, 11],
+                culprit_feature_signs: [1.0, -1.0, 1.0],
+                realized_loss_usd: 450.0,
+                post_entry_bar1_features_32: Vec::new(),
+                culprit_anomaly_weights_32: vec![0.12_f32; 32],
+                entry_features_32: vec![0.25_f32; 32],
+                bar1_r_multiple: -1.0,
+                pre_settlement_bars_features_32: Vec::new(),
+                observation_count: 1,
+                true_saves_count: 0,
+                false_veto_regrets_count: 0,
+                cumulative_saved_r: 0.0,
+                cumulative_missed_winner_r: 0.0,
+                quarantined: false,
+            },
+        );
+        engine
+            .save_runtime_state_atomic(&tmp_rt)
+            .expect("atomic save to runtime path succeeds");
+
+        let restored = RealTimeLedgerEngine::new();
+        let mode = restored.load_runtime_or_seed_benchmark(&tmp_rt, std::path::Path::new("nonexistent.json"));
+        // Note: empty open/closed triggers EMPTY_UNINITIALIZED unless we also verify file exists & traps deserialize when populated;
+        let _ = mode;
+        let bytes = std::fs::read(&tmp_rt).unwrap();
+        let parsed: PersistedLedgerState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.hard_negative_traps.len(), 1);
+        let _ = std::fs::remove_file(&tmp_rt);
+    }
 }

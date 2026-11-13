@@ -457,6 +457,34 @@ impl PrecedentKnnIndex {
         }
     }
 
+    /// Initializes a completely empty, Gen-0 precedent index with zero pre-seeded trades for
+    /// strictly causal zero-lookahead walk-forward simulation.
+    pub fn new_empty_causal() -> Self {
+        let mut default_synaptic_map = HashMap::new();
+        for b in [
+            BrainHorizonId::Brain01PennyAnomaly,
+            BrainHorizonId::Brain02IntradayDayTrade,
+            BrainHorizonId::Brain03ShortTermSwing,
+            BrainHorizonId::Brain04CoreSwing,
+            BrainHorizonId::Brain05LongTermWealth,
+        ] {
+            let mut st = BrainSynapticPlasticityState::new_gen0(b);
+            st.refresh_inspector_rankings();
+            default_synaptic_map.insert(b, st);
+        }
+
+        Self {
+            records: RwLock::new(Vec::with_capacity(256)),
+            hard_negative_traps: RwLock::new(Vec::with_capacity(128)),
+            winner_pullbacks: RwLock::new(Vec::with_capacity(256)),
+            mid_trade_winner_trajectories: RwLock::new(Vec::with_capacity(256)),
+            mid_trade_loss_trajectories: RwLock::new(Vec::with_capacity(128)),
+            runner_continuation_trajectories: RwLock::new(Vec::with_capacity(256)),
+            profit_giveback_trajectories: RwLock::new(Vec::with_capacity(256)),
+            synaptic_plasticity_states: RwLock::new(default_synaptic_map),
+        }
+    }
+
     pub fn get_synaptic_plasticity_state(
         &self,
         brain_id: BrainHorizonId,
@@ -3629,8 +3657,7 @@ impl PrecedentKnnIndex {
 
         let fisher_p = syn_state
             .learned_fisher_sparsity_exponent_p
-            .max(1.0)
-            .min(2.75);
+            .clamp(1.0, 2.75);
         let mut raw_syn_w = [0.0_f64; 32];
         let mut w_sum = 0.0_f64;
         for i in 0..32 {
@@ -3958,8 +3985,7 @@ impl PrecedentKnnIndex {
 
         let fisher_p = syn_state
             .learned_fisher_sparsity_exponent_p
-            .max(1.0)
-            .min(2.75);
+            .clamp(1.0, 2.75);
         let mut raw_syn_w = [0.0_f64; 32];
         let mut w_sum = 0.0_f64;
         for i in 0..32 {

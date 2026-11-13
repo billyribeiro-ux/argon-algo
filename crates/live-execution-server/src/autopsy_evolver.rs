@@ -112,20 +112,15 @@ pub struct DecodedTradeAutopsy {
 
 /// Phase 34 Deliverable 1: Causal Regime Partitioning (`RegimeBucket`) across Stream 1 (`0..12`),
 /// Stream 2 Dealer GEX/Charm/Vanna (`12..20`), and Stream 3 Toxicity/Float (`20..26`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RegimeBucket {
     #[serde(rename = "POS_GAMMA_PIN_MEAN_REVERT")]
+    #[default]
     PosGammaPinMeanRevert,
     #[serde(rename = "NEG_GAMMA_MOMENTUM_TREND")]
     NegGammaMomentumTrend,
     #[serde(rename = "LIQUIDITY_VACUUM_HIGH_TOXICITY")]
     LiquidityVacuumHighToxicity,
-}
-
-impl Default for RegimeBucket {
-    fn default() -> Self {
-        Self::PosGammaPinMeanRevert
-    }
 }
 
 impl RegimeBucket {

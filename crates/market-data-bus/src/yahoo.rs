@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use raw_fingerprint_core::SubPennyPrice;
+use raw_fingerprint_core::{RawBarRecord, SubPennyPrice};
 use reqwest::{Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -157,6 +157,36 @@ pub struct RealExchangeOhlcvBar {
     pub low: f64,
     pub close: f64,
     pub volume: u64,
+}
+
+impl RealExchangeOhlcvBar {
+    /// Converts a real exchange OHLCV bar into a causal `RawBarRecord` for feature extraction.
+    #[inline]
+    pub fn to_raw_bar_record(&self) -> RawBarRecord {
+        let open = SubPennyPrice::from_f64(self.open).unwrap_or(SubPennyPrice::MIN_VALID);
+        let high = SubPennyPrice::from_f64(self.high.max(self.open).max(self.close)).unwrap_or(open);
+        let low = SubPennyPrice::from_f64(self.low.min(self.open).min(self.close).max(0.00001))
+            .unwrap_or(open);
+        let close = SubPennyPrice::from_f64(self.close).unwrap_or(open);
+        let vwap_f = ((self.high + self.low + self.close * 2.0) * 0.25).max(0.00001);
+        let vwap = SubPennyPrice::from_f64(vwap_f).unwrap_or(close);
+        let vol = self.volume.max(1);
+        let spread_f = (close.to_f64() * 0.0004).max(0.0001);
+        let bid_ask_spread = SubPennyPrice::from_f64(spread_f).unwrap_or(SubPennyPrice::MIN_VALID);
+        RawBarRecord {
+            timestamp_ns: self.timestamp_sec * 1_000_000_000,
+            open,
+            high,
+            low,
+            close,
+            volume: vol,
+            vwap,
+            dollar_turnover: (vol as f64) * vwap_f,
+            trade_count: ((vol / 180).max(12) as u32).min(500_000),
+            bid_ask_spread,
+            time_delta_ms: 300_000,
+        }
+    }
 }
 
 /// Real FINRA RegSHO Daily Short Volume record parsed from `CNMSshvol{YYYYMMDD}.txt`.
@@ -589,7 +619,7 @@ impl YahooSessionManager {
 
         let min_cached_bars = match timeframe {
             Timeframe::W1 | Timeframe::Mo1 => 100,
-            Timeframe::M1 | Timeframe::M3 => 180.max(target_len.min(1200)),
+            Timeframe::M1 | Timeframe::M3 => 180.max(target_len.min(6_500)),
             _ => 250.max(target_len.min(1800)),
         };
         if let Some(cached) =
@@ -630,6 +660,8 @@ impl YahooSessionManager {
         }
 
         // For intraday timeframes (`1m`, `3m`, `5m`, `15m`, `1h`, `4h`):
+        // For deep `1m` history (`target_len > 3_000`), stitch 4 contiguous 7-day `(period1, period2)`
+        // Yahoo `v8/finance/chart` windows (~21 real exchange trading days, ~7,700+ bars/symbol).
         // Use deep `60d` window for `5m`/`15m` (~4,680 real intraday bars) and `730d` for `1h`.
         let (yf_interval, primary_range, fallback_range) = match timeframe {
             Timeframe::Tick | Timeframe::M1 | Timeframe::M3 => ("1m", "7d", "5d"),
@@ -640,10 +672,38 @@ impl YahooSessionManager {
             _ => ("5m", "60d", "1mo"),
         };
 
-        let mut intraday_bars = self
-            .try_fetch_v8_chart_ohlcv(&clean_sym, yf_interval, primary_range)
-            .await
-            .unwrap_or_default();
+        let mut intraday_bars = if matches!(timeframe, Timeframe::Tick | Timeframe::M1 | Timeframe::M3)
+            && target_len > 3_000
+        {
+            let now_sec = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(1_794_600_000);
+            let mut stitched: Vec<RealExchangeOhlcvBar> = Vec::new();
+            for w in (0..4_i64).rev() {
+                let p2 = now_sec - w * 7 * 86_400;
+                let p1 = p2 - 7 * 86_400 + 60;
+                if let Ok(win_bars) = self
+                    .try_fetch_v8_chart_ohlcv_period(&clean_sym, yf_interval, p1, p2)
+                    .await
+                {
+                    stitched.extend(win_bars);
+                }
+            }
+            if !stitched.is_empty() {
+                stitched.sort_by_key(|b| b.timestamp_sec);
+                stitched.dedup_by_key(|b| b.timestamp_sec);
+                stitched
+            } else {
+                self.try_fetch_v8_chart_ohlcv(&clean_sym, yf_interval, primary_range)
+                    .await
+                    .unwrap_or_default()
+            }
+        } else {
+            self.try_fetch_v8_chart_ohlcv(&clean_sym, yf_interval, primary_range)
+                .await
+                .unwrap_or_default()
+        };
 
         if intraday_bars.is_empty() {
             intraday_bars = self
@@ -946,25 +1006,8 @@ impl YahooSessionManager {
         Ok(extracted_bars)
     }
 
-    async fn try_fetch_v8_chart_ohlcv(
-        &self,
-        symbol: &str,
-        interval: &str,
-        range: &str,
-    ) -> Result<Vec<RealExchangeOhlcvBar>, DataBusError> {
-        let encoded_sym = encode_yahoo_url_symbol(symbol);
-        let crumb_opt = self.crumb.read().clone();
-        let url = if let Some(crumb) = crumb_opt {
-            format!(
-                "https://query2.finance.yahoo.com/v8/finance/chart/{encoded_sym}?interval={interval}&range={range}&includePrePost=false&crumb={crumb}"
-            )
-        } else {
-            format!(
-                "https://query1.finance.yahoo.com/v8/finance/chart/{encoded_sym}?interval={interval}&range={range}&includePrePost=false"
-            )
-        };
-
-        let mut req = self.client.get(&url);
+    async fn fetch_v8_chart_url(&self, url: &str) -> Result<Vec<RealExchangeOhlcvBar>, DataBusError> {
+        let mut req = self.client.get(url);
         if let Some(cookie) = self.cookie_header.read().clone() {
             req = req.header(reqwest::header::COOKIE, cookie);
         }
@@ -983,6 +1026,47 @@ impl YahooSessionManager {
             .await
             .map_err(|e| DataBusError::ConnectionError(e.to_string()))?;
         Self::parse_v8_chart_json_bars(&root)
+    }
+
+    async fn try_fetch_v8_chart_ohlcv(
+        &self,
+        symbol: &str,
+        interval: &str,
+        range: &str,
+    ) -> Result<Vec<RealExchangeOhlcvBar>, DataBusError> {
+        let encoded_sym = encode_yahoo_url_symbol(symbol);
+        let crumb_opt = self.crumb.read().clone();
+        let url = if let Some(crumb) = crumb_opt {
+            format!(
+                "https://query2.finance.yahoo.com/v8/finance/chart/{encoded_sym}?interval={interval}&range={range}&includePrePost=false&crumb={crumb}"
+            )
+        } else {
+            format!(
+                "https://query1.finance.yahoo.com/v8/finance/chart/{encoded_sym}?interval={interval}&range={range}&includePrePost=false"
+            )
+        };
+        self.fetch_v8_chart_url(&url).await
+    }
+
+    async fn try_fetch_v8_chart_ohlcv_period(
+        &self,
+        symbol: &str,
+        interval: &str,
+        period1: i64,
+        period2: i64,
+    ) -> Result<Vec<RealExchangeOhlcvBar>, DataBusError> {
+        let encoded_sym = encode_yahoo_url_symbol(symbol);
+        let crumb_opt = self.crumb.read().clone();
+        let url = if let Some(crumb) = crumb_opt {
+            format!(
+                "https://query2.finance.yahoo.com/v8/finance/chart/{encoded_sym}?interval={interval}&period1={period1}&period2={period2}&includePrePost=false&crumb={crumb}"
+            )
+        } else {
+            format!(
+                "https://query1.finance.yahoo.com/v8/finance/chart/{encoded_sym}?interval={interval}&period1={period1}&period2={period2}&includePrePost=false"
+            )
+        };
+        self.fetch_v8_chart_url(&url).await
     }
 
     fn parse_v8_chart_json_bars(root: &Value) -> Result<Vec<RealExchangeOhlcvBar>, DataBusError> {
@@ -2661,7 +2745,7 @@ pub fn lookup_bar_le_timestamp(
 }
 
 #[inline]
-fn est_trading_day_key(ts_sec: i64) -> i64 {
+pub fn est_trading_day_key(ts_sec: i64) -> i64 {
     (ts_sec - 5 * 3_600).div_euclid(86_400)
 }
 

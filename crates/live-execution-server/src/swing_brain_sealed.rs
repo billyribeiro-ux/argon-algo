@@ -6454,10 +6454,19 @@ pub fn run_sealed_swing_walkforward(
     precomputed_h1: &HashMap<String, Vec<CausalBarPhysicsSnapshot>>,
     starting_equity_usd: f64,
 ) -> SealedSwingReport {
+    let (_, d2_m5_days) = collect_sorted_timestamps_and_days(&ds.m5_bars, true);
     let (h1_ts, d2_h1_days) = collect_sorted_timestamps_and_days(&ds.h1_bars, true);
-    let m5_warmup = 20.min(d2_h1_days.len().saturating_sub(5).max(1));
-    let h1_warmup_start_day = d2_h1_days.first().copied().unwrap_or(0);
-    let d2_oos_start_day = d2_h1_days.get(m5_warmup).copied().unwrap_or(i64::MAX);
+    let m5_warmup = 20.min(d2_m5_days.len().saturating_sub(5).max(1));
+    let d2_warmup_start_day = d2_m5_days.first().copied().unwrap_or(0);
+    let h1_warmup_start_day = d2_h1_days.first().copied().unwrap_or(d2_warmup_start_day);
+    let d2_oos_start_day = if !d2_m5_days.is_empty() {
+        d2_m5_days.get(m5_warmup).copied().unwrap_or(i64::MAX)
+    } else {
+        // Fallback when standalone test only loaded H1: 20 warmup -> 46 OOS trading days
+        let oos_count = 46.min(d2_h1_days.len().saturating_sub(20));
+        let oos_start_idx = d2_h1_days.len().saturating_sub(oos_count);
+        d2_h1_days.get(oos_start_idx).copied().unwrap_or(i64::MAX)
+    };
     let h1_warmup_cutoff_ts = h1_ts
         .iter()
         .copied()

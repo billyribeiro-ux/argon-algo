@@ -9,7 +9,7 @@ description = "Scale-independent 4-stream raw market physics tensor engine with 
 
 [lib]
 name = "raw_fingerprint_core"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [features]
 default = []

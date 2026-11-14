@@ -1014,7 +1014,7 @@ impl PhysicsWorldModel {
         for h_idx in 0..WM_HORIZONS.len() {
             let base = h_idx * 4;
             if base + 2 < self.b_wm.len() {
-                let q50 = (self.b_wm[base + 1] * 0.90).clamp(-0.025, 0.025);
+                let q50 = (self.b_wm[base + 1] * 0.55).clamp(-0.004, 0.004);
                 let half_iqr = (0.5 * (self.b_wm[base + 2] - self.b_wm[base])).clamp(0.008, 0.45);
                 self.b_wm[base] = q50 - half_iqr;
                 self.b_wm[base + 1] = q50;
@@ -1098,9 +1098,7 @@ impl AgentHyperParams {
         let is_swing = horizon_label.contains("BRAIN-03")
             || horizon_label.contains("BRAIN-04")
             || horizon_label.contains("Swing");
-        let chunks = if is_scalp_1m {
-            [64usize, 84, 104, 128]
-        } else if is_swing {
+        let chunks = if is_swing {
             [56usize, 72, 96, 112]
         } else {
             [44usize, 60, 78, 96]
@@ -1122,17 +1120,17 @@ impl AgentHyperParams {
             -0.05_f32
         };
         let cs_grid = if is_scalp_1m {
-            [0.50_f32, 0.72, 0.96, 1.22]
+            [0.52_f32, 0.76, 1.00, 1.26]
         } else if is_scalp_5m {
-            [0.56_f32, 0.80, 1.08, 1.38]
+            [0.64_f32, 0.90, 1.18, 1.48]
         } else if is_penny {
-            [0.62_f32, 0.88, 1.18, 1.50]
+            [0.64_f32, 0.92, 1.22, 1.54]
         } else if is_day_large {
-            [0.60_f32, 0.86, 1.14, 1.45]
+            [0.64_f32, 0.90, 1.18, 1.48]
         } else if is_swing {
-            [0.52_f32, 0.76, 1.02, 1.30]
+            [0.54_f32, 0.78, 1.04, 1.34]
         } else {
-            [0.60_f32, 0.88, 1.16, 1.48]
+            [0.62_f32, 0.88, 1.16, 1.48]
         };
         let base_cs = cs_grid[(idx / 6) % 4] * rand_uniform(seed, 0.90, 1.10);
         let log_cs = base_cs.max(0.12).ln();
@@ -1323,9 +1321,15 @@ fn compute_cost_scaled_deadzone_with_iqr(
         let eod_urgency = ((0.24 - sess_rem).max(0.0) / 0.24).powi(2);
         let peak_bps = (peak_excursion.max(0.0)) * 10_000.0;
         let giveback_bps = (drawdown_from_peak.max(0.0)) * 10_000.0;
-        let mfe_target_bps = (1.40 * rt_cost_bps)
-            .max(0.85 * wm_iqr_24_bps.clamp(0.0, 340.0))
-            .max(40.0);
+        let mfe_target_bps = if sess_rem >= 0.999 {
+            (1.40 * rt_cost_bps)
+                .max(0.85 * wm_iqr_24_bps.clamp(0.0, 340.0))
+                .max(40.0)
+        } else {
+            let iqr_intraday =
+                (0.72 * wm_iqr_24_bps * (0.35 + 0.65 * sess_rem)).clamp(0.0, 115.0);
+            (1.25 * rt_cost_bps).max(iqr_intraday).max(34.0)
+        };
         let mfe_booked_gate =
             sigmoid((peak_bps - mfe_target_bps) / (0.65 * mfe_target_bps).max(12.0));
         let mfe_giveback_ratio = (giveback_bps / peak_bps.max(mfe_target_bps)).clamp(0.0, 1.5);
@@ -3936,34 +3940,51 @@ impl SequencePolicyNet {
         apply_slice(&mut self.w_c, &accum.g_w_c, wd);
         apply_slice(&mut self.b_c, &accum.g_b_c, 0.0);
 
-        // Zero-rule conditional symmetry regularization: prevent scalar intercepts & unsigned magnitude
-        // columns (`session_time_left`, `one_way_cost_bps`, `rc_log`) from memorizing unconditional warmup drift
-        // as a permanent `LONG`-only or `SHORT`-only DC offset.
+        // Zero-rule conditional symmetry regularization: prevent scalar intercepts (`b_a_heads`, `ln_out_b`,
+        // `b_h`, `b_wm_aux`) & unsigned magnitude columns (`session_time_left`, `one_way_cost_bps`, `rc_log`)
+        // from memorizing unconditional warmup drift as a permanent `LONG`-only or `SHORT`-only DC offset.
+        for b in &mut self.b_h {
+            *b = (*b * 0.92).clamp(-0.10, 0.10);
+        }
+        for b in &mut self.ln_out_b {
+            *b = (*b * 0.78).clamp(-0.025, 0.025);
+        }
         for b in &mut self.b_a_heads {
-            *b = (*b * 0.88).clamp(-0.022, 0.022);
+            *b = (*b * 0.55).clamp(-0.010, 0.010);
         }
         let d = HIDDEN_DIM;
         let hd = HEAD_IN_DIM;
         let s_off = d + WM_OUT_DIM;
+        let ln_b_sq: f32 = self.ln_out_b.iter().map(|x| x * x).sum();
         for k in 0..SPECIALIST_K {
             let off_k = k * hd;
+            if ln_b_sq > 1e-8 && off_k + d <= self.w_a_heads.len() {
+                let mut dot = 0.0_f32;
+                for i in 0..d {
+                    dot += self.w_a_heads[off_k + i] * self.ln_out_b[i];
+                }
+                let proj = 0.50 * (dot / ln_b_sq);
+                for i in 0..d {
+                    self.w_a_heads[off_k + i] -= proj * self.ln_out_b[i];
+                }
+            }
             for h_idx in 0..WM_HORIZONS.len() {
                 let rc_col = off_k + d + h_idx * 4 + 3;
                 if rc_col < self.w_a_heads.len() {
-                    self.w_a_heads[rc_col] = (self.w_a_heads[rc_col] * 0.85).clamp(-0.02, 0.02);
+                    self.w_a_heads[rc_col] = (self.w_a_heads[rc_col] * 0.80).clamp(-0.015, 0.015);
                 }
             }
             for u_col in (s_off + 2)..(s_off + SELF_STATE_DIM) {
                 let c_idx = off_k + u_col;
                 if c_idx < self.w_a_heads.len() {
-                    self.w_a_heads[c_idx] = (self.w_a_heads[c_idx] * 0.85).clamp(-0.02, 0.02);
+                    self.w_a_heads[c_idx] = (self.w_a_heads[c_idx] * 0.80).clamp(-0.015, 0.015);
                 }
             }
         }
         for h_idx in 0..WM_HORIZONS.len() {
             let base = h_idx * 4;
             if base + 2 < self.b_wm_aux.len() {
-                let q50 = (self.b_wm_aux[base + 1] * 0.90).clamp(-0.025, 0.025);
+                let q50 = (self.b_wm_aux[base + 1] * 0.55).clamp(-0.004, 0.004);
                 let half_iqr =
                     (0.5 * (self.b_wm_aux[base + 2] - self.b_wm_aux[base])).clamp(0.008, 0.45);
                 self.b_wm_aux[base] = q50 - half_iqr;
@@ -6280,11 +6301,11 @@ impl PureAutonomousRlBrain {
                     let min_cov = if !has_eval_history {
                         0.08
                     } else if rt_cost_bps >= 45.0 {
-                        0.12
+                        0.16
                     } else {
-                        0.18
+                        0.22
                     };
-                    let min_cons = if has_eval_history { 0.45 } else { 0.25 };
+                    let min_cons = if has_eval_history { 0.50 } else { 0.25 };
                     if coverage < min_cov || dir_consensus < min_cons {
                         agg_action = 0.0;
                     } else {
@@ -6292,14 +6313,13 @@ impl PureAutonomousRlBrain {
                         let net_ratio =
                             (q_entry_minus_flat_bps / scale_bps).clamp(-4.0, 4.0);
                         let lcb_taper = if has_eval_history {
-                            ((net_ratio + 0.40) / 0.56).clamp(0.0, 1.0)
+                            ((net_ratio + 0.26) / 0.48).clamp(0.0, 1.0)
                         } else {
                             ((net_ratio + 0.72) / 0.72).clamp(0.0, 1.0)
                         };
-                        let soft_conf = sigmoid(2.15 * (net_ratio + 0.14)) * lcb_taper;
-                        let support = 0.46 + 0.54 * coverage.powf(0.42);
-                        let blended = active_mean * support;
-                        let lcb_mag = (blended.abs() - 0.08 * std_active).max(0.0)
+                        let soft_conf = sigmoid(2.15 * (net_ratio + 0.12)) * lcb_taper;
+                        let blended = 0.50 * agg_action + 0.50 * active_mean * coverage.sqrt();
+                        let lcb_mag = (blended.abs() - 0.10 * std_active).max(0.0)
                             * dir_consensus
                             * soft_conf;
                         agg_action = if lcb_mag <= 1e-5 {

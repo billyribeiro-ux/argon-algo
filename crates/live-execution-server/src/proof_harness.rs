@@ -654,7 +654,7 @@ pub async fn fetch_all_proof_datasets(adapter: &YahooFinanceLiveAdapter) -> Proo
     ds
 }
 
-fn collect_sorted_timestamps_and_days(
+pub fn collect_sorted_timestamps_and_days(
     series: &HashMap<String, Vec<RealExchangeOhlcvBar>>,
     regular_hours_only: bool,
 ) -> (Vec<i64>, Vec<i64>) {
@@ -2283,10 +2283,10 @@ fn build_single_causal_bar(
         let mut w_sum = 0.0_f32;
         let horizons: [usize; 4] = match bucket {
             ProofBucket::Scalp0Dte1m => [10, 25, 50, 90],
-            ProofBucket::Scalp0Dte5m => [3, 7, 14, 24],
-            ProofBucket::Brain01PennyDay | ProofBucket::Brain02LargeCapDay => [5, 11, 22, 38],
-            ProofBucket::Brain03ShortSwing => [2, 5, 10, 18],
-            ProofBucket::Brain04CoreSwing => [4, 8, 16, 28],
+            ProofBucket::Scalp0Dte5m
+            | ProofBucket::Brain01PennyDay
+            | ProofBucket::Brain02LargeCapDay => [4, 9, 18, 32],
+            ProofBucket::Brain03ShortSwing | ProofBucket::Brain04CoreSwing => [2, 4, 8, 16],
         };
         let max_h = horizons[3];
         for step_k in 1..=max_h {
@@ -4406,13 +4406,14 @@ fn execute_closed_loop_red_trade_autopsy_and_promotion(
         m.hparams.conformal_q_bps = train_template.conformal_q_bps;
     }
     score_member_train_window(&mut scored_base, &wm_cache);
-    let routing_specs: [(f64, f32); 6] = if champ_eval.trades.len() < 5 {
+    let routing_specs: [(f64, f32); 7] = if champ_eval.trades.len() < 5 {
         [
             (2.8, 1.00),
             (7.5, 1.00),
             (14.0, 1.00),
             (6.0, 1.08),
             (11.0, 1.20),
+            (14.0, 1.35),
             (3.6, 0.90),
         ]
     } else {
@@ -4420,9 +4421,10 @@ fn execute_closed_loop_red_trade_autopsy_and_promotion(
             (2.5, 1.00),
             (6.5, 1.00),
             (13.5, 1.00),
-            (5.5, 1.07),
-            (9.5, 1.16),
-            (14.0, 1.28),
+            (5.5, 1.08),
+            (9.5, 1.18),
+            (12.5, 1.32),
+            (8.0, 0.95),
         ]
     };
     let mut cand_results: Vec<(PureAutonomousRlBrain, DiscreteCausalEvalSummary, f64, bool)> =
@@ -4442,8 +4444,8 @@ fn execute_closed_loop_red_trade_autopsy_and_promotion(
             })
             .collect();
 
-    // Candidates 7..=8: Trust-region RL + Fisher EWC candidates trained strictly on `<= train_split_ts`
-    let rl_specs: [(usize, f32, f32, f64); 2] = [
+    // Candidates 8..=10: Trust-region RL + Fisher EWC candidates trained strictly on `<= train_split_ts`
+    let rl_specs: [(usize, f32, f32, f64); 3] = [
         (
             4,
             0.080,
@@ -4462,6 +4464,12 @@ fn execute_closed_loop_red_trade_autopsy_and_promotion(
             if is_paralyzed { 0.12 } else { 1.65 },
             8.5,
         ),
+        (
+            3,
+            0.035,
+            if is_paralyzed { 0.16 } else { 2.60 },
+            11.0,
+        ),
     ];
 
     let mut max_flat_replayed = audited_tel.flat_regret_windows_replayed;
@@ -4469,7 +4477,7 @@ fn execute_closed_loop_red_trade_autopsy_and_promotion(
         || red_audited > 0
         || exit_faults > 0
         || champ_eval.trades.len() < 6
-        || champ_eval.net_pf < 1.75;
+        || champ_eval.net_pf < 1.85;
     let mut rl_scored: Vec<(PureAutonomousRlBrain, DiscreteCausalEvalSummary, f64, bool, f64)> =
         Vec::new();
     if should_run_rl_specs {
@@ -4491,7 +4499,7 @@ fn execute_closed_loop_red_trade_autopsy_and_promotion(
             }
             max_flat_replayed =
                 max_flat_replayed.max(cand.autopsy_telemetry.flat_regret_windows_replayed);
-            if champ_eval.trades.len() < 4 {
+            if is_paralyzed {
                 let _ = cand.audit_and_train_paralysis_regret(
                     train_eps_ref,
                     train_split_ts,
@@ -4803,7 +4811,14 @@ fn train_warmup_with_causal_pbt(
     // Stage B: Purged Expanding Inner Walk-Forward PBT Calibration (`<= warmup_cutoff_ts`)
     // Strictly cap fold BPTT training at `<= 0.70 * n_ts` so the final 30% (`[0.71 .. 1.00]`) of warmup
     // remains 100% Out-Of-Fold (unseen by policy weights!) for specialist `hedge_weight` selection!
-    let (n_folds, epochs_per_gen) = (4usize, 3usize);
+    let (n_folds, epochs_per_gen) = (
+        4usize,
+        if bucket == ProofBucket::Scalp0Dte5m {
+            4usize
+        } else {
+            3usize
+        },
+    );
     let n_ts = warmup_ts.len();
     let mut best_pf = 0.0_f64;
     let mut best_pnl = 0.0_f64;
@@ -5363,19 +5378,17 @@ fn run_oos_timeline_with_pure_rl_brains(
                 let prev_red_count = red_trades_seen_by_bucket.get(&bucket).copied().unwrap_or(0);
                 let has_new_red_trade = cur_red_count > prev_red_count;
                 let bucket_oos_trades = oos_blotter.iter().filter(|t| t.bucket == bucket).count();
-                let slow_pace = completed_oos_days_count >= 3
-                    && bucket_oos_trades * 3 < completed_oos_days_count;
                 let days_since_last = completed_oos_days_count
                     .saturating_sub(last_autopsy_day.get(&bucket).copied().unwrap_or(0));
                 let should_run_autopsy = if bucket == ProofBucket::Scalp0Dte1m {
                     has_new_red_trade
                         || completed_oos_days_count == 1
-                        || days_since_last >= 2
+                        || days_since_last >= 3
                 } else {
                     has_new_red_trade
                         || completed_oos_days_count == 1
-                        || days_since_last >= 4
-                        || ((bucket_oos_trades == 0 || slow_pace) && days_since_last >= 2)
+                        || days_since_last >= 6
+                        || (bucket_oos_trades < 5 && days_since_last >= 3)
                 };
 
                 let lookback_days = match bucket {

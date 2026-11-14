@@ -6,7 +6,7 @@ use market_data_bus::yahoo::YahooFinanceLiveAdapter;
 async fn test_swing_eval_baseline() {
     let adapter = YahooFinanceLiveAdapter::new();
     let ds = fetch_all_proof_datasets(&adapter).await;
-    println!("Loaded {} h1 symbols", ds.h1_bars.len());
+    println!("Loaded {} h1 symbols, {} m5 symbols", ds.h1_bars.len(), ds.m5_bars.len());
     let t0 = std::time::Instant::now();
     let report = run_sealed_swing_standalone(&ds, 100_000.0);
     println!("Sealed swing executed in {:.2}s", t0.elapsed().as_secs_f64());

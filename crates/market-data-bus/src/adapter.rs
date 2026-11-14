@@ -25,7 +25,15 @@ pub enum DataBusError {
     ConnectionError(String),
     #[error("Invalid request parameter: {0}")]
     InvalidRequest(String),
+    #[error("Adapter '{0}' is not configured with live credentials")]
+    AdapterNotConfigured(String),
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Data error: {0}")]
+    DataError(String),
 }
+
+pub type MarketDataError = DataBusError;
 
 /// Provider health and latency telemetry reported to the Command Terminal HUD.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

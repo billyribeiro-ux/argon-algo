@@ -254,12 +254,11 @@ fn generate_deterministic_bars(
     let mut cur_scaled = profile.base_price_scaled.max(MIN_SUB_PENNY_UNITS);
 
     for i in 0..count {
-        // Create an organic multi-bar compression coil followed by a high-volume institutional expansion
         let phase = (i as f64) / (count as f64);
         let impulse = if phase > 0.72 {
-            0.0085 // accumulation breakout trace
+            0.0085
         } else if phase > 0.45 {
-            -0.0012 // compression coil shakeout
+            -0.0012
         } else {
             0.0020
         };
@@ -274,8 +273,7 @@ fn generate_deterministic_bars(
         let close_u = (open_u + step_u).max(MIN_SUB_PENNY_UNITS);
 
         let wick_up_u = ((open_u as f64) * 0.004).round().max(1.0) as i64;
-        let wick_dn_u = if phase > 0.65 && phase <= 0.75 {
-            // Stopping-volume lower absorption wick right before breakout
+        let wick_dn_u = if (0.65..=0.75).contains(&phase) {
             ((open_u as f64) * 0.015).round().max(2.0) as i64
         } else {
             ((open_u as f64) * 0.003).round().max(1.0) as i64
@@ -378,20 +376,16 @@ fn generate_deterministic_option_chain(underlying: &str) -> UnifiedOptionChain {
                     bid,
                     ask,
                     last: ask,
-                    volume: if is_call { 14_500 } else { 5_200 },
-                    open_interest: if is_call { 42_000 } else { 19_000 },
-                    ask_fill_aggression: if is_call { 0.79 } else { 0.34 },
-                    bid_fill_aggression: if is_call { 0.21 } else { 0.66 },
-                    iv: 0.44 + offset.abs() * 0.5,
-                    delta: if is_call {
-                        (0.52 + moneyness * 2.5).clamp(0.05, 0.95)
-                    } else {
-                        (-0.48 + moneyness * 2.5).clamp(-0.95, -0.05)
-                    },
-                    gamma: (0.065 * (-offset.abs() * 18.0).exp()).max(0.002),
-                    vanna: 0.028 * (if is_call { 1.0 } else { -0.6 }),
-                    theta: -0.085,
-                    vega: 0.14,
+                    volume: 125,
+                    open_interest: 450,
+                    ask_fill_aggression: 0.55,
+                    bid_fill_aggression: 0.45,
+                    iv: 0.38,
+                    delta: if is_call { 0.52 } else { -0.48 },
+                    gamma: 0.045,
+                    vanna: 0.015,
+                    theta: -0.082,
+                    vega: 0.125,
                 });
             }
         }
@@ -465,6 +459,55 @@ impl MarketDataAdapter for HistoricalReplayAdapter {
                 "HistoricalReplayAdapter is disconnected".to_string(),
             ));
         }
+        if let Some(real_bars) = crate::yahoo::YahooSessionManager::try_load_warm_ohlcv_disk_cache(
+            symbol,
+            timeframe,
+            1,
+            u64::MAX,
+        )
+        && !real_bars.is_empty()
+        {
+            let mut unified: Vec<UnifiedBar> = real_bars
+                    .into_iter()
+                    .map(|b| {
+                        let open_price =
+                            SubPennyPrice::from_f64(b.open).unwrap_or(SubPennyPrice::MIN_VALID);
+                        let high_price =
+                            SubPennyPrice::from_f64(b.high).unwrap_or(SubPennyPrice::MIN_VALID);
+                        let low_price =
+                            SubPennyPrice::from_f64(b.low).unwrap_or(SubPennyPrice::MIN_VALID);
+                        let close_price =
+                            SubPennyPrice::from_f64(b.close).unwrap_or(SubPennyPrice::MIN_VALID);
+                        let vwap_price = SubPennyPrice::from_f64(
+                            (b.open + b.high + b.low + 2.0 * b.close) / 5.0,
+                        )
+                        .unwrap_or(close_price);
+                        let turnover = (b.volume as f64) * vwap_price.to_f64();
+                        UnifiedBar {
+                            symbol: symbol.to_uppercase(),
+                            timestamp_ns: b.timestamp_sec * 1_000_000_000,
+                            timeframe,
+                            open: open_price,
+                            high: high_price,
+                            low: low_price,
+                            close: close_price,
+                            volume: b.volume,
+                            vwap: vwap_price,
+                            dollar_turnover: turnover,
+                            trade_count: ((b.volume / 250).max(1) as u32).min(100_000),
+                            bid_ask_spread: SubPennyPrice::from_scaled_units(
+                                (close_price.scaled_units() / 1000).max(1),
+                            )
+                            .unwrap_or(SubPennyPrice::MIN_VALID),
+                        }
+                    })
+                    .collect();
+                if limit > 0 && unified.len() > limit {
+                    let start = unified.len() - limit;
+                    unified = unified[start..].to_vec();
+                }
+                return Ok(unified);
+        }
         Ok(generate_deterministic_bars(symbol, timeframe, limit))
     }
 
@@ -508,6 +551,11 @@ impl MarketDataAdapter for HistoricalReplayAdapter {
         &self,
         underlying: &str,
     ) -> Result<UnifiedOptionChain, DataBusError> {
+        if !self.is_connected() {
+            return Err(DataBusError::ConnectionError(
+                "HistoricalReplayAdapter is disconnected".to_string(),
+            ));
+        }
         Ok(generate_deterministic_option_chain(underlying))
     }
 
@@ -621,36 +669,57 @@ impl MarketDataAdapter for AlpacaFreeAdapter {
 
     async fn fetch_historical_bars(
         &self,
-        symbol: &str,
-        timeframe: Timeframe,
-        limit: usize,
+        _symbol: &str,
+        _timeframe: Timeframe,
+        _limit: usize,
     ) -> Result<Vec<UnifiedBar>, DataBusError> {
-        if !self.is_connected() {
-            return Err(DataBusError::ConnectionError(
-                "AlpacaFreeAdapter offline".into(),
+        if !self.is_authenticated() {
+            return Err(DataBusError::AdapterNotConfigured(
+                "AlpacaFreeAdapter: API key not configured".into(),
             ));
         }
-        Ok(generate_deterministic_bars(symbol, timeframe, limit))
+        Err(DataBusError::AdapterNotConfigured(
+            "AlpacaFreeAdapter: Live feed stream uninitialized".into(),
+        ))
     }
 
     async fn fetch_universe_snapshots(
         &self,
-        symbols: Option<&[String]>,
+        _symbols: Option<&[String]>,
     ) -> Result<Vec<TickerSnapshot>, DataBusError> {
-        let replay = HistoricalReplayAdapter::new(ReplaySpeed::MaxSpeed, 128);
-        replay.fetch_universe_snapshots(symbols).await
+        if !self.is_authenticated() {
+            return Err(DataBusError::AdapterNotConfigured(
+                "AlpacaFreeAdapter: API key not configured".into(),
+            ));
+        }
+        Err(DataBusError::AdapterNotConfigured(
+            "AlpacaFreeAdapter: Universe snapshot stream uninitialized".into(),
+        ))
     }
 
     async fn fetch_option_chain(
         &self,
-        underlying: &str,
+        _underlying: &str,
     ) -> Result<UnifiedOptionChain, DataBusError> {
-        Ok(generate_deterministic_option_chain(underlying))
+        if !self.is_authenticated() {
+            return Err(DataBusError::AdapterNotConfigured(
+                "AlpacaFreeAdapter: API key not configured".into(),
+            ));
+        }
+        Err(DataBusError::AdapterNotConfigured(
+            "AlpacaFreeAdapter: Option chain stream uninitialized".into(),
+        ))
     }
 
     async fn fetch_market_internals(&self) -> Result<UnifiedMarketInternals, DataBusError> {
-        let replay = HistoricalReplayAdapter::new(ReplaySpeed::MaxSpeed, 32);
-        replay.fetch_market_internals().await
+        if !self.is_authenticated() {
+            return Err(DataBusError::AdapterNotConfigured(
+                "AlpacaFreeAdapter: API key not configured".into(),
+            ));
+        }
+        Err(DataBusError::AdapterNotConfigured(
+            "AlpacaFreeAdapter: Market internals stream uninitialized".into(),
+        ))
     }
 }
 
@@ -662,7 +731,7 @@ pub struct SchwabDirectAdapter {
 impl SchwabDirectAdapter {
     pub const fn new() -> Self {
         Self {
-            connected: AtomicBool::new(true),
+            connected: AtomicBool::new(false),
         }
     }
 }
@@ -684,8 +753,9 @@ impl MarketDataAdapter for SchwabDirectAdapter {
     }
 
     async fn connect(&self) -> Result<(), DataBusError> {
-        self.connected.store(true, Ordering::SeqCst);
-        Ok(())
+        Err(DataBusError::AdapterNotConfigured(
+            "SchwabDirectAdapter: Live Schwab OAuth credentials not configured".into(),
+        ))
     }
 
     async fn disconnect(&self) -> Result<(), DataBusError> {
@@ -694,41 +764,42 @@ impl MarketDataAdapter for SchwabDirectAdapter {
     }
 
     fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
+        false
     }
 
     async fn fetch_historical_bars(
         &self,
-        symbol: &str,
-        timeframe: Timeframe,
-        limit: usize,
+        _symbol: &str,
+        _timeframe: Timeframe,
+        _limit: usize,
     ) -> Result<Vec<UnifiedBar>, DataBusError> {
-        if !self.is_connected() {
-            return Err(DataBusError::ConnectionError(
-                "SchwabDirectAdapter offline".into(),
-            ));
-        }
-        Ok(generate_deterministic_bars(symbol, timeframe, limit))
+        Err(DataBusError::AdapterNotConfigured(
+            "SchwabDirectAdapter: Live Schwab OAuth credentials not configured".into(),
+        ))
     }
 
     async fn fetch_universe_snapshots(
         &self,
-        symbols: Option<&[String]>,
+        _symbols: Option<&[String]>,
     ) -> Result<Vec<TickerSnapshot>, DataBusError> {
-        let replay = HistoricalReplayAdapter::new(ReplaySpeed::MaxSpeed, 128);
-        replay.fetch_universe_snapshots(symbols).await
+        Err(DataBusError::AdapterNotConfigured(
+            "SchwabDirectAdapter: Live Schwab OAuth credentials not configured".into(),
+        ))
     }
 
     async fn fetch_option_chain(
         &self,
-        underlying: &str,
+        _underlying: &str,
     ) -> Result<UnifiedOptionChain, DataBusError> {
-        Ok(generate_deterministic_option_chain(underlying))
+        Err(DataBusError::AdapterNotConfigured(
+            "SchwabDirectAdapter: Live Schwab OAuth credentials not configured".into(),
+        ))
     }
 
     async fn fetch_market_internals(&self) -> Result<UnifiedMarketInternals, DataBusError> {
-        let replay = HistoricalReplayAdapter::new(ReplaySpeed::MaxSpeed, 32);
-        replay.fetch_market_internals().await
+        Err(DataBusError::AdapterNotConfigured(
+            "SchwabDirectAdapter: Live Schwab OAuth credentials not configured".into(),
+        ))
     }
 }
 
@@ -740,7 +811,7 @@ pub struct FreeBulkBackfillAdapter {
 impl FreeBulkBackfillAdapter {
     pub const fn new() -> Self {
         Self {
-            connected: AtomicBool::new(true),
+            connected: AtomicBool::new(false),
         }
     }
 }
@@ -762,8 +833,9 @@ impl MarketDataAdapter for FreeBulkBackfillAdapter {
     }
 
     async fn connect(&self) -> Result<(), DataBusError> {
-        self.connected.store(true, Ordering::SeqCst);
-        Ok(())
+        Err(DataBusError::AdapterNotConfigured(
+            "FreeBulkBackfillAdapter: Bulk backfill service credentials not configured".into(),
+        ))
     }
 
     async fn disconnect(&self) -> Result<(), DataBusError> {
@@ -772,36 +844,42 @@ impl MarketDataAdapter for FreeBulkBackfillAdapter {
     }
 
     fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
+        false
     }
 
     async fn fetch_historical_bars(
         &self,
-        symbol: &str,
-        timeframe: Timeframe,
-        limit: usize,
+        _symbol: &str,
+        _timeframe: Timeframe,
+        _limit: usize,
     ) -> Result<Vec<UnifiedBar>, DataBusError> {
-        Ok(generate_deterministic_bars(symbol, timeframe, limit))
+        Err(DataBusError::AdapterNotConfigured(
+            "FreeBulkBackfillAdapter: Bulk backfill service credentials not configured".into(),
+        ))
     }
 
     async fn fetch_universe_snapshots(
         &self,
-        symbols: Option<&[String]>,
+        _symbols: Option<&[String]>,
     ) -> Result<Vec<TickerSnapshot>, DataBusError> {
-        let replay = HistoricalReplayAdapter::new(ReplaySpeed::MaxSpeed, 128);
-        replay.fetch_universe_snapshots(symbols).await
+        Err(DataBusError::AdapterNotConfigured(
+            "FreeBulkBackfillAdapter: Bulk backfill service credentials not configured".into(),
+        ))
     }
 
     async fn fetch_option_chain(
         &self,
-        underlying: &str,
+        _underlying: &str,
     ) -> Result<UnifiedOptionChain, DataBusError> {
-        Ok(generate_deterministic_option_chain(underlying))
+        Err(DataBusError::AdapterNotConfigured(
+            "FreeBulkBackfillAdapter: Bulk backfill service credentials not configured".into(),
+        ))
     }
 
     async fn fetch_market_internals(&self) -> Result<UnifiedMarketInternals, DataBusError> {
-        let replay = HistoricalReplayAdapter::new(ReplaySpeed::MaxSpeed, 32);
-        replay.fetch_market_internals().await
+        Err(DataBusError::AdapterNotConfigured(
+            "FreeBulkBackfillAdapter: Bulk backfill service credentials not configured".into(),
+        ))
     }
 }
 
@@ -814,7 +892,7 @@ pub struct InstitutionalExpansionAdapter {
 impl InstitutionalExpansionAdapter {
     pub const fn new(vendor_tag: &'static str) -> Self {
         Self {
-            connected: AtomicBool::new(true),
+            connected: AtomicBool::new(false),
             vendor_tag,
         }
     }
@@ -835,8 +913,10 @@ impl MarketDataAdapter for InstitutionalExpansionAdapter {
     }
 
     async fn connect(&self) -> Result<(), DataBusError> {
-        self.connected.store(true, Ordering::SeqCst);
-        Ok(())
+        Err(DataBusError::AdapterNotConfigured(format!(
+            "InstitutionalExpansionAdapter ({}): Live API credentials not configured",
+            self.vendor_tag
+        )))
     }
 
     async fn disconnect(&self) -> Result<(), DataBusError> {
@@ -845,35 +925,45 @@ impl MarketDataAdapter for InstitutionalExpansionAdapter {
     }
 
     fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
+        false
     }
 
     async fn fetch_historical_bars(
         &self,
-        symbol: &str,
-        timeframe: Timeframe,
-        limit: usize,
+        _symbol: &str,
+        _timeframe: Timeframe,
+        _limit: usize,
     ) -> Result<Vec<UnifiedBar>, DataBusError> {
-        Ok(generate_deterministic_bars(symbol, timeframe, limit))
+        Err(DataBusError::AdapterNotConfigured(format!(
+            "InstitutionalExpansionAdapter ({}): Live API credentials not configured",
+            self.vendor_tag
+        )))
     }
 
     async fn fetch_universe_snapshots(
         &self,
-        symbols: Option<&[String]>,
+        _symbols: Option<&[String]>,
     ) -> Result<Vec<TickerSnapshot>, DataBusError> {
-        let replay = HistoricalReplayAdapter::new(ReplaySpeed::MaxSpeed, 128);
-        replay.fetch_universe_snapshots(symbols).await
+        Err(DataBusError::AdapterNotConfigured(format!(
+            "InstitutionalExpansionAdapter ({}): Live API credentials not configured",
+            self.vendor_tag
+        )))
     }
 
     async fn fetch_option_chain(
         &self,
-        underlying: &str,
+        _underlying: &str,
     ) -> Result<UnifiedOptionChain, DataBusError> {
-        Ok(generate_deterministic_option_chain(underlying))
+        Err(DataBusError::AdapterNotConfigured(format!(
+            "InstitutionalExpansionAdapter ({}): Live API credentials not configured",
+            self.vendor_tag
+        )))
     }
 
     async fn fetch_market_internals(&self) -> Result<UnifiedMarketInternals, DataBusError> {
-        let replay = HistoricalReplayAdapter::new(ReplaySpeed::MaxSpeed, 32);
-        replay.fetch_market_internals().await
+        Err(DataBusError::AdapterNotConfigured(format!(
+            "InstitutionalExpansionAdapter ({}): Live API credentials not configured",
+            self.vendor_tag
+        )))
     }
 }

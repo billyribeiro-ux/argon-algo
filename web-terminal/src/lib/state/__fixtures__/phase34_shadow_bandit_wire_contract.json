@@ -1,6 +1,6 @@
 {
   "status": "PROMOTED_CHAMPION",
-  "timestamp_iso": "2026-11-13T23:16:34.112025+00:00",
+  "timestamp_iso": "2026-11-14T00:44:07.592152+00:00",
   "current_generation_id": 38,
   "candidate_generation_id": 39,
   "promoted_generation_id": 39,
@@ -18,7 +18,7 @@
   "premature_shakeout_count": 0,
   "autopsies_decoded": [
     {
-      "trade_id": "7b43f21b-d0cc-4c32-9705-3fb1b6a3d4b1",
+      "trade_id": "b196ae39-cc54-4ff0-988f-0134d32ec262",
       "symbol": "SPY",
       "brain_id": "BRAIN-02",
       "realized_r": -1.45,
@@ -76,7 +76,7 @@
       ],
       "mahalanobis_distance_shift": 4.734,
       "collapse_bar_offset": 1,
-      "summary": "Trade 7b43f21b on SPY (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [close_log_ret] (MFE: +0.00R -> Realized: -1.45R, Giveback: 0.0%, LW-Mahalanobis Shift: 4.734)",
+      "summary": "Trade b196ae39 on SPY (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [close_log_ret] (MFE: +0.00R -> Realized: -1.45R, Giveback: 0.0%, LW-Mahalanobis Shift: 4.734)",
       "entry_features_32": [
         0.8153846,
         0.025,
@@ -461,9 +461,9 @@
         "6d9b0291-466c-42b5-9f10-3001a20f2915": 1.1308,
         "72c628a1-b359-4cc6-9a01-328e920fe9ee": 1.1148,
         "760f0c60-4ab0-4a3d-9a8d-21b5fc78de52": 1.0357,
-        "7b43f21b-d0cc-4c32-9705-3fb1b6a3d4b1": 0.9925,
         "9e123dab-246a-42c1-9e06-f5f0e5dd7456": 1.1369,
         "a3f24427-7572-4e8f-abd5-c385666dbe16": 1.09,
+        "b196ae39-cc54-4ff0-988f-0134d32ec262": 0.9925,
         "b5d1ab65-d397-4301-b040-5d1820a1b16b": 1.136,
         "c657bf95-c630-46d2-8e05-77f55fbe4841": 1.1405,
         "df3ee90f-2c41-4037-a8cb-6642df100a05": 1.0352,

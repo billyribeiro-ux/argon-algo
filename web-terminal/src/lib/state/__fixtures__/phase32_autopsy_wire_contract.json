@@ -1,6 +1,6 @@
 {
   "status": "PROMOTED_CHAMPION",
-  "timestamp_iso": "2026-11-13T23:16:32.062120+00:00",
+  "timestamp_iso": "2026-11-14T00:44:05.738122+00:00",
   "current_generation_id": 36,
   "candidate_generation_id": 37,
   "promoted_generation_id": 37,
@@ -18,7 +18,7 @@
   "premature_shakeout_count": 0,
   "autopsies_decoded": [
     {
-      "trade_id": "f9cf31c7-8810-46cd-b64a-f59c4fc94f6b",
+      "trade_id": "26e16829-c7c6-4ea2-934c-b5751c89649f",
       "symbol": "NVDA",
       "brain_id": "BRAIN-02",
       "realized_r": -1.0,
@@ -76,7 +76,7 @@
       ],
       "mahalanobis_distance_shift": 8.857,
       "collapse_bar_offset": 1,
-      "summary": "Trade f9cf31c7 on NVDA (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [float_rotation_log] (MFE: +0.03R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 8.857)",
+      "summary": "Trade 26e16829 on NVDA (BRAIN-02) failed via ENTRY_LIQUIDITY_VACUUM_TRAP at Bar +1: top culprit [float_rotation_log] (MFE: +0.03R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 8.857)",
       "entry_features_32": [
         0.5588235,
         0.025,
@@ -113,7 +113,7 @@
       ]
     },
     {
-      "trade_id": "a0234a45-5b58-44bd-ac52-eab2e7aab4a7",
+      "trade_id": "3a4e650d-6536-4861-a838-3250cef98a96",
       "symbol": "AMD",
       "brain_id": "BRAIN-02",
       "realized_r": -1.0,
@@ -171,7 +171,7 @@
       ],
       "mahalanobis_distance_shift": 4.825,
       "collapse_bar_offset": 2,
-      "summary": "Trade a0234a45 on AMD (BRAIN-02) failed via POST_ENTRY_ORDERFLOW_TOXICITY_REVERSAL at Bar +2: top culprit [close_log_ret] (MFE: +0.35R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 4.825)",
+      "summary": "Trade 3a4e650d on AMD (BRAIN-02) failed via POST_ENTRY_ORDERFLOW_TOXICITY_REVERSAL at Bar +2: top culprit [close_log_ret] (MFE: +0.35R -> Realized: -1.00R, Giveback: 100.0%, LW-Mahalanobis Shift: 4.825)",
       "entry_features_32": [
         0.8208955,
         0.025,
@@ -208,7 +208,7 @@
       ]
     },
     {
-      "trade_id": "586b2f86-aebc-4826-b09b-9b1e8a008201",
+      "trade_id": "87c89a29-2cf0-4aec-958c-6660b5be80a6",
       "symbol": "QQQ",
       "brain_id": "BRAIN-02",
       "realized_r": 1.472425,
@@ -266,7 +266,7 @@
       ],
       "mahalanobis_distance_shift": 6.191,
       "collapse_bar_offset": 3,
-      "summary": "Trade 586b2f86 on QQQ (BRAIN-02) failed via MFE_STALL_GIVEBACK_EXHAUSTION at Bar +3: top culprit [close_log_ret] (MFE: +2.45R -> Realized: 1.47R, Giveback: 39.9%, LW-Mahalanobis Shift: 6.191)",
+      "summary": "Trade 87c89a29 on QQQ (BRAIN-02) failed via MFE_STALL_GIVEBACK_EXHAUSTION at Bar +3: top culprit [close_log_ret] (MFE: +2.45R -> Realized: 1.47R, Giveback: 39.9%, LW-Mahalanobis Shift: 6.191)",
       "entry_features_32": [
         0.84126985,
         0.025,
@@ -642,9 +642,11 @@
       "trap_conviction_weights": {
         "0b6d9498-3edc-4231-b974-762301b8659c": 1.001,
         "1ffa1890-0e4a-40ea-8642-2c8fffad6630": 0.9998,
+        "26e16829-c7c6-4ea2-934c-b5751c89649f": 1.0298,
         "274cfa64-a4da-4a4e-b8c1-583c95203b6b": 1.0017,
         "2c5e547e-a32a-40bf-ba8e-d126823a6bd0": 0.9994,
         "3670baa8-a27c-44fa-a072-2bf8ffed6b7d": 0.9962,
+        "3a4e650d-6536-4861-a838-3250cef98a96": 0.9883,
         "532945d3-0361-4934-b1cc-36d8ce985f4f": 1.0088,
         "58e17930-211e-470c-9b93-98f4f2d0d68c": 0.9876,
         "6d444c75-650d-4200-90e7-8ff5797f832c": 1.005,
@@ -652,14 +654,12 @@
         "72c628a1-b359-4cc6-9a01-328e920fe9ee": 1.0065,
         "760f0c60-4ab0-4a3d-9a8d-21b5fc78de52": 0.9971,
         "9e123dab-246a-42c1-9e06-f5f0e5dd7456": 0.994,
-        "a0234a45-5b58-44bd-ac52-eab2e7aab4a7": 0.9883,
         "a3f24427-7572-4e8f-abd5-c385666dbe16": 0.9955,
         "b5d1ab65-d397-4301-b040-5d1820a1b16b": 0.9908,
         "c657bf95-c630-46d2-8e05-77f55fbe4841": 0.9913,
         "df3ee90f-2c41-4037-a8cb-6642df100a05": 0.9953,
         "e69f2515-f284-4f09-84ee-dc0bd5a9a663": 0.987,
         "ec3688f8-debd-4bb5-b2ee-7778b57457d7": 0.9956,
-        "f9cf31c7-8810-46cd-b64a-f59c4fc94f6b": 1.0298,
         "fedbdf31-5e47-4216-b83a-b0a0dc036ff3": 1.0015
       },
       "empirical_bayes_shrinkage_lambda": 0.9104,

@@ -43,6 +43,12 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 fastrand = "2.4.1"
 bytes = "1.11.1"
 http = "1.4.2"
+memmap2 = "0.9.5"
+bytemuck = { version = "1.21.0", features = ["derive"] }
+chrono-tz = { version = "0.10.1", features = ["serde"] }
+parquet = { version = "54.2.1", features = ["arrow", "zstd", "snap", "flate2"] }
+arrow = { version = "54.2.1" }
+crc32fast = "1.4.2"
 
 raw-fingerprint-core = { path = "crates/raw-fingerprint-core" }
 market-data-bus = { path = "crates/market-data-bus" }

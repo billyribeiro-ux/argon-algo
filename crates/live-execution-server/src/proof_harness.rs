@@ -761,6 +761,10 @@ fn session_eod_hhmm(bucket: ProofBucket) -> u32 {
 
 #[inline]
 fn normalized_session_remaining(bucket: ProofBucket, hhmm: u32) -> f64 {
+    if !bucket.is_intraday() {
+        // Multi-day Swing (`1h` `BRAIN-03` & `BRAIN-04`) has zero daily closing-bell forced flatten!
+        return 1.0;
+    }
     let cur_m = ((hhmm / 100) * 60 + (hhmm % 100)) as f64;
     let end_m = match bucket {
         ProofBucket::Scalp0Dte1m | ProofBucket::Scalp0Dte5m => 15.0 * 60.0 + 50.0,
@@ -1534,8 +1538,8 @@ fn open_simulated_position_at_next_bar(
         .max(1e-5);
 
     let scaled_budget = (desired_risk_budget_usd
-        * (0.55 + 0.45 * (target_action.abs() as f64).clamp(0.0, 1.0)))
-    .max(250.0);
+        * (0.85 + 0.15 * (target_action.abs() as f64).clamp(0.0, 1.0)))
+    .max(450.0);
     let right = OptionRight::from_direction(direction);
     let base_vix = if is_intraday {
         entry_snap.vix9d_spot_dec
@@ -2276,17 +2280,13 @@ fn build_single_causal_bar(
         let mut acc_s_sh = 0.0_f32;
         let mut acc_l_opt = 0.0_f32;
         let mut acc_s_opt = 0.0_f32;
-        let mut best_l_sh = f32::NEG_INFINITY;
-        let mut best_s_sh = f32::NEG_INFINITY;
-        let mut best_l_opt = f32::NEG_INFINITY;
-        let mut best_s_opt = f32::NEG_INFINITY;
         let mut w_sum = 0.0_f32;
-        let horizons: [usize; 4] = if bucket == ProofBucket::Scalp0Dte1m {
-            [10, 25, 50, 90]
-        } else if is_scalp || is_day {
-            [4, 9, 18, 32]
-        } else {
-            [2, 4, 8, 16]
+        let horizons: [usize; 4] = match bucket {
+            ProofBucket::Scalp0Dte1m => [10, 25, 50, 90],
+            ProofBucket::Scalp0Dte5m => [3, 7, 14, 24],
+            ProofBucket::Brain01PennyDay | ProofBucket::Brain02LargeCapDay => [5, 11, 22, 38],
+            ProofBucket::Brain03ShortSwing => [2, 5, 10, 18],
+            ProofBucket::Brain04CoreSwing => [4, 8, 16, 28],
         };
         let max_h = horizons[3];
         for step_k in 1..=max_h {
@@ -2330,20 +2330,16 @@ fn build_single_causal_bar(
                 0.0
             };
             if w > 0.0 {
-                let v_l_sh = gross_sh - 0.18 * mae_l_sh - rt_sh;
-                let v_s_sh = -gross_sh - 0.18 * mae_s_sh - rt_sh;
+                let v_l_sh = gross_sh - 0.20 * mae_l_sh - rt_sh;
+                let v_s_sh = -gross_sh - 0.20 * mae_s_sh - rt_sh;
                 w_sum += w;
                 acc_l_sh += w * v_l_sh;
                 acc_s_sh += w * v_s_sh;
-                best_l_sh = best_l_sh.max(v_l_sh);
-                best_s_sh = best_s_sh.max(v_s_sh);
                 if option_allowed {
-                    let v_l_opt = gross_l_opt - 0.18 * mae_l_opt - rt_opt;
-                    let v_s_opt = gross_s_opt - 0.18 * mae_s_opt - rt_opt;
+                    let v_l_opt = gross_l_opt - 0.20 * mae_l_opt - rt_opt;
+                    let v_s_opt = gross_s_opt - 0.20 * mae_s_opt - rt_opt;
                     acc_l_opt += w * v_l_opt;
                     acc_s_opt += w * v_s_opt;
-                    best_l_opt = best_l_opt.max(v_l_opt);
-                    best_s_opt = best_s_opt.max(v_s_opt);
                 }
                 cf_valid = true;
             }
@@ -2352,19 +2348,15 @@ fn build_single_causal_bar(
             }
         }
         if cf_valid && w_sum > 0.0 {
-            let m_l_sh = acc_l_sh / w_sum;
-            let m_s_sh = acc_s_sh / w_sum;
-            cf_net_returns[0] = (0.64 * m_l_sh + 0.36 * best_l_sh).clamp(-0.35, 0.35);
-            cf_net_returns[1] = (0.64 * m_s_sh + 0.36 * best_s_sh).clamp(-0.35, 0.35);
+            cf_net_returns[0] = (acc_l_sh / w_sum).clamp(-0.35, 0.35);
+            cf_net_returns[1] = (acc_s_sh / w_sum).clamp(-0.35, 0.35);
             cf_net_returns[2] = if option_allowed {
-                let m_l_opt = acc_l_opt / w_sum;
-                (0.64 * m_l_opt + 0.36 * best_l_opt).clamp(-0.35, 0.35)
+                (acc_l_opt / w_sum).clamp(-0.35, 0.35)
             } else {
                 cf_net_returns[0]
             };
             cf_net_returns[3] = if option_allowed {
-                let m_s_opt = acc_s_opt / w_sum;
-                (0.64 * m_s_opt + 0.36 * best_s_opt).clamp(-0.35, 0.35)
+                (acc_s_opt / w_sum).clamp(-0.35, 0.35)
             } else {
                 cf_net_returns[1]
             };
@@ -2452,146 +2444,150 @@ fn build_causal_session_episodes(
 
     let is_intraday = bucket.is_intraday();
     let eod_hhmm = session_eod_hhmm(bucket);
-    let mut episodes = Vec::new();
-
-    for sym in syms {
-        let Some(bars) = symbol_bars.get(&sym) else {
-            continue;
-        };
-        let Some(snaps) = precomputed.get(&sym) else {
-            continue;
-        };
-        if bars.len() < 8 || snaps.len() != bars.len() {
-            continue;
-        }
-
-        if is_intraday {
-            // Group indices by `day_key` within `[09:35 ET ..= eod_hhmm]` strictly `<= max_ts_sec`
-            let mut day_groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
-            for t in 0..bars.len().saturating_sub(1) {
-                if bars[t + 1].timestamp_sec > max_ts_sec {
-                    break;
-                }
-                let snap = &snaps[t];
-                if !snap.valid || snap.day_key < min_day {
-                    continue;
-                }
-                if !(935..=eod_hhmm).contains(&snap.hhmm) {
-                    continue;
-                }
-                if !symbol_matches_bucket(&sym, bars[t].close, bucket) {
-                    continue;
-                }
-                day_groups.entry(snap.day_key).or_default().push(t);
+    let per_sym_episodes: Vec<Vec<CausalSessionEpisode>> = syms
+        .par_iter()
+        .map(|sym| {
+            let mut local_eps = Vec::new();
+            let Some(bars) = symbol_bars.get(sym) else {
+                return local_eps;
+            };
+            let Some(snaps) = precomputed.get(sym) else {
+                return local_eps;
+            };
+            if bars.len() < 8 || snaps.len() != bars.len() {
+                return local_eps;
             }
 
-            let mut cross_day_regime_z = [0.0_f32; WM_DIM];
-            for (d_key, indices) in day_groups {
-                if indices.len() < 6 {
-                    continue;
+            if is_intraday {
+                // Group indices by `day_key` within `[09:35 ET ..= eod_hhmm]` strictly `<= max_ts_sec`
+                let mut day_groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+                for t in 0..bars.len().saturating_sub(1) {
+                    if bars[t + 1].timestamp_sec > max_ts_sec {
+                        break;
+                    }
+                    let snap = &snaps[t];
+                    if !snap.valid || snap.day_key < min_day {
+                        continue;
+                    }
+                    if !(935..=eod_hhmm).contains(&snap.hhmm) {
+                        continue;
+                    }
+                    if !symbol_matches_bucket(sym, bars[t].close, bucket) {
+                        continue;
+                    }
+                    day_groups.entry(snap.day_key).or_default().push(t);
                 }
-                let last_i = indices.len() - 1;
-                let mut ep_bars = Vec::with_capacity(indices.len());
-                for (pos_i, &bar_i) in indices.iter().enumerate() {
-                    let is_last_session_bar = pos_i == last_i;
-                    if let Some(mut cbar) = build_single_causal_bar(
-                        &sym,
-                        bucket,
-                        bars,
-                        snaps,
-                        bar_i,
-                        max_ts_sec,
-                        is_last_session_bar,
-                    ) {
-                        if is_last_session_bar {
-                            cbar.force_flat = true;
-                            cbar.entry_allowed = false;
+
+                let mut cross_day_regime_z = [0.0_f32; WM_DIM];
+                for (d_key, indices) in day_groups {
+                    if indices.len() < 6 {
+                        continue;
+                    }
+                    let last_i = indices.len() - 1;
+                    let mut ep_bars = Vec::with_capacity(indices.len());
+                    for (pos_i, &bar_i) in indices.iter().enumerate() {
+                        let is_last_session_bar = pos_i == last_i;
+                        if let Some(mut cbar) = build_single_causal_bar(
+                            sym,
+                            bucket,
+                            bars,
+                            snaps,
+                            bar_i,
+                            max_ts_sec,
+                            is_last_session_bar,
+                        ) {
+                            if is_last_session_bar {
+                                cbar.force_flat = true;
+                                cbar.entry_allowed = false;
+                            }
+                            ep_bars.push(cbar);
                         }
-                        ep_bars.push(cbar);
+                    }
+                    if ep_bars.len() >= 6 {
+                        // Ensure final bar of session episode ALWAYS enforces `a_{T_eod} = 0.0`!
+                        if let Some(last_b) = ep_bars.last_mut() {
+                            last_b.force_flat = true;
+                            last_b.entry_allowed = false;
+                        }
+                        let prior_z = cross_day_regime_z;
+                        if let Some(wm) = world_model
+                            && feat_mean.len() == RL_STATE_DIM
+                            && feat_var.len() == RL_STATE_DIM
+                        {
+                            let mut z_step = prior_z;
+                            for b in &ep_bars {
+                                let xn = normalize_212_with_stats(&b.x_212, feat_mean, feat_var);
+                                z_step = wm.forward_step(&xn, &z_step).0;
+                            }
+                            for j in 0..WM_DIM {
+                                cross_day_regime_z[j] = 0.45 * z_step[j];
+                            }
+                        }
+
+                        if let (Some(first_b), Some(last_b)) = (ep_bars.first(), ep_bars.last()) {
+                            local_eps.push(CausalSessionEpisode {
+                                symbol: sym.clone(),
+                                day_key: d_key,
+                                start_ts_sec: first_b.ts_sec,
+                                end_ts_sec: last_b.ts_sec,
+                                is_intraday_session: true,
+                                prior_regime_z: prior_z,
+                                bars: ep_bars,
+                            });
+                        }
                     }
                 }
-                if ep_bars.len() >= 6 {
-                    // Ensure final bar of session episode ALWAYS enforces `a_{T_eod} = 0.0`!
-                    if let Some(last_b) = ep_bars.last_mut() {
-                        last_b.force_flat = true;
-                        last_b.entry_allowed = false;
+            } else {
+                // Swing (`1h`): slice into causal multi-week episodes (`<= 70` hourly bars = ~10 trading days)
+                let mut all_swing_bars = Vec::new();
+                for t in 0..bars.len().saturating_sub(2) {
+                    if bars[t + 2].timestamp_sec > max_ts_sec {
+                        break;
                     }
-                    let prior_z = cross_day_regime_z;
+                    if snaps[t].day_key < min_day {
+                        continue;
+                    }
+                    if let Some(cbar) =
+                        build_single_causal_bar(sym, bucket, bars, snaps, t, max_ts_sec, false)
+                    {
+                        all_swing_bars.push(cbar);
+                    }
+                }
+                let mut start = 0usize;
+                let mut z_carry = [0.0_f32; WM_DIM];
+                while start + 12 <= all_swing_bars.len() {
+                    let end = (start + 70).min(all_swing_bars.len());
+                    let slice = all_swing_bars[start..end].to_vec();
+                    let prior_z = z_carry;
                     if let Some(wm) = world_model
                         && feat_mean.len() == RL_STATE_DIM
                         && feat_var.len() == RL_STATE_DIM
                     {
                         let mut z_step = prior_z;
-                        for b in &ep_bars {
+                        for b in &slice {
                             let xn = normalize_212_with_stats(&b.x_212, feat_mean, feat_var);
                             z_step = wm.forward_step(&xn, &z_step).0;
                         }
-                        for j in 0..WM_DIM {
-                            cross_day_regime_z[j] = 0.45 * z_step[j];
-                        }
+                        z_carry = z_step;
                     }
-
-                    if let (Some(first_b), Some(last_b)) = (ep_bars.first(), ep_bars.last()) {
-                        episodes.push(CausalSessionEpisode {
+                    if let (Some(first_b), Some(last_b)) = (slice.first(), slice.last()) {
+                        local_eps.push(CausalSessionEpisode {
                             symbol: sym.clone(),
-                            day_key: d_key,
+                            day_key: est_trading_day_key(first_b.ts_sec),
                             start_ts_sec: first_b.ts_sec,
                             end_ts_sec: last_b.ts_sec,
-                            is_intraday_session: true,
+                            is_intraday_session: false,
                             prior_regime_z: prior_z,
-                            bars: ep_bars,
+                            bars: slice,
                         });
                     }
+                    start += 70;
                 }
             }
-        } else {
-            // Swing (`1h`): slice into causal multi-week episodes (`<= 70` hourly bars = ~10 trading days)
-            let mut all_swing_bars = Vec::new();
-            for t in 0..bars.len().saturating_sub(2) {
-                if bars[t + 2].timestamp_sec > max_ts_sec {
-                    break;
-                }
-                if snaps[t].day_key < min_day {
-                    continue;
-                }
-                if let Some(cbar) =
-                    build_single_causal_bar(&sym, bucket, bars, snaps, t, max_ts_sec, false)
-                {
-                    all_swing_bars.push(cbar);
-                }
-            }
-            let mut start = 0usize;
-            let mut z_carry = [0.0_f32; WM_DIM];
-            while start + 12 <= all_swing_bars.len() {
-                let end = (start + 70).min(all_swing_bars.len());
-                let slice = all_swing_bars[start..end].to_vec();
-                let prior_z = z_carry;
-                if let Some(wm) = world_model
-                    && feat_mean.len() == RL_STATE_DIM
-                    && feat_var.len() == RL_STATE_DIM
-                {
-                    let mut z_step = prior_z;
-                    for b in &slice {
-                        let xn = normalize_212_with_stats(&b.x_212, feat_mean, feat_var);
-                        z_step = wm.forward_step(&xn, &z_step).0;
-                    }
-                    z_carry = z_step;
-                }
-                if let (Some(first_b), Some(last_b)) = (slice.first(), slice.last()) {
-                    episodes.push(CausalSessionEpisode {
-                        symbol: sym.clone(),
-                        day_key: est_trading_day_key(first_b.ts_sec),
-                        start_ts_sec: first_b.ts_sec,
-                        end_ts_sec: last_b.ts_sec,
-                        is_intraday_session: false,
-                        prior_regime_z: prior_z,
-                        bars: slice,
-                    });
-                }
-                start += 70;
-            }
-        }
-    }
+            local_eps
+        })
+        .collect();
+    let mut episodes: Vec<CausalSessionEpisode> = per_sym_episodes.into_iter().flatten().collect();
 
     episodes.sort_by_key(|ep| (ep.end_ts_sec, ep.symbol.clone()));
     episodes
@@ -2806,6 +2802,9 @@ fn evaluate_single_member_indexed(
             }
             let bar_t = &idx.bars_by_sym[sid][bi];
             let sym = &idx.syms[sid];
+            if !symbol_matches_bucket(sym, bar_t.close, bucket) {
+                continue;
+            }
             let is_penny = is_penny_symbol_cand(sym, bar_t.close);
             let opt_allowed = !is_penny && is_option_vehicle_allowed(sym, bar_t.close);
             let slip_bps = explicit_one_way_slippage_bps(sym, bar_t.close, is_penny) as f32;
@@ -2952,7 +2951,7 @@ fn evaluate_single_member_indexed(
                     peak_v_liq_ret: pos.peak_v_liq_ret,
                 });
             } else {
-                if !is_new && snap_t.valid && bi < wm_cache[sid].len() {
+                if snap_t.valid && bi < wm_cache[sid].len() {
                     let pos = &mut open_positions[i_pos];
                     let (ref x_n, ref z_wm, ref wm_pred) = wm_cache[sid][bi];
                     let norm_rem = normalized_session_remaining(bucket, snap_t.hhmm);
@@ -2982,23 +2981,24 @@ fn evaluate_single_member_indexed(
                     .clamp(0.0, 2.0);
                     sym_prev_act[sid] = step.action;
 
-                    let pos_sign = pos.direction.sign() as f32;
-                    let exit_snap = (0.22 * pos.current_target_action.abs()).clamp(0.028, 0.075);
-                    if step.action.abs() < exit_snap || step.action.signum() != pos_sign {
-                        pos.pending_exit = true;
-                    } else if (step.action - pos.current_target_action).abs() >= 0.30 {
-                        pos.pending_scale_action = Some(step.action);
+                    if !is_new {
+                        let pos_sign = pos.direction.sign() as f32;
+                        let exit_snap = (0.22 * pos.current_target_action.abs()).clamp(0.028, 0.075);
+                        if step.action.abs() < exit_snap || step.action.signum() != pos_sign {
+                            pos.pending_exit = true;
+                        } else if (step.action - pos.current_target_action).abs() >= 0.30 {
+                            pos.pending_scale_action = Some(step.action);
+                        }
                     }
                 }
                 i_pos += 1;
             }
         }
 
-        // 3. Evaluate flat symbols
+        // 3. Evaluate flat symbols (always advance GRU hidden state `hiddens[sid]` on every valid bar,
+        // gating only new-entry candidate emission when slots are full or past session entry cutoff!)
         let (_, hhmm) = ny_et_hhmm(t_sec);
-        if !entry_allowed_at_hhmm(bucket, hhmm) || open_positions.len() >= max_slots {
-            continue;
-        }
+        let can_enter = entry_allowed_at_hhmm(bucket, hhmm) && open_positions.len() < max_slots;
         let norm_rem = normalized_session_remaining(bucket, hhmm);
         let mut candidates: Vec<(f64, PendingNextBarSignal)> = Vec::new();
 
@@ -3060,7 +3060,7 @@ fn evaluate_single_member_indexed(
             flat_steps += 1;
             sum_dz_margin += (step.raw_z.abs() - step.deadzone) as f64;
 
-            if step.action.abs() >= 0.070 {
+            if can_enter && step.action.abs() >= 0.070 {
                 let dir = if step.action > 0.0 {
                     TradeDirection::Long
                 } else {
@@ -3075,7 +3075,7 @@ fn evaluate_single_member_indexed(
                     step.vehicle_prob >= 0.5,
                 );
                 let risk_budget_usd =
-                    (equity * (0.0055 + 0.0065 * step.action.abs() as f64)).clamp(420.0, 1_250.0);
+                    (equity * (0.0062 + 0.0018 * step.action.abs() as f64)).clamp(580.0, 820.0);
                 candidates.push((
                     step.action.abs() as f64,
                     PendingNextBarSignal {
@@ -3222,6 +3222,9 @@ fn evaluate_brain_ensemble_retest_indexed(
             }
             let bar_t = &idx.bars_by_sym[sid][bi];
             let sym = &idx.syms[sid];
+            if !symbol_matches_bucket(sym, bar_t.close, bucket) {
+                continue;
+            }
             let is_penny = is_penny_symbol_cand(sym, bar_t.close);
             let opt_allowed = !is_penny && is_option_vehicle_allowed(sym, bar_t.close);
             let slip_bps = explicit_one_way_slippage_bps(sym, bar_t.close, is_penny) as f32;
@@ -3361,7 +3364,7 @@ fn evaluate_brain_ensemble_retest_indexed(
                     peak_v_liq_ret: pos.peak_v_liq_ret,
                 });
             } else {
-                if !is_new && snap_t.valid && bi < wm_cache[sid].len() {
+                if snap_t.valid && bi < wm_cache[sid].len() {
                     let pos = &mut open_positions[i_pos];
                     let (ref x_n, ref z_wm, ref wm_pred) = wm_cache[sid][bi];
                     let norm_rem = normalized_session_remaining(bucket, snap_t.hhmm);
@@ -3386,12 +3389,14 @@ fn evaluate_brain_ensemble_retest_indexed(
                         + turn_alpha * (inf.action - sym_prev_act[sid]).abs().min(2.0);
                     sym_prev_act[sid] = inf.action;
 
-                    let pos_sign = pos.direction.sign() as f32;
-                    let exit_snap = (0.22 * pos.current_target_action.abs()).clamp(0.028, 0.075);
-                    if inf.action.abs() < exit_snap || inf.action.signum() != pos_sign {
-                        pos.pending_exit = true;
-                    } else if (inf.action - pos.current_target_action).abs() >= 0.30 {
-                        pos.pending_scale_action = Some(inf.action);
+                    if !is_new {
+                        let pos_sign = pos.direction.sign() as f32;
+                        let exit_snap = (0.22 * pos.current_target_action.abs()).clamp(0.028, 0.075);
+                        if inf.action.abs() < exit_snap || inf.action.signum() != pos_sign {
+                            pos.pending_exit = true;
+                        } else if (inf.action - pos.current_target_action).abs() >= 0.30 {
+                            pos.pending_scale_action = Some(inf.action);
+                        }
                     }
                 }
                 i_pos += 1;
@@ -3399,11 +3404,8 @@ fn evaluate_brain_ensemble_retest_indexed(
         }
 
         let (_, hhmm) = ny_et_hhmm(t_sec);
-        if !entry_allowed_at_hhmm(bucket, hhmm)
-            || open_positions.len() + pending_signals.len() >= max_slots
-        {
-            continue;
-        }
+        let can_enter = entry_allowed_at_hhmm(bucket, hhmm)
+            && open_positions.len() + pending_signals.len() < max_slots;
         let norm_rem = normalized_session_remaining(bucket, hhmm);
         let mut candidates: Vec<(f64, PendingNextBarSignal)> = Vec::new();
 
@@ -3454,7 +3456,7 @@ fn evaluate_brain_ensemble_retest_indexed(
                 + turn_alpha * (inf.action - sym_prev_act[sid]).abs().min(2.0);
             sym_prev_act[sid] = inf.action;
 
-            if inf.action.abs() >= 0.070 {
+            if can_enter && inf.action.abs() >= 0.070 {
                 let dir = if inf.action > 0.0 {
                     TradeDirection::Long
                 } else {
@@ -3469,7 +3471,7 @@ fn evaluate_brain_ensemble_retest_indexed(
                     inf.vehicle_prob >= 0.5,
                 );
                 let risk_budget_usd =
-                    (equity * (0.0055 + 0.0065 * inf.action.abs() as f64)).clamp(420.0, 1_250.0);
+                    (equity * (0.0062 + 0.0018 * inf.action.abs() as f64)).clamp(580.0, 820.0);
                 candidates.push((
                     inf.action.abs() as f64,
                     PendingNextBarSignal {
@@ -3867,27 +3869,57 @@ fn is_purged_holdout_lcb_promotion(
 
     // 2. Underwater incumbent (`U_lcb <= 0.0` or `Net PF <= 1.0` or `Net PnL <= 0.0`):
     if u_inc <= 0.0 || champ_holdout.net_pf <= 1.0 || champ_holdout.net_pnl_usd <= 0.0 {
+        if champ_holdout.winners_count >= 5 && cand_holdout.winners_count < 4 {
+            return false;
+        }
         let min_flip_pf = if cand_holdout.trades.len() > champ_holdout.trades.len() {
-            1.12
+            1.15
         } else {
-            1.02
+            1.05
         };
+        let red_shrunk = champ_holdout.red_loss_usd <= 1e-6
+            || cand_holdout.red_loss_usd <= champ_holdout.red_loss_usd + 1e-6;
         let flips_profitable = u_cand > 0.0
             && cand_holdout.net_pnl_usd > 0.0
-            && cand_holdout.net_pf > min_flip_pf;
+            && cand_holdout.net_pf > min_flip_pf
+            && red_shrunk;
         let strict_loss_pruning = u_cand > u_inc + 1e-6
             && cand_holdout.trades.len() < champ_holdout.trades.len()
-            && cand_holdout.net_pf >= 0.96
+            && cand_holdout.net_pnl_usd > 0.0
+            && cand_holdout.net_pf >= 1.06
             && cand_holdout.net_pf > champ_holdout.net_pf + 0.05
             && cand_holdout.red_loss_usd <= champ_holdout.red_loss_usd * 0.80;
         return flips_profitable || strict_loss_pruning;
     }
 
     // 3. Profitable incumbent (`U_lcb > 0`, `Net PF > 1.0`):
-    //    Promote strictly via `U_lcb(cand) > U_lcb(inc) + eps` + `Net PF > 1.05` + Expectancy Preservation
-    //    (ZERO raw gross-loss veto, ZERO integer win-count or trade-count floor veto!)
-    if u_cand <= u_inc + 1e-6 || cand_holdout.net_pf <= 1.05 || cand_holdout.net_pnl_usd <= 0.0 {
+    if u_cand <= u_inc + 1e-6
+        || cand_holdout.net_pnl_usd <= champ_holdout.net_pnl_usd + 1e-6
+        || cand_holdout.net_pf <= 1.08
+    {
         return false;
+    }
+    if champ_holdout.winners_count >= 5
+        && (cand_holdout.winners_count < 4
+            || cand_holdout.win_r_sum + 1e-6 < champ_holdout.win_r_sum * 0.72)
+    {
+        return false;
+    }
+    if champ_holdout.trades.len() < 3 && champ_holdout.red_loss_usd <= 1e-6 {
+        if cand_holdout.red_loss_usd > champ_holdout.red_loss_usd + 1e-6
+            && cand_holdout.net_pf < 2.10
+        {
+            return false;
+        }
+    } else {
+        let pf_ok = if champ_holdout.red_loss_usd > 1e-6 {
+            cand_holdout.net_pf > champ_holdout.net_pf
+        } else {
+            cand_holdout.net_pf >= champ_holdout.net_pf
+        };
+        if !pf_ok || cand_holdout.red_loss_usd > champ_holdout.red_loss_usd + 1e-6 {
+            return false;
+        }
     }
     let (inc_net_r, inc_mean_wr, inc_exp) = eval_expectancy_metrics(champ_holdout);
     let (cand_net_r, cand_mean_wr, cand_exp) = eval_expectancy_metrics(cand_holdout);
@@ -3923,30 +3955,61 @@ fn is_causal_promotion(
 
     // 1. Dormant `0`-trade incumbent (`U_lcb == 0.0`): wake up into a genuinely net-profitable policy!
     if champ_eval.trades.is_empty() {
-        return u_cand > 0.0 && cand_eval.net_pf >= 1.12 && cand_eval.net_pnl_usd > 0.0;
+        return u_cand > 0.0 && cand_eval.net_pf >= 1.15 && cand_eval.net_pnl_usd > 0.0;
     }
 
     // 2. Underwater incumbent (`U_lcb <= 0.0` or `Net PF <= 1.0` or `Net PnL <= 0.0`):
     if u_inc <= 0.0 || champ_eval.net_pf <= 1.0 || champ_eval.net_pnl_usd <= 0.0 {
+        if champ_eval.winners_count >= 5 && cand_eval.winners_count < 4 {
+            return false;
+        }
         let min_flip_pf = if cand_eval.trades.len() > champ_eval.trades.len() {
-            1.15
+            1.18
         } else {
-            1.05
+            1.08
         };
-        let flips_profitable =
-            u_cand > 0.0 && cand_eval.net_pnl_usd > 0.0 && cand_eval.net_pf >= min_flip_pf;
+        let red_shrunk = champ_eval.red_loss_usd <= 1e-6
+            || cand_eval.red_loss_usd <= champ_eval.red_loss_usd + 1e-6;
+        let flips_profitable = u_cand > 0.0
+            && cand_eval.net_pnl_usd > 0.0
+            && cand_eval.net_pf >= min_flip_pf
+            && red_shrunk;
         let strict_loss_pruning = u_cand > u_inc + 1e-6
             && cand_eval.trades.len() < champ_eval.trades.len()
-            && cand_eval.net_pf >= 0.96
+            && cand_eval.net_pnl_usd > 0.0
+            && cand_eval.net_pf >= 1.08
             && cand_eval.net_pf > champ_eval.net_pf + 0.05
             && cand_eval.red_loss_usd <= champ_eval.red_loss_usd * 0.80;
         return flips_profitable || strict_loss_pruning;
     }
 
     // 3. Profitable incumbent (`U_lcb > 0.0`, `Net PF > 1.0`):
-    //    Unified `U_lcb` improvement + Winner Expectancy Preservation (ZERO `red_loss_shrunk` or `winners_count` vetoes!)
-    if u_cand <= u_inc + 1e-6 || cand_eval.net_pf < 1.10 || cand_eval.net_pnl_usd <= 0.0 {
+    //    Enforce strict Net PnL improvement + Net PF improvement + Red-Loss reduction + Winner-R & Sample-Floor preservation!
+    if u_cand <= u_inc + 1e-6
+        || cand_eval.net_pnl_usd <= champ_eval.net_pnl_usd + 1e-6
+        || cand_eval.net_pf < 1.15
+    {
         return false;
+    }
+    if champ_eval.winners_count >= 5
+        && (cand_eval.winners_count < 4
+            || cand_eval.win_r_sum + 1e-6 < champ_eval.win_r_sum * 0.72)
+    {
+        return false;
+    }
+    if champ_eval.trades.len() < 3 && champ_eval.red_loss_usd <= 1e-6 {
+        if cand_eval.red_loss_usd > champ_eval.red_loss_usd + 1e-6 && cand_eval.net_pf < 2.10 {
+            return false;
+        }
+    } else {
+        let pf_ok = if champ_eval.red_loss_usd > 1e-6 {
+            cand_eval.net_pf > champ_eval.net_pf
+        } else {
+            cand_eval.net_pf >= champ_eval.net_pf
+        };
+        if !pf_ok || cand_eval.red_loss_usd > champ_eval.red_loss_usd + 1e-6 {
+            return false;
+        }
     }
     let (inc_net_r, inc_mean_wr, inc_exp) = eval_expectancy_metrics(champ_eval);
     let (cand_net_r, cand_mean_wr, cand_exp) = eval_expectancy_metrics(cand_eval);
@@ -3956,7 +4019,7 @@ fn is_causal_promotion(
         if cand_eval.trades.len() > champ_eval.trades.len() + 3 && cand_exp < inc_exp * 0.85 {
             cand_eval.net_pf >= champ_eval.net_pf.min(1.65)
         } else {
-            cand_eval.net_pf >= champ_eval.net_pf.min(1.35) - 0.02
+            true
         };
     expectancy_preserved && no_dilutive_bloat
 }
@@ -4315,6 +4378,14 @@ fn execute_closed_loop_red_trade_autopsy_and_promotion(
             );
             let val_ok = if cv.trades.is_empty() && ve.trades.is_empty() {
                 full_ev.net_pf > 1.18 && compute_utility_lcb(&full_ev) > 0.0
+            } else if cv.trades.len() <= 1
+                && ve.trades.len() <= 1
+                && ve.red_loss_usd <= cv.red_loss_usd + 1e-6
+                && ve.net_pnl_usd >= cv.net_pnl_usd - 1e-6
+            {
+                full_ev.trades.len() >= 5
+                    && full_ev.net_pf > champ_eval.net_pf + 0.10
+                    && full_ev.red_loss_usd + 1e-6 < champ_eval.red_loss_usd
             } else {
                 is_purged_holdout_lcb_promotion(cv, &ve, is_paralyzed)
             };
@@ -4335,14 +4406,25 @@ fn execute_closed_loop_red_trade_autopsy_and_promotion(
         m.hparams.conformal_q_bps = train_template.conformal_q_bps;
     }
     score_member_train_window(&mut scored_base, &wm_cache);
-    let routing_specs: [(f64, f32); 6] = [
-        (2.4, 1.00),
-        (6.5, 1.00),
-        (14.0, 1.00),
-        (5.5, 1.08),
-        (9.5, 1.16),
-        (4.5, 0.93),
-    ];
+    let routing_specs: [(f64, f32); 6] = if champ_eval.trades.len() < 5 {
+        [
+            (2.8, 1.00),
+            (7.5, 1.00),
+            (14.0, 1.00),
+            (6.0, 1.08),
+            (11.0, 1.20),
+            (3.6, 0.90),
+        ]
+    } else {
+        [
+            (2.5, 1.00),
+            (6.5, 1.00),
+            (13.5, 1.00),
+            (5.5, 1.07),
+            (9.5, 1.16),
+            (14.0, 1.28),
+        ]
+    };
     let mut cand_results: Vec<(PureAutonomousRlBrain, DiscreteCausalEvalSummary, f64, bool)> =
         routing_specs
             .par_iter()
@@ -4360,92 +4442,86 @@ fn execute_closed_loop_red_trade_autopsy_and_promotion(
             })
             .collect();
 
-    // Candidates 7..=9: Trust-region RL + Fisher EWC candidates trained strictly on `<= train_split_ts`
-    let mut rl_specs: Vec<(usize, f32, f32, f64)> = vec![
+    // Candidates 7..=8: Trust-region RL + Fisher EWC candidates trained strictly on `<= train_split_ts`
+    let rl_specs: [(usize, f32, f32, f64); 2] = [
         (
             4,
-            0.075,
+            0.080,
             if is_paralyzed {
                 0.08
             } else if champ_eval.net_pf < 1.15 {
-                0.45
+                0.42
             } else {
                 1.35
             },
-            4.2,
+            4.5,
         ),
         (
             3,
-            0.050,
-            if is_paralyzed { 0.12 } else { 1.60 },
-            8.0,
+            0.052,
+            if is_paralyzed { 0.12 } else { 1.65 },
+            8.5,
         ),
     ];
-    if champ_eval.net_pf < 1.15 || is_paralyzed {
-        rl_specs.push((
-            5,
-            0.105,
-            if is_paralyzed { 0.05 } else { 0.40 },
-            6.5,
-        ));
-    }
-    let rl_train_end_ts = if train_split_ts < cutoff_ts {
-        train_split_ts
-    } else {
-        cutoff_ts
-    };
 
     let mut max_flat_replayed = audited_tel.flat_regret_windows_replayed;
+    let should_run_rl_specs = is_paralyzed
+        || red_audited > 0
+        || exit_faults > 0
+        || champ_eval.trades.len() < 6
+        || champ_eval.net_pf < 1.75;
     let mut rl_scored: Vec<(PureAutonomousRlBrain, DiscreteCausalEvalSummary, f64, bool, f64)> =
-        Vec::with_capacity(rl_specs.len());
-    for &(steps, lr_sc, ewc_lam, eta) in &rl_specs {
-        let mut cand = train_template.clone();
-        cand.train_red_autopsy_and_causal_batch_parallel_le(
-            train_eps_ref,
-            train_split_ts,
-            steps,
-            lr_sc,
-            ewc_lam,
-        );
-        if is_intraday && (exit_faults > 0 || champ_eval.net_pf < 1.15) {
-            let _ = cand.train_intraday_exit_timing_episodes(
-                train_eps_ref,
-                2,
-                (lr_sc * 2.5).clamp(0.18, 0.45),
-            );
-        }
-        max_flat_replayed =
-            max_flat_replayed.max(cand.autopsy_telemetry.flat_regret_windows_replayed);
-        if champ_eval.trades.len() < 4 {
-            let _ = cand.audit_and_train_paralysis_regret(
+        Vec::new();
+    if should_run_rl_specs {
+        for &(steps, lr_sc, ewc_lam, eta) in &rl_specs {
+            let mut cand = train_template.clone();
+            cand.train_red_autopsy_and_causal_batch_parallel_le(
                 train_eps_ref,
                 train_split_ts,
-                (steps / 2).max(2),
-                lr_sc.max(0.38),
+                steps,
+                lr_sc,
+                ewc_lam,
             );
+            if is_intraday && (exit_faults > 0 || champ_eval.net_pf < 1.15) {
+                let _ = cand.train_intraday_exit_timing_episodes(
+                    train_eps_ref,
+                    2,
+                    (lr_sc * 2.5).clamp(0.18, 0.45),
+                );
+            }
+            max_flat_replayed =
+                max_flat_replayed.max(cand.autopsy_telemetry.flat_regret_windows_replayed);
+            if champ_eval.trades.len() < 4 {
+                let _ = cand.audit_and_train_paralysis_regret(
+                    train_eps_ref,
+                    train_split_ts,
+                    (steps / 2).max(2),
+                    lr_sc.max(0.38),
+                );
+            }
+            if steps >= 3 && (is_paralyzed || (red_audited > 0 && has_vehicle_regret)) {
+                let _ = cand.train_vehicle_regret_episodes_ext(
+                    train_eps_ref,
+                    2,
+                    (lr_sc * 0.8).max(0.20),
+                    false,
+                );
+            }
+            score_member_train_window(&mut cand, &wm_cache);
+            cand.update_hedge_weights_with_eta(eta);
+            let w_sum: f64 = cand.population.iter().map(|m| m.hedge_weight).sum();
+            let train_rank: f64 = if w_sum > 1e-9 {
+                cand.population
+                    .iter()
+                    .map(|m| m.hedge_weight * m.causal_score)
+                    .sum::<f64>()
+                    / w_sum
+            } else {
+                -5.0
+            };
+            let (full_ev, rank_score, passes) = eval_cand_gate(&cand, &wm_cache);
+            rl_scored.push((cand, full_ev, rank_score, passes, train_rank));
         }
-        if steps >= 3 && (is_paralyzed || (red_audited > 0 && has_vehicle_regret)) {
-            let _ = cand.train_vehicle_regret_episodes_ext(
-                train_eps_ref,
-                2,
-                (lr_sc * 0.8).max(0.20),
-                false,
-            );
-        }
-        score_member_train_window(&mut cand, &wm_cache);
-        cand.update_hedge_weights_with_eta(eta);
-        let train_ev = evaluate_brain_ensemble_retest_indexed(
-            &cand,
-            idx,
-            &wm_cache,
-            retest_start_ts,
-            rl_train_end_ts,
-            starting_equity,
-        );
-        let train_rank = 0.65 * compute_utility_lcb(&train_ev)
-            + 0.35 * compute_recency_weighted_causal_score(&train_ev, rl_train_end_ts, is_intraday);
-        let (full_ev, rank_score, passes) = eval_cand_gate(&cand, &wm_cache);
-        rl_scored.push((cand, full_ev, rank_score, passes, train_rank));
     }
 
     // Causal World-Model TTT + EWC Loss-Autopsy candidate trained strictly `<= train_split_ts` (when paralyzed or net_pf < 1.05)
@@ -5016,14 +5092,16 @@ fn train_warmup_with_causal_pbt(
         },
         ens_warmup.trades.len(),
     );
-    if ens_warmup.trades.len() < 5 || ens_warmup.net_pf < 1.22 {
+    if ens_warmup.trades.len() < 3 || ens_warmup.net_pf < 1.15 {
         let cap_eps = slice_eps_le(warmup_cutoff_ts);
         let cal_eps = if !cap_eps.is_empty() {
             &cap_eps[..]
         } else {
             &full_eps[..]
         };
-        let cal_retest_start_ts = warmup_ts.first().copied().unwrap_or(last_val_start_ts);
+        // Evaluate strictly on Out-Of-Fold `[last_val_start_ts .. warmup_cutoff_ts]` so in-sample
+        // `[0.00 .. 0.68]` BPTT memorization never overwrites OOF specialist routing scores!
+        let cal_retest_start_ts = last_val_start_ts;
         let pre_cal = brain.clone();
         let promoted = execute_closed_loop_red_trade_autopsy_and_promotion(
             brain,
@@ -5292,20 +5370,20 @@ fn run_oos_timeline_with_pure_rl_brains(
                 let should_run_autopsy = if bucket == ProofBucket::Scalp0Dte1m {
                     has_new_red_trade
                         || completed_oos_days_count == 1
-                        || days_since_last >= 1
+                        || days_since_last >= 2
                 } else {
                     has_new_red_trade
                         || completed_oos_days_count == 1
-                        || days_since_last >= 3
+                        || days_since_last >= 4
                         || ((bucket_oos_trades == 0 || slow_pace) && days_since_last >= 2)
                 };
 
                 let lookback_days = match bucket {
-                    ProofBucket::Scalp0Dte1m => 12,
+                    ProofBucket::Scalp0Dte1m => 30,
                     ProofBucket::Scalp0Dte5m
                     | ProofBucket::Brain01PennyDay
-                    | ProofBucket::Brain02LargeCapDay => 20,
-                    ProofBucket::Brain03ShortSwing | ProofBucket::Brain04CoreSwing => 36,
+                    | ProofBucket::Brain02LargeCapDay => 28,
+                    ProofBucket::Brain03ShortSwing | ProofBucket::Brain04CoreSwing => 45,
                 };
                 let rolling_min_day = (pd - lookback_days).max(warmup_start_day);
                 let rolling_retest_start_ts = b_idx
@@ -5345,6 +5423,116 @@ fn run_oos_timeline_with_pure_rl_brains(
                     );
                     if !promoted {
                         restore_champion_weights_keeping_audit_memory(brain, backup_brain);
+                    } else {
+                        // Causally re-warm `wm_hiddens[bucket]` and `hidden_states[bucket]` over the last 48
+                        // resolved timestamps (`<= prev_ts_sec`) using the newly promoted champion so newly
+                        // routed specialists never start the next OOS session from cold `[0.0; 64]` GRU states!
+                        let refreshed_wm = b_idx.precompute_wm_cache(
+                            &brain.world_model,
+                            &brain.feat_mean,
+                            &brain.feat_var,
+                            prev_ts_sec,
+                        );
+                        let end_rw = b_idx.all_ts.partition_point(|&ts| ts <= prev_ts_sec);
+                        let start_rw = end_rw.saturating_sub(48);
+                        let turn_alpha: f32 = if bucket.is_intraday() { 0.14 } else { 0.18 };
+                        let h_map = hidden_states.entry(bucket).or_default();
+                        let wm_map = wm_hiddens.entry(bucket).or_default();
+                        let turn_map = ema_turn_map.entry(bucket).or_default();
+                        let pact_map = prev_act_map.entry(bucket).or_default();
+                        let day_map = last_sym_day.entry(bucket).or_default();
+                        for (sid, sym) in b_idx.syms.iter().enumerate() {
+                            h_map.remove(sym);
+                            turn_map.insert(sym.clone(), 0.0);
+                            pact_map.insert(sym.clone(), 0.0);
+                            day_map.insert(sym.clone(), i64::MIN);
+                            if let Some(last_entry) = refreshed_wm.get(sid).and_then(|v| v.last()) {
+                                wm_map.insert(sym.clone(), last_entry.1);
+                            }
+                        }
+                        for ti_rw in start_rw..end_rw {
+                            let ts_rw = b_idx.all_ts[ti_rw];
+                            let d_rw = est_trading_day_key(ts_rw);
+                            let (_, hhmm_rw) = ny_et_hhmm(ts_rw);
+                            let norm_rem_rw = normalized_session_remaining(bucket, hhmm_rw);
+                            for &(sid_u16, bidx_u32) in &b_idx.at_ts[ti_rw] {
+                                let sid = sid_u16 as usize;
+                                let bi = bidx_u32 as usize;
+                                if sid >= refreshed_wm.len() || bi >= refreshed_wm[sid].len() {
+                                    continue;
+                                }
+                                let sym = &b_idx.syms[sid];
+                                if bucket.is_intraday() {
+                                    let prev_d = day_map.get(sym).copied().unwrap_or(i64::MIN);
+                                    if prev_d != d_rw {
+                                        h_map.remove(sym);
+                                        if prev_d != i64::MIN
+                                            && let Some(t_ref) = turn_map.get_mut(sym)
+                                        {
+                                            *t_ref *= 0.25;
+                                        }
+                                        pact_map.insert(sym.clone(), 0.0);
+                                        day_map.insert(sym.clone(), d_rw);
+                                    }
+                                }
+                                let snap_rw = &b_idx.snaps_by_sym[sid][bi];
+                                if !snap_rw.valid {
+                                    continue;
+                                }
+                                let bar_rw = &b_idx.bars_by_sym[sid][bi];
+                                if !symbol_matches_bucket(sym, bar_rw.close, bucket) {
+                                    continue;
+                                }
+                                let is_penny = is_penny_symbol_cand(sym, bar_rw.close);
+                                let opt_ok = !is_penny && is_option_vehicle_allowed(sym, bar_rw.close);
+                                let slip_bps =
+                                    explicit_one_way_slippage_bps(sym, bar_rw.close, is_penny) as f32;
+                                let cur_turn = turn_map.get(sym).copied().unwrap_or(0.0);
+                                let prev_act = pact_map.get(sym).copied().unwrap_or(0.0);
+                                let self_s = if let Some(open_p) = open_positions
+                                    .iter()
+                                    .find(|p| p.bucket == bucket && p.symbol == *sym && ts_rw >= p.entry_ts_sec)
+                                {
+                                    let mut p_clone = open_p.clone();
+                                    let iv_rw = exit_iv_for_bar(bucket, snap_rw);
+                                    build_active_position_self_awareness(
+                                        &mut p_clone,
+                                        ts_rw,
+                                        bar_rw.close,
+                                        iv_rw,
+                                        norm_rem_rw,
+                                        cur_turn,
+                                    )
+                                    .0
+                                } else {
+                                    SelfAwarenessState {
+                                        current_pos: 0.0,
+                                        unrealized_net_ret: 0.0,
+                                        peak_excursion: 0.0,
+                                        drawdown_from_peak: 0.0,
+                                        log_bars_held: 0.0,
+                                        one_way_cost_bps: slip_bps,
+                                        session_time_left: norm_rem_rw as f32,
+                                        ema_turnover: cur_turn,
+                                    }
+                                };
+                                let (ref x_n, ref z_wm, ref wm_pred) = refreshed_wm[sid][bi];
+                                let prev_hs = h_map.get(sym).map(Vec::as_slice).unwrap_or(&[]);
+                                let inf = brain.infer_ensemble_step_with_precomputed_wm(
+                                    x_n,
+                                    z_wm,
+                                    wm_pred,
+                                    self_s,
+                                    prev_hs,
+                                    opt_ok,
+                                );
+                                h_map.insert(sym.clone(), inf.next_hiddens);
+                                let next_turn = (1.0 - turn_alpha) * cur_turn
+                                    + turn_alpha * (inf.action - prev_act).abs().min(2.0);
+                                turn_map.insert(sym.clone(), next_turn);
+                                pact_map.insert(sym.clone(), inf.action);
+                            }
+                        }
                     }
                 }
             }
@@ -5432,11 +5620,6 @@ fn run_oos_timeline_with_pure_rl_brains(
         let mut stepped_wm_this_bar: BTreeSet<(ProofBucket, String)> = BTreeSet::new();
 
         // B. STEP ALL OPEN POSITIONS AT BAR `t_sec`
-        let step_open_heat_frac = open_positions
-            .iter()
-            .map(|p| p.risk_budget_usd)
-            .sum::<f64>()
-            / equity_usd.max(50_000.0);
         let mut remaining_open = Vec::with_capacity(open_positions.len());
         for mut pos in open_positions.drain(..) {
             let Some(&bar_idx) = ts_index_by_sym.get(&pos.symbol).and_then(|m| m.get(&t_sec))
@@ -5468,18 +5651,15 @@ fn run_oos_timeline_with_pure_rl_brains(
                     .insert(pos.symbol.clone(), 0.0);
                 oos_blotter.push(blotter);
             } else {
-                if !is_new
-                    && snap_t.valid
+                if snap_t.valid
                     && let Some(brain) = brains.get(&pos.bucket)
                 {
                     let turn_alpha: f32 = if pos.bucket.is_intraday() { 0.14 } else { 0.18 };
                     let (_, hhmm) = ny_et_hhmm(t_sec);
                     let norm_rem = normalized_session_remaining(pos.bucket, hhmm);
-                    let raw_x = snap_t.to_raw_180_vector(
-                        norm_rem,
-                        step_open_heat_frac,
-                        pos.is_option_routed,
-                    );
+                    // Maintain 100% feature standardization parity with `build_single_causal_bar` & `precompute_wm_cache`
+                    // (`(norm_rem, 0.0, false)`), passing option friction cleanly via `self_s.one_way_cost_bps`!
+                    let raw_x = snap_t.to_raw_180_vector(norm_rem, 0.0, false);
                     let cur_turn = ema_turn_map
                         .entry(pos.bucket)
                         .or_default()
@@ -5528,12 +5708,14 @@ fn run_oos_timeline_with_pure_rl_brains(
                         .insert(pos.symbol.clone(), inf.action);
                     stepped_wm_this_bar.insert((pos.bucket, pos.symbol.clone()));
 
-                    let pos_sign = pos.direction.sign() as f32;
-                    let exit_snap = (0.22 * pos.current_target_action.abs()).clamp(0.028, 0.075);
-                    if inf.action.abs() < exit_snap || inf.action.signum() != pos_sign {
-                        pos.pending_exit = true;
-                    } else if (inf.action - pos.current_target_action).abs() >= 0.30 {
-                        pos.pending_scale_action = Some(inf.action);
+                    if !is_new {
+                        let pos_sign = pos.direction.sign() as f32;
+                        let exit_snap = (0.22 * pos.current_target_action.abs()).clamp(0.028, 0.075);
+                        if inf.action.abs() < exit_snap || inf.action.signum() != pos_sign {
+                            pos.pending_exit = true;
+                        } else if (inf.action - pos.current_target_action).abs() >= 0.30 {
+                            pos.pending_scale_action = Some(inf.action);
+                        }
                     }
                 }
                 remaining_open.push(pos);
@@ -5579,14 +5761,11 @@ fn run_oos_timeline_with_pure_rl_brains(
                     continue;
                 }
 
-                let already_open_or_pending = open_positions
+                let already_open = open_positions
                     .iter()
-                    .any(|p| p.symbol == *sym && p.bucket == bucket)
-                    || pending_signals
-                        .iter()
-                        .any(|s| s.symbol == *sym && s.bucket == bucket);
-                if !bucket_can_enter || already_open_or_pending {
-                    // Maintain continuous World-Model latent state `z_wm` even when flat entry is gated!
+                    .any(|p| p.symbol == *sym && p.bucket == bucket);
+                if already_open {
+                    // Already stepped both `bucket_h` and `bucket_wm_h` in Section B above!
                     if !stepped_wm_this_bar.contains(&(bucket, sym.clone())) {
                         let raw_x = snap.to_raw_180_vector(norm_rem, 0.0, false);
                         let x_norm = brain.normalize_x(&raw_x);
@@ -5597,11 +5776,13 @@ fn run_oos_timeline_with_pure_rl_brains(
                     continue;
                 }
 
+                // Always step BOTH `bucket_h` and `bucket_wm_h` on every flat symbol bar so GRU hidden states
+                // never freeze when slots are full or past session entry cutoff!
                 let turn_alpha: f32 = if bucket.is_intraday() { 0.14 } else { 0.18 };
                 let is_penny = is_penny_symbol_cand(sym, bar_t.close);
                 let option_allowed = !is_penny && is_option_vehicle_allowed(sym, bar_t.close);
                 let slip_bps = explicit_one_way_slippage_bps(sym, bar_t.close, is_penny) as f32;
-                let raw_x = snap.to_raw_180_vector(norm_rem, open_heat_frac, false);
+                let raw_x = snap.to_raw_180_vector(norm_rem, 0.0, false);
                 let cur_turn = ema_turn_map
                     .entry(bucket)
                     .or_default()
@@ -5647,6 +5828,13 @@ fn run_oos_timeline_with_pure_rl_brains(
                     .insert(sym.clone(), inf.action);
                 stepped_wm_this_bar.insert((bucket, sym.clone()));
 
+                let already_pending = pending_signals
+                    .iter()
+                    .any(|s| s.symbol == *sym && s.bucket == bucket);
+                if !bucket_can_enter || already_pending {
+                    continue;
+                }
+
                 if inf.action.abs() < 0.070 {
                     abstained_flat_oos = abstained_flat_oos.saturating_add(1);
                     continue;
@@ -5666,7 +5854,7 @@ fn run_oos_timeline_with_pure_rl_brains(
                     inf.vehicle_prob >= 0.5,
                 );
                 let risk_budget_usd =
-                    (equity_usd * (0.0055 + 0.0065 * inf.action.abs() as f64)).clamp(420.0, 1_250.0);
+                    (equity_usd * (0.0062 + 0.0018 * inf.action.abs() as f64)).clamp(580.0, 820.0);
                 let conf_pct = (55.0 + (inf.action.abs() as f64) * 40.0).clamp(55.0, 98.5);
 
                 scored_actions.push((

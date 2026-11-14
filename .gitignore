@@ -31,4 +31,5 @@ web-terminal/dist/
 
 # Runtime execution state (182MB+)
 data/live_runtime_state.json
+data/raw_downloads/
 

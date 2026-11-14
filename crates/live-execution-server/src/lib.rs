@@ -19,6 +19,7 @@ pub mod portfolio_eigen_risk;
 pub mod precedent_knn;
 pub mod proof_harness;
 pub mod pure_rl_brain;
+pub mod swing_brain_sealed;
 pub mod regime_bocpd;
 pub mod routes;
 pub mod webhooks;

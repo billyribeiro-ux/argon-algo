@@ -1173,7 +1173,7 @@ fn extract_causal_32_htf_features(
 
 /// Precomputes strictly causal (`<= bar_idx`) raw 4-stream tensors across all symbols on a timeline.
 #[allow(clippy::too_many_arguments)]
-fn precompute_causal_timeline_physics(
+pub fn precompute_causal_timeline_physics(
     symbol_bars: &HashMap<String, Vec<RealExchangeOhlcvBar>>,
     h1_bars: &HashMap<String, Vec<RealExchangeOhlcvBar>>,
     daily_bars: &HashMap<String, Vec<RealExchangeOhlcvBar>>,

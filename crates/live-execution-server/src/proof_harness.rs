@@ -2768,6 +2768,7 @@ fn evaluate_single_member_indexed(
     let mut sym_last_day = vec![i64::MIN; n_syms];
     let mut sym_ema_turn = vec![0.0_f32; n_syms];
     let mut sym_prev_act = vec![0.0_f32; n_syms];
+    let turn_alpha: f32 = if is_intraday { 0.14 } else { 0.18 };
     let mut open_positions: Vec<ActiveSimulatedPosition> = Vec::with_capacity(max_slots);
     let mut pending_signals: Vec<PendingNextBarSignal> = Vec::with_capacity(max_slots);
     let mut settled: Vec<SettledCausalTrade> = Vec::new();
@@ -2832,6 +2833,14 @@ fn evaluate_single_member_indexed(
                 opt_allowed,
             );
             hiddens[sid] = step.next_hidden;
+            let snapped_pre = if step.action.abs() >= 0.070 {
+                step.action
+            } else {
+                0.0
+            };
+            sym_ema_turn[sid] = (1.0 - turn_alpha) * sym_ema_turn[sid]
+                + turn_alpha * (snapped_pre - sym_prev_act[sid]).abs().min(2.0);
+            sym_prev_act[sid] = snapped_pre;
         }
     }
 
@@ -2936,6 +2945,7 @@ fn evaluate_single_member_indexed(
                 equity += blotter.net_pnl_usd;
                 peak_eq = peak_eq.max(equity);
                 max_dd_pct = max_dd_pct.max(((peak_eq - equity) / peak_eq.max(1.0)) * 100.0);
+                sym_prev_act[pos.sym_id] = 0.0;
                 settled.push(SettledCausalTrade {
                     sym_id: pos.sym_id,
                     symbol: pos.symbol,
@@ -2976,18 +2986,23 @@ fn evaluate_single_member_indexed(
                         !pos.is_penny_tier && is_option_vehicle_allowed(&pos.symbol, bar_t.close),
                     );
                     hiddens[sid] = step.next_hidden;
-                    sym_ema_turn[sid] = (0.90 * sym_ema_turn[sid]
-                        + 0.10 * (step.action - sym_prev_act[sid]).abs())
-                    .clamp(0.0, 2.0);
-                    sym_prev_act[sid] = step.action;
+                    let hold_snap = (0.22 * self_s.current_pos.abs()).clamp(0.028, 0.075);
+                    let snapped_hold = if step.action.abs() >= hold_snap {
+                        step.action
+                    } else {
+                        0.0
+                    };
+                    sym_ema_turn[sid] = (1.0 - turn_alpha) * sym_ema_turn[sid]
+                        + turn_alpha * (snapped_hold - sym_prev_act[sid]).abs().min(2.0);
+                    sym_prev_act[sid] = snapped_hold;
 
                     if !is_new {
                         let pos_sign = pos.direction.sign() as f32;
                         let exit_snap = (0.22 * pos.current_target_action.abs()).clamp(0.028, 0.075);
-                        if step.action.abs() < exit_snap || step.action.signum() != pos_sign {
+                        if snapped_hold.abs() < exit_snap || snapped_hold.signum() != pos_sign {
                             pos.pending_exit = true;
-                        } else if (step.action - pos.current_target_action).abs() >= 0.30 {
-                            pos.pending_scale_action = Some(step.action);
+                        } else if (snapped_hold - pos.current_target_action).abs() >= 0.30 {
+                            pos.pending_scale_action = Some(snapped_hold);
                         }
                     }
                 }
@@ -2998,7 +3013,8 @@ fn evaluate_single_member_indexed(
         // 3. Evaluate flat symbols (always advance GRU hidden state `hiddens[sid]` on every valid bar,
         // gating only new-entry candidate emission when slots are full or past session entry cutoff!)
         let (_, hhmm) = ny_et_hhmm(t_sec);
-        let can_enter = entry_allowed_at_hhmm(bucket, hhmm) && open_positions.len() < max_slots;
+        let can_enter = entry_allowed_at_hhmm(bucket, hhmm)
+            && open_positions.len() + pending_signals.len() < max_slots;
         let norm_rem = normalized_session_remaining(bucket, hhmm);
         let mut candidates: Vec<(f64, PendingNextBarSignal)> = Vec::new();
 
@@ -3049,18 +3065,18 @@ fn evaluate_single_member_indexed(
                 opt_allowed,
             );
             hiddens[sid] = step.next_hidden;
-            sym_ema_turn[sid] =
-                (0.90 * sym_ema_turn[sid] + 0.10 * (step.action - sym_prev_act[sid]).abs())
-                    .clamp(0.0, 2.0);
-            sym_prev_act[sid] = if step.action.abs() >= 0.070 {
+            let snapped_flat = if step.action.abs() >= 0.070 {
                 step.action
             } else {
                 0.0
             };
+            sym_ema_turn[sid] = (1.0 - turn_alpha) * sym_ema_turn[sid]
+                + turn_alpha * (snapped_flat - sym_prev_act[sid]).abs().min(2.0);
+            sym_prev_act[sid] = snapped_flat;
             flat_steps += 1;
             sum_dz_margin += (step.raw_z.abs() - step.deadzone) as f64;
 
-            if can_enter && step.action.abs() >= 0.070 {
+            if can_enter && snapped_flat.abs() >= 0.070 {
                 let dir = if step.action > 0.0 {
                     TradeDirection::Long
                 } else {
@@ -3104,7 +3120,7 @@ fn evaluate_single_member_indexed(
             }
         }
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let slots_left = max_slots.saturating_sub(open_positions.len());
+        let slots_left = max_slots.saturating_sub(open_positions.len() + pending_signals.len());
         for (_, sig) in candidates.into_iter().take(slots_left.min(2)) {
             pending_signals.push(sig);
         }
@@ -3594,22 +3610,29 @@ fn summarize_settled_causal_trades(
     } else {
         0.0
     };
-    let trade_bonus = if n < 6 {
-        -1.6 + 0.22 * (n as f64)
-    } else if pf >= 1.15 {
-        (n as f64).min(24.0).sqrt() * 0.10
-    } else {
-        -0.04 * (n.saturating_sub(8) as f64)
-    };
     let mean_r = settled.iter().map(|t| t.net_r).sum::<f64>() / (n as f64);
-    let n_trust = (n as f64 / 15.0).min(1.0);
-    let pf_adj = 1.0 + (pf.min(4.0) - 1.0) * n_trust;
-    let score = (pf_adj - 1.0) * 1.8
-        + sharpe * 0.35
-        + (net_pnl / 1200.0).clamp(-3.0, 3.5)
-        - max_dd_pct * 0.05
-        + mean_r.clamp(-1.5, 2.0) * 0.90
-        + trade_bonus;
+    let score = if net_pnl <= 0.0 || pf <= 1.0 {
+        // Strictly negative score for net-losing specialists so losers NEVER outrank multi-trade winners!
+        let loss_pen = (net_pnl / 800.0).clamp(-4.5, -0.05)
+            - (1.0 - pf.clamp(0.0, 1.0)) * 1.60
+            - max_dd_pct * 0.05
+            - (n.saturating_sub(12) as f64) * 0.03;
+        loss_pen.min(-0.35)
+    } else {
+        // Sample-confidence weighting prevents 1-trade `PF=12` flukes from beating `4..16`-trade winners!
+        let sample_conf = match n {
+            1 => 0.10,
+            2 => 0.32,
+            3 => 0.62,
+            4 => 0.84,
+            _ => ((n as f64) / 6.0).clamp(0.90, 1.25),
+        };
+        let raw_gain = (pf.min(4.2) - 1.0) * 1.45
+            + sharpe.clamp(0.0, 5.0) * 0.32
+            + (net_pnl / 900.0).clamp(0.02, 3.8)
+            + mean_r.clamp(0.0, 2.2) * 0.65;
+        (raw_gain * sample_conf - max_dd_pct * 0.04).max(0.05)
+    };
 
     DiscreteCausalEvalSummary {
         score,
@@ -3862,9 +3885,13 @@ fn is_purged_holdout_lcb_promotion(
     let u_inc = compute_utility_lcb(champ_holdout);
     let u_cand = compute_utility_lcb(cand_holdout);
 
-    // 1. Dormant `0`-trade incumbent (`U_lcb == 0.0`): promote any net-profitable wakeup (`U_lcb > 0`, `Net PF > 1.0`)
+    // 1. Dormant `0`-trade incumbent (`U_lcb == 0.0`): promote only selective, bounded-loss net-profitable wakeups!
     if champ_holdout.trades.is_empty() {
-        return u_cand > 0.0 && cand_holdout.net_pf > 1.0 && cand_holdout.net_pnl_usd > 0.0;
+        return u_cand > 0.0
+            && cand_holdout.net_pf >= 1.25
+            && cand_holdout.net_pnl_usd > 0.0
+            && cand_holdout.trades.len() <= 28
+            && cand_holdout.red_loss_usd <= 600.0;
     }
 
     // 2. Underwater incumbent (`U_lcb <= 0.0` or `Net PF <= 1.0` or `Net PnL <= 0.0`):
@@ -3953,9 +3980,13 @@ fn is_causal_promotion(
     let u_inc = compute_utility_lcb(champ_eval);
     let u_cand = compute_utility_lcb(cand_eval);
 
-    // 1. Dormant `0`-trade incumbent (`U_lcb == 0.0`): wake up into a genuinely net-profitable policy!
+    // 1. Dormant `0`-trade incumbent (`U_lcb == 0.0`): wake up into a selective, bounded-loss net-profitable policy!
     if champ_eval.trades.is_empty() {
-        return u_cand > 0.0 && cand_eval.net_pf >= 1.15 && cand_eval.net_pnl_usd > 0.0;
+        return u_cand > 0.0
+            && cand_eval.net_pf >= 1.30
+            && cand_eval.net_pnl_usd > 0.0
+            && cand_eval.trades.len() <= 30
+            && cand_eval.red_loss_usd <= 650.0;
     }
 
     // 2. Underwater incumbent (`U_lcb <= 0.0` or `Net PF <= 1.0` or `Net PnL <= 0.0`):
@@ -4406,24 +4437,26 @@ fn execute_closed_loop_red_trade_autopsy_and_promotion(
         m.hparams.conformal_q_bps = train_template.conformal_q_bps;
     }
     score_member_train_window(&mut scored_base, &wm_cache);
-    let routing_specs: [(f64, f32); 7] = if champ_eval.trades.len() < 5 {
+    let routing_specs: [(f64, f32); 8] = if champ_eval.trades.len() < 5 {
         [
             (2.8, 1.00),
             (7.5, 1.00),
-            (14.0, 1.00),
-            (6.0, 1.08),
-            (11.0, 1.20),
-            (14.0, 1.35),
-            (3.6, 0.90),
+            (18.0, 1.00),
+            (65.0, 1.00),
+            (6.5, 1.08),
+            (14.0, 1.16),
+            (6.5, 0.93),
+            (18.0, 0.88),
         ]
     } else {
         [
             (2.5, 1.00),
-            (6.5, 1.00),
-            (13.5, 1.00),
-            (5.5, 1.08),
-            (9.5, 1.18),
-            (12.5, 1.32),
+            (7.0, 1.00),
+            (18.0, 1.00),
+            (65.0, 1.00),
+            (8.0, 1.05),
+            (16.0, 1.12),
+            (28.0, 1.22),
             (8.0, 0.95),
         ]
     };
@@ -5004,9 +5037,9 @@ fn train_warmup_with_causal_pbt(
             brain.autopsy_telemetry.flat_regret_windows_replayed = keep_flat;
         }
     }
-    let eta_grid: [f64; 5] = [1.8, 3.2, 6.0, 11.0, 18.0];
+    let eta_grid: [f64; 5] = [2.5, 6.0, 14.0, 32.0, 75.0];
     let select_best_eta = |b: &mut PureAutonomousRlBrain| -> (f64, DiscreteCausalEvalSummary, f64) {
-        let mut b_eta = 3.2_f64;
+        let mut b_eta = 6.0_f64;
         let mut b_sc = f64::NEG_INFINITY;
         let mut b_ev: Option<DiscreteCausalEvalSummary> = None;
         for &eta in &eta_grid {
@@ -5019,14 +5052,21 @@ fn train_warmup_with_causal_pbt(
                 warmup_cutoff_ts,
                 starting_equity,
             );
-            let active_bonus = if !ev.trades.is_empty() && ev.net_pf > 1.0 {
-                6_000.0
+            let n_tr = ev.trades.len();
+            let active_bonus = if n_tr >= 3 && ev.net_pf >= 1.20 && ev.net_pnl_usd > 0.0 {
+                8_000.0 + (n_tr.min(16) as f64) * 35.0
+            } else if n_tr >= 1 && ev.net_pf > 1.0 && ev.net_pnl_usd > 0.0 {
+                3_000.0 + (n_tr as f64) * 25.0
             } else {
                 0.0
             };
-            let sc = active_bonus
-                + 0.70 * compute_utility_lcb(&ev)
-                + 0.30 * compute_recency_weighted_causal_score(&ev, warmup_cutoff_ts, bucket.is_intraday());
+            let rec_sc = if n_tr == 0 {
+                0.0
+            } else {
+                compute_recency_weighted_causal_score(&ev, warmup_cutoff_ts, bucket.is_intraday())
+                    .clamp(-5.0, 25.0)
+            };
+            let sc = active_bonus + 0.75 * compute_utility_lcb(&ev) + 0.25 * (rec_sc * 50.0);
             if sc > b_sc {
                 b_sc = sc;
                 b_eta = eta;
@@ -5095,18 +5135,9 @@ fn train_warmup_with_causal_pbt(
     brain.promoted_generation_id = 1;
     brain.autopsy_telemetry.promoted_generations = 1;
 
+    // `conformal_q_bps` is already causally calibrated prior to OOF specialist scoring and `select_best_eta`
+    // (`line 4966`); do NOT mutate `conformal_q_bps` post-selection without re-evaluating `ens_warmup`!
     let mut ens_warmup = ens_selected_ev;
-    // Calibrate conformal epistemic residual on full warmup OOF results (`<= warmup_cutoff_ts`)
-    let _ = brain.calibrate_causal_conformal_residual(
-        &full_eps,
-        warmup_cutoff_ts,
-        if !ens_warmup.trades.is_empty() {
-            ens_warmup.net_pf
-        } else {
-            best_pf.max(0.95)
-        },
-        ens_warmup.trades.len(),
-    );
     if ens_warmup.trades.len() < 3 || ens_warmup.net_pf < 1.15 {
         let cap_eps = slice_eps_le(warmup_cutoff_ts);
         let cal_eps = if !cap_eps.is_empty() {
@@ -6249,11 +6280,29 @@ pub fn verify_future_curtain_zero_lookahead_invariance() -> (f32, f32, f32, f32)
 }
 
 pub fn execute_walkforward_proof_on_datasets(
+    onnx_engine: &OnnxMultiBrainEngine,
+    ds: &ProofDatasets,
+    starting_equity_usd: f64,
+    blotter_csv_path: &Path,
+    report_md_path: &Path,
+) -> Result<WalkforwardProofReport, String> {
+    execute_walkforward_proof_on_datasets_ex(
+        onnx_engine,
+        ds,
+        starting_equity_usd,
+        blotter_csv_path,
+        report_md_path,
+        true,
+    )
+}
+
+pub fn execute_walkforward_proof_on_datasets_ex(
     _onnx_engine: &OnnxMultiBrainEngine,
     ds: &ProofDatasets,
     starting_equity_usd: f64,
     blotter_csv_path: &Path,
     report_md_path: &Path,
+    include_swing: bool,
 ) -> Result<WalkforwardProofReport, String> {
     let _ = build_causal_universe_snapshots_at_timestamp;
     let _ = lookup_bar_le_timestamp;
@@ -6277,14 +6326,14 @@ pub fn execute_walkforward_proof_on_datasets(
     let m5_warmup = 24.min(d2_m5_days.len().saturating_sub(5).max(1));
     let m5_oos = d2_m5_days.len().saturating_sub(m5_warmup);
     let d2_warmup_start_day = d2_m5_days.first().copied().unwrap_or(0);
-    let h1_warmup_start_day = d2_h1_days.first().copied().unwrap_or(d2_warmup_start_day);
+    let _h1_warmup_start_day = d2_h1_days.first().copied().unwrap_or(d2_warmup_start_day);
     let d2_oos_start_day = d2_m5_days.get(m5_warmup).copied().unwrap_or(i64::MAX);
     let m5_warmup_cutoff_ts = m5_ts
         .iter()
         .copied()
         .rfind(|&ts| est_trading_day_key(ts) < d2_oos_start_day)
         .unwrap_or(0);
-    let h1_warmup_cutoff_ts = h1_ts
+    let _h1_warmup_cutoff_ts = h1_ts
         .iter()
         .copied()
         .rfind(|&ts| est_trading_day_key(ts) < d2_oos_start_day)
@@ -6333,7 +6382,7 @@ pub fn execute_walkforward_proof_on_datasets(
         BrainHorizonId::Brain03ShortTermSwing,
         ProofBucket::Brain03ShortSwing.bars_per_year(),
     );
-    let pre_h1_b4 = precompute_causal_timeline_physics(
+    let _pre_h1_b4 = precompute_causal_timeline_physics(
         &ds.h1_bars,
         &ds.h1_bars,
         &ds.d1_bars,
@@ -6357,20 +6406,30 @@ pub fn execute_walkforward_proof_on_datasets(
         m5_oos
     );
 
-    let all_buckets = [
+    let intraday_buckets = [
         ProofBucket::Scalp0Dte1m,
         ProofBucket::Scalp0Dte5m,
         ProofBucket::Brain01PennyDay,
         ProofBucket::Brain02LargeCapDay,
-        ProofBucket::Brain03ShortSwing,
-        ProofBucket::Brain04CoreSwing,
     ];
+    let all_buckets: Vec<ProofBucket> = if include_swing {
+        vec![
+            ProofBucket::Scalp0Dte1m,
+            ProofBucket::Scalp0Dte5m,
+            ProofBucket::Brain01PennyDay,
+            ProofBucket::Brain02LargeCapDay,
+            ProofBucket::Brain03ShortSwing,
+            ProofBucket::Brain04CoreSwing,
+        ]
+    } else {
+        intraday_buckets.to_vec()
+    };
     let mut warmup_brains: BTreeMap<ProofBucket, PureAutonomousRlBrain> = BTreeMap::new();
     let mut warmup_telemetry: Vec<WarmupTrainingTelemetry> = Vec::with_capacity(all_buckets.len());
     let mut promotion_ledger: Vec<GenerationPromotionLedgerRow> = Vec::new();
     let mut warmup_cf_total = 0usize;
 
-    for bucket in all_buckets {
+    for bucket in intraday_buckets {
         let t_b = std::time::Instant::now();
         let mut brain = PureAutonomousRlBrain::new_for_horizon(bucket.label(), bucket.seed_base());
         let (bars_ref, pre_ref, min_day, cutoff_ts, pretrain_m5) = match bucket {
@@ -6390,20 +6449,7 @@ pub fn execute_walkforward_proof_on_datasets(
                 m5_warmup_cutoff_ts,
                 None,
             ),
-            ProofBucket::Brain03ShortSwing => (
-                &ds.h1_bars,
-                &pre_h1_b3,
-                h1_warmup_start_day,
-                h1_warmup_cutoff_ts,
-                None,
-            ),
-            ProofBucket::Brain04CoreSwing => (
-                &ds.h1_bars,
-                &pre_h1_b4,
-                h1_warmup_start_day,
-                h1_warmup_cutoff_ts,
-                None,
-            ),
+            _ => unreachable!(),
         };
         let (tel, bars_trained) = train_warmup_with_causal_pbt(
             &mut brain,
@@ -6430,6 +6476,19 @@ pub fn execute_walkforward_proof_on_datasets(
         warmup_telemetry.push(tel);
         warmup_brains.insert(bucket, brain);
     }
+
+    // IMMUTABLE FIREWALL: Delegate SWING (BRAIN-03 & BRAIN-04) to sealed module
+    let sealed_swing_report = if include_swing {
+        let rep = crate::swing_brain_sealed::run_sealed_swing_walkforward(
+            ds,
+            &pre_h1_b3,
+            starting_equity_usd,
+        );
+        warmup_telemetry.extend(rep.warmup_telemetry.clone());
+        Some(rep)
+    } else {
+        None
+    };
 
     let run_full_oos = |mode: ProofRunMode,
                         brains: &mut BTreeMap<ProofBucket, PureAutonomousRlBrain>,
@@ -6475,39 +6534,22 @@ pub fn execute_walkforward_proof_on_datasets(
         abstained += res_m5.abstained_flat_oos;
         oos_cf += res_m5.oos_counterfactuals_harvested;
 
-        let res_h1_b3 = run_oos_timeline_with_pure_rl_brains(
-            mode,
-            &ds.h1_bars,
-            &pre_h1_b3,
-            &[ProofBucket::Brain03ShortSwing],
-            brains,
-            h1_warmup_start_day,
-            true,
-            d2_oos_start_day,
-            starting_equity_usd,
-            promo_log,
-        );
-        trades.extend(res_h1_b3.blotter);
-        abstained += res_h1_b3.abstained_flat_oos;
-        oos_cf += res_h1_b3.oos_counterfactuals_harvested;
+        if let Some(ref rep) = sealed_swing_report {
+            let swing_blotter = if mode == ProofRunMode::RunAFrozenWarmupMl {
+                &rep.blotter_run_a
+            } else {
+                &rep.blotter_run_b
+            };
+            trades.extend(swing_blotter.clone());
+            abstained += rep.abstained_flat_oos;
+            oos_cf += rep.oos_counterfactuals_harvested;
+            if mode == ProofRunMode::RunBOnlineRl {
+                promo_log.extend(rep.promotion_ledger.clone());
+            }
+        }
 
-        let res_h1_b4 = run_oos_timeline_with_pure_rl_brains(
-            mode,
-            &ds.h1_bars,
-            &pre_h1_b4,
-            &[ProofBucket::Brain04CoreSwing],
-            brains,
-            h1_warmup_start_day,
-            true,
-            d2_oos_start_day,
-            starting_equity_usd,
-            promo_log,
-        );
-        trades.extend(res_h1_b4.blotter);
-        abstained += res_h1_b4.abstained_flat_oos;
-        oos_cf += res_h1_b4.oos_counterfactuals_harvested;
-
-        let total_online_updates: u64 = brains.values().map(|b| b.online_updates_count).sum();
+        let total_online_updates: u64 = brains.values().map(|b| b.online_updates_count).sum::<u64>()
+            + sealed_swing_report.as_ref().map(|r| r.online_updates_count).unwrap_or(0);
         (trades, abstained, oos_cf, total_online_updates)
     };
 
@@ -6552,7 +6594,10 @@ pub fn execute_walkforward_proof_on_datasets(
         let bench_path = resolve_workspace_artifact_path(BENCHMARK_LEDGER_FIXTURE_PATH);
         let ledger = RealTimeLedgerEngine::new();
         let _ = ledger.load_runtime_or_seed_benchmark(&rt_path, &bench_path);
-        let persisted_suite: Vec<PureAutonomousRlBrain> = brains_b.into_values().collect();
+        let mut existing_brains = ledger.snapshot_pure_rl_brains();
+        existing_brains.retain(|b| b.brain_key.starts_with("BRAIN-03") || b.brain_key.starts_with("BRAIN-04"));
+        let mut persisted_suite: Vec<PureAutonomousRlBrain> = brains_b.into_values().collect();
+        persisted_suite.extend(existing_brains);
         ledger.replace_pure_rl_brains(persisted_suite);
         let _ = ledger.save_runtime_state_atomic(&rt_path);
     }
@@ -6953,15 +6998,25 @@ pub async fn run_chronological_hard_evidence_proof(
     adapter: &YahooFinanceLiveAdapter,
     starting_equity_usd: f64,
 ) -> Result<WalkforwardProofReport, String> {
+    run_chronological_hard_evidence_proof_ex(onnx_engine, adapter, starting_equity_usd, true).await
+}
+
+pub async fn run_chronological_hard_evidence_proof_ex(
+    onnx_engine: Arc<OnnxMultiBrainEngine>,
+    adapter: &YahooFinanceLiveAdapter,
+    starting_equity_usd: f64,
+    include_swing: bool,
+) -> Result<WalkforwardProofReport, String> {
     let ds = fetch_all_proof_datasets(adapter).await;
     let blotter_path = resolve_workspace_artifact_path(WALKFORWARD_BLOTTER_CSV_PATH);
     let report_path = resolve_workspace_artifact_path(PROOF_REPORT_MD_PATH);
-    execute_walkforward_proof_on_datasets(
+    execute_walkforward_proof_on_datasets_ex(
         &onnx_engine,
         &ds,
         starting_equity_usd,
         &blotter_path,
         &report_path,
+        include_swing,
     )
 }
 

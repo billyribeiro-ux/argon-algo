@@ -1014,7 +1014,7 @@ impl PhysicsWorldModel {
         for h_idx in 0..WM_HORIZONS.len() {
             let base = h_idx * 4;
             if base + 2 < self.b_wm.len() {
-                let q50 = (self.b_wm[base + 1] * 0.55).clamp(-0.004, 0.004);
+                let q50 = (self.b_wm[base + 1] * 0.88).clamp(-0.012, 0.012);
                 let half_iqr = (0.5 * (self.b_wm[base + 2] - self.b_wm[base])).clamp(0.008, 0.45);
                 self.b_wm[base] = q50 - half_iqr;
                 self.b_wm[base + 1] = q50;
@@ -1120,17 +1120,15 @@ impl AgentHyperParams {
             -0.05_f32
         };
         let cs_grid = if is_scalp_1m {
-            [0.52_f32, 0.76, 1.00, 1.26]
+            [0.50_f32, 0.72, 0.96, 1.22]
         } else if is_scalp_5m {
-            [0.64_f32, 0.90, 1.18, 1.48]
-        } else if is_penny {
-            [0.64_f32, 0.92, 1.22, 1.54]
-        } else if is_day_large {
-            [0.64_f32, 0.90, 1.18, 1.48]
+            [0.60_f32, 0.85, 1.12, 1.42]
+        } else if is_penny || is_day_large {
+            [0.58_f32, 0.84, 1.12, 1.42]
         } else if is_swing {
-            [0.54_f32, 0.78, 1.04, 1.34]
+            [0.52_f32, 0.76, 1.02, 1.30]
         } else {
-            [0.62_f32, 0.88, 1.16, 1.48]
+            [0.58_f32, 0.84, 1.12, 1.42]
         };
         let base_cs = cs_grid[(idx / 6) % 4] * rand_uniform(seed, 0.90, 1.10);
         let log_cs = base_cs.max(0.12).ln();
@@ -1297,7 +1295,11 @@ fn compute_cost_scaled_deadzone_with_iqr(
     let sp = softplus(d_pre);
     let dsp = sigmoid(d_pre);
     let rt_cost_bps = (2.0 * one_way_cost_bps).max(4.0);
-    let vol_cost_bps = rt_cost_bps.max(0.42 * wm_iqr_8_bps.clamp(0.0, 260.0));
+    // `wm_dir_lcb_bps` and `dir_critic_lcb_bps` already subtract full `rt_cost_bps`; use sublinear
+    // excess hurdle scaling above 36 bps so high-friction Penny (`70 bps` RT) demands `> 70 bps` net edge
+    // without triple-counting `70 bps` into permanent paralysis.
+    let eff_cost_bps = rt_cost_bps.min(36.0) + 0.35 * (rt_cost_bps - 36.0).max(0.0);
+    let vol_cost_bps = eff_cost_bps.max(0.42 * wm_iqr_8_bps.clamp(0.0, 260.0));
     let scale_denom = vol_cost_bps.max(16.0);
     let turn_clamped = ema_turnover.clamp(0.0, 1.5);
 
@@ -1306,16 +1308,15 @@ fn compute_cost_scaled_deadzone_with_iqr(
     if is_holding_pos {
         // Sunk-Cost Amortized Continuation Advantage (`Q_hold(x_t, s_t) - Q_flat(x_t, s_t)`):
         // Once holding, entry spread is sunk; let winners run until `peak_bps` clears multi-bar
-        // `mfe_target_bps` (`max(1.40 * rt_cost_bps, 0.85 * wm_iqr_24_bps, 40 bps)`), while cutting
-        // unbooked failed theses tightly on 8-bar IQR scale (`Avg Win > 1.8x Avg Loss`)!
+        // `mfe_target_bps`, while cutting unbooked failed theses cleanly on 8-bar IQR scale!
         let sess_rem = session_time_left.clamp(0.0, 1.0);
         let cont_wm_bps = wm_dir_lcb_bps + rt_cost_bps;
         let cont_critic_bps = dir_critic_lcb_bps + rt_cost_bps;
-        let sunk_amort = (-0.80 * log_bars_held.max(0.0)).exp();
+        let sunk_amort = (-0.58 * log_bars_held.max(0.0)).exp();
         let reentry_prob =
-            ((0.22 + 0.45 * turn_clamped.min(1.0)) * (0.20 + 0.80 * sess_rem)).clamp(0.05, 0.75);
-        let rt_ref_bps = vol_cost_bps.min(42.0);
-        let q_flat_bps = -(0.54 * sunk_amort + 0.34 * reentry_prob) * rt_ref_bps;
+            ((0.24 + 0.45 * turn_clamped.min(1.0)) * (0.20 + 0.80 * sess_rem)).clamp(0.05, 0.78);
+        let rt_ref_bps = vol_cost_bps.min(44.0);
+        let q_flat_bps = -(0.66 * sunk_amort + 0.36 * reentry_prob) * rt_ref_bps;
 
         let sess_elapsed = (1.0 - sess_rem).clamp(0.0, 1.0);
         let eod_urgency = ((0.24 - sess_rem).max(0.0) / 0.24).powi(2);
@@ -1327,48 +1328,48 @@ fn compute_cost_scaled_deadzone_with_iqr(
                 .max(40.0)
         } else {
             let iqr_intraday =
-                (0.72 * wm_iqr_24_bps * (0.35 + 0.65 * sess_rem)).clamp(0.0, 115.0);
-            (1.25 * rt_cost_bps).max(iqr_intraday).max(34.0)
+                (0.76 * wm_iqr_24_bps * (0.38 + 0.62 * sess_rem)).clamp(0.0, 125.0);
+            (1.30 * rt_cost_bps).max(iqr_intraday).max(38.0)
         };
         let mfe_booked_gate =
             sigmoid((peak_bps - mfe_target_bps) / (0.65 * mfe_target_bps).max(12.0));
         let mfe_giveback_ratio = (giveback_bps / peak_bps.max(mfe_target_bps)).clamp(0.0, 1.5);
 
-        let carry_cost_bps = rt_ref_bps * (0.08 * sess_elapsed + 1.45 * eod_urgency)
-            + (0.10 + 0.54 * mfe_booked_gate) * giveback_bps;
+        let carry_cost_bps = rt_ref_bps * (0.06 * sess_elapsed + 1.45 * eod_urgency)
+            + (0.08 + 0.54 * mfe_booked_gate) * giveback_bps;
         let q_hold_bps = 0.58 * cont_critic_bps + 0.42 * cont_wm_bps - carry_cost_bps;
         let q_adv_bps = q_hold_bps - q_flat_bps;
 
-        let hold_def_arg = (-q_adv_bps) / (1.45 * scale_denom);
+        let hold_def_arg = (-q_adv_bps) / (1.55 * scale_denom);
         let hold_def_raw = softplus(hold_def_arg);
-        let hold_def = hold_def_raw.min(1.90) * 0.16 * (1.0 - 0.50 * sunk_amort);
-        let mfe_harvest = 0.27 * mfe_booked_gate * mfe_giveback_ratio;
-        let loss_scale_bps = (1.32 * scale_denom).max(23.0);
+        let hold_def = hold_def_raw.min(1.85) * 0.14 * (1.0 - 0.55 * sunk_amort);
+        let mfe_harvest = 0.26 * mfe_booked_gate * mfe_giveback_ratio;
+        let loss_scale_bps = (1.50 * scale_denom).max(26.0);
         let underwater_ratio = giveback_bps / loss_scale_bps;
         let underwater_cut = (1.0 - mfe_booked_gate)
-            * 0.34
-            * softplus(underwater_ratio - 0.82).min(2.6)
-            * (1.0 - 0.50 * sunk_amort);
-        let raw_tau_hold = 0.040
-            + 0.040 * sp
-            + 0.016 * (rt_ref_bps / 100.0)
+            * 0.32
+            * softplus(underwater_ratio - 0.90).min(2.6)
+            * (1.0 - 0.55 * sunk_amort);
+        let raw_tau_hold = 0.038
+            + 0.038 * sp
+            + 0.015 * (rt_ref_bps / 100.0)
             + hold_def
             + mfe_harvest
             + underwater_cut
             + 0.32 * eod_urgency;
-        let in_hold_bounds = (0.038..0.95).contains(&raw_tau_hold);
+        let in_hold_bounds = (0.036..0.95).contains(&raw_tau_hold);
         return (
-            raw_tau_hold.clamp(0.038, 0.95),
-            if in_hold_bounds { 0.040 * dsp } else { 0.0 },
+            raw_tau_hold.clamp(0.036, 0.95),
+            if in_hold_bounds { 0.038 * dsp } else { 0.0 },
             0.0,
         );
     }
 
     // Asymmetric Epistemic / Distributional LCB + Turnover-Amortized Entry Gate:
     let joint_lcb_bps = 0.58 * dir_critic_lcb_bps + 0.42 * wm_dir_lcb_bps;
-    let turn_mult = 1.0 + 0.75 * turn_clamped;
-    let excess_hurdle_bps = (0.20 + 0.22 * sp) * rt_cost_bps
-        + (0.38 * cs * turn_mult + 0.55 * turn_clamped) * vol_cost_bps;
+    let turn_mult = 1.0 + 0.80 * turn_clamped;
+    let excess_hurdle_bps = (0.18 + 0.20 * sp) * eff_cost_bps
+        + (0.37 * cs * turn_mult + 0.62 * turn_clamped) * vol_cost_bps;
     let lcb_deficit_bps = excess_hurdle_bps - joint_lcb_bps;
     let def_arg = lcb_deficit_bps / (1.35 * scale_denom);
     let smooth_def_raw = softplus(def_arg);
@@ -1378,21 +1379,21 @@ fn compute_cost_scaled_deadzone_with_iqr(
     } else {
         0.0
     };
-    let dsmooth_ddpre = def_slope * (0.22 * dsp * rt_cost_bps);
-    let dsmooth_dlogk = def_slope * (0.38 * cs * turn_mult * vol_cost_bps);
+    let dsmooth_ddpre = def_slope * (0.20 * dsp * eff_cost_bps);
+    let dsmooth_dlogk = def_slope * (0.37 * cs * turn_mult * vol_cost_bps);
 
     let lcb_neg_raw = softplus((-joint_lcb_bps) / (1.5 * scale_denom));
     let lcb_neg_widen = lcb_neg_raw.min(2.0) * 0.06;
-    let cost_scale_term = 0.24 * cs * (vol_cost_bps / 100.0);
-    let base_tau = 0.125 + 0.070 * sp + cost_scale_term + smooth_def + lcb_neg_widen;
+    let cost_scale_term = 0.22 * cs * (vol_cost_bps / 100.0);
+    let base_tau = 0.120 + 0.068 * sp + cost_scale_term + smooth_def + lcb_neg_widen;
     let in_bounds = (0.10..0.96).contains(&base_tau);
     let dtau_ddpre = if in_bounds {
-        0.070 * dsp + dsmooth_ddpre
+        0.068 * dsp + dsmooth_ddpre
     } else {
         0.0
     };
     let dtau_dlogk = if in_bounds {
-        0.24 * cs * (vol_cost_bps / 100.0) + dsmooth_dlogk
+        0.22 * cs * (vol_cost_bps / 100.0) + dsmooth_dlogk
     } else {
         0.02 * cs
     };
@@ -3940,51 +3941,38 @@ impl SequencePolicyNet {
         apply_slice(&mut self.w_c, &accum.g_w_c, wd);
         apply_slice(&mut self.b_c, &accum.g_b_c, 0.0);
 
-        // Zero-rule conditional symmetry regularization: prevent scalar intercepts (`b_a_heads`, `ln_out_b`,
-        // `b_h`, `b_wm_aux`) & unsigned magnitude columns (`session_time_left`, `one_way_cost_bps`, `rc_log`)
-        // from memorizing unconditional warmup drift as a permanent `LONG`-only or `SHORT`-only DC offset.
-        for b in &mut self.b_h {
-            *b = (*b * 0.92).clamp(-0.10, 0.10);
-        }
+        // Zero-rule conditional symmetry regularization: bound scalar intercepts (`b_a_heads`, `b_wm_aux`)
+        // & unsigned magnitude columns (`session_time_left`, `one_way_cost_bps`, `rc_log`) so warmup drift
+        // cannot create a permanent `LONG`-only or `SHORT`-only DC offset, while preserving full LayerNorm
+        // trunk shift (`ln_out_b`) and dynamic latent weights `w_a_heads[0..HIDDEN_DIM]`.
         for b in &mut self.ln_out_b {
-            *b = (*b * 0.78).clamp(-0.025, 0.025);
+            *b = b.clamp(-0.15, 0.15);
         }
         for b in &mut self.b_a_heads {
-            *b = (*b * 0.55).clamp(-0.010, 0.010);
+            *b = (*b * 0.92).clamp(-0.018, 0.018);
         }
         let d = HIDDEN_DIM;
         let hd = HEAD_IN_DIM;
         let s_off = d + WM_OUT_DIM;
-        let ln_b_sq: f32 = self.ln_out_b.iter().map(|x| x * x).sum();
         for k in 0..SPECIALIST_K {
             let off_k = k * hd;
-            if ln_b_sq > 1e-8 && off_k + d <= self.w_a_heads.len() {
-                let mut dot = 0.0_f32;
-                for i in 0..d {
-                    dot += self.w_a_heads[off_k + i] * self.ln_out_b[i];
-                }
-                let proj = 0.50 * (dot / ln_b_sq);
-                for i in 0..d {
-                    self.w_a_heads[off_k + i] -= proj * self.ln_out_b[i];
-                }
-            }
             for h_idx in 0..WM_HORIZONS.len() {
                 let rc_col = off_k + d + h_idx * 4 + 3;
                 if rc_col < self.w_a_heads.len() {
-                    self.w_a_heads[rc_col] = (self.w_a_heads[rc_col] * 0.80).clamp(-0.015, 0.015);
+                    self.w_a_heads[rc_col] = (self.w_a_heads[rc_col] * 0.94).clamp(-0.024, 0.024);
                 }
             }
             for u_col in (s_off + 2)..(s_off + SELF_STATE_DIM) {
                 let c_idx = off_k + u_col;
                 if c_idx < self.w_a_heads.len() {
-                    self.w_a_heads[c_idx] = (self.w_a_heads[c_idx] * 0.80).clamp(-0.015, 0.015);
+                    self.w_a_heads[c_idx] = (self.w_a_heads[c_idx] * 0.94).clamp(-0.024, 0.024);
                 }
             }
         }
         for h_idx in 0..WM_HORIZONS.len() {
             let base = h_idx * 4;
             if base + 2 < self.b_wm_aux.len() {
-                let q50 = (self.b_wm_aux[base + 1] * 0.55).clamp(-0.004, 0.004);
+                let q50 = (self.b_wm_aux[base + 1] * 0.88).clamp(-0.012, 0.012);
                 let half_iqr =
                     (0.5 * (self.b_wm_aux[base + 2] - self.b_wm_aux[base])).clamp(0.008, 0.45);
                 self.b_wm_aux[base] = q50 - half_iqr;
@@ -5946,7 +5934,7 @@ impl PureAutonomousRlBrain {
     }
 
     pub fn update_hedge_weights(&mut self) {
-        self.update_hedge_weights_with_eta(2.8);
+        self.update_hedge_weights_with_eta(6.5);
     }
 
     pub fn pbt_exploit_and_explore(&mut self) {
@@ -6034,23 +6022,11 @@ impl PureAutonomousRlBrain {
             .unwrap_or(f64::NEG_INFINITY);
 
         let mut weighted_action = 0.0_f64;
-        let mut weighted_action_sq = 0.0_f64;
-        let mut pos_action_sum = 0.0_f64;
-        let mut neg_action_sum = 0.0_f64;
         let mut pos_sign_weight = 0.0_f64;
         let mut neg_sign_weight = 0.0_f64;
         let mut weighted_vehicle = 0.0_f64;
         let mut weighted_stop = 0.0_f64;
         let mut weighted_dz = 0.0_f64;
-        let mut weighted_long_mean_bps = 0.0_f64;
-        let mut weighted_long_mean_sq = 0.0_f64;
-        let mut weighted_long_spread_bps = 0.0_f64;
-        let mut weighted_short_mean_bps = 0.0_f64;
-        let mut weighted_short_mean_sq = 0.0_f64;
-        let mut weighted_short_spread_bps = 0.0_f64;
-        let mut weighted_downside_av = 0.0_f64;
-        let mut weighted_cost_sens = 0.0_f64;
-        let mut weighted_causal_pf = 0.0_f64;
         let mut positive_weight_sum = 0.0_f64;
         let mut active_specialists = 0usize;
 
@@ -6100,9 +6076,9 @@ impl PureAutonomousRlBrain {
                 active_routed_count += 1;
             }
         }
-        // When causal evaluation history exists, concentrate execution on at most the Top 6 routed specialists
-        // (prevents tail dilution from marginal members and accelerates ensemble inference 3x).
-        if has_eval_history && active_routed_count > 6 {
+        // When causal evaluation history exists, concentrate execution on at most the Top 3 routed specialists
+        // (prevents tail dilution from marginal members, preserves single-specialist OOF fidelity, and accelerates inference 8x).
+        if has_eval_history && active_routed_count > 3 {
             let mut order: Vec<usize> = (0..pop_len)
                 .filter(|&i| routed_weights[i] > 1e-8)
                 .collect();
@@ -6115,7 +6091,7 @@ impl PureAutonomousRlBrain {
                             .total_cmp(&self.population[a].causal_score)
                     })
             });
-            for &drop_idx in order.iter().skip(6) {
+            for &drop_idx in order.iter().skip(3) {
                 routed_weights[drop_idx] = 0.0;
             }
         }
@@ -6150,59 +6126,12 @@ impl PureAutonomousRlBrain {
                 active_specialists += 1;
                 if step.action > 0.0 {
                     pos_sign_weight += w;
-                    pos_action_sum += w * (step.action as f64);
                 } else {
                     neg_sign_weight += w;
-                    neg_action_sum += w * (step.action as f64);
                 }
             }
 
-            let (l_mean_sh, l_spr_sh, l_lcb_sh) =
-                compute_critic_channel_lcb(&step.critic_all[0..5], member.hparams.downside_aversion);
-            let (s_mean_sh, s_spr_sh, s_lcb_sh) =
-                compute_critic_channel_lcb(&step.critic_all[5..10], member.hparams.downside_aversion);
-            let (l_mean_best, l_spr_best) = if option_allowed {
-                let (lm_o, ls_o, ll_o) = compute_critic_channel_lcb(
-                    &step.critic_all[10..15],
-                    member.hparams.downside_aversion,
-                );
-                if ll_o > l_lcb_sh {
-                    (lm_o, ls_o)
-                } else {
-                    (l_mean_sh, l_spr_sh)
-                }
-            } else {
-                (l_mean_sh, l_spr_sh)
-            };
-            let (s_mean_best, s_spr_best) = if option_allowed {
-                let (sm_o, ss_o, sl_o) = compute_critic_channel_lcb(
-                    &step.critic_all[15..20],
-                    member.hparams.downside_aversion,
-                );
-                if sl_o > s_lcb_sh {
-                    (sm_o, ss_o)
-                } else {
-                    (s_mean_sh, s_spr_sh)
-                }
-            } else {
-                (s_mean_sh, s_spr_sh)
-            };
-
-            let lm_bps = (l_mean_best * 10_000.0) as f64;
-            let sm_bps = (s_mean_best * 10_000.0) as f64;
-            weighted_long_mean_bps += w * lm_bps;
-            weighted_long_mean_sq += w * lm_bps * lm_bps;
-            weighted_long_spread_bps += w * ((l_spr_best * 10_000.0) as f64);
-            weighted_short_mean_bps += w * sm_bps;
-            weighted_short_mean_sq += w * sm_bps * sm_bps;
-            weighted_short_spread_bps += w * ((s_spr_best * 10_000.0) as f64);
-            weighted_downside_av += w * (member.hparams.downside_aversion as f64);
-            weighted_cost_sens += w * (member.hparams.cost_sensitivity.max(0.02) as f64);
-            weighted_causal_pf += w * member.causal_pf.clamp(0.0, 4.0);
-
-            let act = step.action as f64;
-            weighted_action += w * act;
-            weighted_action_sq += w * act * act;
+            weighted_action += w * (step.action as f64);
             weighted_vehicle += w * (step.vehicle_prob as f64);
             weighted_stop += w * (step.tail_stop_dist as f64);
             weighted_dz += w * (step.deadzone as f64);
@@ -6231,113 +6160,26 @@ impl PureAutonomousRlBrain {
         };
 
         let is_holding = self_state.current_pos.abs() > 1e-4;
-        let turn_clamped = self_state.ema_turnover.clamp(0.0, 1.5);
-        if positive_weight_sum > 1e-9 {
-            let rt_cost_bps = (2.0 * self_state.one_way_cost_bps).max(4.0);
-            let avg_down_av = (weighted_downside_av / positive_weight_sum) as f32;
-            let avg_cs = (weighted_cost_sens / positive_weight_sum) as f32;
-            let avg_pf = if has_eval_history {
-                (weighted_causal_pf / positive_weight_sum) as f32
+        if !is_holding && positive_weight_sum > 1e-9 {
+            // Each routed specialist (`SequencePolicyNet` with `K = 5` heads) already enforces Distributional
+            // Critic LCB, World-Model LCB, `conformal_q_bps`, and Cost-Scaled Turnover-Amortized Deadzones.
+            // Require directional sign agreement among active routed specialists without double-subtracting costs!
+            let active_w = pos_sign_weight + neg_sign_weight;
+            if active_w <= 1e-9 || agg_action.abs() <= 1e-6 {
+                agg_action = 0.0;
             } else {
-                1.10
-            };
-            let cal_shortfall = (1.05 - avg_pf).max(0.0);
-            let lambda_aleatoric =
-                0.075 + 0.02 * avg_down_av.clamp(0.3, 6.0) + 0.06 * cal_shortfall;
-            let lambda_epistemic = 0.20 + 0.45 * cal_shortfall;
-            let has_wm_signal = wm_pred.iter().any(|v| v.abs() > 1e-8);
-
-            if !is_holding {
-                let active_w = pos_sign_weight + neg_sign_weight;
-                if active_w <= 1e-9 || agg_action.abs() <= 1e-6 {
+                let dir_consensus = (((pos_sign_weight - neg_sign_weight).abs() / active_w) as f32)
+                    .clamp(0.0, 1.0);
+                let min_cons = if has_eval_history { 0.50 } else { 0.30 };
+                if dir_consensus < min_cons {
                     agg_action = 0.0;
                 } else {
-                    let dir_consensus = (((pos_sign_weight - neg_sign_weight).abs() / active_w)
-                        as f32)
-                        .clamp(0.0, 1.0);
-                    let coverage = ((active_w / positive_weight_sum) as f32).clamp(0.0, 1.0);
-                    let active_mean = (weighted_action / active_w) as f32;
-                    let var_active =
-                        ((weighted_action_sq / active_w) - (active_mean as f64).powi(2)).max(0.0);
-                    let std_active = var_active.sqrt() as f32;
-
-                    // Distributional + Epistemic Ensemble LCB coupled with unconstrained `k_theta` & `ema_turnover`:
-                    let (dir_mean_bps, dir_spread_bps, dir_epistemic_std_bps) =
-                        if agg_action >= 0.0 {
-                            let m = weighted_long_mean_bps / positive_weight_sum;
-                            let s = weighted_long_spread_bps / positive_weight_sum;
-                            let v =
-                                ((weighted_long_mean_sq / positive_weight_sum) - m * m).max(0.0);
-                            (m as f32, s as f32, v.sqrt() as f32)
-                        } else {
-                            let m = weighted_short_mean_bps / positive_weight_sum;
-                            let s = weighted_short_spread_bps / positive_weight_sum;
-                            let v =
-                                ((weighted_short_mean_sq / positive_weight_sum) - m * m).max(0.0);
-                            (m as f32, s as f32, v.sqrt() as f32)
-                        };
-                    let wm_cal_lcb_bps = wm_directional_lcb_bps(
-                        wm_pred,
-                        agg_action.signum(),
-                        rt_cost_bps,
-                        avg_down_av,
-                    ) - self.conformal_q_bps;
-                    let ens_critic_lcb_bps = dir_mean_bps
-                        - lambda_aleatoric * dir_spread_bps
-                        - lambda_epistemic * dir_epistemic_std_bps;
-                    let lcb_net_bps = if has_wm_signal {
-                        0.58 * ens_critic_lcb_bps + 0.42 * wm_cal_lcb_bps
-                    } else {
-                        ens_critic_lcb_bps - 0.42 * self.conformal_q_bps
-                    } - 0.45 * cal_shortfall * rt_cost_bps;
-
-                    let wm_iqr_8_bps =
-                        ((wm_pred[10] - wm_pred[8]).abs() * 10_000.0).clamp(0.0, 260.0);
-                    let vol_cost_bps = rt_cost_bps.max(0.42 * wm_iqr_8_bps);
-                    let hurdle_turn_bps = vol_cost_bps
-                        * (0.12 * (avg_cs - 0.78).max(0.0) + 0.62 * turn_clamped);
-                    let q_entry_minus_flat_bps = lcb_net_bps - hurdle_turn_bps;
-
-                    let min_cov = if !has_eval_history {
-                        0.08
-                    } else if rt_cost_bps >= 45.0 {
-                        0.16
-                    } else {
-                        0.22
-                    };
-                    let min_cons = if has_eval_history { 0.50 } else { 0.25 };
-                    if coverage < min_cov || dir_consensus < min_cons {
-                        agg_action = 0.0;
-                    } else {
-                        let scale_bps = vol_cost_bps.clamp(12.0, 48.0);
-                        let net_ratio =
-                            (q_entry_minus_flat_bps / scale_bps).clamp(-4.0, 4.0);
-                        let lcb_taper = if has_eval_history {
-                            ((net_ratio + 0.26) / 0.48).clamp(0.0, 1.0)
-                        } else {
-                            ((net_ratio + 0.72) / 0.72).clamp(0.0, 1.0)
-                        };
-                        let soft_conf = sigmoid(2.15 * (net_ratio + 0.12)) * lcb_taper;
-                        let blended = 0.50 * agg_action + 0.50 * active_mean * coverage.sqrt();
-                        let lcb_mag = (blended.abs() - 0.10 * std_active).max(0.0)
-                            * dir_consensus
-                            * soft_conf;
-                        agg_action = if lcb_mag <= 1e-5 {
-                            0.0
-                        } else {
-                            blended.signum() * lcb_mag
-                        };
-                    }
+                    agg_action *= dir_consensus;
                 }
-            } else {
-                // True routed ensemble mean `agg_action = weighted_action / positive_weight_sum` while holding:
-                // when the majority of specialists flip to `0.0` (`Neural-Exit`), `agg_action` drops cleanly
-                // below `flat_snap` without a single stubborn specialist blocking the exit!
-                let _ = (pos_action_sum, neg_action_sum);
             }
         }
 
-        // Responsive Neural-Exit snap when holding without prematurely whipsawing healthy trends!
+        // Exact Entry vs Hold parity with single-specialist discrete evaluator (`evaluate_single_member_indexed`):
         let flat_snap = if !is_holding {
             0.070
         } else {
